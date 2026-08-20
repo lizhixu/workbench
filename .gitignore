@@ -1,0 +1,43 @@
+# Local session/cache directories (per-session sandbox state)
+.zcode/
+260814094426488/
+tmp/
+reports/
+
+# Build outputs
+bin/
+watchman*.exe
+watchman*.exe~
+watchman
+watchman.exe
+
+# Runtime data (DB, JSON stores, recordings, metrics history)
+data/
+
+# Web build artifacts & dependencies
+web/dist/
+web/node_modules/
+
+# Logs
+*.log
+agent.log
+agent2.log
+backend.log
+frontend.log
+server.log
+
+# Agent runtime state
+agent_state.json
+
+# Docker test artifacts
+docker_all.json
+docker_ps.json
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

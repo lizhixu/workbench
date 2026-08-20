@@ -1,0 +1,274 @@
+syntax = "proto3";
+
+package watchman.agent;
+
+option go_package = "watchman/proto/agentpb;agentpb";
+
+// AgentService is the single bidirectional stream that carries all channels
+// between the control server and an agent (registration, heartbeat, terminal,
+// file transfer, command exec, metrics, system info, docker, scan, upgrade).
+//
+// The agent is the gRPC client and dials out to the server; the managed host
+// never listens on any inbound port.
+service AgentService {
+  // Connect is opened by the agent on startup (and re-opened on reconnect).
+  // Both sides exchange oneof envelopes over the same stream.
+  rpc Connect(stream AgentMessage) returns (stream ServerMessage);
+}
+
+// ---- Envelopes -------------------------------------------------------
+
+// AgentMessage is sent from agent to server.
+message AgentMessage {
+  oneof payload {
+    RegisterRequest register = 1;
+    Heartbeat heartbeat = 2;
+    TerminalOutput term_out = 3;
+    FileChunk file_chunk = 4;
+    ExecResult exec_result = 5;
+    MetricsSample metrics = 6;
+    SysInfoSnapshot sysinfo = 7;
+    DockerEvent docker = 8; // (P2)
+    ScanProgress scan_progress = 9; // (P3)
+    UpgradeProgress upgrade_progress = 10; // (P3)
+    Ack ack = 99;
+  }
+}
+
+// ServerMessage is sent from server to agent.
+message ServerMessage {
+  oneof payload {
+    RegisterResponse register = 1;
+    HeartbeatAck heartbeat = 2;
+    TerminalOpen term_open = 3;
+    TerminalInput term_in = 4;
+    TerminalResize term_resize = 5;
+    TerminalClose term_close = 6;
+    FileOp file_op = 7;
+    ExecRequest exec = 8;
+    SysInfoQuery sysinfo_q = 9;
+    MetricsQuery metrics_q = 10;
+    DockerOp docker_op = 11; // (P2)
+    ScanRequest scan = 12; // (P3)
+    UpgradeRequest upgrade = 13; // (P3)
+  }
+}
+
+// ---- Registration & heartbeat ---------------------------------------
+
+message RegisterRequest {
+  // enroll_token is a one-time token issued by the server; used only on first
+  // registration to exchange for a long-lived auth_token. Empty on reconnect
+  // when the agent already has an auth_token (sent via gRPC metadata).
+  string enroll_token = 1;
+  // agent_id is the persistent local identifier of the agent. On first
+  // registration the agent generates one; the server may override it.
+  string agent_id = 2;
+  string hostname = 3;
+  string os = 4; // linux / windows / darwin
+  string arch = 5; // amd64 / arm64
+  string distro = 6;
+  string agent_version = 7;
+  int64 uptime = 8; // real OS uptime in seconds (since boot), sent at registration so the UI doesn't wait for the first metrics cycle
+  int32 cpu_cores = 9; // logical CPU cores count (e.g. 16, 4)
+  int64 mem_total = 10; // total memory in bytes
+  string internal_ip = 11; // local private IP (e.g. 172.20.69.191)
+  string public_ip = 12; // external public IP (e.g. 183.159.65.120)
+  string location = 13; // geo location (e.g. 浙江省-杭州市)
+}
+
+message RegisterResponse {
+  bool ok = 1;
+  string error = 2; // set when ok=false (e.g. invalid/expired/revoked token)
+  string agent_id = 3;
+  // auth_token is the long-lived credential returned on first registration.
+  // Empty on subsequent reconnects (the agent keeps using its existing token).
+  string auth_token = 4;
+  int32 heartbeat_interval_sec = 5;
+  // session_keep_sec is how long the server keeps a PTY session alive after
+  // the agent disconnects, to allow seamless resume.
+  int32 session_keep_sec = 6;
+}
+
+message Heartbeat {
+  int64 ts = 1; // unix seconds
+}
+
+message HeartbeatAck {
+  int64 ts = 1;
+}
+
+// ---- Terminal --------------------------------------------------------
+
+message TerminalOpen {
+  string session_id = 1;
+  string shell = 2; // bash / sh / powershell / cmd
+  string account = 3; // optional login account; empty = default
+  string cwd = 4;
+  uint32 cols = 5;
+  uint32 rows = 6;
+  string share_mode = 7; // none / view / control (P2)
+}
+
+message TerminalOutput {
+  string session_id = 1;
+  bytes data = 2;
+}
+
+message TerminalInput {
+  string session_id = 1;
+  bytes data = 2;
+}
+
+message TerminalResize {
+  string session_id = 1;
+  uint32 cols = 2;
+  uint32 rows = 3;
+}
+
+message TerminalClose {
+  string session_id = 1;
+}
+
+// ---- File transfer ---------------------------------------------------
+
+message FileOp {
+  string op_id = 1;
+  // op is one of: read, write, stat, list, mkdir, move, remove, copy,
+  // upload, download, resume.
+  string op = 2;
+  string path = 3;
+  int64 offset = 4;
+  int64 length = 5;
+  int64 total_size = 6;
+  uint32 chunk_seq = 7;
+  bytes data = 8;
+  bool overwrite = 9;
+  string dest_path = 10; // for move / copy
+}
+
+message FileChunk {
+  string op_id = 1;
+  uint32 chunk_seq = 2;
+  bytes data = 3;
+  int64 offset = 4;
+  bool eof = 5;
+  string sha256 = 6;
+}
+
+// ---- Command exec ----------------------------------------------------
+
+message ExecRequest {
+  string exec_id = 1;
+  string shell = 2; // bash / sh / cmd / powershell
+  string command = 3; // single command or script body
+  bool is_script = 4;
+  int32 timeout_sec = 5;
+}
+
+message ExecResult {
+  string exec_id = 1;
+  int32 exit_code = 2;
+  bytes stdout = 3;
+  bytes stderr = 4;
+  int64 duration_ms = 5;
+  string error = 6;
+}
+
+// ---- Metrics ---------------------------------------------------------
+
+message MetricsSample {
+  string agent_id = 1;
+  int64 ts = 2; // unix seconds
+  double cpu_usage = 3; // percent 0..100
+  double mem_usage = 4; // percent 0..100
+  int64 mem_total = 5; // bytes
+  int64 mem_used = 6; // bytes
+  double net_rx = 7; // bytes/s
+  double net_tx = 8; // bytes/s
+  double disk_read = 9; // bytes/s
+  double disk_write = 10; // bytes/s
+  repeated Mount mounts = 11;
+  int64 uptime = 12; // host uptime in seconds (real OS boot-derived)
+}
+
+message Mount {
+  string path = 1;
+  int64 total = 2; // bytes
+  int64 used = 3; // bytes
+}
+
+// ---- System info -----------------------------------------------------
+
+message SysInfoQuery {
+  string kind = 1; // process / port / user / login
+}
+
+// MetricsQuery asks the agent for current (or a single historical) metrics.
+message MetricsQuery {
+  bool live = 1; // when true the agent starts streaming MetricsSample periodically
+  int32 interval_sec = 2; // sampling interval when live=true
+}
+
+message SysInfoSnapshot {
+  string kind = 1;
+  // json_payload is a structured JSON payload whose schema depends on kind.
+  bytes json_payload = 2;
+}
+
+// ---- Docker (P2) -----------------------------------------------------
+
+message DockerOp {
+  string op_id = 1;
+  // op is one of: ps, images, start, stop, restart, rm, logs, exec, inspect,
+  // remove_image, prune_images.
+  string op = 2;
+  string container = 3;
+  string image = 4;
+  bytes args_json = 5;
+}
+
+message DockerEvent {
+  string op_id = 1;
+  bool ok = 2;
+  string error = 3;
+  bytes payload_json = 4; // result payload
+}
+
+// ---- Security scan (P3) ---------------------------------------------
+
+message ScanRequest {
+  string scan_id = 1;
+  string type = 2; // baseline / intrusion / vuln
+  string rule_set = 3;
+}
+
+message ScanProgress {
+  string scan_id = 1;
+  double progress = 2; // 0..1
+  bool done = 3;
+  bytes findings_json = 4;
+  string report_ref = 5;
+}
+
+// ---- Agent upgrade (P3) ---------------------------------------------
+
+message UpgradeRequest {
+  string version = 1;
+  string url = 2;
+  string sha256 = 3;
+}
+
+message UpgradeProgress {
+  string stage = 1; // downloading / verifying / replacing / restarting
+  double progress = 2; // 0..1
+  string error = 3;
+}
+
+// ---- Generic ack -----------------------------------------------------
+
+message Ack {
+  bool ok = 1;
+  string error = 2;
+  string ref = 3; // optional correlation id
+}

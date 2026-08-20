@@ -1,0 +1,450 @@
+package alert
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"math"
+	"net/http"
+	"time"
+
+	"watchman/proto/agentpb"
+	"watchman/server/internal/ai"
+	"watchman/server/internal/metrics"
+	"watchman/server/internal/rpc"
+)
+
+// HostInfo is a snapshot of an agent's state used for rule evaluation.
+type HostInfo struct {
+	ID       string
+	Hostname string
+	Group    string
+	Status   string // online / offline
+	Metrics  *agentpb.MetricsSample
+}
+
+// HostProvider supplies the current host list to the monitor. The registry
+// implements this interface.
+type HostProvider interface {
+	ListHosts() []HostInfo
+}
+
+// Monitor periodically evaluates alert rules against the live host state.
+type Monitor struct {
+	store        *Store
+	provider     HostProvider
+	metricsStore *metrics.Store
+	aiAssistant  *ai.Assistant
+	log          *slog.Logger
+	stop         chan struct{}
+}
+
+// NewMonitor creates a monitor that evaluates rules every interval.
+// metricsStore and aiAssistant are optional (enable anomaly detection + AI
+// interpretation when non-nil).
+func NewMonitor(store *Store, provider HostProvider, metricsStore *metrics.Store, aiAssistant *ai.Assistant, log *slog.Logger) *Monitor {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Monitor{
+		store:        store,
+		provider:     provider,
+		metricsStore: metricsStore,
+		aiAssistant:  aiAssistant,
+		log:          log,
+		stop:         make(chan struct{}),
+	}
+}
+
+// Start launches the monitor goroutine. It runs until Stop is called.
+func (m *Monitor) Start(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	m.log.Info("alert monitor started", "interval", interval)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.stop:
+			return
+		case <-ticker.C:
+			m.evaluate()
+		}
+	}
+}
+
+// Stop halts the monitor.
+func (m *Monitor) Stop() {
+	close(m.stop)
+}
+
+func (m *Monitor) evaluate() {
+	// Alert storm suppression: if >20 events fired in the last 5 minutes,
+	// collapse them into a single summary event and downgrade the rest.
+	m.suppressStorm()
+
+	rules := m.store.ListRules()
+	hosts := m.provider.ListHosts()
+
+	for _, rule := range rules {
+		if !rule.Enabled {
+			continue
+		}
+		for _, host := range hosts {
+			if !matchesFilter(host, rule) {
+				continue
+			}
+			m.checkRule(rule, host)
+		}
+	}
+}
+
+// suppressStorm detects alert storms (>20 events in 5 min) and merges them
+// into a single critical summary event, downgrading the originals to info.
+func (m *Monitor) suppressStorm() {
+	now := time.Now()
+	windowStart := now.Add(-5 * time.Minute)
+
+	m.store.mu.Lock()
+	var recent []*Event
+	for _, e := range m.store.events {
+		if e.FiredAt.After(windowStart) && !e.Resolved {
+			recent = append(recent, e)
+		}
+	}
+	// Only suppress if we crossed the threshold and haven't already summarized
+	// this storm (avoid re-summarizing every tick). We detect "already
+	// summarized" by checking if a storm summary event exists in this window.
+	alreadySummarized := false
+	for _, e := range recent {
+		if e.RuleID == "__storm__" {
+			alreadySummarized = true
+			break
+		}
+	}
+	if len(recent) < 20 || alreadySummarized {
+		m.store.mu.Unlock()
+		return
+	}
+
+	// Downgrade all recent events to info severity.
+	for _, e := range recent {
+		e.Severity = SeverityInfo
+	}
+	// Build a storm summary.
+	summary := &Event{
+		ID:       randomID(),
+		RuleID:   "__storm__",
+		RuleName: "告警风暴",
+		Severity: SeverityCritical,
+		Message:  fmt.Sprintf("告警风暴：过去 5 分钟内触发 %d 条告警，已合并降噪", len(recent)),
+		FiredAt:  now,
+	}
+	m.store.events = append(m.store.events, summary)
+	m.store.mu.Unlock()
+	_ = m.store.persist()
+	m.log.Warn("alert storm suppressed", "count", len(recent))
+	// AI-generate a storm summary interpretation.
+	m.interpretAsync(summary)
+}
+
+func matchesFilter(host HostInfo, rule *Rule) bool {
+	if rule.HostFilter != "" {
+		if !contains(host.Hostname, rule.HostFilter) {
+			return false
+		}
+	}
+	if rule.GroupFilter != "" {
+		if host.Group != rule.GroupFilter {
+			return false
+		}
+	}
+	return true
+}
+
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && (s == sub || (len(s) > 0 && indexOf(s, sub) >= 0))
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m *Monitor) checkRule(rule *Rule, host HostInfo) {
+	key := rule.ID + ":" + host.ID
+	triggered := false
+	message := ""
+
+	switch rule.Type {
+	case RuleOffline:
+		if host.Status != "online" {
+			triggered = true
+			message = fmt.Sprintf("主机 %s 已离线", host.Hostname)
+		}
+	case RuleCPUHigh:
+		if host.Metrics != nil && host.Metrics.GetCpuUsage() > rule.Threshold {
+			triggered = true
+			message = fmt.Sprintf("主机 %s CPU 使用率 %.1f%% 超过阈值 %.0f%%", host.Hostname, host.Metrics.GetCpuUsage(), rule.Threshold)
+		}
+	case RuleMemHigh:
+		if host.Metrics != nil {
+			memPct := 0.0
+			if host.Metrics.GetMemTotal() > 0 {
+				memPct = float64(host.Metrics.GetMemUsed()) / float64(host.Metrics.GetMemTotal()) * 100
+			}
+			if memPct > rule.Threshold {
+				triggered = true
+				message = fmt.Sprintf("主机 %s 内存使用率 %.1f%% 超过阈值 %.0f%%", host.Hostname, memPct, rule.Threshold)
+			}
+		}
+	case RuleDiskHigh:
+		if host.Metrics != nil {
+			for _, mt := range host.Metrics.GetMounts() {
+				pct := 0.0
+				if mt.GetTotal() > 0 {
+					pct = float64(mt.GetUsed()) / float64(mt.GetTotal()) * 100
+				}
+				if pct > rule.Threshold {
+					triggered = true
+					message = fmt.Sprintf("主机 %s 磁盘 %s 使用率 %.1f%% 超过阈值 %.0f%%", host.Hostname, mt.GetPath(), pct, rule.Threshold)
+					break
+				}
+			}
+		}
+	case RuleAnomaly:
+		if m.metricsStore != nil && host.Metrics != nil {
+			triggered, message = m.detectAnomaly(rule, host)
+		}
+	}
+
+	if triggered {
+		if !m.store.isFiring(key) {
+			m.store.setFiring(key, true)
+			event := &Event{
+				ID:       randomID(),
+				RuleID:   rule.ID,
+				RuleName: rule.Name,
+				Severity: rule.Severity,
+				HostID:   host.ID,
+				Hostname: host.Hostname,
+				Message:  message,
+				FiredAt:  time.Now(),
+			}
+			m.store.addEvent(event)
+			_ = m.store.persist()
+			m.log.Warn("alert fired", "rule", rule.Name, "host", host.Hostname, "severity", rule.Severity, "msg", message)
+			m.notify(event)
+			// Asynchronously generate AI interpretation (best-effort, non-blocking).
+			m.interpretAsync(event)
+		}
+	} else {
+		// Condition cleared — mark resolved.
+		if m.store.isFiring(key) {
+			m.store.setFiring(key, false)
+			m.resolveEvent(rule.ID, host.ID)
+		}
+	}
+}
+
+// detectAnomaly pulls the last hour of a metric from the metrics store,
+// computes mean and standard deviation, and triggers when the latest sample
+// deviates more than threshold × σ from the mean. threshold is interpreted as
+// the σ multiplier (default 3).
+func (m *Monitor) detectAnomaly(rule *Rule, host HostInfo) (bool, string) {
+	sigmaMult := rule.Threshold
+	if sigmaMult <= 0 {
+		sigmaMult = 3
+	}
+	metric := rule.Metric
+	if metric == "" {
+		metric = "cpu"
+	}
+
+	now := time.Now().Unix()
+	from := now - 3600 // last 1 hour
+	pts := m.metricsStore.QueryHistory(host.ID, from, now, 15)
+	if len(pts) < 10 {
+		return false, "" // not enough data for statistics
+	}
+
+	var values []float64
+	var latest float64
+	for i, pt := range pts {
+		var v float64
+		switch metric {
+		case "cpu":
+			v = pt.CPUUsage
+		case "mem":
+			if pt.MemTotal > 0 {
+				v = float64(pt.MemUsed) / float64(pt.MemTotal) * 100
+			}
+		case "net_rx":
+			v = pt.NetRx
+		case "net_tx":
+			v = pt.NetTx
+		case "disk_read":
+			v = pt.DiskRead
+		case "disk_write":
+			v = pt.DiskWrite
+		default:
+			v = pt.CPUUsage
+		}
+		values = append(values, v)
+		if i == len(pts)-1 {
+			latest = v
+		}
+	}
+
+	mean, std := meanStddev(values)
+	if std < 0.001 {
+		return false, "" // no variance, can't detect anomaly
+	}
+
+	deviation := math.Abs(latest - mean)
+	if deviation > sigmaMult*std {
+		return true, fmt.Sprintf("主机 %s 的 %s 指标异常：当前 %.2f 偏离均值 %.2f 达 %.1fσ（超过 %.0fσ 阈值）",
+			host.Hostname, metricLabel(metric), latest, mean, deviation/std, sigmaMult)
+	}
+	return false, ""
+}
+
+func metricLabel(m string) string {
+	switch m {
+	case "cpu":
+		return "CPU"
+	case "mem":
+		return "内存"
+	case "net_rx":
+		return "网络接收"
+	case "net_tx":
+		return "网络发送"
+	case "disk_read":
+		return "磁盘读"
+	case "disk_write":
+		return "磁盘写"
+	default:
+		return m
+	}
+}
+
+func meanStddev(values []float64) (mean, stddev float64) {
+	n := float64(len(values))
+	if n == 0 {
+		return 0, 0
+	}
+	var sum float64
+	for _, v := range values {
+		sum += v
+	}
+	mean = sum / n
+	var sqSum float64
+	for _, v := range values {
+		sqSum += (v - mean) * (v - mean)
+	}
+	stddev = math.Sqrt(sqSum / n)
+	return
+}
+
+// interpretAsync generates an AI interpretation for an alert event in the
+// background and appends it to the event. Non-blocking; failures are logged.
+func (m *Monitor) interpretAsync(event *Event) {
+	if m.aiAssistant == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		interpretation, err := m.aiAssistant.InterpretAlert(ctx, event.Message, event.HostID, "")
+		if err != nil || interpretation == "" {
+			return
+		}
+		m.store.mu.Lock()
+		for _, e := range m.store.events {
+			if e.ID == event.ID {
+				e.AIInterpretation = interpretation
+				break
+			}
+		}
+		m.store.mu.Unlock()
+		_ = m.store.persist()
+	}()
+}
+
+func (m *Monitor) resolveEvent(ruleID, hostID string) {
+	m.store.mu.Lock()
+	for _, e := range m.store.events {
+		if e.RuleID == ruleID && e.HostID == hostID && !e.Resolved {
+			e.Resolved = true
+			e.ResolvedAt = time.Now()
+		}
+	}
+	m.store.mu.Unlock()
+	_ = m.store.persist()
+}
+
+func (m *Monitor) notify(e *Event) {
+	cfg := m.store.GetWebhook()
+	if !cfg.Enabled || cfg.URL == "" {
+		return
+	}
+	go func() {
+		payload, _ := json.Marshal(map[string]any{
+			"event":     e,
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+		req, err := http.NewRequest("POST", cfg.URL, bytes.NewReader(payload))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if cfg.Secret != "" {
+			req.Header.Set("X-Webhook-Secret", cfg.Secret)
+		}
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			m.log.Warn("webhook notify failed", "url", cfg.URL, "err", err)
+			return
+		}
+		_ = resp.Body.Close()
+		m.log.Info("webhook notified", "url", cfg.URL, "status", resp.StatusCode)
+	}()
+}
+
+// ---- Registry adapter ----
+
+// registryAdapter adapts *rpc.Registry to the HostProvider interface.
+type registryAdapter struct {
+	reg *rpc.Registry
+}
+
+// NewHostProvider wraps a registry as a HostProvider.
+func NewHostProvider(reg *rpc.Registry) HostProvider {
+	return &registryAdapter{reg: reg}
+}
+
+func (a *registryAdapter) ListHosts() []HostInfo {
+	agents := a.reg.ListAgents()
+	out := make([]HostInfo, 0, len(agents))
+	for _, ag := range agents {
+		hi := HostInfo{
+			ID:       ag.ID,
+			Hostname: ag.Hostname,
+			Group:    ag.Group,
+			Status:   ag.Status,
+		}
+		hub := a.reg.Hub(ag.ID)
+		if hub != nil {
+			hi.Metrics = hub.LastMetrics()
+		}
+		out = append(out, hi)
+	}
+	return out
+}

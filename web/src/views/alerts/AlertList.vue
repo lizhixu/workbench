@@ -1,0 +1,813 @@
+<script setup lang="ts">
+import { onMounted, ref, computed } from 'vue'
+import { useRouter } from 'vue-router'
+import {
+  NCard,
+  NButton,
+  NSpace,
+  NTable,
+  NTag,
+  NModal,
+  NForm,
+  NFormItem,
+  NInput,
+  NSelect,
+  NSwitch,
+  NInputNumber,
+  NPopconfirm,
+  NTabs,
+  NTabPane,
+  NEmpty,
+  useMessage,
+  NIcon,
+  NBadge,
+  NRadioGroup,
+  NRadioButton,
+} from 'naive-ui'
+import {
+  AddCircleOutline,
+  RefreshOutline,
+  TrashOutline,
+  NotificationsOutline,
+  WarningOutline,
+  AlertCircleOutline,
+  InformationCircleOutline,
+  CheckmarkDoneOutline,
+  ServerOutline,
+  SparklesOutline,
+} from '@vicons/ionicons5'
+import type { AlertRule, RuleType, Severity, WebhookConfig } from '../../api/alerts'
+import {
+  listRules,
+  createRule,
+  updateRule,
+  deleteRule,
+  getWebhook,
+  setWebhook,
+} from '../../api/alerts'
+import { useWorkspaceStore } from '../../stores/workspace'
+import { useNotificationStore } from '../../stores/notifications'
+
+const router = useRouter()
+const message = useMessage()
+const workspace = useWorkspaceStore()
+const notifStore = useNotificationStore()
+
+const rules = ref<AlertRule[]>([])
+const loading = ref(false)
+const activeTab = ref('messages')
+
+// Filter state for messages tab
+const statusFilter = ref<'all' | 'unread' | 'resolved'>('all')
+const severityFilter = ref<string>('all')
+const searchKeyword = ref('')
+
+// Rule modal
+const showRuleModal = ref(false)
+const editingRule = ref<AlertRule | null>(null)
+const ruleForm = ref({
+  name: '',
+  type: 'offline' as RuleType,
+  severity: 'warning' as Severity,
+  threshold: 90,
+  duration: 0,
+  metric: 'cpu',
+  host_filter: '',
+  group_filter: '',
+  enabled: true,
+})
+
+// Webhook
+const webhook = ref<WebhookConfig>({ url: '', secret: '', enabled: false })
+
+const ruleTypeOptions = [
+  { label: '主机离线', value: 'offline' },
+  { label: 'CPU 使用率高', value: 'cpu_high' },
+  { label: '内存使用率高', value: 'mem_high' },
+  { label: '磁盘使用率高', value: 'disk_high' },
+  { label: 'AI 异常检测', value: 'anomaly' },
+]
+
+const anomalyMetricOptions = [
+  { label: 'CPU 使用率', value: 'cpu' },
+  { label: '内存使用率', value: 'mem' },
+  { label: '网络接收速率', value: 'net_rx' },
+  { label: '网络发送速率', value: 'net_tx' },
+  { label: '磁盘读速率', value: 'disk_read' },
+  { label: '磁盘写速率', value: 'disk_write' },
+]
+
+const severityOptions = [
+  { label: '全部级别', value: 'all' },
+  { label: '严重 (Critical)', value: 'critical' },
+  { label: '警告 (Warning)', value: 'warning' },
+  { label: '信息 (Info)', value: 'info' },
+]
+
+const filteredEvents = computed(() => {
+  return notifStore.events.filter((e) => {
+    // Status filter
+    if (statusFilter.value === 'unread' && e.resolved) return false
+    if (statusFilter.value === 'resolved' && !e.resolved) return false
+
+    // Severity filter
+    if (severityFilter.value !== 'all' && e.severity !== severityFilter.value) return false
+
+    // Keyword filter
+    if (searchKeyword.value.trim()) {
+      const q = searchKeyword.value.trim().toLowerCase()
+      const hostMatch = (e.hostname || '').toLowerCase().includes(q)
+      const msgMatch = (e.message || '').toLowerCase().includes(q)
+      const ruleMatch = (e.rule_name || '').toLowerCase().includes(q)
+      if (!hostMatch && !msgMatch && !ruleMatch) return false
+    }
+
+    return true
+  })
+})
+
+function sevTagType(s: Severity) {
+  if (s === 'critical') return 'error' as const
+  if (s === 'warning') return 'warning' as const
+  return 'info' as const
+}
+
+function sevLabel(s: Severity) {
+  if (s === 'critical') return '严重'
+  if (s === 'warning') return '警告'
+  return '信息'
+}
+
+function ruleTypeLabel(t: RuleType) {
+  const o = ruleTypeOptions.find((x) => x.value === t)
+  return o?.label || t
+}
+
+function fmtTime(s: string): string {
+  if (!s) return '-'
+  return s.slice(0, 19).replace('T', ' ')
+}
+
+function goHostDetail(hostId: string, hostname: string) {
+  if (!hostId) return
+  workspace.openTab({
+    key: `/hosts/${hostId}`,
+    title: hostname || hostId,
+    path: `/hosts/${hostId}`,
+    closable: true,
+  })
+  router.push(`/hosts/${hostId}`)
+}
+
+async function loadRules() {
+  try {
+    rules.value = await listRules()
+  } catch (e: any) {
+    message.error(e.message)
+  }
+}
+
+async function loadWebhook() {
+  try {
+    webhook.value = await getWebhook()
+  } catch (e: any) {
+    message.error(e.message)
+  }
+}
+
+async function refreshAll() {
+  loading.value = true
+  await Promise.all([notifStore.fetchEvents(), loadRules(), loadWebhook()])
+  loading.value = false
+}
+
+function openCreateRule() {
+  editingRule.value = null
+  ruleForm.value = {
+    name: '',
+    type: 'offline',
+    severity: 'warning',
+    threshold: 90,
+    duration: 0,
+    metric: 'cpu',
+    host_filter: '',
+    group_filter: '',
+    enabled: true,
+  }
+  showRuleModal.value = true
+}
+
+function openEditRule(r: AlertRule) {
+  editingRule.value = r
+  ruleForm.value = {
+    name: r.name,
+    type: r.type,
+    severity: r.severity,
+    threshold: r.threshold,
+    duration: r.duration,
+    metric: r.metric || 'cpu',
+    host_filter: r.host_filter,
+    group_filter: r.group_filter,
+    enabled: r.enabled,
+  }
+  showRuleModal.value = true
+}
+
+async function saveRule() {
+  if (!ruleForm.value.name) {
+    message.warning('请输入规则名称')
+    return
+  }
+  try {
+    if (editingRule.value) {
+      await updateRule(editingRule.value.id, ruleForm.value)
+      message.success('规则已更新')
+    } else {
+      await createRule(ruleForm.value)
+      message.success('规则已创建')
+    }
+    showRuleModal.value = false
+    loadRules()
+  } catch (e: any) {
+    message.error(e.message)
+  }
+}
+
+async function doDeleteRule(id: string) {
+  try {
+    await deleteRule(id)
+    message.success('规则已删除')
+    loadRules()
+  } catch (e: any) {
+    message.error(e.message)
+  }
+}
+
+async function toggleRule(r: AlertRule, enabled: boolean) {
+  try {
+    await updateRule(r.id, { ...r, enabled })
+    loadRules()
+  } catch (e: any) {
+    message.error(e.message)
+  }
+}
+
+async function saveWebhook() {
+  try {
+    await setWebhook(webhook.value)
+    message.success('Webhook 配置已保存')
+    loadWebhook()
+  } catch (e: any) {
+    message.error(e.message)
+  }
+}
+
+async function doAckEvent(id: string) {
+  try {
+    await notifStore.markAsRead(id)
+    message.success('已标记为已读')
+  } catch (e: any) {
+    message.error(e.message)
+  }
+}
+
+async function doAckAllEvents() {
+  try {
+    await notifStore.markAllAsRead()
+    message.success('全部消息已标记为已读')
+  } catch (e: any) {
+    message.error(e.message)
+  }
+}
+
+onMounted(() => {
+  workspace.openTab({
+    key: '/alerts',
+    title: '消息中心',
+    path: '/alerts',
+    closable: true,
+  })
+  refreshAll()
+})
+</script>
+
+<template>
+  <div class="message-center-view">
+    <!-- Header -->
+    <div class="page-header">
+      <div class="header-left">
+        <div class="title-wrap">
+          <NIcon size="22" color="#6366f1"><NotificationsOutline /></NIcon>
+          <h2 class="page-title">消息与告警中心</h2>
+        </div>
+        <span class="page-desc">聚合展示主机上下线、系统告警与运维事件</span>
+      </div>
+      <div class="header-right">
+        <NSpace :size="10">
+          <NButton
+            v-if="activeTab === 'messages' && notifStore.unreadCount > 0"
+            secondary
+            type="primary"
+            size="small"
+            @click="doAckAllEvents"
+          >
+            <template #icon><NIcon :component="CheckmarkDoneOutline" /></template>
+            全部标记已读
+          </NButton>
+          <NButton size="small" @click="refreshAll" :loading="loading || notifStore.loading">
+            <template #icon><NIcon :component="RefreshOutline" /></template>
+            刷新
+          </NButton>
+        </NSpace>
+      </div>
+    </div>
+
+    <!-- Tabs Container -->
+    <div class="tabs-container">
+      <NTabs v-model:value="activeTab" type="line" animated>
+        <!-- 消息列表 / 事件通知 Tab -->
+        <NTabPane name="messages">
+          <template #tab>
+            <NSpace align="center" :size="6">
+              <span>消息列表</span>
+              <NBadge
+                v-if="notifStore.unreadCount > 0"
+                :value="notifStore.unreadCount"
+                :max="99"
+                type="error"
+              />
+            </NSpace>
+          </template>
+
+          <div class="messages-tab-content">
+            <!-- Filter Toolbar -->
+            <div class="filter-toolbar">
+              <div class="filter-left">
+                <NRadioGroup v-model:value="statusFilter" size="small">
+                  <NRadioButton value="all">全部 ({{ notifStore.events.length }})</NRadioButton>
+                  <NRadioButton value="unread">未读 ({{ notifStore.unreadCount }})</NRadioButton>
+                  <NRadioButton value="resolved">已读/已恢复</NRadioButton>
+                </NRadioGroup>
+
+                <NSelect
+                  v-model:value="severityFilter"
+                  :options="severityOptions"
+                  size="small"
+                  style="width: 140px"
+                />
+
+                <NInput
+                  v-model:value="searchKeyword"
+                  placeholder="搜索主机、消息内容或规则"
+                  size="small"
+                  clearable
+                  style="width: 220px"
+                />
+              </div>
+
+              <div class="filter-right">
+                <span class="result-count">共 {{ filteredEvents.length }} 条记录</span>
+              </div>
+            </div>
+
+            <!-- Events List Table -->
+            <div class="table-card">
+              <NEmpty v-if="filteredEvents.length === 0" description="暂无符合条件的消息通知" />
+              <NTable v-else :single-line="false" size="small" class="custom-table">
+                <thead>
+                  <tr>
+                    <th style="width: 100px">级别</th>
+                    <th style="width: 130px">触发规则</th>
+                    <th style="width: 160px">关联主机</th>
+                    <th>消息详情</th>
+                    <th style="width: 200px">AI 解读</th>
+                    <th style="width: 160px">发生时间</th>
+                    <th style="width: 90px">状态</th>
+                    <th style="width: 140px">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="e in filteredEvents"
+                    :key="e.id"
+                    :class="{ 'unread-row': !e.resolved }"
+                  >
+                    <td>
+                      <NTag :type="sevTagType(e.severity)" size="small" round>
+                        <template #icon>
+                          <NIcon>
+                            <AlertCircleOutline v-if="e.severity === 'critical'" />
+                            <WarningOutline v-else-if="e.severity === 'warning'" />
+                            <InformationCircleOutline v-else />
+                          </NIcon>
+                        </template>
+                        {{ sevLabel(e.severity) }}
+                      </NTag>
+                    </td>
+                    <td>
+                      <span class="rule-name-tag">{{ e.rule_name || '系统监控' }}</span>
+                    </td>
+                    <td>
+                      <div
+                        class="host-cell"
+                        :class="{ clickable: !!e.host_id }"
+                        @click="goHostDetail(e.host_id, e.hostname)"
+                      >
+                        <NIcon size="14"><ServerOutline /></NIcon>
+                        <span class="host-name-text">{{ e.hostname || e.host_id || '-' }}</span>
+                      </div>
+                    </td>
+                    <td class="event-msg-cell">
+                      <span class="msg-text">{{ e.message }}</span>
+                    </td>
+                    <td class="ai-interpret-cell">
+                      <NTooltip v-if="e.ai_interpretation" placement="top" :style="{ maxWidth: '400px' }">
+                        <template #trigger>
+                          <span class="ai-interpret-summary">
+                            <NIcon size="12" color="#6366f1"><SparklesOutline /></NIcon>
+                            {{ e.ai_interpretation.slice(0, 40) }}{{ e.ai_interpretation.length > 40 ? '...' : '' }}
+                          </span>
+                        </template>
+                        {{ e.ai_interpretation }}
+                      </NTooltip>
+                      <span v-else class="muted-text">-</span>
+                    </td>
+                    <td class="time-cell">{{ fmtTime(e.fired_at) }}</td>
+                    <td>
+                      <NTag :type="e.resolved ? 'default' : 'warning'" size="small" round>
+                        {{ e.resolved ? '已读' : '未读' }}
+                      </NTag>
+                    </td>
+                    <td>
+                      <NSpace :size="6">
+                        <NButton
+                          v-if="!e.resolved"
+                          size="tiny"
+                          type="success"
+                          secondary
+                          @click="doAckEvent(e.id)"
+                        >
+                          标记已读
+                        </NButton>
+                        <NButton
+                          v-if="e.host_id"
+                          size="tiny"
+                          quaternary
+                          type="primary"
+                          @click="goHostDetail(e.host_id, e.hostname)"
+                        >
+                          查看主机
+                        </NButton>
+                      </NSpace>
+                    </td>
+                  </tr>
+                </tbody>
+              </NTable>
+            </div>
+          </div>
+        </NTabPane>
+
+        <!-- 告警规则 Tab -->
+        <NTabPane name="rules" tab="告警规则配置">
+          <div class="rules-tab-content">
+            <div class="toolbar-bar">
+              <NButton type="primary" size="small" @click="openCreateRule">
+                <template #icon><NIcon :component="AddCircleOutline" /></template>
+                新增规则
+              </NButton>
+            </div>
+
+            <div class="table-card">
+              <NEmpty v-if="rules.length === 0" description="暂无告警规则，点击上方按钮新增" />
+              <NTable v-else :single-line="false" size="small" class="custom-table">
+                <thead>
+                  <tr>
+                    <th>规则名称</th>
+                    <th>监控类型</th>
+                    <th>告警级别</th>
+                    <th>触发阈值</th>
+                    <th>主机过滤</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="r in rules" :key="r.id">
+                    <td class="rule-title-cell" @click="openEditRule(r)">
+                      {{ r.name }}
+                    </td>
+                    <td>{{ ruleTypeLabel(r.type) }}</td>
+                    <td>
+                      <NTag :type="sevTagType(r.severity)" size="small" round>
+                        {{ sevLabel(r.severity) }}
+                      </NTag>
+                    </td>
+                    <td>{{
+                      r.type === 'offline' ? '心跳中断'
+                      : r.type === 'anomaly' ? `> ${r.threshold}σ`
+                      : `> ${r.threshold}%`
+                    }}</td>
+                    <td>{{ r.host_filter || '全部主机' }}</td>
+                    <td>
+                      <NSwitch
+                        :value="r.enabled"
+                        size="small"
+                        @update:value="(v: boolean) => toggleRule(r, v)"
+                      />
+                    </td>
+                    <td>
+                      <NSpace :size="4">
+                        <NButton size="small" quaternary @click="openEditRule(r)">编辑</NButton>
+                        <NPopconfirm @positive-click="doDeleteRule(r.id)">
+                          <template #trigger>
+                            <NButton size="small" quaternary type="error">
+                              <template #icon><NIcon :component="TrashOutline" /></template>
+                            </NButton>
+                          </template>
+                          确认删除规则 {{ r.name }}？
+                        </NPopconfirm>
+                      </NSpace>
+                    </td>
+                  </tr>
+                </tbody>
+              </NTable>
+            </div>
+          </div>
+        </NTabPane>
+
+        <!-- Webhook 通知渠道 Tab -->
+        <NTabPane name="webhook" tab="通知渠道 (Webhook)">
+          <div class="webhook-tab-content">
+            <NCard title="Webhook 告警推送" class="webhook-card">
+              <p class="webhook-intro">
+                配置企业微信、钉钉、飞书或自建系统 Webhook 地址，当告警触发时系统会自动发送 HTTP POST 请求。
+              </p>
+              <NForm label-placement="top" style="margin-top: 16px">
+                <NFormItem label="Webhook URL">
+                  <NInput
+                    v-model:value="webhook.url"
+                    placeholder="https://oapi.dingtalk.com/robot/send?access_token=..."
+                  />
+                </NFormItem>
+                <NFormItem label="签名密钥 Secret (可选，将放入 X-Webhook-Secret 头部)">
+                  <NInput
+                    v-model:value="webhook.secret"
+                    placeholder="请输入密钥"
+                    type="password"
+                    show-password-on="click"
+                  />
+                </NFormItem>
+                <NFormItem label="启用 Webhook 推送">
+                  <NSwitch v-model:value="webhook.enabled" />
+                </NFormItem>
+              </NForm>
+              <NSpace justify="end" style="margin-top: 12px">
+                <NButton type="primary" @click="saveWebhook">
+                  <template #icon><NIcon :component="NotificationsOutline" /></template>
+                  保存配置
+                </NButton>
+              </NSpace>
+            </NCard>
+          </div>
+        </NTabPane>
+      </NTabs>
+    </div>
+
+    <!-- Rule modal -->
+    <NModal
+      v-model:show="showRuleModal"
+      preset="card"
+      :title="editingRule ? '编辑告警规则' : '新增告警规则'"
+      style="width: 520px"
+    >
+      <NForm label-placement="top">
+        <NFormItem label="规则名称" required>
+          <NInput v-model:value="ruleForm.name" placeholder="例如：生产服务器 CPU 高负载预警" />
+        </NFormItem>
+        <NFormItem label="监控类型" required>
+          <NSelect v-model:value="ruleForm.type" :options="ruleTypeOptions" />
+        </NFormItem>
+        <NFormItem label="告警级别" required>
+          <NSelect
+            v-model:value="ruleForm.severity"
+            :options="severityOptions.filter((o) => o.value !== 'all')"
+          />
+        </NFormItem>
+        <NFormItem label="阈值 (%)" v-if="ruleForm.type !== 'offline' && ruleForm.type !== 'anomaly'">
+          <NInputNumber v-model:value="ruleForm.threshold" :min="1" :max="100" style="width: 100%" />
+        </NFormItem>
+        <NFormItem label="监控指标" v-if="ruleForm.type === 'anomaly'">
+          <NSelect v-model:value="ruleForm.metric" :options="anomalyMetricOptions" />
+        </NFormItem>
+        <NFormItem label="偏离倍数 (σ)" v-if="ruleForm.type === 'anomaly'">
+          <NInputNumber v-model:value="ruleForm.threshold" :min="1" :max="10" :step="0.5" style="width: 100%" />
+          <span class="muted-text" style="margin-left: 8px">当前值偏离均值超过 {{ ruleForm.threshold }}σ 时触发</span>
+        </NFormItem>
+        <NFormItem label="主机过滤 (主机名包含，留空则匹配全部)">
+          <NInput v-model:value="ruleForm.host_filter" placeholder="例如：prod 或 web" />
+        </NFormItem>
+        <NFormItem label="分组过滤 (留空则匹配全部)">
+          <NInput v-model:value="ruleForm.group_filter" placeholder="例如：production" />
+        </NFormItem>
+        <NFormItem label="是否启用">
+          <NSwitch v-model:value="ruleForm.enabled" />
+        </NFormItem>
+      </NForm>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showRuleModal = false">取消</NButton>
+          <NButton type="primary" @click="saveRule">保存</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+  </div>
+</template>
+
+<style scoped lang="scss">
+.message-center-view {
+  padding: 16px 20px;
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+
+  .page-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    .header-left {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+
+      .title-wrap {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+
+        .page-title {
+          margin: 0;
+          font-size: 18px;
+          font-weight: 600;
+          color: var(--text-primary);
+        }
+      }
+
+      .page-desc {
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+    }
+  }
+
+  .tabs-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .filter-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+    gap: 10px;
+
+    .filter-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .filter-right {
+      .result-count {
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+    }
+  }
+
+  .table-card {
+    background-color: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px 16px;
+    box-shadow: var(--shadow-sm);
+
+    .custom-table {
+      width: 100%;
+
+      th {
+        background-color: var(--bg-card-subtle);
+        color: var(--text-secondary);
+        font-weight: 600;
+        font-size: 12px;
+      }
+
+      td {
+        color: var(--text-primary);
+        font-size: 13px;
+        vertical-align: middle;
+      }
+
+      .unread-row {
+        background-color: rgba(99, 102, 241, 0.04);
+      }
+
+      .rule-name-tag {
+        font-weight: 500;
+        color: var(--text-primary);
+      }
+
+      .host-cell {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--text-secondary);
+
+        &.clickable {
+          cursor: pointer;
+          color: #3b82f6;
+          &:hover {
+            text-decoration: underline;
+          }
+        }
+
+        .host-name-text {
+          font-weight: 500;
+        }
+      }
+
+      .event-msg-cell {
+        max-width: 380px;
+        word-break: break-word;
+
+        .msg-text {
+          line-height: 1.4;
+        }
+      }
+
+      .ai-interpret-cell {
+        max-width: 200px;
+        font-size: 12px;
+
+        .ai-interpret-summary {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          color: #6366f1;
+          cursor: help;
+          line-height: 1.4;
+        }
+      }
+
+      .muted-text {
+        color: var(--text-secondary);
+        font-size: 12px;
+      }
+
+      .time-cell {
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+
+      .rule-title-cell {
+        font-weight: 600;
+        cursor: pointer;
+        color: #3b82f6;
+        &:hover {
+          text-decoration: underline;
+        }
+      }
+    }
+  }
+
+  .toolbar-bar {
+    margin-bottom: 12px;
+  }
+
+  .webhook-tab-content {
+    display: flex;
+    justify-content: flex-start;
+
+    .webhook-card {
+      max-width: 650px;
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+
+      .webhook-intro {
+        margin: 0;
+        font-size: 13px;
+        color: var(--text-secondary);
+        line-height: 1.5;
+      }
+    }
+  }
+}
+</style>

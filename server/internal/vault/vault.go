@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -124,6 +125,8 @@ func (s *Store) load() error {
 	return nil
 }
 
+// persist writes the encrypted credentials to disk. It takes the read lock
+// itself, so callers must NOT hold s.mu — sync.RWMutex is not reentrant.
 func (s *Store) persist() error {
 	s.mu.RLock()
 	entries := make([]onDiskEntry, 0, len(s.creds))
@@ -162,6 +165,14 @@ func (s *Store) List() []*Credential {
 		clone.Secret = "" // never expose in list
 		out = append(out, &clone)
 	}
+	// Map iteration is randomized; sort by creation time (ID as tiebreaker) so
+	// the credential list keeps a stable order across requests.
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out
 }
 
@@ -230,11 +241,15 @@ func (s *Store) Update(id string, c *Credential) error {
 // Delete removes a credential.
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, ok := s.creds[id]; !ok {
+		s.mu.Unlock()
 		return errors.New("credential not found")
 	}
 	delete(s.creds, id)
+	s.mu.Unlock()
+	// persist takes the read lock itself, so it must run after the unlock:
+	// sync.RWMutex is not reentrant and holding the write lock here would
+	// deadlock the store for the rest of the process's life.
 	return s.persist()
 }
 

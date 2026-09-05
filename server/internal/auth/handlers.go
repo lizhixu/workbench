@@ -9,6 +9,9 @@ import (
 // Handlers bundles the user-management REST endpoints.
 type Handlers struct {
 	store *Store
+	// onUserDeleted lets other stores drop data keyed by username when an
+	// account is removed, so a recreated account does not inherit it.
+	onUserDeleted func(username string)
 }
 
 // NewHandlers creates an auth Handlers backed by the given store.
@@ -16,17 +19,49 @@ func NewHandlers(store *Store) *Handlers {
 	return &Handlers{store: store}
 }
 
+// OnUserDeleted registers a callback invoked after an account is deleted.
+func (h *Handlers) OnUserDeleted(fn func(username string)) *Handlers {
+	h.onUserDeleted = fn
+	return h
+}
+
 // Register mounts user-management routes on the given router group.
 // The group is expected to already require authentication (Middleware applied).
 func (h *Handlers) Register(rg *gin.RouterGroup) {
+	// Any authenticated user may read their own profile and end their session.
+	rg.GET("/auth/me", h.me)
+	rg.POST("/auth/logout", h.logout)
+
 	// User management is admin-only. Operators/viewers can still read their
-	// own profile via /auth/me if needed, but the admin user list is gated.
+	// own profile via /auth/me, but the admin user list is gated.
 	rg.GET("/users", RequireRole(RoleAdmin), h.listUsers)
 	rg.POST("/users", RequireRole(RoleAdmin), h.createUser)
 	rg.PUT("/users/:username/password", h.updatePassword)
 	rg.PUT("/users/:username/role", RequireRole(RoleAdmin), h.updateRole)
 	rg.POST("/users/:username/reset-password", RequireRole(RoleAdmin), h.resetPassword)
 	rg.DELETE("/users/:username", RequireRole(RoleAdmin), h.deleteUser)
+}
+
+// me returns the caller's own account, so a client holding a token can confirm
+// it is still valid and learn its role without guessing from local storage.
+func (h *Handlers) me(c *gin.Context) {
+	u, ok := h.store.Get(Username(c))
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "account no longer exists"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": u})
+}
+
+// logout exists so clients have one endpoint to call when signing out. Tokens
+// are stateless JWTs that stay valid until they expire, so the server cannot
+// revoke them here; the client must discard its copy. The response says so
+// explicitly rather than implying the token was invalidated.
+func (h *Handlers) logout(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"ok":   true,
+		"note": "令牌为无状态 JWT，服务端不吊销；客户端需自行丢弃令牌，令牌到期前仍然有效",
+	})
 }
 
 // Login handles POST /auth/login. This is registered as a PUBLIC route (before
@@ -137,9 +172,13 @@ func (h *Handlers) resetPassword(c *gin.Context) {
 }
 
 func (h *Handlers) deleteUser(c *gin.Context) {
-	if err := h.store.Delete(c.Param("username")); err != nil {
+	username := c.Param("username")
+	if err := h.store.Delete(username); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if h.onUserDeleted != nil {
+		h.onUserDeleted(username)
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

@@ -16,6 +16,8 @@ data/
 
 # Web build artifacts & dependencies
 web/dist/
+web/dist.tar.gz
+web/tsc.err
 web/node_modules/
 
 # Logs

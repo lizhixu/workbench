@@ -41,6 +41,30 @@ type Assistant struct {
 	metricsStore metricsStoreRef
 	alertStore   alertStoreRef
 	reports      *reportStore
+	policy       policyChecker
+}
+
+// policyChecker is a minimal interface over the command policy store, used to
+// flag high-risk steps in generated plans without importing the policy package
+// (which would otherwise pull the audit/regex machinery into ai). It mirrors
+// policy.Store.Check without the concrete return type.
+type policyChecker interface {
+	CheckRisk(command string) (riskLevel string, blocked bool, needsConfirm bool, matchedPattern string)
+}
+
+// SetPolicyChecker injects the command policy so PlanTask can annotate step
+// risk. Safe to call with nil (risk annotation falls back to a built-in
+// heuristic).
+func (a *Assistant) SetPolicyChecker(p policyChecker) {
+	a.mu.Lock()
+	a.policy = p
+	a.mu.Unlock()
+}
+
+func (a *Assistant) policyCheckerRef() policyChecker {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.policy
 }
 
 // metricsStoreRef is a minimal interface to avoid a circular import with the

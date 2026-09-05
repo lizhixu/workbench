@@ -45,6 +45,12 @@ export interface Host {
   internal_ip?: string
   public_ip?: string
   location?: string
+  // Extended live metrics from the agent's latest sample.
+  cpu_model?: string
+  load1?: number
+  swap_usage?: number
+  month_rx?: number
+  month_tx?: number
 }
 
 export interface ListResponse<T> {
@@ -110,6 +116,18 @@ export interface Metrics {
   disk_read: number
   disk_write: number
   mounts: Mount[]
+  // Extended metrics (zero/absent on older agents).
+  load1?: number
+  load5?: number
+  load15?: number
+  swap_total?: number
+  swap_used?: number
+  tcp_established?: number
+  udp_count?: number
+  process_count?: number
+  cpu_model?: string
+  month_rx?: number
+  month_tx?: number
 }
 
 // ---- Docker ----

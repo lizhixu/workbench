@@ -146,22 +146,22 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 		return fmt.Errorf("open stream: %w", err)
 	}
 
-		hwInfo := CollectHostHardwareInfo()
-		reg := &agentpb.RegisterRequest{
-			EnrollToken:  d.cfg.EnrollToken,
-			AgentId:      d.cfg.State.AgentID,
-			Hostname:     hostname(),
-			Os:           runtime.GOOS,
-			Arch:         runtime.GOARCH,
-			Distro:       hwInfo.Distro,
-			AgentVersion: "0.1.0-dev",
-			Uptime:       hwInfo.Uptime,
-			CpuCores:     hwInfo.CPUCores,
-			MemTotal:     hwInfo.MemTotal,
-			InternalIp:   hwInfo.InternalIP,
-			PublicIp:     hwInfo.PublicIP,
-			Location:     hwInfo.Location,
-		}
+	hwInfo := CollectHostHardwareInfo()
+	reg := &agentpb.RegisterRequest{
+		EnrollToken:  d.cfg.EnrollToken,
+		AgentId:      d.cfg.State.AgentID,
+		Hostname:     hostname(),
+		Os:           runtime.GOOS,
+		Arch:         runtime.GOARCH,
+		Distro:       hwInfo.Distro,
+		AgentVersion: "0.1.0-dev",
+		Uptime:       hwInfo.Uptime,
+		CpuCores:     hwInfo.CPUCores,
+		MemTotal:     hwInfo.MemTotal,
+		InternalIp:   hwInfo.InternalIP,
+		PublicIp:     hwInfo.PublicIP,
+		Location:     hwInfo.Location,
+	}
 	if err := stream.Send(&agentpb.AgentMessage{
 		Payload: &agentpb.AgentMessage_Register{Register: reg},
 	}); err != nil {
@@ -211,6 +211,7 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 	}
 	if d.metrics != nil {
 		d.metrics.SetSender(hub)
+		d.metrics.StartBackground(30)
 		defer d.metrics.Stop()
 	}
 	if d.sysinfo != nil {
@@ -282,7 +283,7 @@ func (d *Dialer) handleServerMessage(msg *agentpb.ServerMessage) error {
 		if d.files == nil {
 			return fmt.Errorf("file manager not available")
 		}
-		go d.files.Handle(p.FileOp)
+		d.files.HandleAsync(p.FileOp)
 		return nil
 
 	// Exec.

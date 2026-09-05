@@ -29,6 +29,17 @@ type Point struct {
 	NetTx     float64 `json:"net_tx"`
 	DiskRead  float64 `json:"disk_read"`
 	DiskWrite float64 `json:"disk_write"`
+	// Extended metrics (older records simply have zero values).
+	Load1         float64 `json:"load1"`
+	Load5         float64 `json:"load5"`
+	Load15        float64 `json:"load15"`
+	SwapTotal     int64   `json:"swap_total"`
+	SwapUsed      int64   `json:"swap_used"`
+	TcpEstablished int32  `json:"tcp_established"`
+	UdpCount      int32   `json:"udp_count"`
+	ProcessCount  int32   `json:"process_count"`
+	MonthRx       int64   `json:"month_rx"`
+	MonthTx       int64   `json:"month_tx"`
 }
 
 // Store handles metric persistence and downsampling.
@@ -70,6 +81,16 @@ func (s *Store) AddSample(hostID string, m *agentpb.MetricsSample) {
 		NetTx:     m.GetNetTx(),
 		DiskRead:  m.GetDiskRead(),
 		DiskWrite: m.GetDiskWrite(),
+		Load1:         m.GetLoad1(),
+		Load5:         m.GetLoad5(),
+		Load15:        m.GetLoad15(),
+		SwapTotal:     m.GetSwapTotal(),
+		SwapUsed:      m.GetSwapUsed(),
+		TcpEstablished: m.GetTcpEstablished(),
+		UdpCount:      m.GetUdpCount(),
+		ProcessCount:  m.GetProcessCount(),
+		MonthRx:       m.GetMonthRx(),
+		MonthTx:       m.GetMonthTx(),
 	}
 	if pt.Timestamp == 0 {
 		pt.Timestamp = time.Now().Unix()
@@ -136,7 +157,10 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 		return raw
 	}
 
-	// 2. Downsample points by time bucket
+	// 2. Downsample points by time bucket. Rates and utilisation are averaged
+	// within the bucket; capacities (mem/swap total) take the bucket max; and
+	// monthly traffic counters, being monotonic, take the latest value so the
+	// downsampled series still reports true month-to-date usage.
 	type bucket struct {
 		ts        int64
 		count     int
@@ -148,6 +172,16 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 		netTx     float64
 		diskRead  float64
 		diskWrite float64
+		load1     float64
+		load5     float64
+		load15    float64
+		swapTotal int64
+		swapUsed  int64
+		tcpEst    float64
+		udpCount  float64
+		procCount float64
+		monthRx   int64
+		monthTx   int64
 	}
 
 	buckets := make(map[int64]*bucket)
@@ -157,7 +191,7 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 		bKey := (pt.Timestamp / int64(stepSec)) * int64(stepSec)
 		b, ok := buckets[bKey]
 		if !ok {
-			b = &bucket{ts: bKey, memTotal: pt.MemTotal}
+			b = &bucket{ts: bKey, memTotal: pt.MemTotal, swapTotal: pt.SwapTotal}
 			buckets[bKey] = b
 			bucketKeys = append(bucketKeys, bKey)
 		}
@@ -169,9 +203,22 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 		b.netTx += pt.NetTx
 		b.diskRead += pt.DiskRead
 		b.diskWrite += pt.DiskWrite
+		b.load1 += pt.Load1
+		b.load5 += pt.Load5
+		b.load15 += pt.Load15
+		b.swapUsed += pt.SwapUsed
+		b.tcpEst += float64(pt.TcpEstablished)
+		b.udpCount += float64(pt.UdpCount)
+		b.procCount += float64(pt.ProcessCount)
 		if pt.MemTotal > b.memTotal {
 			b.memTotal = pt.MemTotal
 		}
+		if pt.SwapTotal > b.swapTotal {
+			b.swapTotal = pt.SwapTotal
+		}
+		// raw is sorted ascending, so the last write wins and is the newest.
+		b.monthRx = pt.MonthRx
+		b.monthTx = pt.MonthTx
 	}
 
 	sort.Slice(bucketKeys, func(i, j int) bool {
@@ -186,15 +233,25 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 		}
 		n := float64(b.count)
 		result = append(result, Point{
-			Timestamp: b.ts,
-			CPUUsage:  b.cpu / n,
-			MemUsage:  b.mem / n,
-			MemTotal:  b.memTotal,
-			MemUsed:   int64(float64(b.memUsed) / n),
-			NetRx:     b.netRx / n,
-			NetTx:     b.netTx / n,
-			DiskRead:  b.diskRead / n,
-			DiskWrite: b.diskWrite / n,
+			Timestamp:      b.ts,
+			CPUUsage:       b.cpu / n,
+			MemUsage:       b.mem / n,
+			MemTotal:       b.memTotal,
+			MemUsed:        int64(float64(b.memUsed) / n),
+			NetRx:          b.netRx / n,
+			NetTx:          b.netTx / n,
+			DiskRead:       b.diskRead / n,
+			DiskWrite:      b.diskWrite / n,
+			Load1:          b.load1 / n,
+			Load5:          b.load5 / n,
+			Load15:         b.load15 / n,
+			SwapTotal:      b.swapTotal,
+			SwapUsed:       int64(float64(b.swapUsed) / n),
+			TcpEstablished: int32(b.tcpEst / n),
+			UdpCount:       int32(b.udpCount / n),
+			ProcessCount:   int32(b.procCount / n),
+			MonthRx:        b.monthRx,
+			MonthTx:        b.monthTx,
 		})
 	}
 

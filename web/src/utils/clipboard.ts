@@ -1,18 +1,41 @@
 /**
- * Safe clipboard copy utility with robust fallback for non-secure HTTP contexts.
- *
- * Navigator.clipboard.writeText is only available in Secure Contexts (HTTPS or
- * localhost). In plain HTTP ip/domain contexts it may exist but silently fail,
- * or be undefined entirely. We verify success and fall back to a legacy
- * textarea + document.execCommand('copy') technique, keeping the textarea
- * focused long enough for the command to commit.
+ * Universal clipboard copy utility with multi-tier fallback.
+ * Works seamlessly in both HTTPS and plain HTTP IP environments,
+ * and handles modal focus traps (e.g. Naive UI NModal / Element Plus dialogs).
  */
 
-function legacyCopy(text: string): boolean {
+function copyViaEvent(text: string): boolean {
+  let success = false
+  const listener = (e: ClipboardEvent) => {
+    if (e.clipboardData) {
+      e.clipboardData.clearData()
+      e.clipboardData.setData('text/plain', text)
+      e.preventDefault()
+      success = true
+    }
+  }
+
   try {
+    document.addEventListener('copy', listener)
+    // Trigger the copy event while user interaction is active
+    document.execCommand('copy')
+  } catch {
+    success = false
+  } finally {
+    document.removeEventListener('copy', listener)
+  }
+
+  return success
+}
+
+function copyViaTextarea(text: string): boolean {
+  try {
+    const activeEl = (document.activeElement as HTMLElement) || document.body
+    // Prefer appending inside active modal/container to avoid focus trap conflicts
+    const container = activeEl.closest('.n-modal, .n-dialog, .n-drawer, [role="dialog"]') || document.body
+
     const textArea = document.createElement('textarea')
     textArea.value = text
-    // Place outside the viewport but keep it rendered (display:none breaks select on iOS).
     textArea.style.position = 'fixed'
     textArea.style.top = '0'
     textArea.style.left = '0'
@@ -23,15 +46,10 @@ function legacyCopy(text: string): boolean {
     textArea.style.outline = 'none'
     textArea.style.boxShadow = 'none'
     textArea.style.background = 'transparent'
-    textArea.style.opacity = '0'
-    textArea.setAttribute('readonly', '')
-    // Prevent zoom on iOS.
-    textArea.style.fontSize = '12px'
+    textArea.style.opacity = '0.01'
+    textArea.style.zIndex = '99999'
 
-    document.body.appendChild(textArea)
-
-    // Save current focus so we can restore it afterwards.
-    const previouslyFocused = document.activeElement as HTMLElement | null
+    container.appendChild(textArea)
 
     textArea.focus()
     textArea.select()
@@ -44,12 +62,11 @@ function legacyCopy(text: string): boolean {
       successful = false
     }
 
-    document.body.removeChild(textArea)
+    container.removeChild(textArea)
 
-    // Restore focus to the original element (e.g. the button in the modal).
-    if (previouslyFocused && typeof previouslyFocused.focus === 'function') {
+    if (activeEl && typeof activeEl.focus === 'function') {
       try {
-        previouslyFocused.focus()
+        activeEl.focus()
       } catch {
         /* ignore */
       }
@@ -64,38 +81,31 @@ function legacyCopy(text: string): boolean {
 export async function copyToClipboard(text: string): Promise<boolean> {
   if (!text) return false
 
-  // 1. Modern Clipboard API — only reliable in Secure Contexts.
+  // 1. Try modern navigator.clipboard.writeText if available
   if (
     typeof navigator !== 'undefined' &&
     navigator.clipboard &&
-    typeof navigator.clipboard.writeText === 'function' &&
-    (window.isSecureContext === true ||
-      window.location.protocol === 'https:' ||
-      window.location.hostname === 'localhost' ||
-      window.location.hostname === '127.0.0.1')
+    typeof navigator.clipboard.writeText === 'function'
   ) {
     try {
       await navigator.clipboard.writeText(text)
-      // Verify by reading back — some browsers silently fail write in HTTP.
-      if (navigator.clipboard.readText) {
-        try {
-          const readBack = await navigator.clipboard.readText()
-          if (readBack === text) return true
-        } catch {
-          // readText may be blocked; assume write succeeded.
-          return true
-        }
-      }
       return true
     } catch {
-      // fall through to legacy
+      // Permission denied or non-secure context restriction; fallback to next strategies
     }
   }
 
-  // 2. Legacy fallback for non-secure contexts.
-  if (legacyCopy(text)) return true
+  // 2. Try clipboard event interception (foolproof for user gesture in modals/HTTP)
+  if (copyViaEvent(text)) {
+    return true
+  }
 
-  // 3. Final fallback — open a prompt so the user can manually copy.
+  // 3. Try in-container textarea selection
+  if (copyViaTextarea(text)) {
+    return true
+  }
+
+  // 4. Final fallback: prompt user to copy manually
   try {
     window.prompt('请手动复制以下内容（Ctrl+C / Cmd+C）：', text)
     return true

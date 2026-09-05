@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { ref, nextTick, onMounted } from 'vue'
 import {
-  NSpace,
   NInput,
   NButton,
   NIcon,
@@ -9,9 +8,13 @@ import {
   NEmpty,
   useMessage,
 } from 'naive-ui'
-import { ChatbubbleEllipsesOutline, PaperPlaneOutline, SparklesOutline } from '@vicons/ionicons5'
+import { ChatbubbleEllipsesOutline, PaperPlaneOutline, SparklesOutline, CopyOutline } from '@vicons/ionicons5'
 import { chat, type ChatMessage, type ChatResponse } from '../../api/ai'
 import { useWorkspaceStore } from '../../stores/workspace'
+import { copyToClipboard } from '../../utils/clipboard'
+
+// KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
+defineOptions({ name: 'AiChat' })
 
 const message = useMessage()
 const workspace = useWorkspaceStore()
@@ -58,6 +61,16 @@ async function scrollToBottom() {
   await nextTick()
   if (chatListRef.value) {
     chatListRef.value.scrollTop = chatListRef.value.scrollHeight
+  }
+}
+
+async function copyMsg(content: string) {
+  if (!content) return
+  const ok = await copyToClipboard(content)
+  if (ok) {
+    message.success('已复制内容到剪贴板')
+  } else {
+    message.error('复制失败，请手动选中复制')
   }
 }
 
@@ -127,7 +140,16 @@ onMounted(() => {
             <NIcon v-if="msg.role === 'user'" size="16"><ChatbubbleEllipsesOutline /></NIcon>
             <NIcon v-else size="16" color="#6366f1"><SparklesOutline /></NIcon>
           </div>
-          <div class="msg-content" v-html="renderMarkdown(msg.content)" />
+          <div class="msg-bubble-wrap">
+            <div class="msg-content" v-html="renderMarkdown(msg.content)" />
+            <button
+              class="msg-copy-btn"
+              title="复制内容"
+              @click="copyMsg(msg.content)"
+            >
+              <NIcon size="14"><CopyOutline /></NIcon>
+            </button>
+          </div>
         </div>
 
         <div v-if="loading" class="chat-message assistant">
@@ -143,16 +165,18 @@ onMounted(() => {
 
       <!-- Input area -->
       <div class="chat-input-area">
-        <NSpace align="flex-end" :size="8">
+        <div class="input-row">
           <NInput
             v-model:value="inputText"
             type="textarea"
-            :autosize="{ minRows: 1, maxRows: 4 }"
-            placeholder="输入你的问题，例如：哪台机器磁盘快满了？"
-            @keydown.enter.prevent="send()"
+            :rows="2"
+            placeholder="输入你的运维问题，例如：哪台机器磁盘快满了？最近有哪些异常告警？（Shift+Enter 换行，Enter 发送）"
+            class="fixed-chat-input"
+            @keydown.enter.exact.prevent="send()"
           />
           <NButton
             type="primary"
+            class="send-btn"
             :loading="loading"
             :disabled="!inputText.trim()"
             @click="send()"
@@ -160,7 +184,7 @@ onMounted(() => {
             <template #icon><NIcon><PaperPlaneOutline /></NIcon></template>
             发送
           </NButton>
-        </NSpace>
+        </div>
       </div>
     </div>
   </div>
@@ -171,7 +195,6 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  padding: 16px;
   box-sizing: border-box;
   gap: 12px;
 
@@ -241,9 +264,13 @@ onMounted(() => {
         background: var(--bg-card-subtle);
       }
 
-      .msg-content {
-        background: rgba(99, 102, 241, 0.1);
-        border-color: rgba(99, 102, 241, 0.2);
+      .msg-bubble-wrap {
+        flex-direction: row-reverse;
+
+        .msg-content {
+          background: rgba(99, 102, 241, 0.1);
+          border-color: rgba(99, 102, 241, 0.2);
+        }
       }
     }
 
@@ -252,8 +279,40 @@ onMounted(() => {
         background: rgba(99, 102, 241, 0.1);
       }
 
-      .msg-content {
-        background: var(--bg-card-subtle);
+      .msg-bubble-wrap {
+        .msg-content {
+          background: var(--bg-card-subtle);
+        }
+      }
+    }
+
+    .msg-bubble-wrap {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      position: relative;
+
+      &:hover .msg-copy-btn {
+        opacity: 1;
+      }
+
+      .msg-copy-btn {
+        opacity: 0;
+        transition: opacity 0.15s ease;
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        padding: 4px;
+        color: var(--text-tertiary, #9ca3af);
+        border-radius: 4px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+
+        &:hover {
+          color: #6366f1;
+          background: rgba(99, 102, 241, 0.1);
+        }
       }
     }
 
@@ -304,8 +363,69 @@ onMounted(() => {
 
   .chat-input-area {
     flex-shrink: 0;
-    padding-top: 8px;
+    padding: 10px 0 2px;
     border-top: 1px solid var(--border-color);
+
+    .input-row {
+      display: flex;
+      align-items: stretch;
+      gap: 10px;
+      width: 100%;
+
+      .fixed-chat-input {
+        flex: 1;
+        min-width: 0;
+        height: 64px;
+
+        :deep(.n-input-wrapper) {
+          height: 100%;
+          padding: 8px 12px;
+        }
+
+        :deep(textarea) {
+          height: 100% !important;
+          resize: none !important;
+          line-height: 1.5;
+          font-size: 13.5px;
+        }
+      }
+
+      .send-btn {
+        flex-shrink: 0;
+        width: 88px;
+        height: 64px;
+        font-size: 14px;
+        font-weight: 500;
+      }
+    }
+  }
+}
+
+/* ===================== 移动端适配 ===================== */
+@media (max-width: 768px) {
+  .ai-chat-view {
+    gap: 8px;
+
+    .chat-header {
+      .chat-title {
+        font-size: 16px;
+      }
+
+      .chat-desc {
+        display: none;
+      }
+    }
+
+    /* 气泡加宽 + 代码块可横向滚动 */
+    .chat-message {
+      max-width: 94%;
+    }
+
+    .chat-input-area {
+      :deep(.n-input-group) {
+        flex-wrap: wrap;
+      }
+    }
   }
 }
 </style>

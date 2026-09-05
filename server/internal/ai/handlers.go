@@ -21,6 +21,7 @@ func (h *Handlers) Register(rg *gin.RouterGroup) {
 	rg.POST("/ai/diagnose", h.diagnose)
 	rg.POST("/ai/analyze-exec", h.analyzeExec)
 	rg.POST("/ai/nl2command", h.nl2command)
+	rg.POST("/ai/plan", h.planTask)
 	rg.GET("/ai/config", h.getConfig)
 	rg.PUT("/ai/config", h.setConfig)
 	rg.POST("/ai/test", h.testConnection)
@@ -79,6 +80,24 @@ func (h *Handlers) nl2command(c *gin.Context) {
 		return
 	}
 	resp, err := h.assistant.Nl2Command(c.Request.Context(), body.Prompt, body.HostID)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": resp})
+}
+
+func (h *Handlers) planTask(c *gin.Context) {
+	var req TaskPlanRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Prompt == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "prompt required"})
+		return
+	}
+	resp, err := h.assistant.PlanTask(c.Request.Context(), req)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return

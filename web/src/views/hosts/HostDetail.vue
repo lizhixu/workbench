@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { defineAsyncComponent, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { NSpin, NIcon, useMessage, NTooltip } from 'naive-ui'
 import {
   StatsChartOutline,
@@ -15,21 +15,27 @@ import { getHost } from '../../api/hosts'
 import type { Host } from '../../api/types'
 import { useWorkspaceStore } from '../../stores/workspace'
 import HostHeaderBanner from '../../components/host/HostHeaderBanner.vue'
-import TerminalPane from '../../components/host/TerminalPane.vue'
-import MetricsPane from '../../components/host/MetricsPane.vue'
-import SysInfoPane from '../../components/host/SysInfoPane.vue'
-import FileManagerPane from '../../components/host/FileManagerPane.vue'
-import DockerView from '../docker/Docker.vue'
-import AppStoreView from '../apps/AppStore.vue'
-import VulnerabilitiesView from './tabs/Vulnerabilities.vue'
+
+// KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
+defineOptions({ name: 'HostDetail' })
+
+// 七个面板按需加载：静态导入会把 echarts、xterm、Docker、应用市场、漏洞管理
+// 全部打进本路由的同一个 chunk（约 1MB），只想看进程列表也得先下完整包。
+const FileManagerPane = defineAsyncComponent(() => import('../../components/host/FileManagerPane.vue'))
+const MetricsPane = defineAsyncComponent(() => import('../../components/host/MetricsPane.vue'))
+const SysInfoPane = defineAsyncComponent(() => import('../../components/host/SysInfoPane.vue'))
+const TerminalPane = defineAsyncComponent(() => import('../../components/host/TerminalPane.vue'))
+const DockerView = defineAsyncComponent(() => import('../docker/Docker.vue'))
+const AppStoreView = defineAsyncComponent(() => import('../apps/AppStore.vue'))
+const VulnerabilitiesView = defineAsyncComponent(() => import('./tabs/Vulnerabilities.vue'))
 
 const route = useRoute()
+const router = useRouter()
 const message = useMessage()
 const workspace = useWorkspaceStore()
 
 const host = ref<Host | null>(null)
 const loading = ref(true)
-const activeSubTab = ref('files') // Default to files tab as shown in screenshots
 
 const subNavItems = [
   { key: 'files', label: '文件管理', icon: FolderOpenOutline },
@@ -41,6 +47,49 @@ const subNavItems = [
   { key: 'vulnerabilities', label: '漏洞管理', icon: ShieldCheckmarkOutline },
 ]
 
+const validTabs = subNavItems.map((i) => i.key)
+
+function resolveTab(raw: unknown): string {
+  const key = typeof raw === 'string' ? raw : ''
+  return validTabs.includes(key) ? key : 'files'
+}
+
+const activeSubTab = ref(resolveTab(route.query.tab))
+
+// 子页签既要能深链、刷新后还原，也要在顶部页签之间来回切换时记得住。所以
+// 除了写 URL，还把带 query 的完整路径回写到工作区页签上——点页签回来时用的
+// 就是这个 path，不带 query 的话会退回默认的「文件管理」，终端会话就断了。
+function selectTab(key: string) {
+  if (activeSubTab.value === key) return
+  activeSubTab.value = key
+  const query = { ...route.query, tab: key }
+  router.replace({ query })
+  rememberSubTab(key)
+}
+
+function rememberSubTab(key: string) {
+  const hostId = route.params.id as string
+  if (!hostId) return
+  workspace.openTab({
+    key: `/hosts/${hostId}`,
+    title: host.value?.hostname || hostId,
+    path: `/hosts/${hostId}?tab=${key}`,
+    closable: true,
+    viewName: 'HostDetail',
+  })
+}
+
+watch(
+  () => route.query.tab,
+  (raw) => {
+    // 组件被 KeepAlive 缓存后，切到别的页签时这里仍会收到通知，而那时
+    // query.tab 是空的。只在仍处于本主机路由时才同步，否则会把已选的子页签
+    // 重置成默认值，回来时终端已经被卸载。
+    if (route.name !== 'host-detail') return
+    activeSubTab.value = resolveTab(raw)
+  },
+)
+
 async function load() {
   loading.value = true
   try {
@@ -49,8 +98,9 @@ async function load() {
     workspace.openTab({
       key: `/hosts/${hostId}`,
       title: host.value.hostname,
-      path: `/hosts/${hostId}`,
+      path: `/hosts/${hostId}?tab=${activeSubTab.value}`,
       closable: true,
+      viewName: 'HostDetail',
     })
   } catch (e: any) {
     message.error(e.message || '加载主机信息失败')
@@ -73,58 +123,71 @@ onMounted(load)
       <div class="detail-body-container">
         <!-- 左侧 Icon 二级导航 -->
         <div class="sub-nav-sidebar">
-          <div
+          <NTooltip
             v-for="item in subNavItems"
             :key="item.key"
-            class="sub-nav-item"
-            :class="{ active: activeSubTab === item.key }"
-            @click="activeSubTab = item.key"
+            trigger="hover"
+            placement="right"
           >
-            <NTooltip trigger="hover" placement="right">
-              <template #trigger>
-                <div class="icon-wrap">
-                  <NIcon size="20"><component :is="item.icon" /></NIcon>
-                </div>
-              </template>
-              {{ item.label }}
-            </NTooltip>
-          </div>
+            <template #trigger>
+              <div
+                class="sub-nav-item"
+                :class="{ active: activeSubTab === item.key }"
+                @click="selectTab(item.key)"
+              >
+                <NIcon size="20">
+                  <component :is="item.icon" />
+                </NIcon>
+              </div>
+            </template>
+            {{ item.label }}
+          </NTooltip>
         </div>
 
         <!-- 右侧子视图面板 -->
-        <div class="sub-view-pane">
-          <!-- 文件管理 -->
-          <FileManagerPane
-            v-if="activeSubTab === 'files'"
-            :host-id="host.id"
-            :os="host.os"
-          />
+        <div class="sub-view-pane" :class="{ 'is-terminal': activeSubTab === 'terminal' }">
+          <!-- 面板按需加载，首次切换时显示等待态而不是空白 -->
+          <Suspense>
+            <template #default>
+              <!-- 文件管理 -->
+              <FileManagerPane
+                v-if="activeSubTab === 'files'"
+                :host-id="host.id"
+                :os="host.os"
+              />
 
-          <!-- 资源监控 (Overview) -->
-          <MetricsPane
-            v-else-if="activeSubTab === 'metrics'"
-            :host-id="host.id"
-          />
+              <!-- 资源监控 (Overview) -->
+              <MetricsPane
+                v-else-if="activeSubTab === 'metrics'"
+                :host-id="host.id"
+              />
 
-          <!-- 系统状态与进程 -->
-          <SysInfoPane
-            v-else-if="activeSubTab === 'sysinfo'"
-            :host-id="host.id"
-          />
+              <!-- 系统状态与进程 -->
+              <SysInfoPane
+                v-else-if="activeSubTab === 'sysinfo'"
+                :host-id="host.id"
+              />
 
-          <!-- 在线终端 -->
-          <div v-else-if="activeSubTab === 'terminal'" class="terminal-pane-wrapper">
-            <TerminalPane :host-id="host.id" />
-          </div>
+              <!-- 在线终端 -->
+              <div v-else-if="activeSubTab === 'terminal'" class="terminal-pane-wrapper">
+                <TerminalPane :host-id="host.id" :os="host.os" :distro="host.distro" />
+              </div>
 
-          <!-- Docker 管理 (P2) -->
-          <DockerView v-else-if="activeSubTab === 'docker'" />
+              <!-- Docker 管理 (P2) -->
+              <DockerView v-else-if="activeSubTab === 'docker'" />
 
-          <!-- 应用市场 (P2) -->
-          <AppStoreView v-else-if="activeSubTab === 'apps'" :host-id="host.id" />
+              <!-- 应用市场 (P2) -->
+              <AppStoreView v-else-if="activeSubTab === 'apps'" :host-id="host.id" />
 
-          <!-- 漏洞管理 (P3) -->
-          <VulnerabilitiesView v-else-if="activeSubTab === 'vulnerabilities'" :host-id="host.id" />
+              <!-- 漏洞管理 (P3) -->
+              <VulnerabilitiesView v-else-if="activeSubTab === 'vulnerabilities'" :host-id="host.id" />
+            </template>
+            <template #fallback>
+              <div class="pane-loading">
+                <NSpin size="medium" />
+              </div>
+            </template>
+          </Suspense>
         </div>
       </div>
     </template>
@@ -136,7 +199,6 @@ onMounted(load)
   display: flex;
   flex-direction: column;
   height: 100%;
-  padding: 14px;
   box-sizing: border-box;
 
   .spin-center {
@@ -175,6 +237,16 @@ onMounted(load)
         cursor: pointer;
         color: var(--text-secondary);
         transition: all 0.15s ease;
+        line-height: 1;
+        box-sizing: border-box;
+
+        :deep(.n-icon) {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          margin: 0;
+          padding: 0;
+        }
 
         &:hover {
           color: #6366f1;
@@ -197,14 +269,66 @@ onMounted(load)
       border-radius: 8px;
       box-shadow: var(--shadow-sm);
       overflow-y: auto;
-      padding: 14px;
+      overflow-x: hidden;
+      padding: var(--card-padding);
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
+
+      &.is-terminal {
+        overflow: hidden;
+        padding: 0;
+      }
 
       .terminal-pane-wrapper {
         height: 100%;
-        min-height: 550px;
+        min-height: 100%;
         background: var(--code-box-bg);
         border-radius: 6px;
         overflow: hidden;
+      }
+
+      .pane-loading {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 240px;
+        height: 100%;
+      }
+    }
+  }
+}
+
+/* ===================== 移动端适配 ===================== */
+@media (max-width: 768px) {
+  .host-detail-layout {
+    .detail-body-container {
+      flex-direction: column;
+      gap: 8px;
+
+      /* 左侧竖版 Icon 导航 → 顶部横向滚动条 */
+      .sub-nav-sidebar {
+        width: 100%;
+        flex-direction: row;
+        justify-content: flex-start;
+        padding: 6px 8px;
+        gap: 8px;
+        overflow-x: auto;
+
+        &::-webkit-scrollbar {
+          display: none;
+        }
+
+        .sub-nav-item {
+          flex-shrink: 0;
+        }
+      }
+
+      .sub-view-pane {
+        overflow-y: auto;
+
+        .terminal-pane-wrapper {
+          min-height: 420px;
+        }
       }
     }
   }

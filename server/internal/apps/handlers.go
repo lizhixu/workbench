@@ -34,17 +34,17 @@ type EnvField struct {
 
 // AppTemplate defines an application available in the App Store catalog.
 type AppTemplate struct {
-	ID             string     `json:"id"`
-	Name           string     `json:"name"`
-	Category       string     `json:"category"` // web | database | security | tool
-	Icon           string     `json:"icon"`     // icon identifier
-	Version        string     `json:"version"`
-	Description    string     `json:"description"`
-	Image          string     `json:"image"`
-	DefaultPort    int        `json:"default_port"`
-	ContainerPort  int        `json:"container_port"`
-	DefaultVolume  string     `json:"default_volume"`
-	EnvFields      []EnvField `json:"env_fields"`
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	Category      string     `json:"category"` // web | database | security | tool
+	Icon          string     `json:"icon"`     // icon identifier
+	Version       string     `json:"version"`
+	Description   string     `json:"description"`
+	Image         string     `json:"image"`
+	DefaultPort   int        `json:"default_port"`
+	ContainerPort int        `json:"container_port"`
+	DefaultVolume string     `json:"default_volume"`
+	EnvFields     []EnvField `json:"env_fields"`
 }
 
 // Catalog contains standard templates for one-click installation.
@@ -164,13 +164,15 @@ func NewHandlers(reg *rpc.Registry) *Handlers {
 	return &Handlers{reg: reg}
 }
 
-// Register registers App Store routes into the gin router.
-func (h *Handlers) Register(rg *gin.RouterGroup) {
+// Register mounts read-only routes on rg and mutating routes on writeRG.
+// Installing an app or Docker itself runs commands on the managed host, so the
+// caller gates writeRG to roles allowed to change host state.
+func (h *Handlers) Register(rg, writeRG *gin.RouterGroup) {
 	rg.GET("/apps/catalog", h.getCatalog)
 	rg.GET("/hosts/:id/apps", h.getInstalledApps)
-	rg.POST("/hosts/:id/apps/install", h.installApp)
-	rg.DELETE("/hosts/:id/apps/:name", h.uninstallApp)
-	rg.POST("/hosts/:id/docker/install-script", h.installDockerScript)
+	writeRG.POST("/hosts/:id/apps/install", h.installApp)
+	writeRG.DELETE("/hosts/:id/apps/:name", h.uninstallApp)
+	writeRG.POST("/hosts/:id/docker/install-script", h.installDockerScript)
 }
 
 func (h *Handlers) getCatalog(c *gin.Context) {
@@ -289,8 +291,10 @@ func (h *Handlers) installApp(c *gin.Context) {
 
 	cmdStr := strings.Join(args, " ")
 
-	// Execute on agent via ExecRequest
-	opID := "app-inst-" + hostID[:4]
+	// Execute on agent via ExecRequest. A random suffix keeps concurrent installs
+	// on the same host from sharing a correlation id (and never slices hostID,
+	// which may be shorter than 4 characters).
+	opID := "app-inst-" + randomToken(4)
 	resultCh := make(chan *agentpb.ExecResult, 1)
 	hub.SetRespHandler(opID, func(msg *agentpb.AgentMessage) {
 		hub.SetRespHandler(opID, nil)
@@ -323,6 +327,11 @@ func (h *Handlers) installApp(c *gin.Context) {
 			if errOutput == "" {
 				errOutput = string(res.GetStdout())
 			}
+			// A failed `docker run` still leaves a container holding the name
+			// (for example when the host port is taken), so the next attempt
+			// would fail with a confusing "name already in use". Drop the
+			// carcass so a retry can succeed once the cause is fixed.
+			h.removeContainer(hub, containerName)
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error":     fmt.Sprintf("install failed (code %d): %s", res.GetExitCode(), errOutput),
 				"exit_code": res.GetExitCode(),
@@ -336,6 +345,31 @@ func (h *Handlers) installApp(c *gin.Context) {
 			"output":         string(res.GetStdout()),
 		})
 	case <-c.Request.Context().Done():
+		hub.SetRespHandler(opID, nil)
+	}
+}
+
+// removeContainer force-removes a container on the agent, best effort. It is
+// used to clean up after a failed install so the container name is free again.
+func (h *Handlers) removeContainer(hub *rpc.Hub, name string) {
+	opID := "app-rm-" + randomToken(4)
+	done := make(chan struct{}, 1)
+	hub.SetRespHandler(opID, func(*agentpb.AgentMessage) {
+		hub.SetRespHandler(opID, nil)
+		done <- struct{}{}
+	})
+	hub.Send(&agentpb.ServerMessage{
+		Payload: &agentpb.ServerMessage_Exec{
+			Exec: &agentpb.ExecRequest{
+				ExecId:     opID,
+				Command:    "docker rm -f " + name,
+				TimeoutSec: 30,
+			},
+		},
+	})
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
 		hub.SetRespHandler(opID, nil)
 	}
 }
@@ -363,7 +397,7 @@ echo "Docker installation complete."
 docker --version
 `
 
-	opID := "dk-inst-" + hostID[:4]
+	opID := "dk-inst-" + randomToken(4)
 	resultCh := make(chan *agentpb.ExecResult, 1)
 	hub.SetRespHandler(opID, func(msg *agentpb.AgentMessage) {
 		hub.SetRespHandler(opID, nil)

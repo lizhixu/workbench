@@ -1,6 +1,13 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { listEvents, ackEvent, ackAllEvents, type AlertEvent } from '../api/alerts'
+import {
+  listEvents,
+  ackEvent,
+  ackAllEvents,
+  deleteEvent,
+  clearEvents,
+  type AlertEvent,
+} from '../api/alerts'
 
 export const useNotificationStore = defineStore('notifications', () => {
   const events = ref<AlertEvent[]>([])
@@ -41,6 +48,20 @@ export const useNotificationStore = defineStore('notifications', () => {
     }
   }
 
+  async function removeEvent(id: string) {
+    await deleteEvent(id)
+    events.value = events.value.filter((e) => e.id !== id)
+  }
+
+  async function clearAll(resolvedOnly = false) {
+    await clearEvents(resolvedOnly)
+    if (resolvedOnly) {
+      events.value = events.value.filter((e) => !e.resolved)
+    } else {
+      events.value = []
+    }
+  }
+
   function startPolling(intervalMs = 15000) {
     if (pollTimer) return
     fetchEvents()
@@ -63,6 +84,8 @@ export const useNotificationStore = defineStore('notifications', () => {
     fetchEvents,
     markAsRead,
     markAllAsRead,
+    removeEvent,
+    clearAll,
     startPolling,
     stopPolling,
   }

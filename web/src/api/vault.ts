@@ -5,11 +5,14 @@ export interface Credential {
   name: string
   type: string
   username: string
+  /** 仅写入时使用；读取接口不会回传密钥明文。 */
   secret: string
   host: string
   description: string
   created_at: string
   updated_at: string
+  /** 详情接口返回，表示是否已存有密钥。 */
+  has_secret?: boolean
 }
 
 export function listCredentials() {
@@ -17,7 +20,9 @@ export function listCredentials() {
 }
 
 export function getCredential(id: string) {
-  return unwrap<{ data: Credential }>(http.get(`/vault/credentials/${id}`)).then((r) => r.data)
+  return unwrap<{ data: Credential; has_secret: boolean }>(
+    http.get(`/vault/credentials/${id}`),
+  ).then((r) => ({ ...r.data, has_secret: r.has_secret }))
 }
 
 export function createCredential(cred: Omit<Credential, 'id' | 'created_at' | 'updated_at'>) {

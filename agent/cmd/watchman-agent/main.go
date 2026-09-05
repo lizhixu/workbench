@@ -25,6 +25,7 @@ func main() {
 	server := flag.String("server", "localhost:9090", "control server address (host:port)")
 	enroll := flag.String("enroll", "", "one-time enroll token (first registration only)")
 	state := flag.String("state", config.DefaultStatePath(), "path to agent state file")
+	trafficResetDay := flag.Int("traffic-reset-day", 1, "billing cycle reset day-of-month (1-28) for monthly traffic stats")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -54,7 +55,9 @@ func main() {
 	d.SetShellManager(shell.NewManager(log))
 	d.SetFileManager(files.NewManager(log))
 	d.SetExecManager(exec.NewManager(log))
-	d.SetMetricsManager(metrics.NewManager(log))
+	mm := metrics.NewManager(log)
+	mm.SetStateFile(*state, *trafficResetDay)
+	d.SetMetricsManager(mm)
 	d.SetSysInfoManager(sysinfo.NewManager(log))
 	d.SetDockerManager(docker.NewManager(log))
 	d.SetUpgradeManager(upgrade.NewManager(log))

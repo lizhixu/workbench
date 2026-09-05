@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 import {
   NCard,
   NSpace,
@@ -9,7 +9,6 @@ import {
   NTag,
   NDataTable,
   NEmpty,
-  NPopconfirm,
   NIcon,
   useMessage,
 } from 'naive-ui'
@@ -22,6 +21,7 @@ import {
   type CommandPolicy,
   type CommandAuditEntry,
 } from '../../api/policy'
+import { useTablePagination } from '../../composables/useTablePagination'
 
 const message = useMessage()
 
@@ -42,11 +42,33 @@ const newHighRisk = ref('')
 // Audit
 const auditEntries = ref<CommandAuditEntry[]>([])
 const auditLoading = ref(false)
+// 拦截审计会持续累积（AGENTS.md 8.2）：分页取代原来的 max-height 限高，
+// 否则超出 limit 的记录在界面上根本触达不到。
+const auditCount = computed(() => auditEntries.value.length)
+const { pagination: auditPagination, resetPage: resetAuditPage } = useTablePagination({
+  // 这张表是设置页某张卡片里的一节，每页 10 条既能翻到全部记录，
+  // 又不会让整个设置页被它撑长。
+  pageSize: 10,
+  pageSizes: [10, 20, 50],
+  rowCount: auditCount,
+})
+
+// The server omits empty pattern lists (Go marshals a nil slice as null), and
+// the template reads `.length` on each one — without this normalisation the
+// whole card throws during render and shows up blank.
+function normalizePolicy(p: CommandPolicy): CommandPolicy {
+  return {
+    enabled: p.enabled,
+    blacklist: p.blacklist ?? [],
+    whitelist: p.whitelist ?? [],
+    high_risk_patterns: p.high_risk_patterns ?? [],
+  }
+}
 
 async function loadPolicy() {
   loading.value = true
   try {
-    policy.value = await getCommandPolicy()
+    policy.value = normalizePolicy(await getCommandPolicy())
   } catch (e: any) {
     message.error(e.message || '加载命令策略失败')
   } finally {
@@ -58,7 +80,7 @@ async function savePolicy() {
   saving.value = true
   try {
     const updated = await setCommandPolicy(policy.value)
-    policy.value = updated
+    policy.value = normalizePolicy(updated)
     message.success('高危命令管控策略已保存')
   } catch (e: any) {
     message.error(e.message || '保存策略失败')
@@ -84,7 +106,10 @@ function removePattern(list: 'blacklist' | 'whitelist' | 'high_risk_patterns', i
 async function loadAudit() {
   auditLoading.value = true
   try {
-    auditEntries.value = await listCommandAudit({ limit: 100 })
+    // 服务端最多保留 1000 条；一次取全量交给前端分页，避免旧的 limit=100
+    // 把更早的记录永久挡在界面之外。
+    auditEntries.value = await listCommandAudit({ limit: 1000 })
+    resetAuditPage()
   } catch (e: any) {
     // silent
   } finally {
@@ -180,7 +205,7 @@ onMounted(() => {
       <!-- Blacklist -->
       <div class="pattern-section">
         <div class="pattern-title">
-          <NTag type="error" size="small" bordered="false">黑名单</NTag>
+          <NTag type="error" size="small" :bordered="false">黑名单</NTag>
           <span class="muted">命中即拦截，不下发到 Agent</span>
         </div>
         <div class="pattern-list">
@@ -204,7 +229,7 @@ onMounted(() => {
       <!-- Whitelist -->
       <div class="pattern-section">
         <div class="pattern-title">
-          <NTag type="success" size="small" bordered="false">白名单</NTag>
+          <NTag type="success" size="small" :bordered="false">白名单</NTag>
           <span class="muted">命中跳过二次确认，直接放行</span>
         </div>
         <div class="pattern-list">
@@ -228,7 +253,7 @@ onMounted(() => {
       <!-- High-risk patterns -->
       <div class="pattern-section">
         <div class="pattern-title">
-          <NTag type="warning" size="small" bordered="false">高危模式</NTag>
+          <NTag type="warning" size="small" :bordered="false">高危模式</NTag>
           <span class="muted">命中需前端二次确认后方可下发</span>
         </div>
         <div class="pattern-list">
@@ -257,18 +282,21 @@ onMounted(() => {
       <div class="audit-section">
         <div class="audit-header">
           <span class="section-title">命令拦截审计</span>
-          <NButton size="small" quaternary :loading="auditLoading" @click="loadAudit">
-            <template #icon><NIcon><RefreshOutline /></NIcon></template>
-            刷新
-          </NButton>
+          <NSpace align="center" :size="10">
+            <span class="muted">共 {{ auditEntries.length }} 条</span>
+            <NButton size="small" quaternary :loading="auditLoading" @click="loadAudit">
+              <template #icon><NIcon><RefreshOutline /></NIcon></template>
+              刷新
+            </NButton>
+          </NSpace>
         </div>
         <NDataTable
           :columns="auditColumns"
           :data="auditEntries"
+          :pagination="auditPagination"
           size="small"
           :bordered="false"
           :row-key="(r: CommandAuditEntry) => r.id"
-          :max-height="320"
         >
           <template #empty>
             <NEmpty description="暂无命令拦截记录" />

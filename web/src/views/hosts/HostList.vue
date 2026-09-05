@@ -3,12 +3,14 @@ import { onMounted, ref, computed, h } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NButton,
-  NSpace,
   NInput,
   NModal,
   NCode,
   NSpin,
   NDropdown,
+  NSelect,
+  NSpace,
+  NTag,
   useMessage,
   useDialog,
   NIcon,
@@ -27,17 +29,27 @@ import {
   PulseOutline,
   SparklesOutline,
   DocumentTextOutline,
+  ShieldCheckmarkOutline,
+  CopyOutline,
+  CheckmarkCircleOutline,
+  LayersOutline,
 } from '@vicons/ionicons5'
 import OsLogo from '../../components/common/OsLogo.vue'
 import { useHostsStore } from '../../stores/hosts'
 import { useWorkspaceStore } from '../../stores/workspace'
-import { enroll, deleteHost } from '../../api/hosts'
+import { useAuthStore } from '../../stores/auth'
+import { enroll, deleteHost, setHostGroup } from '../../api/hosts'
+import { listGroups, type HostGroup } from '../../api/groups'
 import { copyToClipboard } from '../../utils/clipboard'
 import type { Host } from '../../api/types'
+
+// KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
+defineOptions({ name: 'HostList' })
 
 const router = useRouter()
 const store = useHostsStore()
 const workspace = useWorkspaceStore()
+const auth = useAuthStore()
 const message = useMessage()
 const dialog = useDialog()
 
@@ -47,9 +59,30 @@ const enrollToken = ref('')
 const enrollCmd = ref('')
 const enrolling = ref(false)
 
+// Host grouping: filter bar + per-host assignment modal.
+const groups = ref<HostGroup[]>([])
+const groupFilter = ref<string>('')
+const showGroupModal = ref(false)
+const groupTarget = ref<Host | null>(null)
+const groupChoice = ref<string>('')
+
+const groupFilterOptions = computed(() => [
+  { label: '全部分组', value: '' },
+  { label: '未分组', value: '__none__' },
+  ...groups.value.map((g) => ({ label: `${g.name} (${g.host_count})`, value: g.name })),
+])
+
+const groupAssignOptions = computed(() => [
+  { label: '（不属于任何分组）', value: '' },
+  ...groups.value.map((g) => ({ label: g.name, value: g.name })),
+])
+
 const filteredHosts = computed(() => {
   const q = search.value.trim().toLowerCase()
+  const gf = groupFilter.value
   return store.hosts.filter((h) => {
+    if (gf === '__none__' && h.group) return false
+    if (gf && gf !== '__none__' && h.group !== gf) return false
     if (!q) return true
     return (
       h.hostname.toLowerCase().includes(q) ||
@@ -62,6 +95,34 @@ const filteredHosts = computed(() => {
     )
   })
 })
+
+async function loadGroups() {
+  try {
+    groups.value = await listGroups()
+  } catch {
+    // Grouping is optional; a failure here must not block the host list.
+  }
+}
+
+function openGroupModal(host: Host) {
+  groupTarget.value = host
+  groupChoice.value = host.group || ''
+  showGroupModal.value = true
+}
+
+async function submitGroup() {
+  const host = groupTarget.value
+  if (!host) return
+  try {
+    await setHostGroup(host.id, groupChoice.value)
+    message.success(groupChoice.value ? `已将 ${host.hostname} 移入 ${groupChoice.value}` : `已将 ${host.hostname} 移出分组`)
+    showGroupModal.value = false
+    await Promise.all([store.fetchList(), loadGroups()])
+  } catch (e: any) {
+    message.error(e.message || '设置分组失败')
+  }
+}
+
 
 function formatArch(arch?: string): string {
   const a = (arch || '').toLowerCase()
@@ -115,7 +176,13 @@ function goDetail(host: Host, tab = 'metrics') {
 }
 
 function goExec() {
-  router.push('/exec')
+  workspace.openTab({
+    key: '/batch-exec',
+    title: '推送命令',
+    path: '/batch-exec',
+    closable: true,
+  })
+  router.push('/batch-exec')
 }
 
 function goAiChat() {
@@ -138,6 +205,18 @@ function goAiReport() {
   router.push('/ai/report')
 }
 
+const isAdmin = computed(() => auth.role === 'admin')
+
+function goAudit() {
+  workspace.openTab({
+    key: '/audit',
+    title: '操作审计',
+    path: '/audit',
+    closable: true,
+  })
+  router.push('/audit')
+}
+
 function handleMenuSelect(key: string, host: Host) {
   if (key === 'detail') {
     goDetail(host, 'metrics')
@@ -148,7 +227,9 @@ function handleMenuSelect(key: string, host: Host) {
   } else if (key === 'docker') {
     goDetail(host, 'docker')
   } else if (key === 'exec') {
-    router.push('/exec')
+    goExec()
+  } else if (key === 'group') {
+    openGroupModal(host)
   } else if (key === 'unbind') {
     dialog.warning({
       title: '解绑主机确认',
@@ -199,15 +280,24 @@ const menuOptions = [
     key: 'd1',
   },
   {
+    label: '设置分组',
+    key: 'group',
+    icon: () => h(NIcon, null, { default: () => h(LayersOutline) }),
+  },
+  {
     label: '解绑主机',
     key: 'unbind',
     icon: () => h(NIcon, { color: '#ef4444' }, { default: () => h(TrashOutline) }),
   },
 ]
 
+const copied = ref(false)
+let copyTimer: any = null
+
 async function openEnroll() {
   showEnroll.value = true
   enrolling.value = true
+  copied.value = false
   try {
     const res = await enroll()
     enrollToken.value = res.enroll_token
@@ -223,21 +313,38 @@ async function openEnroll() {
 }
 
 async function copyCmd() {
+  if (!enrollCmd.value) return
   const ok = await copyToClipboard(enrollCmd.value)
   if (ok) {
+    copied.value = true
+    if (copyTimer) clearTimeout(copyTimer)
+    copyTimer = setTimeout(() => {
+      copied.value = false
+    }, 2500)
     message.success('已复制安装脚本命令到剪贴板')
   } else {
     message.error('复制失败，请手动选中文本复制')
   }
 }
 
+async function copyIp(ip?: string) {
+  if (!ip || ip === '-') return
+  const ok = await copyToClipboard(ip)
+  if (ok) {
+    message.success(`已复制 IP 地址 (${ip}) 到剪贴板`)
+  } else {
+    message.error('复制失败，请手动选中复制')
+  }
+}
+
 async function refresh() {
-  await store.fetchList()
+  await Promise.all([store.fetchList(), loadGroups()])
 }
 
 onMounted(() => {
   workspace.setActiveKey('/hosts')
   store.fetchList().catch((e) => message.error(e.message))
+  loadGroups()
 })
 </script>
 
@@ -258,6 +365,12 @@ onMounted(() => {
               <NIcon :component="SearchOutline" />
             </template>
           </NInput>
+          <NSelect
+            v-model:value="groupFilter"
+            :options="groupFilterOptions"
+            size="small"
+            style="width: 170px"
+          />
           <span class="total-count-text">共 {{ store.hosts.length }} 台主机</span>
         </div>
 
@@ -288,6 +401,13 @@ onMounted(() => {
               <NIcon :component="DocumentTextOutline" />
             </template>
             运维报告
+          </NButton>
+
+          <NButton v-if="isAdmin" secondary size="small" @click="goAudit">
+            <template #icon>
+              <NIcon :component="ShieldCheckmarkOutline" />
+            </template>
+            操作审计
           </NButton>
 
           <NButton quaternary size="small" @click="refresh" :loading="store.loading">
@@ -323,6 +443,7 @@ onMounted(() => {
             <div class="col-host-info">
               <div class="host-name-row">
                 <span class="host-name">{{ host.hostname }}</span>
+                <NTag v-if="host.group" size="tiny" :bordered="false" type="info">{{ host.group }}</NTag>
               </div>
               <div class="host-distro">
                 {{ host.distro || host.os || 'Linux' }}
@@ -353,11 +474,21 @@ onMounted(() => {
 
             <!-- 5. 内网与外网 IP + 地理位置 -->
             <div class="col-ips">
-              <div class="ip-line">
+              <div
+                class="ip-line"
+                :class="{ 'is-copyable': host.internal_ip && host.internal_ip !== '-' }"
+                :title="host.internal_ip && host.internal_ip !== '-' ? '点击复制内网 IP' : ''"
+                @click.stop="copyIp(host.internal_ip)"
+              >
                 <span class="ip-label">内</span>
                 <span class="ip-value">{{ host.internal_ip || '-' }}</span>
               </div>
-              <div class="ip-line">
+              <div
+                class="ip-line"
+                :class="{ 'is-copyable': host.public_ip && host.public_ip !== '-' }"
+                :title="host.public_ip && host.public_ip !== '-' ? '点击复制外网 IP' : ''"
+                @click.stop="copyIp(host.public_ip)"
+              >
                 <span class="ip-label">外</span>
                 <span class="ip-value">
                   {{ host.public_ip || '-' }}
@@ -401,9 +532,41 @@ onMounted(() => {
             <NCode :code="enrollCmd" language="bash" word-wrap />
           </div>
           <NSpace justify="end" style="margin-top: 14px">
-            <NButton type="primary" @click="copyCmd">复制命令</NButton>
+            <NButton
+              :type="copied ? 'success' : 'primary'"
+              @click="copyCmd"
+            >
+              <template #icon>
+                <NIcon :component="copied ? CheckmarkCircleOutline : CopyOutline" />
+              </template>
+              {{ copied ? '已复制命令' : '复制命令' }}
+            </NButton>
           </NSpace>
         </div>
+      </template>
+    </NModal>
+
+    <!-- 设置主机分组 Modal -->
+    <NModal
+      v-model:show="showGroupModal"
+      preset="card"
+      title="设置主机分组"
+      style="width: 440px"
+    >
+      <NSpace vertical :size="12">
+        <p class="guide-text">
+          将主机 <code>{{ groupTarget?.hostname }}</code> 归入分组，用于按分组给用户授权访问。
+        </p>
+        <NSelect v-model:value="groupChoice" :options="groupAssignOptions" />
+        <p v-if="!groups.length" class="guide-text">
+          暂无可用分组，请先在「分组权限」页面创建分组。
+        </p>
+      </NSpace>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showGroupModal = false">取消</NButton>
+          <NButton type="primary" @click="submitGroup">保存</NButton>
+        </NSpace>
       </template>
     </NModal>
   </div>
@@ -413,7 +576,6 @@ onMounted(() => {
 .baichuan-host-list-view {
   display: flex;
   height: 100%;
-  padding: 16px;
   box-sizing: border-box;
 
   .main-table-area {
@@ -425,7 +587,7 @@ onMounted(() => {
     background-color: var(--bg-card);
     border: 1px solid var(--border-color);
     border-radius: 8px;
-    padding: 16px 20px;
+    padding: var(--card-padding);
     box-shadow: var(--shadow-sm);
 
     .toolbar-bar {
@@ -497,6 +659,7 @@ onMounted(() => {
             .host-name-row {
               display: flex;
               align-items: center;
+              gap: 6px;
 
               .host-name {
                 font-weight: 600;
@@ -580,6 +743,23 @@ onMounted(() => {
               display: flex;
               align-items: center;
 
+              &.is-copyable {
+                cursor: pointer;
+                transition: color 0.15s ease, background-color 0.15s ease;
+                border-radius: 4px;
+                padding: 1px 4px;
+                margin-left: -4px;
+
+                &:hover {
+                  color: #6366f1;
+                  background-color: rgba(99, 102, 241, 0.08);
+
+                  .ip-value {
+                    color: #6366f1;
+                  }
+                }
+              }
+
               .ip-label {
                 color: var(--text-tertiary, #8c8c8c);
                 width: 24px;
@@ -642,6 +822,149 @@ onMounted(() => {
       border: 1px solid var(--border-color);
       padding: 12px;
       border-radius: 6px;
+    }
+  }
+}
+
+/* ===================== 移动端适配 ===================== */
+@media (max-width: 768px) {
+  .baichuan-host-list-view {
+    .main-table-area {
+      gap: 8px;
+
+      /* 工具栏换行：搜索框占满首行，按钮组换到第二行 */
+      .toolbar-bar {
+        flex-wrap: wrap;
+        gap: 8px;
+
+        .toolbar-left {
+          flex: 1 1 100%;
+          min-width: 0;
+
+          .n-input {
+            width: 100% !important;
+            flex: 1;
+          }
+
+          .total-count-text {
+            font-size: 12px;
+            flex-shrink: 0;
+          }
+        }
+
+        .toolbar-right {
+          flex: 1 1 100%;
+          justify-content: flex-end;
+          gap: 8px;
+          flex-wrap: wrap;
+
+          .n-button {
+            padding: 0 10px;
+          }
+        }
+      }
+
+      .host-list-container {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+
+        .host-row-item {
+          /* 桌面端单行 6 列 → 移动端独立卡片布局 */
+          flex-wrap: wrap;
+          padding: 12px 14px;
+          row-gap: 8px;
+          background: var(--bg-card);
+          border: 1px solid var(--border-color);
+          border-radius: 8px;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+          transition: all 0.15s ease;
+
+          &:hover {
+            border-color: var(--primary-color, #6366f1);
+          }
+
+          /* 重排：第一行 logo + 主机名 + 更多按钮；第二行 pill/规格；第三行 IP */
+          .col-os-logo {
+            order: 1;
+            flex: 0 0 44px;
+          }
+
+          .col-host-info {
+            order: 2;
+            flex: 1 1 auto;
+            min-width: 0;
+            padding-right: 4px;
+
+            .host-name {
+              font-size: 14px;
+              white-space: nowrap;
+              overflow: hidden;
+              text-overflow: ellipsis;
+            }
+
+            .host-distro {
+              font-size: 11px;
+              white-space: nowrap;
+              overflow: hidden;
+              text-overflow: ellipsis;
+            }
+          }
+
+          .col-actions {
+            order: 3;
+            flex: 0 0 32px;
+          }
+
+          /* 运行时间 pill：第二行开头 */
+          .col-status {
+            order: 4;
+            flex: 0 0 auto;
+            padding-right: 6px;
+
+            .uptime-pill {
+              padding: 2px 8px;
+              font-size: 11px;
+              white-space: nowrap;
+            }
+          }
+
+          /* 规格与 IP：第二行并排 */
+          .col-specs {
+            order: 5;
+            flex: 1 1 auto;
+            min-width: 0;
+            font-size: 12px;
+
+            .spec-line .spec-label {
+              width: 32px;
+            }
+          }
+
+          .col-ips {
+            order: 6;
+            flex: 1 1 100%;
+            font-size: 11px;
+            padding-top: 4px;
+            border-top: 1px dashed var(--border-dashed, rgba(0, 0, 0, 0.06));
+            display: flex;
+            flex-direction: row;
+            justify-content: space-between;
+            gap: 6px;
+
+            .ip-line {
+              flex: 1;
+              min-width: 0;
+            }
+
+            .ip-value {
+              white-space: nowrap;
+              overflow: hidden;
+              text-overflow: ellipsis;
+            }
+          }
+        }
+      }
     }
   }
 }

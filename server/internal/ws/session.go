@@ -3,19 +3,106 @@ package ws
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"log/slog"
 	"math/big"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// upgrader upgrades HTTP to WebSocket.
+// upgrader upgrades HTTP to WebSocket. Origin is verified because a WebSocket
+// upgrade is not subject to the same-origin policy: without this check any page
+// the operator visits could open a terminal or file channel using the browser's
+// stored token.
 var upgrader = websocket.Upgrader{
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	CheckOrigin:     checkOrigin,
 	ReadBufferSize:  8192,
 	WriteBufferSize: 8192,
+}
+
+var (
+	originMu       sync.RWMutex
+	allowedOrigins []string
+)
+
+// SetAllowedOrigins configures browser origins permitted to open WebSocket
+// connections in addition to the same-origin default. An entry may be a host,
+// a host:port, or a full origin URL; the single entry "*" disables the check
+// and must only be used when no untrusted browser can reach the server.
+func SetAllowedOrigins(list []string) {
+	cleaned := make([]string, 0, len(list))
+	for _, item := range list {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if u, err := url.Parse(item); err == nil && u.Host != "" {
+			item = u.Host
+		}
+		cleaned = append(cleaned, item)
+	}
+	originMu.Lock()
+	allowedOrigins = cleaned
+	originMu.Unlock()
+}
+
+// checkOrigin reports whether the upgrade request's Origin may open a session.
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// Only browsers send Origin, and they always send it on a WebSocket
+		// upgrade. An absent header therefore means a non-browser client (CLI,
+		// tests, agent tooling), which cannot be a cross-site hijack.
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		slog.Warn("ws origin rejected (unparsable)", "origin", origin)
+		return false
+	}
+	if strings.EqualFold(u.Host, r.Host) {
+		return true
+	}
+
+	originMu.RLock()
+	list := allowedOrigins
+	originMu.RUnlock()
+	for _, a := range list {
+		if a == "*" || strings.EqualFold(a, u.Host) {
+			return true
+		}
+	}
+
+	// The Vite dev server proxies /api to the control server, so in development
+	// the page origin (localhost:5173) differs from the request host
+	// (localhost:18080). Accept that only when both sides are loopback, which a
+	// page served from a remote site can never satisfy.
+	if isLoopbackHost(u.Host) && isLoopbackHost(r.Host) {
+		return true
+	}
+
+	slog.Warn("ws origin rejected", "origin", origin, "host", r.Host)
+	return false
+}
+
+// isLoopbackHost reports whether a host or host:port refers to the loopback
+// interface.
+func isLoopbackHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // SessionInfo holds metadata for a registered terminal session.

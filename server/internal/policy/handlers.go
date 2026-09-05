@@ -17,10 +17,15 @@ func NewHandlers(store *Store) *Handlers {
 	return &Handlers{store: store}
 }
 
-// Register mounts policy routes on the given authenticated group.
-func (h *Handlers) Register(rg *gin.RouterGroup) {
+// Register mounts policy routes. Reading the policy and its audit trail is open
+// to any authenticated user; rewriting it can switch off the high-risk command
+// blocklist, so that goes on the caller-supplied admin group.
+func (h *Handlers) Register(rg *gin.RouterGroup, admin *gin.RouterGroup) {
+	if admin == nil {
+		admin = rg
+	}
 	rg.GET("/policy/command", h.getPolicy)
-	rg.PUT("/policy/command", h.setPolicy)
+	admin.PUT("/policy/command", h.setPolicy)
 	rg.GET("/policy/command/audit", h.listAudit)
 }
 

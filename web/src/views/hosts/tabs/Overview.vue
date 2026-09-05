@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref } from 'vue'
+import { onMounted, onBeforeUnmount, ref, computed } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   NCard,
@@ -40,6 +40,12 @@ function fmtBytes(n: number): string {
   return n + ' B'
 }
 
+const swapPct = computed(() => {
+  const m = metrics.value
+  if (!m || !m.swap_total) return null
+  return ((m.swap_used ?? 0) / m.swap_total) * 100
+})
+
 onMounted(() => {
   fetchMetrics()
   timer = setInterval(fetchMetrics, 3000)
@@ -65,7 +71,9 @@ onBeforeUnmount(() => {
               :color="metrics.cpu_usage > 80 ? '#e88080' : '#2080f0'"
               style="margin-top: 12px"
             />
-            <div class="muted">实时采样</div>
+            <div class="muted" :title="metrics.cpu_model || ''">
+              {{ metrics.cpu_model || '实时采样' }}
+            </div>
           </NCard>
         </NGridItem>
 
@@ -113,6 +121,60 @@ onBeforeUnmount(() => {
           </NCard>
         </NGridItem>
       </NGrid>
+
+      <!-- 扩展指标：负载 / Swap / 连接 / 进程 -->
+      <NGrid :cols="4" :x-gap="16" :y-gap="16" responsive="screen" :cols-s="2" :cols-m="4" style="margin-top: 16px">
+        <NGridItem>
+          <NCard title="系统负载" size="small" :bordered="true">
+            <NStatistic label="load avg (1m)" :value="(metrics.load1 ?? 0).toFixed(2)" />
+            <div class="muted mono-font">
+              1m {{ (metrics.load1 ?? 0).toFixed(2) }} · 5m {{ (metrics.load5 ?? 0).toFixed(2) }} · 15m {{ (metrics.load15 ?? 0).toFixed(2) }}
+            </div>
+          </NCard>
+        </NGridItem>
+
+        <NGridItem>
+          <NCard title="Swap 交换分区" size="small" :bordered="true">
+            <template v-if="swapPct !== null">
+              <NStatistic label="Swap %" :value="swapPct.toFixed(1)" />
+              <div class="muted">{{ fmtBytes(metrics.swap_used ?? 0) }} / {{ fmtBytes(metrics.swap_total ?? 0) }}</div>
+            </template>
+            <template v-else>
+              <NStatistic label="未启用" value="—" />
+            </template>
+          </NCard>
+        </NGridItem>
+
+        <NGridItem>
+          <NCard title="网络连接" size="small" :bordered="true">
+            <NStatistic label="TCP ESTABLISHED" :value="metrics.tcp_established ?? 0" />
+            <div class="muted">UDP 套接字 {{ metrics.udp_count ?? 0 }} 个</div>
+          </NCard>
+        </NGridItem>
+
+        <NGridItem>
+          <NCard title="进程数" size="small" :bordered="true">
+            <NStatistic label="运行中进程" :value="metrics.process_count ?? 0" />
+            <div class="muted">实时快照</div>
+          </NCard>
+        </NGridItem>
+      </NGrid>
+
+      <!-- 月度流量 -->
+      <NCard
+        v-if="metrics.month_rx || metrics.month_tx"
+        title="本月流量"
+        size="small"
+        :bordered="true"
+        style="margin-top: 16px"
+      >
+        <div class="traffic-row">
+          <span class="traffic-item">↓ 下行 <b class="mono-font">{{ fmtBytes(metrics.month_rx ?? 0) }}</b></span>
+          <span class="traffic-item">↑ 上行 <b class="mono-font">{{ fmtBytes(metrics.month_tx ?? 0) }}</b></span>
+          <span class="traffic-item">Σ 合计 <b class="mono-font">{{ fmtBytes((metrics.month_rx ?? 0) + (metrics.month_tx ?? 0)) }}</b></span>
+          <span class="traffic-hint">按账单周期累计 · 重启自动校正</span>
+        </div>
+      </NCard>
 
       <!-- 挂载点容量条 -->
       <NCard title="挂载点容量" size="small" :bordered="true">
@@ -162,9 +224,34 @@ onBeforeUnmount(() => {
   font-size: 12px;
   color: #9ca3af;
   margin-top: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .mono-font {
   font-family: monospace;
+}
+
+.traffic-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 24px;
+
+  .traffic-item {
+    font-size: 13px;
+
+    b {
+      font-size: 16px;
+      margin-left: 4px;
+    }
+  }
+
+  .traffic-hint {
+    font-size: 11px;
+    color: #9ca3af;
+    margin-left: auto;
+  }
 }
 </style>

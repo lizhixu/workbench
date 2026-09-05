@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -98,6 +99,8 @@ type Hub struct {
 	respHandlers map[string]func(*agentpb.AgentMessage)
 	// Latest metrics sample (for REST polling).
 	lastMetrics *agentpb.MetricsSample
+	// Back-reference to registry so metrics can update the persisted Agent.
+	registry *Registry
 }
 
 // NewRegistry creates a registry, loading any persisted agents from
@@ -256,7 +259,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 		a.LastSeen = time.Now()
 		_ = r.persistAgentsLocked() // persist updated hostname/os/etc.
 
-		hub := newHub(agentID, heartbeatSec)
+		hub := newHub(agentID, heartbeatSec, r)
 		r.hubs[agentID] = hub
 		return hub, &agentpb.RegisterResponse{
 			Ok:                  true,
@@ -298,7 +301,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 	r.tokens[authTokenNew] = agentID
 	_ = r.persistAgentsLocked() // safe: caller holds r.mu
 
-	hub := newHub(agentID, heartbeatSec)
+	hub := newHub(agentID, heartbeatSec, r)
 	r.hubs[agentID] = hub
 	r.log.Info("agent registered", "agent_id", agentID, "hostname", req.GetHostname())
 	return hub, &agentpb.RegisterResponse{
@@ -354,6 +357,16 @@ func (r *Registry) ListAgents() []*Agent {
 		cp := *a
 		out = append(out, &cp)
 	}
+	// Map iteration order is randomized in Go, so return a stable order or the
+	// host list reshuffles on every refresh. Registration time keeps a host in
+	// the same slot across calls; ID is a deterministic tiebreaker for agents
+	// registered in the same instant (or with a zero timestamp).
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Registered.Equal(out[j].Registered) {
+			return out[i].Registered.Before(out[j].Registered)
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out
 }
 
@@ -399,6 +412,42 @@ func (r *Registry) SetAgentTags(id string, tags []string) error {
 	return nil
 }
 
+// RenameGroup rewrites every agent whose group is oldName to newName and
+// returns how many records changed. Passing an empty newName clears the group
+// (used when a group is deleted) so hosts are never left pointing at a group
+// that no longer exists.
+func (r *Registry) RenameGroup(oldName, newName string) int {
+	if oldName == "" {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, a := range r.agents {
+		if a.Group == oldName {
+			a.Group = newName
+			n++
+		}
+	}
+	if n > 0 {
+		_ = r.persistAgentsLocked()
+	}
+	return n
+}
+
+// CountByGroup returns how many agents are in the given group name.
+func (r *Registry) CountByGroup(name string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, a := range r.agents {
+		if a.Group == name {
+			n++
+		}
+	}
+	return n
+}
+
 // DeleteAgent removes an agent from the registry.
 func (r *Registry) DeleteAgent(id string) error {
 	r.mu.Lock()
@@ -433,7 +482,26 @@ func (r *Registry) ReapStale() {
 	}
 }
 
-func newHub(agentID string, heartbeatSec int32) *Hub {
+// updateAgentMetrics writes the latest uptime and hardware info from a
+// metrics sample back into the persisted Agent struct so the host list
+// API always returns fresh values even without a live hub lookup.
+func (r *Registry) updateAgentMetrics(agentID string, m *agentpb.MetricsSample) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.agents[agentID]
+	if !ok {
+		return
+	}
+	if m.GetUptime() > 0 {
+		a.Uptime = m.GetUptime()
+	}
+	if m.GetMemTotal() > 0 {
+		a.MemTotal = m.GetMemTotal()
+	}
+	a.LastSeen = time.Now()
+}
+
+func newHub(agentID string, heartbeatSec int32, reg *Registry) *Hub {
 	return &Hub{
 		AgentID:      agentID,
 		heartbeat:    heartbeatSec,
@@ -441,6 +509,7 @@ func newHub(agentID string, heartbeatSec int32) *Hub {
 		sendCh:       make(chan *agentpb.ServerMessage, 128),
 		termHandlers: make(map[string]func(*agentpb.TerminalOutput)),
 		respHandlers: make(map[string]func(*agentpb.AgentMessage)),
+		registry:     reg,
 	}
 }
 
@@ -530,7 +599,9 @@ func (h *Hub) handleAgentMessage(msg *agentpb.AgentMessage) error {
 			h.mu.Lock()
 			h.lastMetrics = p.Metrics
 			h.mu.Unlock()
-			// Dispatch to any live metrics handler (registered under "metrics-live") or poll handler ("metrics-poll").
+			if h.registry != nil && p.Metrics.GetUptime() > 0 {
+				h.registry.updateAgentMetrics(h.AgentID, p.Metrics)
+			}
 			h.dispatchResp("metrics-live", msg)
 			h.dispatchResp("metrics-poll", msg)
 			return nil

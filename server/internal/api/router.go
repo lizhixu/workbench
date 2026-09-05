@@ -7,18 +7,25 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"watchman/proto/agentpb"
 	"watchman/server/internal/ai"
 	"watchman/server/internal/alert"
 	"watchman/server/internal/apps"
+	"watchman/server/internal/audit"
 	"watchman/server/internal/auth"
+	"watchman/server/internal/backup"
+	"watchman/server/internal/commands"
+	"watchman/server/internal/groups"
 	"watchman/server/internal/metrics"
 	"watchman/server/internal/policy"
+	"watchman/server/internal/prefs"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/session"
@@ -47,13 +54,24 @@ type HostDTO struct {
 	InternalIP string   `json:"internal_ip"`
 	PublicIP   string   `json:"public_ip"`
 	Location   string   `json:"location"`
+	// Extended live metrics (from the agent's latest sample).
+	CpuModel  string  `json:"cpu_model,omitempty"`
+	Load1     float64 `json:"load1"`
+	SwapUsage float64 `json:"swap_usage"`
+	MonthRx   int64   `json:"month_rx"`
+	MonthTx   int64   `json:"month_tx"`
 }
 
 // Router builds the gin engine with all routes mounted under /api/v1.
 // authStore may be nil for a degraded (token-less) mode used only in tests;
 // in production it is always provided. sessStore tracks terminal sessions
-// for audit (may be nil to disable auditing).
-func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store) *gin.Engine {
+// for audit (may be nil to disable auditing). auditStore records the unified
+// operational audit trail (may be nil to disable). commandStore backs the
+// saved-command library, groupStore backs host grouping + per-group user
+// authorization, prefsStore backs per-user terminal preferences and
+// backupStore backs control-plane backup/restore; all may be nil to disable
+// those features.
+func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, prefsStore *prefs.Store, backupStore *backup.Store) *gin.Engine {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -62,13 +80,13 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	r.Use(gin.Recovery(), requestLogger(log))
 
 	v1 := r.Group("/api/v1")
-	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore}
+	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, prefs: prefsStore}
 
 	// ---- Public routes (no auth) ----
 	// Auth login.
 	if authStore != nil {
 		ah := auth.NewHandlers(authStore)
-		v1.POST("/auth/login", ah.Login)
+		v1.POST("/auth/login", h.loginWithAudit(ah.Login))
 	}
 
 	// Enroll (generates a one-time token; the install script uses it).
@@ -80,30 +98,36 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// ---- Authenticated routes ----
 	authed := v1.Group("", auth.Middleware(authStore))
 
+	// Role gates. A viewer is read-only by design (AGENTS.md 3.15/B.3), so any
+	// route that changes a host — shell, file write, exec, docker, scan — needs
+	// at least operator, and host lifecycle stays with admin.
+	hostWrite := authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator))
+	adminOnly := authed.Group("", auth.RequireRole(auth.RoleAdmin))
+
 	// Hosts.
 	authed.GET("/hosts", h.listHosts)
 	authed.GET("/hosts/:id", h.getHost)
-	authed.DELETE("/hosts/:id", h.deleteHost)
-	authed.PUT("/hosts/:id/group", h.setHostGroup)
-	authed.PUT("/hosts/:id/tags", h.setHostTags)
+	adminOnly.DELETE("/hosts/:id", h.deleteHost)
+	adminOnly.PUT("/hosts/:id/group", h.setHostGroup)
+	adminOnly.PUT("/hosts/:id/tags", h.setHostTags)
 
-	// Terminal.
-	authed.POST("/hosts/:id/terminals", h.openTerminal)
-	authed.POST("/hosts/:id/terminals/:sid/share", h.shareTerminal)
+	// Terminal. An interactive shell is full write access to the host.
+	hostWrite.POST("/hosts/:id/terminals", h.openTerminal)
+	hostWrite.POST("/hosts/:id/terminals/:sid/share", h.shareTerminal)
 
-	// Files.
+	// Files: reads are open to every role, writes are not.
 	authed.GET("/hosts/:id/files", h.fileList)
 	authed.GET("/hosts/:id/files/stat", h.fileStat)
-	authed.POST("/hosts/:id/files/mkdir", h.fileMkdir)
-	authed.POST("/hosts/:id/files/move", h.fileMove)
-	authed.POST("/hosts/:id/files/copy", h.fileCopy)
-	authed.DELETE("/hosts/:id/files", h.fileRemove)
 	authed.GET("/hosts/:id/files/download", h.fileDownload)
-	authed.POST("/hosts/:id/files/upload", h.fileUpload)
+	hostWrite.POST("/hosts/:id/files/mkdir", h.fileMkdir)
+	hostWrite.POST("/hosts/:id/files/move", h.fileMove)
+	hostWrite.POST("/hosts/:id/files/copy", h.fileCopy)
+	hostWrite.DELETE("/hosts/:id/files", h.fileRemove)
+	hostWrite.POST("/hosts/:id/files/upload", h.fileUpload)
 
 	// Exec (push command).
-	authed.POST("/hosts/:id/exec", h.execCommand)
-	authed.POST("/hosts/batch-exec", h.batchExec)
+	hostWrite.POST("/hosts/:id/exec", h.execCommand)
+	hostWrite.POST("/hosts/batch-exec", h.batchExec)
 
 	// Metrics.
 	authed.GET("/hosts/:id/metrics", h.getMetrics)
@@ -111,36 +135,46 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 
 	// SysInfo.
 	authed.GET("/hosts/:id/sysinfo/:kind", h.getSysInfo)
+	hostWrite.POST("/hosts/:id/processes/:pid/kill", h.killProcess)
 
-	// Docker.
+	// Docker: inspection is read-only, container/image operations are not.
 	authed.GET("/hosts/:id/docker/ps", h.dockerPs)
 	authed.GET("/hosts/:id/docker/images", h.dockerImages)
 	authed.GET("/hosts/:id/docker/all", h.dockerAll)
-	authed.POST("/hosts/:id/docker/:op", h.dockerOp)
+	hostWrite.POST("/hosts/:id/docker/:op", h.dockerOp)
 
-	// App Store & templates.
-	apps.NewHandlers(reg).Register(authed)
+	// App Store & templates. Installing an app or Docker runs commands on the
+	// host, so those routes require a role that may change host state and are
+	// recorded in the audit trail.
+	apps.NewHandlers(reg).Register(authed,
+		authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator), h.auditMutation()))
 
 	// Security scanning.
 	if scanStore != nil {
-		scan.NewHandlers(reg, scanStore, log).Register(authed)
+		scan.NewHandlers(reg, scanStore, log).Register(authed, hostWrite)
 	}
 
-	// Sessions (audit / recordings).
+	// Sessions (audit / recordings). Removing a recording destroys audit
+	// evidence, so only an admin may do it.
 	authed.GET("/sessions", h.listSessions)
 	authed.GET("/sessions/:id", h.getSession)
 	authed.GET("/sessions/:id/recording", h.getRecording)
-	authed.DELETE("/sessions/:id", h.deleteSession)
+	adminOnly.DELETE("/sessions/:id", h.deleteSession)
 
 	// Health.
 	authed.GET("/system/health", h.health)
 
 	// Agent upgrade.
-	authed.POST("/hosts/:id/upgrade", auth.RequireRole(auth.RoleAdmin), h.upgradeAgent)
+	adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
 
-	// User management (admin-only for mutating routes).
+	// User management (admin-only for mutating routes). Deleting an account
+	// also drops its terminal preferences, so a recreated account starts fresh.
 	if authStore != nil {
-		auth.NewHandlers(authStore).Register(authed.Group(""))
+		uh := auth.NewHandlers(authStore)
+		if prefsStore != nil {
+			uh.OnUserDeleted(prefsStore.Delete)
+		}
+		uh.Register(authed.Group("", h.auditMutation()))
 	}
 
 	// Alerts (rules + events + webhook).
@@ -150,7 +184,7 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 
 	// Credential vault (admin-only).
 	if vaultStore != nil {
-		vault.NewHandlers(vaultStore).Register(authed.Group(""))
+		vault.NewHandlers(vaultStore).Register(authed.Group("", h.auditMutation()))
 	}
 
 	// AI diagnostics.
@@ -160,7 +194,42 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 
 	// High-risk command control (policy + audit).
 	if policyStore != nil {
-		policy.NewHandlers(policyStore).Register(authed.Group(""))
+		policy.NewHandlers(policyStore).Register(
+			authed.Group("", h.auditMutation()),
+			adminOnly.Group("", h.auditMutation()),
+		)
+	}
+
+	// Unified operational audit trail (admin-only).
+	if auditStore != nil {
+		audit.NewHandlers(auditStore).Register(authed.Group("", auth.RequireRole(auth.RoleAdmin)))
+	}
+
+	// Saved-command library (used by 推送命令 and the settings page).
+	if commandStore != nil {
+		commands.NewHandlers(commandStore).Register(authed.Group("", h.auditMutation()))
+	}
+
+	// Host groups + per-group user authorization (mutations are admin-only).
+	if groupStore != nil {
+		groups.NewHandlers(groupStore, reg).Register(
+			authed.Group(""),
+			authed.Group("", auth.RequireRole(auth.RoleAdmin), h.auditMutation()),
+		)
+	}
+
+	// Per-user terminal preferences (theme / default shell / font).
+	if prefsStore != nil {
+		prefs.NewHandlers(prefsStore).Register(authed)
+	}
+
+	// Control-plane backup / restore. An archive contains every credential,
+	// recording and audit entry the server holds, and a restore rewrites all of
+	// them, so these routes are admin-only and always audited.
+	if backupStore != nil {
+		backup.NewHandlers(backupStore).Register(
+			authed.Group("", auth.RequireRole(auth.RoleAdmin), h.auditMutation()),
+		)
 	}
 
 	// WebSocket endpoint (token via query param, since browsers can't set
@@ -201,6 +270,75 @@ type handlers struct {
 	auth    *auth.Store
 	metrics *metrics.Store
 	policy  *policy.Store
+	audit   *audit.Store
+	groups  *groups.Store
+	prefs   *prefs.Store
+}
+
+// canSeeHost reports whether the caller is allowed to reach the given host,
+// based on the host's group and the caller's group grants. Users without any
+// grant (and admins) are unrestricted, so grouping stays optional.
+func (h *handlers) canSeeHost(c *gin.Context, a *rpc.Agent) bool {
+	if h.groups == nil || a == nil {
+		return true
+	}
+	return h.groups.CanAccessGroup(auth.Username(c), auth.RoleOf(c) == auth.RoleAdmin, a.Group)
+}
+
+// recordAudit appends a unified audit entry, auto-filling the acting user and
+// request metadata. Safe to call when auditing is disabled (nil store).
+func (h *handlers) recordAudit(c *gin.Context, action, targetType, targetID, detail, risk, result string) {
+	if h.audit == nil {
+		return
+	}
+	ip, ua := audit.RequestInfo(c.Request)
+	h.audit.Record(audit.Entry{
+		Username:   auth.Username(c),
+		Action:     action,
+		TargetType: targetType,
+		TargetID:   targetID,
+		Detail:     detail,
+		IP:         ip,
+		UserAgent:  ua,
+		RiskLevel:  risk,
+		Result:     result,
+	})
+}
+
+// loginWithAudit wraps the login handler so successful and failed console
+// logins are recorded in the audit trail (login runs before auth middleware,
+// so the username is taken from the request body).
+func (h *handlers) loginWithAudit(login gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var username string
+		if raw, err := io.ReadAll(c.Request.Body); err == nil {
+			var body struct {
+				Username string `json:"username"`
+			}
+			_ = json.Unmarshal(raw, &body)
+			username = body.Username
+			// Restore the body for the real handler.
+			c.Request.Body = io.NopCloser(bytes.NewReader(raw))
+		}
+		login(c)
+		if h.audit == nil {
+			return
+		}
+		result := audit.ResultSuccess
+		if c.Writer.Status() != http.StatusOK {
+			result = audit.ResultFailed
+		}
+		ip, ua := audit.RequestInfo(c.Request)
+		h.audit.Record(audit.Entry{
+			Username:   username,
+			Action:     "login",
+			TargetType: "system",
+			IP:         ip,
+			UserAgent:  ua,
+			RiskLevel:  audit.RiskMedium,
+			Result:     result,
+		})
+	}
 }
 
 func (h *handlers) enroll(c *gin.Context) {
@@ -224,6 +362,9 @@ func (h *handlers) listHosts(c *gin.Context) {
 	agents := h.reg.ListAgents()
 	out := make([]HostDTO, 0, len(agents))
 	for _, a := range agents {
+		if !h.canSeeHost(c, a) {
+			continue
+		}
 		out = append(out, h.toDTO(a))
 	}
 	c.JSON(http.StatusOK, gin.H{"data": out, "total": len(out)})
@@ -235,6 +376,10 @@ func (h *handlers) getHost(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "host not found"})
 		return
 	}
+	if !h.canSeeHost(c, a) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权访问该主机所属分组"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": h.toDTO(a)})
 }
 
@@ -243,6 +388,7 @@ func (h *handlers) deleteHost(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	h.recordAudit(c, "host_unbind", "host", c.Param("id"), "解绑并移除主机", audit.RiskHigh, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -258,6 +404,7 @@ func (h *handlers) setHostGroup(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	h.recordAudit(c, "host_group", "host", c.Param("id"), "设置分组: "+body.Group, audit.RiskLow, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -273,6 +420,7 @@ func (h *handlers) setHostTags(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	h.recordAudit(c, "host_tags", "host", c.Param("id"), "更新标签", audit.RiskLow, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -294,6 +442,13 @@ func (h *handlers) openTerminal(c *gin.Context) {
 	}
 	_ = c.ShouldBindJSON(&body)
 
+	// An unspecified shell falls back to the caller's saved default, so the
+	// preference applies even when the request comes from a client that does
+	// not read preferences (share links, older UI, API scripts).
+	if body.Shell == "" && h.prefs != nil {
+		body.Shell = h.prefs.Get(auth.Username(c)).DefaultShell
+	}
+
 	sid := randomToken(12)
 	ws.RegisterSession(sid, agentID, body.Shell)
 	// Record the session start for audit.
@@ -301,6 +456,13 @@ func (h *handlers) openTerminal(c *gin.Context) {
 		operator := auth.Username(c)
 		h.sess.Start(sid, agentID, a.Hostname, operator)
 	}
+	shell := body.Shell
+	if shell == "" {
+		shell = "default"
+	}
+	h.recordAudit(c, "terminal_open", "host", agentID,
+		fmt.Sprintf("打开终端会话 %s (shell=%s, 主机=%s)", sid, shell, a.Hostname),
+		audit.RiskMedium, audit.ResultSuccess)
 	// Build the WS URL with the caller's token so the browser can authenticate.
 	wsURL := "/api/v1/ws/terminal/" + sid
 	if tok := c.Query("ws_token"); tok != "" {
@@ -342,6 +504,10 @@ func (h *handlers) shareTerminal(c *gin.Context) {
 		return
 	}
 
+	h.recordAudit(c, "terminal_share", "session", sid,
+		fmt.Sprintf("分享终端会话 (模式=%s, 有效期=%d分钟, 主机=%s)", body.Mode, body.ExpireMinutes, agentID),
+		audit.RiskMedium, audit.ResultSuccess)
+
 	c.JSON(http.StatusOK, gin.H{
 		"share_token": share.Token,
 		"share_code":  share.Code,
@@ -376,10 +542,10 @@ func (h *handlers) getShareInfo(c *gin.Context) {
 
 func (h *handlers) execCommand(c *gin.Context) {
 	var body struct {
-		Command   string `json:"command"`
-		Shell     string `json:"shell"`
-		Timeout   int32  `json:"timeout_sec"`
-		IsScript  bool   `json:"is_script"`
+		Command  string `json:"command"`
+		Shell    string `json:"shell"`
+		Timeout  int32  `json:"timeout_sec"`
+		IsScript bool   `json:"is_script"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -387,8 +553,12 @@ func (h *handlers) execCommand(c *gin.Context) {
 	}
 
 	// High-risk command policy check.
+	risk := audit.RiskLow
 	if h.policy != nil {
 		res := h.policy.Check(body.Command)
+		if res.RiskLevel == policy.RiskHigh {
+			risk = audit.RiskHigh
+		}
 		username := auth.Username(c)
 		hostID := c.Param("id")
 		if !res.Allowed {
@@ -396,6 +566,9 @@ func (h *handlers) execCommand(c *gin.Context) {
 				Username: username, HostID: hostID, Command: body.Command, Shell: body.Shell,
 				RiskLevel: res.RiskLevel, Result: "blocked", Reason: res.Reason,
 			})
+			h.recordAudit(c, "exec", "host", hostID,
+				"命令被策略拦截: "+body.Command+" ("+res.Reason+")",
+				audit.RiskHigh, audit.ResultBlocked)
 			c.JSON(http.StatusForbidden, gin.H{"error": res.Reason, "risk_level": res.RiskLevel, "matched_pattern": res.MatchedPattern})
 			return
 		}
@@ -404,6 +577,9 @@ func (h *handlers) execCommand(c *gin.Context) {
 				Username: username, HostID: hostID, Command: body.Command, Shell: body.Shell,
 				RiskLevel: res.RiskLevel, Result: "denied", Reason: "未确认高危命令",
 			})
+			h.recordAudit(c, "exec", "host", hostID,
+				"高危命令等待二次确认: "+body.Command,
+				audit.RiskHigh, audit.ResultBlocked)
 			c.JSON(http.StatusConflict, gin.H{
 				"error":           res.Reason,
 				"risk_level":      res.RiskLevel,
@@ -452,12 +628,31 @@ func (h *handlers) execCommand(c *gin.Context) {
 	})
 
 	defer hub.SetRespHandler(execID, nil)
+	// Wait long enough for the requested command. A one-liner defaults to 60s,
+	// but an install script (Docker, etc.) can legitimately run for minutes, so
+	// honor the caller's timeout_sec plus round-trip headroom, capped so a stuck
+	// command can't pin a goroutine indefinitely.
+	waitFor := 120 * time.Second
+	if body.Timeout > 0 {
+		waitFor = time.Duration(body.Timeout+30) * time.Second
+	}
+	if waitFor > 900*time.Second {
+		waitFor = 900 * time.Second
+	}
 	select {
 	case res := <-resultCh:
 		if res == nil {
+			h.recordAudit(c, "exec", "host", c.Param("id"), "执行命令失败(agent断开): "+body.Command, risk, audit.ResultFailed)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent disconnected"})
 			return
 		}
+		result := audit.ResultSuccess
+		if res.GetExitCode() != 0 || res.GetError() != "" {
+			result = audit.ResultFailed
+		}
+		h.recordAudit(c, "exec", "host", c.Param("id"),
+			fmt.Sprintf("执行命令 (shell=%s, 退出码=%d): %s", body.Shell, res.GetExitCode(), body.Command),
+			risk, result)
 		c.JSON(http.StatusOK, gin.H{
 			"exec_id":     res.GetExecId(),
 			"exit_code":   res.GetExitCode(),
@@ -466,7 +661,8 @@ func (h *handlers) execCommand(c *gin.Context) {
 			"duration_ms": res.GetDurationMs(),
 			"error":       res.GetError(),
 		})
-	case <-time.After(120 * time.Second):
+	case <-time.After(waitFor):
+		h.recordAudit(c, "exec", "host", c.Param("id"), "执行命令超时: "+body.Command, risk, audit.ResultFailed)
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "exec timeout"})
 	}
 }
@@ -484,14 +680,21 @@ func (h *handlers) batchExec(c *gin.Context) {
 	}
 
 	// High-risk command policy check (batch).
+	batchRisk := audit.RiskLow
 	if h.policy != nil {
 		res := h.policy.Check(body.Command)
+		if res.RiskLevel == policy.RiskHigh {
+			batchRisk = audit.RiskHigh
+		}
 		username := auth.Username(c)
 		if !res.Allowed {
 			h.policy.RecordAudit(policy.AuditEntry{
 				Username: username, HostIDs: body.HostIDs, Command: body.Command, Shell: body.Shell,
 				RiskLevel: res.RiskLevel, Result: "blocked", Reason: res.Reason,
 			})
+			h.recordAudit(c, "batch_exec", "host", strings.Join(body.HostIDs, ","),
+				fmt.Sprintf("批量命令被策略拦截 (%d 台主机): %s", len(body.HostIDs), body.Command),
+				audit.RiskHigh, audit.ResultBlocked)
 			c.JSON(http.StatusForbidden, gin.H{"error": res.Reason, "risk_level": res.RiskLevel, "matched_pattern": res.MatchedPattern})
 			return
 		}
@@ -500,6 +703,9 @@ func (h *handlers) batchExec(c *gin.Context) {
 				Username: username, HostIDs: body.HostIDs, Command: body.Command, Shell: body.Shell,
 				RiskLevel: res.RiskLevel, Result: "denied", Reason: "未确认高危命令",
 			})
+			h.recordAudit(c, "batch_exec", "host", strings.Join(body.HostIDs, ","),
+				fmt.Sprintf("批量高危命令等待二次确认 (%d 台主机): %s", len(body.HostIDs), body.Command),
+				audit.RiskHigh, audit.ResultBlocked)
 			c.JSON(http.StatusConflict, gin.H{
 				"error":           res.Reason,
 				"risk_level":      res.RiskLevel,
@@ -571,6 +777,19 @@ func (h *handlers) batchExec(c *gin.Context) {
 			results = append(results, result{Error: "timeout"})
 		}
 	}
+	failed := 0
+	for _, r := range results {
+		if r.Error != "" || r.ExitCode != 0 {
+			failed++
+		}
+	}
+	resultLabel := audit.ResultSuccess
+	if failed > 0 {
+		resultLabel = audit.ResultFailed
+	}
+	h.recordAudit(c, "batch_exec", "host", strings.Join(body.HostIDs, ","),
+		fmt.Sprintf("批量推送命令到 %d 台主机 (%d 台异常): %s", len(body.HostIDs), failed, body.Command),
+		batchRisk, resultLabel)
 	c.JSON(http.StatusOK, gin.H{"results": results})
 }
 
@@ -601,19 +820,19 @@ func (h *handlers) getMetrics(c *gin.Context) {
 		},
 	})
 	select {
-		case m := <-resultCh:
-			if m == nil {
-				if lm != nil {
-					c.JSON(http.StatusOK, metricsToJSON(lm))
-					return
-				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no metrics"})
+	case m := <-resultCh:
+		if m == nil {
+			if lm != nil {
+				c.JSON(http.StatusOK, metricsToJSON(lm))
 				return
 			}
-			if h.metrics != nil {
-				h.metrics.AddSample(c.Param("id"), m)
-			}
-			c.JSON(http.StatusOK, metricsToJSON(m))
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no metrics"})
+			return
+		}
+		if h.metrics != nil {
+			h.metrics.AddSample(c.Param("id"), m)
+		}
+		c.JSON(http.StatusOK, metricsToJSON(m))
 	case <-time.After(3 * time.Second):
 		hub.SetRespHandler("metrics-live", nil)
 		if lm != nil {
@@ -634,16 +853,27 @@ func metricsToJSON(m *agentpb.MetricsSample) gin.H {
 		})
 	}
 	return gin.H{
-		"ts":         m.GetTs(),
-		"cpu_usage":  m.GetCpuUsage(),
-		"mem_usage":  m.GetMemUsage(),
-		"mem_total":  m.GetMemTotal(),
-		"mem_used":   m.GetMemUsed(),
-		"net_rx":     m.GetNetRx(),
-		"net_tx":     m.GetNetTx(),
-		"disk_read":  m.GetDiskRead(),
-		"disk_write": m.GetDiskWrite(),
-		"mounts":     mounts,
+		"ts":              m.GetTs(),
+		"cpu_usage":       m.GetCpuUsage(),
+		"mem_usage":       m.GetMemUsage(),
+		"mem_total":       m.GetMemTotal(),
+		"mem_used":        m.GetMemUsed(),
+		"net_rx":          m.GetNetRx(),
+		"net_tx":          m.GetNetTx(),
+		"disk_read":       m.GetDiskRead(),
+		"disk_write":      m.GetDiskWrite(),
+		"mounts":          mounts,
+		"load1":           m.GetLoad1(),
+		"load5":           m.GetLoad5(),
+		"load15":          m.GetLoad15(),
+		"swap_total":      m.GetSwapTotal(),
+		"swap_used":       m.GetSwapUsed(),
+		"tcp_established": m.GetTcpEstablished(),
+		"udp_count":       m.GetUdpCount(),
+		"process_count":   m.GetProcessCount(),
+		"cpu_model":       m.GetCpuModel(),
+		"month_rx":        m.GetMonthRx(),
+		"month_tx":        m.GetMonthTx(),
 	}
 }
 
@@ -698,7 +928,86 @@ func (h *handlers) getSysInfo(c *gin.Context) {
 		return
 	}
 	kind := c.Param("kind")
-	ref := "sysinfo:" + kind
+	if kind == "kill" {
+		// Killing is a mutation and has its own audited route; refuse to reach it
+		// through the read-only sysinfo path.
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请使用 POST /hosts/:id/processes/:pid/kill"})
+		return
+	}
+	h.sysInfoQuery(c, hub, &agentpb.SysInfoQuery{Kind: kind})
+}
+
+// killProcess terminates a single process on the target host. Admin/operator
+// only, group-scoped, and audited as a high-risk action.
+func (h *handlers) killProcess(c *gin.Context) {
+	a := h.reg.GetAgent(c.Param("id"))
+	if a == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "host not found"})
+		return
+	}
+	if !h.canSeeHost(c, a) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权访问该主机所属分组"})
+		return
+	}
+	pid, err := strconv.Atoi(c.Param("pid"))
+	if err != nil || pid <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "非法 PID"})
+		return
+	}
+	hub := h.reg.Hub(c.Param("id"))
+	if hub == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline"})
+		return
+	}
+
+	var body struct {
+		Force bool   `json:"force"`
+		Name  string `json:"name"`
+	}
+	_ = c.ShouldBindJSON(&body)
+
+	signal := "SIGTERM"
+	if body.Force {
+		signal = "SIGKILL"
+	}
+	detail := fmt.Sprintf("结束进程 PID=%d (%s)", pid, signal)
+	if body.Name != "" {
+		detail = fmt.Sprintf("结束进程 %s PID=%d (%s)", body.Name, pid, signal)
+	}
+
+	status, payload := h.sysInfoCall(hub, &agentpb.SysInfoQuery{
+		Kind:  "kill",
+		Pid:   int32(pid),
+		Force: body.Force,
+	})
+	result := audit.ResultSuccess
+	if status != http.StatusOK {
+		result = audit.ResultFailed
+	}
+	h.recordAudit(c, "process_kill", "host", c.Param("id"), detail, audit.RiskHigh, result)
+	if status != http.StatusOK {
+		c.JSON(status, gin.H{"error": string(payload)})
+		return
+	}
+	c.Data(http.StatusOK, "application/json", payload)
+}
+
+// sysInfoQuery issues a SysInfoQuery and writes the agent's raw JSON payload to
+// the response.
+func (h *handlers) sysInfoQuery(c *gin.Context, hub *rpc.Hub, q *agentpb.SysInfoQuery) {
+	status, payload := h.sysInfoCall(hub, q)
+	if status != http.StatusOK {
+		c.JSON(status, gin.H{"error": string(payload)})
+		return
+	}
+	// Return the raw JSON payload from the agent.
+	c.Data(http.StatusOK, "application/json", payload)
+}
+
+// sysInfoCall performs one request/response round trip over the agent hub. On
+// success it returns (200, jsonPayload); on failure (status, errorText).
+func (h *handlers) sysInfoCall(hub *rpc.Hub, q *agentpb.SysInfoQuery) (int, []byte) {
+	ref := "sysinfo:" + q.GetKind()
 	resultCh := make(chan []byte, 1)
 	hub.SetRespHandler(ref, func(msg *agentpb.AgentMessage) {
 		hub.SetRespHandler(ref, nil)
@@ -713,23 +1022,27 @@ func (h *handlers) getSysInfo(c *gin.Context) {
 			resultCh <- nil
 		}
 	})
-	hub.Send(&agentpb.ServerMessage{
-		Payload: &agentpb.ServerMessage_SysinfoQ{
-			SysinfoQ: &agentpb.SysInfoQuery{Kind: kind},
-		},
-	})
 	defer hub.SetRespHandler(ref, nil)
+
+	hub.Send(&agentpb.ServerMessage{
+		Payload: &agentpb.ServerMessage_SysinfoQ{SysinfoQ: q},
+	})
+
 	select {
 	case data := <-resultCh:
 		if data == nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no response"})
-			return
+			return http.StatusServiceUnavailable, []byte("no response")
 		}
-		// Return the raw JSON payload from the agent.
-		c.Data(http.StatusOK, "application/json", data)
+		// The agent reports failures as {"error":"..."} through the same channel.
+		var probe struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(data, &probe) == nil && probe.Error != "" {
+			return http.StatusInternalServerError, []byte(probe.Error)
+		}
+		return http.StatusOK, data
 	case <-time.After(10 * time.Second):
-		hub.SetRespHandler(ref, nil)
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "sysinfo timeout"})
+		return http.StatusGatewayTimeout, []byte("sysinfo timeout")
 	}
 }
 
@@ -756,6 +1069,20 @@ func (h *handlers) dockerOp(c *gin.Context) {
 		Image     string `json:"image"`
 	}
 	_ = c.ShouldBindJSON(&body)
+	// Mutating docker operations are audited; read-only ones (ps/images) are not.
+	switch op {
+	case "start", "stop", "restart", "rm", "pull", "rmi", "prune", "remove_image":
+		target := body.Container
+		if target == "" {
+			target = body.Image
+		}
+		risk := audit.RiskLow
+		if op == "rm" || op == "rmi" || op == "remove_image" || op == "prune" {
+			risk = audit.RiskHigh
+		}
+		h.recordAudit(c, "docker_op", "host", c.Param("id"),
+			fmt.Sprintf("Docker 操作 %s %s", op, target), risk, audit.ResultSuccess)
+	}
 	h.dockerCall(c, op, body.Container, body.Image)
 }
 
@@ -805,6 +1132,19 @@ func (h *handlers) dockerCall(c *gin.Context, op, container string, image ...str
 		// not a single JSON document, so try line-by-line parsing as a
 		// fallback before returning the raw text.
 		payload := ev.GetPayloadJson()
+		// ps/images are lists. `docker --format {{json .}}` prints one object per
+		// line, so a single container is a valid standalone JSON object while two
+		// or more are NDJSON. Parsing the document first would hand the browser
+		// an object in the one-container case and render an empty table, so list
+		// ops are always normalised to an array.
+		if op == "ps" || op == "images" {
+			rows := parseNDJSON(payload)
+			if rows == nil {
+				rows = []any{}
+			}
+			c.JSON(http.StatusOK, gin.H{"ok": true, "data": rows})
+			return
+		}
 		var parsed any
 		if json.Unmarshal(payload, &parsed) == nil {
 			c.JSON(http.StatusOK, gin.H{"ok": true, "data": parsed})
@@ -911,8 +1251,8 @@ loop:
 			lastProgress = p
 			if p.GetError() != "" {
 				c.JSON(http.StatusInternalServerError, gin.H{
-					"error":  p.GetError(),
-					"stage":  p.GetStage(),
+					"error": p.GetError(),
+					"stage": p.GetStage(),
 				})
 				return
 			}
@@ -925,11 +1265,81 @@ loop:
 		}
 	}
 
+	h.recordAudit(c, "agent_upgrade", "host", c.Param("id"),
+		fmt.Sprintf("升级 Agent 到 %s", body.Version), audit.RiskMedium, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{
 		"ok":      true,
 		"version": body.Version,
 		"message": "upgrade complete, agent restarting",
 	})
+}
+
+// ---- Audit helper for user/policy/vault mutations ---------------------
+
+// auditMutation wraps admin mutation route groups and records successful
+// writes to the unified audit trail. GETs and failed requests are skipped;
+// the action name is derived from the HTTP method + route pattern.
+func (h *handlers) auditMutation() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Next()
+		if h.audit == nil || c.Request.Method == http.MethodGet || c.Writer.Status() >= 400 {
+			return
+		}
+		action, ok := deriveMutationAction(c.Request.Method, c.FullPath())
+		if !ok {
+			return
+		}
+		risk := audit.RiskMedium
+		switch action {
+		case "user_delete", "policy_update", "docker_install",
+			"system_restore", "system_backup_delete":
+			risk = audit.RiskHigh
+		}
+		// Host-scoped routes carry :id; user routes carry :username; the rest
+		// (backups, groups, commands) name their target with :name or :id.
+		targetType, targetID := "system", c.Param("username")
+		if id := c.Param("id"); id != "" {
+			targetType, targetID = "host", id
+		}
+		if targetID == "" {
+			targetID = c.Param("name")
+		}
+		h.recordAudit(c, action, targetType, targetID,
+			c.Request.Method+" "+c.FullPath(), risk, audit.ResultSuccess)
+	}
+}
+
+// deriveMutationAction maps an HTTP method + gin route pattern to a concrete
+// audit action name.
+func deriveMutationAction(method, pattern string) (string, bool) {
+	type rule struct{ method, pattern, action string }
+	rules := []rule{
+		{http.MethodPost, "/api/v1/users", "user_create"},
+		{http.MethodPut, "/api/v1/users/:username/password", "user_password"},
+		{http.MethodPut, "/api/v1/users/:username/role", "user_role"},
+		{http.MethodPost, "/api/v1/users/:username/reset-password", "user_reset_password"},
+		{http.MethodDelete, "/api/v1/users/:username", "user_delete"},
+		{http.MethodPut, "/api/v1/policy/command", "policy_update"},
+		{http.MethodPost, "/api/v1/hosts/:id/apps/install", "app_install"},
+		{http.MethodDelete, "/api/v1/hosts/:id/apps/:name", "app_uninstall"},
+		{http.MethodPost, "/api/v1/hosts/:id/docker/install-script", "docker_install"},
+		// Control-plane backup / restore: a restore rewrites the whole dataset,
+		// so it is recorded as a high-risk action.
+		{http.MethodPost, "/api/v1/system/backup", "system_backup"},
+		{http.MethodDelete, "/api/v1/system/backups/:name", "system_backup_delete"},
+		{http.MethodPost, "/api/v1/system/backups/:name/restore", "system_restore"},
+		{http.MethodPost, "/api/v1/system/restore", "system_restore"},
+	}
+	for _, r := range rules {
+		if method == r.method && pattern == r.pattern {
+			return r.action, true
+		}
+	}
+	// Vault credential mutations share one pattern family.
+	if strings.HasPrefix(pattern, "/api/v1/vault") {
+		return "vault_op", true
+	}
+	return "", false
 }
 
 // ---- Sessions / Audit ------------------------------------------------
@@ -940,7 +1350,26 @@ func (h *handlers) listSessions(c *gin.Context) {
 		return
 	}
 	list := h.sess.List()
-	c.JSON(http.StatusOK, gin.H{"data": list, "total": len(list)})
+	total := len(list)
+	// Optional paging. Without page_size the full list is returned, so existing
+	// callers keep working; total always reports the unpaged count so the client
+	// can render a page count.
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	pageSize, _ := strconv.Atoi(c.Query("page_size"))
+	if pageSize > 0 {
+		if offset < 0 {
+			offset = 0
+		}
+		if offset > total {
+			offset = total
+		}
+		end := offset + pageSize
+		if end > total {
+			end = total
+		}
+		list = list[offset:end]
+	}
+	c.JSON(http.StatusOK, gin.H{"data": list, "total": total})
 }
 
 func (h *handlers) getSession(c *gin.Context) {
@@ -1117,6 +1546,13 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 			}
 			if m.GetMemTotal() > 0 {
 				dto.MemTotal = m.GetMemTotal()
+			}
+			dto.CpuModel = m.GetCpuModel()
+			dto.Load1 = m.GetLoad1()
+			dto.MonthRx = m.GetMonthRx()
+			dto.MonthTx = m.GetMonthTx()
+			if m.GetSwapTotal() > 0 {
+				dto.SwapUsage = float64(m.GetSwapUsed()) / float64(m.GetSwapTotal()) * 100
 			}
 		}
 	}

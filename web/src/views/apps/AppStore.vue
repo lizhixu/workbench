@@ -271,7 +271,7 @@ onMounted(() => {
             </NButton>
           </div>
 
-          <NGrid :cols="3" :x-gap="14" :y-gap="14" responsive="screen">
+          <NGrid cols="1 s:2 l:3" :x-gap="14" :y-gap="14" responsive="screen">
             <NGridItem v-for="app in catalog" :key="app.id">
               <div class="app-card">
                 <div class="app-card-header">
@@ -310,8 +310,8 @@ onMounted(() => {
 
         <!-- Tab 2: 已部署应用实例 -->
         <NTabPane name="installed" tab="已部署实例">
-          <NSpace vertical :size="10">
-            <NSpace justify="space-between" align="center">
+          <div class="installed-body">
+            <NSpace justify="space-between" align="center" class="installed-toolbar">
               <span class="sub-tip">当前主机通过应用市场或标准 Label 管理的容器应用。</span>
               <NButton size="small" :loading="loadingInstalled" @click="loadInstalled">
                 <template #icon><NIcon :component="RefreshOutline" /></template>
@@ -319,7 +319,9 @@ onMounted(() => {
               </NButton>
             </NSpace>
 
+            <!-- 已安装应用：单台主机上的实例数天然有限（AGENTS.md 8.2 例外） -->
             <NDataTable
+              flex-height
               :columns="installedColumns"
               :data="installedApps"
               :loading="loadingInstalled"
@@ -328,7 +330,7 @@ onMounted(() => {
             >
               <template #empty>暂未安装任何应用</template>
             </NDataTable>
-          </NSpace>
+          </div>
         </NTabPane>
       </NTabs>
     </NCard>
@@ -404,8 +406,61 @@ onMounted(() => {
 
 <style scoped lang="scss">
 .app-store-container {
+  /* 撑满面板高度，使「已部署实例」表格能按剩余空间滚动（AGENTS.md 8.2） */
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+
   .app-store-card {
     background-color: transparent;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+
+    :deep(.n-card-content) {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    :deep(.n-tabs) {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* 模板库页签内容可滚动；已部署实例交给表格滚动 */
+    :deep(.n-tabs-pane-wrapper),
+    :deep(.n-tab-pane) {
+      flex: 1;
+      min-height: 0;
+    }
+
+    :deep(.n-tab-pane) {
+      overflow-y: auto;
+    }
+  }
+
+  .installed-body {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    height: 100%;
+    min-height: 0;
+
+    .installed-toolbar {
+      flex-shrink: 0;
+    }
+
+    :deep(.n-data-table) {
+      flex: 1;
+      min-height: 0;
+    }
   }
 
   .catalog-toolbar {

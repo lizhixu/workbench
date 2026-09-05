@@ -66,18 +66,28 @@ async function handleLogin() {
 <style scoped lang="scss">
 .login-bg {
   height: 100vh;
+  height: 100dvh;
   display: flex;
   align-items: center;
   justify-content: center;
   background: linear-gradient(135deg, #1f2937 0%, #111827 100%);
+  padding: 16px;
+  box-sizing: border-box;
 }
 .login-card {
   width: 380px;
+  max-width: 100%;
 }
 .hint {
   margin-top: 12px;
   text-align: center;
   font-size: 12px;
   color: #9ca3af;
+}
+
+@media (max-width: 480px) {
+  .login-card {
+    width: 100%;
+  }
 }
 </style>

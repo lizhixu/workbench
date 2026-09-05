@@ -28,9 +28,13 @@ func NewHandlers(reg *rpc.Registry, store *Store, log *slog.Logger) *Handlers {
 	return &Handlers{reg: reg, store: store, log: log}
 }
 
-// Register mounts scan routes on the given router group.
-func (h *Handlers) Register(rg *gin.RouterGroup) {
-	rg.POST("/hosts/:id/scans", h.triggerScan)
+// Register mounts scan routes. Reads go on rg; triggering a scan runs commands
+// on the target host, so it goes on the caller-supplied write group.
+func (h *Handlers) Register(rg *gin.RouterGroup, write *gin.RouterGroup) {
+	if write == nil {
+		write = rg
+	}
+	write.POST("/hosts/:id/scans", h.triggerScan)
 	rg.GET("/scans", h.listScans)
 	rg.GET("/scans/:id", h.getScan)
 	rg.GET("/hosts/:id/scans/latest", h.getLatestScan)

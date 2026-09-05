@@ -108,14 +108,43 @@ export async function fileUpload(hostId: string, path: string, file: File) {
   return resp.data
 }
 
+// fileReadText fetches a file as UTF-8 text for the preview/edit panel. Large
+// files are rejected client-side by the caller after a fileStat size check.
+export async function fileReadText(hostId: string, path: string) {
+  const resp = await http.get(`/hosts/${hostId}/files/download`, {
+    params: { path },
+    responseType: 'text',
+    transformResponse: [(d) => d],
+    timeout: 60000,
+  })
+  return typeof resp.data === 'string' ? resp.data : String(resp.data ?? '')
+}
+
+// fileWriteText saves edited text back to the host, reusing the chunked upload
+// endpoint so no separate write path is needed.
+export async function fileWriteText(hostId: string, path: string, content: string) {
+  const resp = await http.post(
+    `/hosts/${hostId}/files/upload?path=${encodeURIComponent(path)}`,
+    new Blob([content], { type: 'application/octet-stream' }),
+    { headers: { 'Content-Type': 'application/octet-stream' }, timeout: 60000 },
+  )
+  return resp.data
+}
+
 // ---- Exec ----
 export function execCommand(hostId: string, command: string, shell = '', timeoutSec = 60, isScript = false, confirmRisk = false) {
+  // The default axios timeout (15s) is far shorter than a long-running command
+  // (a Docker install pulls packages for minutes). Align the HTTP timeout with
+  // the requested server-side exec timeout, plus headroom for round-trip, so
+  // the browser doesn't abort a command the agent is still running.
+  const httpTimeout = Math.max(timeoutSec + 30, 60) * 1000
+  const headers = confirmRisk ? { 'X-Confirm-Risk': 'true' } : undefined
   return unwrap<any>(http.post(`/hosts/${hostId}/exec`, {
     command,
     shell,
     timeout_sec: timeoutSec,
     is_script: isScript,
-  }, confirmRisk ? { headers: { 'X-Confirm-Risk': 'true' } } : {}))
+  }, { timeout: httpTimeout, headers }))
 }
 
 export function batchExec(hostIds: string[], command: string, shell = '', timeoutSec = 60, confirmRisk = false) {
@@ -142,6 +171,17 @@ export interface MetricPoint {
   net_tx: number
   disk_read: number
   disk_write: number
+  // Extended metrics (zero/absent on older records).
+  load1?: number
+  load5?: number
+  load15?: number
+  swap_total?: number
+  swap_used?: number
+  tcp_established?: number
+  udp_count?: number
+  process_count?: number
+  month_rx?: number
+  month_tx?: number
 }
 
 export interface MetricsHistoryResponse {
@@ -217,13 +257,40 @@ export function uninstallApp(hostId: string, appName: string) {
   return unwrap<any>(http.delete(`/hosts/${hostId}/apps/${appName}`))
 }
 
-export function getDockerInstallScript(hostId: string) {
-  return unwrap<{ script: string; command: string }>(http.get(`/hosts/${hostId}/apps/install-docker-script`))
+export interface DockerInstallResult {
+  ok: boolean
+  exit_code: number
+  stdout: string
+  stderr: string
+}
+
+// installDocker runs the server-side one-click Docker install script on the
+// host. The script is defined on the server, not sent by the client, so the
+// command that actually runs cannot be tampered with from the browser.
+export function installDocker(hostId: string) {
+  return unwrap<DockerInstallResult>(
+    http.post(`/hosts/${hostId}/docker/install-script`, {}, { timeout: 330000 }),
+  )
 }
 
 // ---- SysInfo ----
 export function getSysInfo(hostId: string, kind: string) {
   return unwrap<any>(http.get(`/hosts/${hostId}/sysinfo/${kind}`))
+}
+
+export interface KillProcessResult {
+  ok: boolean
+  pid: number
+  name: string
+  force: boolean
+}
+
+// killProcess terminates one process on the host. force selects SIGKILL over
+// SIGTERM; name is sent for the audit trail only.
+export function killProcess(hostId: string, pid: number, force = false, name = '') {
+  return unwrap<KillProcessResult>(
+    http.post(`/hosts/${hostId}/processes/${pid}/kill`, { force, name }),
+  )
 }
 
 // ---- Docker ----
@@ -247,8 +314,8 @@ export function dockerOp(hostId: string, op: string, container = '', image = '')
 }
 
 // ---- Sessions ----
-export function listSessions() {
-  return unwrap<ListResponse<SessionRecord>>(http.get('/sessions'))
+export function listSessions(params?: { offset?: number; page_size?: number }) {
+  return unwrap<ListResponse<SessionRecord>>(http.get('/sessions', { params }))
 }
 
 export function getSession(id: string) {

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"watchman/proto/agentpb"
@@ -25,48 +26,113 @@ type Frame struct {
 	Mode   string `json:"mode,omitempty"`   // view | control | owner
 }
 
+// Timeouts for the browser-facing socket and for how long an unattended PTY is
+// kept alive. A network blip must not destroy a working shell, so the PTY
+// outlives the socket by sessionGrace (AGENTS.md A.3 "会话恢复").
+const (
+	// pongWait bounds how long we wait for any client frame. The browser pings
+	// every 25s, so a silent socket past this is a hard disconnect (closed lid,
+	// pulled cable) that TCP itself would not surface for another two hours.
+	pongWait = 70 * time.Second
+	// writeWait bounds a single write, so one stuck client cannot block the
+	// broadcast loop for everyone sharing the session.
+	writeWait = 10 * time.Second
+	// sessionGrace is how long the PTY survives with no client attached.
+	sessionGrace = 60 * time.Second
+)
+
+// sessionGraceForTest is the grace period actually used, so tests can shorten
+// it instead of waiting a full minute.
+var sessionGraceForTest = sessionGrace
+
 type sessionHub struct {
 	mu      sync.Mutex
 	sid     string
 	agentID string
 	clients map[*websocket.Conn]string // conn -> mode
+
+	// reapTimer is armed when the last client leaves and cancelled if someone
+	// reattaches within sessionGrace. Non-nil means "pending teardown".
+	reapTimer *time.Timer
 }
 
 var (
-	hubMu       sync.Mutex
-	activeHubs  = make(map[string]*sessionHub) // sid -> sessionHub
+	hubMu      sync.Mutex
+	activeHubs = make(map[string]*sessionHub) // sid -> sessionHub
 )
 
-func getOrCreateHub(sid, agentID string) *sessionHub {
+// getOrCreateHub returns the hub for sid. The second result reports whether a
+// PTY already exists for it: either clients are attached, or the hub is inside
+// its grace period and its PTY is still alive on the agent. In both cases the
+// caller must NOT reopen the PTY — it reattaches to the running shell.
+func getOrCreateHub(sid, agentID string) (*sessionHub, bool) {
 	hubMu.Lock()
 	defer hubMu.Unlock()
-	h, ok := activeHubs[sid]
-	if !ok {
-		h = &sessionHub{
-			sid:     sid,
-			agentID: agentID,
-			clients: make(map[*websocket.Conn]string),
+	if h, ok := activeHubs[sid]; ok {
+		h.mu.Lock()
+		// Cancel a pending teardown: this client is the reconnect we waited for.
+		if h.reapTimer != nil {
+			h.reapTimer.Stop()
+			h.reapTimer = nil
 		}
-		activeHubs[sid] = h
+		h.mu.Unlock()
+		return h, true
 	}
-	return h
+	h := &sessionHub{
+		sid:     sid,
+		agentID: agentID,
+		clients: make(map[*websocket.Conn]string),
+	}
+	activeHubs[sid] = h
+	return h, false
 }
 
-func removeHubClient(sid string, conn *websocket.Conn) int {
+// detachClient removes conn from the session. When nobody is left the PTY is
+// not killed right away: teardown is deferred by sessionGrace so a reconnecting
+// browser finds its shell — with its scrollback and running processes — intact.
+func detachClient(sid string, conn *websocket.Conn, teardown func()) {
 	hubMu.Lock()
-	defer hubMu.Unlock()
 	h, ok := activeHubs[sid]
 	if !ok {
-		return 0
+		hubMu.Unlock()
+		return
 	}
 	h.mu.Lock()
 	delete(h.clients, conn)
 	remaining := len(h.clients)
-	h.mu.Unlock()
-	if remaining == 0 {
-		delete(activeHubs, sid)
+	if remaining == 0 && h.reapTimer == nil {
+		h.reapTimer = time.AfterFunc(sessionGraceForTest, func() {
+			hubMu.Lock()
+			cur, still := activeHubs[sid]
+			if !still || cur != h {
+				hubMu.Unlock()
+				return
+			}
+			cur.mu.Lock()
+			empty := len(cur.clients) == 0
+			cur.mu.Unlock()
+			if !empty {
+				// Someone reattached in the race window; keep the PTY.
+				hubMu.Unlock()
+				return
+			}
+			delete(activeHubs, sid)
+			hubMu.Unlock()
+			teardown()
+		})
 	}
-	return remaining
+	h.mu.Unlock()
+	hubMu.Unlock()
+}
+
+// broadcast writes a frame to every attached client under a write deadline.
+func (h *sessionHub) broadcast(f Frame) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for c := range h.clients {
+		_ = c.SetWriteDeadline(time.Now().Add(writeWait))
+		_ = c.WriteJSON(f)
+	}
 }
 
 // TerminalHandler returns an http.HandlerFunc that upgrades to WebSocket and
@@ -121,31 +187,36 @@ func TerminalHandler(reg *rpc.Registry, log *slog.Logger, onEnd func(sid string)
 		}
 		defer conn.Close()
 
-		sHub := getOrCreateHub(sid, agentID)
+		// A silent socket past pongWait is a hard disconnect. Every client frame
+		// (input, resize, ping) and every pong pushes the deadline out.
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		conn.SetPongHandler(func(string) error {
+			return conn.SetReadDeadline(time.Now().Add(pongWait))
+		})
+
+		sHub, ptyLive := getOrCreateHub(sid, agentID)
 		sHub.mu.Lock()
-		firstClient := len(sHub.clients) == 0
 		sHub.clients[conn] = mode
 		sHub.mu.Unlock()
 
-		log.Info("terminal ws attached", "sid", sid, "agent", agentID, "mode", mode)
+		log.Info("terminal ws attached", "sid", sid, "agent", agentID, "mode", mode, "reattach", ptyLive)
 
 		// Send initial mode notice to client
+		_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 		_ = conn.WriteJSON(Frame{Type: "notice", Sid: sid, Mode: mode})
 
-		// If this is the first client attaching, register gRPC terminal output broadcaster and open PTY
-		if firstClient {
+		// Only open a PTY when there is not one already. A reattach (second
+		// viewer, or the same browser coming back within the grace period) must
+		// reuse the running shell, otherwise the user loses their scrollback and
+		// any process still running in it.
+		if !ptyLive {
 			hub.SetTermHandler(sid, func(t *agentpb.TerminalOutput) {
 				data := base64.StdEncoding.EncodeToString(t.GetData())
 				frame := Frame{Type: "output", Sid: sid, Data: data}
 				if len(t.GetData()) == 0 {
 					frame = Frame{Type: "ended", Sid: sid}
 				}
-
-				sHub.mu.Lock()
-				for c := range sHub.clients {
-					_ = c.WriteJSON(frame)
-				}
-				sHub.mu.Unlock()
+				sHub.broadcast(frame)
 			})
 
 			// Open PTY on agent
@@ -160,23 +231,25 @@ func TerminalHandler(reg *rpc.Registry, log *slog.Logger, onEnd func(sid string)
 					},
 				},
 			}) {
+				_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 				_ = conn.WriteJSON(Frame{Type: "ended", Sid: sid, Reason: "agent gone"})
 				return
 			}
 		}
 
-		defer func() {
-			rem := removeHubClient(sid, conn)
-			if rem == 0 {
-				hub.SetTermHandler(sid, nil)
-				hub.Send(&agentpb.ServerMessage{
-					Payload: &agentpb.ServerMessage_TermClose{TermClose: &agentpb.TerminalClose{SessionId: sid}},
-				})
-				if onEnd != nil {
-					onEnd(sid)
-				}
+		defer detachClient(sid, conn, func() {
+			// Nobody came back within the grace period: tear the PTY down and
+			// drop the session mapping so sessionIdx does not grow forever.
+			log.Info("terminal session reaped after grace period", "sid", sid, "grace", sessionGrace)
+			hub.SetTermHandler(sid, nil)
+			hub.Send(&agentpb.ServerMessage{
+				Payload: &agentpb.ServerMessage_TermClose{TermClose: &agentpb.TerminalClose{SessionId: sid}},
+			})
+			UnregisterSession(sid)
+			if onEnd != nil {
+				onEnd(sid)
 			}
-		}()
+		})
 
 		// Pump browser -> agent
 		for {
@@ -185,6 +258,8 @@ func TerminalHandler(reg *rpc.Registry, log *slog.Logger, onEnd func(sid string)
 				log.Debug("ws read end", "sid", sid, "err", err)
 				return
 			}
+			// Any traffic proves the client is alive.
+			_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 			var f Frame
 			if err := json.Unmarshal(raw, &f); err != nil {
 				continue
@@ -215,6 +290,7 @@ func TerminalHandler(reg *rpc.Registry, log *slog.Logger, onEnd func(sid string)
 					},
 				})
 			case "ping":
+				_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 				_ = conn.WriteJSON(Frame{Type: "pong"})
 			}
 		}

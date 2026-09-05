@@ -911,23 +911,180 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
 - 结构化日志（zerolog/zap）+ Prometheus `/metrics`（可选）便于接入监控。
 - Agent 侧：本地日志 + 回连后将关键日志摘要上报控制端（便于远程排障）。
 
-914	至此后端架构覆盖：目录、协议、数据模型、REST API、终端通路、部署配置、安全运维、可观测、备份迁移，以及 P2/P3（Docker/应用市场/组网/扫描/证书轮换/Agent 自更新）的协议与模型预留。
-915	
-916	(P2 起：终端分享、Docker 管理、应用市场、告警规则、动态组网、会话回放完善、AI 诊断/问答。)
-917	
-918	---
-919	
-920	## 7. 自动 Code Review 与代码质量校验规范
-921	
-922	为了确保 AI 开发助手产出的代码稳定可靠、零语法/编译错误，所有代码生成与变更操作必须严格遵守以下自动 Review 机制：
-923	
-924	1. **零错误防线 (Zero-Error Defense)**：
-925	   - **前端 (Vue 3 / TypeScript)**：任何 `.vue`、`.ts` 文件修改后，必须验证组件与 Icon 组件导入正确、Vue template 结构完整无断句错误、全量去除废弃字符（如 Emoji 表情符号），且符合 TypeScript 类型约束。
-926	   - **后端 (Go)**：修改 Go 代码后必须进行 `go vet` / `go build` 校验，确保导出的函数、结构体字段、Protobuf IDL 接口声明与实现完全一致。
-927	
-928	2. **修改前精准对齐 (Precise Match Verification)**：
-929	   - 使用 `Edit` 工具前必须先完整读取目标代码段落，确保 `old_string` 与文件原文逐字逐行完全匹配，防止产生不匹配报错或损坏文件内容。
-930	
-931	3. **修改后自动 Review 流程**：
-932	   - **编译/构建检查**：代码编写完成后，自动执行前端与后端构建测试，验证没有打破既有功能。
-933	   - **功能与视觉对齐**：修改完毕后进行自动化与人工视觉 Review，确保 UI 布局契合长亭百川云/牧云控制台风格规范。
+至此后端架构覆盖：目录、协议、数据模型、REST API、终端通路、部署配置、安全运维、可观测、备份迁移，以及 P2/P3（Docker/应用市场/组网/扫描/证书轮换/Agent 自更新）的协议与模型预留。
+
+(P2 起：终端分享、Docker 管理、应用市场、告警规则、动态组网、会话回放完善、AI 诊断/问答。)
+
+---
+
+## 7. 自动 Code Review 与代码质量校验规范
+
+为了确保 AI 开发助手产出的代码稳定可靠、零语法/编译错误，所有代码生成与变更操作必须严格遵守以下自动 Review 机制：
+
+1. **零错误防线 (Zero-Error Defense)**：
+   - **前端 (Vue 3 / TypeScript)**：任何 `.vue`、`.ts` 文件修改后，必须验证组件与 Icon 组件导入正确、Vue template 结构完整无断句错误、全量去除废弃字符（如 Emoji 表情符号），且符合 TypeScript 类型约束。
+   - **后端 (Go)**：修改 Go 代码后必须进行 `go vet` / `go build` 校验，确保导出的函数、结构体字段、Protobuf IDL 接口声明与实现完全一致。
+
+2. **修改前精准对齐 (Precise Match Verification)**：
+   - 使用 `Edit` 工具前必须先完整读取目标代码段落，确保 `old_string` 与文件原文逐字逐行完全匹配，防止产生不匹配报错或损坏文件内容。
+
+3. **修改后自动 Review 流程**：
+   - **编译/构建检查**：代码编写完成后，自动执行前端与后端构建测试，验证没有打破既有功能。
+   - **功能与视觉对齐**：修改完毕后进行自动化与人工视觉 Review，确保 UI 布局契合长亭百川云/牧云控制台风格规范。
+
+---
+
+## 8. 前端布局规范
+
+### 8.1 页面留白统一
+
+- 路由页面的外层内边距由 `AppShell` 的 `.app-body` 统一施加，取值来自 `--page-padding`（桌面 16px / 窄屏 10px）。
+- **页面组件自身不得再设置外层 `padding`**，否则各页面留白会重新出现不一致。
+- 页面内主卡片/面板的内边距统一取 `--card-padding`，与页面留白同一档位。
+
+### 8.2 大数据表格：整页高度自适应 + 表头分页固定
+
+凡是承载**不定长数据列表**的表格（审计日志、进程清单、端口清单、系统账号、登录历史、会话记录、文件列表、容器/镜像列表、扫描结果、告警消息、用户、凭据、分组、命令拦截审计等），一律采用「整页填满视口 + 表头与分页固定 + 仅数据区滚动 + **必须分页**」的布局。不允许让整页跟着表格一起长高，把分页条推到首屏之外；也不允许不分页地一次渲染全量数据。
+
+实现要求：
+
+1. **页面根容器**撑满可用高度并作为纵向 flex 容器：
+
+   ```scss
+   .xxx-view {
+     display: flex;
+     flex-direction: column;
+     height: 100%;
+     min-height: 0; // 必须，否则子项无法收缩
+   }
+   ```
+
+2. **表格容器**吃掉剩余空间，且**必须**同时写 `min-height: 0`。flex 子项默认 `min-height: auto`，不写则永远不会收缩，滚动条会跑到页面外层：
+
+   ```scss
+   .table-card {
+     flex: 1;
+     min-height: 0;
+     display: flex;
+     flex-direction: column;
+   }
+   ```
+
+   包一层 naive `NCard` 时，还需让其内容区同样具备 flex 能力：
+
+   ```scss
+   .table-card :deep(.n-card-content) {
+     flex: 1;
+     min-height: 0;
+     display: flex;
+     flex-direction: column;
+     overflow: hidden;
+   }
+   ```
+
+3. **`NDataTable` 一律加 `flex-height`**，让表格按父容器高度计算滚动区，表头随之固定：
+
+   ```vue
+   <NDataTable flex-height :columns="columns" :data="rows" />
+   ```
+
+   - `flex-height` 与写死的 `:max-height` 是互斥语义，用了前者就不要再写后者。
+   - 横向可滚动的宽表继续保留 `:scroll-x`，两者可共存。
+
+4. **分页条固定在表格下方**，用 `flex-shrink: 0` 钉住，不参与滚动。分页条需要固定条高与上下对称内边距，让分页组件在条内垂直居中；只加 `padding-top` 会使分页紧贴卡片底边，视觉上像被裁切，「每页条数」下拉也会顶到边缘。
+
+5. **必须有分页，不允许一次渲染全量数据**。上面第 4 条只规定了分页条的位置，不是「有分页时才管位置」——凡是不定长列表都必须分页。没有分页时，进程清单、目录列表、扫描发现这类数据会一次性渲染成千上万行，滚动卡顿且用户永远找不到末尾；配合写死的 `:max-height` 更会把超出高度的记录彻底藏起来（既没有分页也没有提示，用户以为数据只有这么多）。
+
+   两种实现，按数据来源二选一：
+
+   - **服务端分页**（数据会持续累积，且后端支持分页参数）：请求带 `offset` / `page_size`，响应的 `total` 必须是**未分页的总数**，前端用独立 `NPagination` 放进 `.table-pagination-bar`。换页、改每页条数都重新请求。已有实现：审计日志 `AuditList.vue`、会话审计 `SessionList.vue`（后端 `GET /sessions` 的 `offset`/`page_size` 为可选参数，不传返回全量，老调用方不受影响）。
+   - **前端分页**（数据已整份在内存里，或后端本身有条数上限）：把全量数组交给 `NDataTable` 的 `:pagination`，由 naive-ui 负责切片并把分页条渲染在表格滚动区下方。统一用 `web/src/composables/useTablePagination.ts`：
+
+     ```ts
+     const rowCount = computed(() => rows.value.length)
+     const { pagination, resetPage } = useTablePagination({ pageSize: 20, rowCount })
+     ```
+
+     ```vue
+     <NDataTable flex-height :columns="columns" :data="rows" :pagination="pagination" />
+     ```
+
+     `rowCount` 用于**页码收敛**：删除某页最后一行、或筛选条件收紧后行数变少时，页码会被夹回最大有效页，否则表格会在「还有数据」的情况下渲染成空白。数据源重新加载（换目录、切页签、刷新）后调用 `resetPage()` 回到第一页。筛选条件变化也要 `watch` 到 `resetPage()`。
+
+6. 全局提供可复用类（见 `web/src/styles/global.scss`）：`.page-flex-column`、`.table-flex-fill`、`.table-pagination-bar`。新页面直接套用，避免每处重复写 flex 三件套。
+
+7. **不要用原生 `<NTable>` 承载不定长列表**。`NTable` 只是带样式的 `<table>`，没有 `flex-height`、没有分页、没有固定表头，写出来的页面一定违反本节。需要表格就用 `NDataTable` + `columns` render 函数；单元格样式因此由 render 生成，scoped 样式要用 `:deep()` 穿透。
+
+**例外**：卡片内的辅助性小表格（常用命令库、备份列表、批量执行的主机勾选框、告警规则清单、单个分组的授权名单等），数据量天然有限且不是页面主体，可继续用固定 `:max-height` 限高、不分页，但**必须在代码注释里写明它属于本例外**，便于后续 review 区分「有意为之」和「漏了」。
+
+### 8.3 滚动容器约定
+
+- 一个可滚动区域只允许有一个滚动源。页面外层把滚动交给表格时，外层容器必须 `overflow: hidden`，防止出现双层滚动条。
+- 长列表滚动容器统一带 `-webkit-overflow-scrolling: touch` 与 `overscroll-behavior: contain`（`global.scss` 已按类名集中声明）。
+
+### 8.4 页签工作区与 KeepAlive
+
+顶部页签是工作区语义：切走再切回**不能丢状态**。终端会话、已填未提交的表单、翻到的页码、展开的树节点，都必须原样保留。
+
+实现约定：
+
+1. `AppShell` 的 `RouterView` 用 `KeepAlive` 包裹，`include` 取「仍在页签栏里的视图组件名 + 当前路由的视图名」：
+
+   ```vue
+   <RouterView v-slot="{ Component, route: r }">
+     <KeepAlive :include="keepAliveInclude">
+       <component :is="Component" :key="cacheKeyOf(r)" />
+     </KeepAlive>
+   </RouterView>
+   ```
+
+   必须并上当前路由的视图名：主机详情这类页签是在组件挂载后的异步 `load()` 里才注册的，首屏渲染时 `include` 里还没有它，Vue 会给这次 vnode 打上「不缓存」标记，之后再改 `include` 也救不回来。
+
+2. **每个路由组件必须用 `defineOptions({ name: 'Xxx' })` 声明稳定组件名**，同时在路由表写 `meta.viewName`，两者保持一致。`KeepAlive` 的 `include` 按组件名匹配，`<script setup>` 推断出的 `__name` 在生产构建里可能被压掉，不显式声明缓存就会静默失效。页签可能由 `HostList`、`AlertList` 等处打开而没传 `viewName`，`AppShell` 会按 `route.meta.viewName` 统一回填。
+
+3. **缓存键要带路由参数**。同一个组件在不同参数下必须各自缓存，否则从主机 A 的详情切到主机 B，B 会复用 A 的实例并显示上一台主机的数据：
+
+   ```ts
+   function cacheKeyOf(r: RouteLocationNormalizedLoaded): string {
+     const id = r.params.id
+     return typeof id === 'string' && id ? `${r.name as string}:${id}` : (r.name as string) || r.path
+   }
+   ```
+
+4. **页签关闭即释放缓存**。`cachedViews` 由页签列表推导，页签一关组件名从 `include` 消失，`KeepAlive` 随即卸载实例并触发 `onUnmounted`——终端断连、定时器清理、图表 dispose 都依赖这一步。不要在页签之外另建缓存清单，两份状态一定会漂移。
+
+5. **页内子页签要写进页签的 `path`**。主机详情的「文件管理 / 资源监控 / 在线终端」是 `?tab=` query，点顶部页签回来时走的是 `tab.path`；不带 query 就会退回默认子页签，正在用的终端随之被卸载。切换子页签时用 `openTab` 把带 query 的完整路径回写到页签上（见 `HostDetail.vue` 的 `rememberSubTab`）。
+
+6. **组件被缓存后仍会收到路由 watch 通知**，那时 `route` 已经指向别的页面。所有依赖 `route.query` / `route.params` 的 watch 都要先确认自己仍是当前路由（`if (route.name !== 'host-detail') return`），否则会把状态重置成默认值。
+
+7. **被缓存的组件不会卸载，副作用要按激活状态管理**：
+   - 轮询、`setInterval`：`onDeactivated` 停、`onActivated` 起，并在恢复时立刻取一次数据，避免图表留空档。参考 `MetricsPane.vue`。
+   - 依赖容器尺寸的组件（xterm、echarts）：隐藏时容器量到 0，`onActivated` 里 `nextTick` 后重新 `fit`/`resize`，终端还要把新尺寸同步给远端 PTY，否则回显错行。参考 `TerminalPane.vue`。
+   - 长连接（WebSocket / PTY）**不要**在 `onDeactivated` 里断开，那正是页签要保住的东西。
+
+### 8.5 终端会话的断线与重连
+
+终端不是普通页面，它承载着一个真实运行的 shell。网络抖动、合盖休眠、切后台都不能让用户丢掉正在跑的进程。
+
+服务端（`server/internal/ws/terminal.go`）：
+
+1. **PTY 比 socket 活得久**。最后一个客户端离开时不立即发 `TermClose`，而是挂一个 `sessionGrace`（60 秒）定时器；期间有客户端按同一 `sid` 接回来就取消定时器，直接续上原 shell。这就是设计文档 A.3 承诺的「会话恢复」。
+
+2. **重连不能重开 PTY**。`getOrCreateHub` 的第二个返回值表示「该会话已有活着的 PTY」，为真时必须跳过 `TermOpen`，否则会在原 shell 之上再开一个，用户看到的是被清空的终端。
+
+3. **宽限期到期要彻底清理**：`TermClose` + `UnregisterSession(sid)` + 审计 `End`。少了 `UnregisterSession`，`sessionIdx` 会无限增长。
+
+4. **必须设读写超时**。浏览器每 25 秒发一次 ping，服务端 `SetReadDeadline(pongWait = 70s)`，任何客户端帧或 pong 都刷新它。没有这个，硬断线（拔网线、断电）要等 TCP keepalive 两小时才被发现，PTY 一直挂着占资源。写侧用 `SetWriteDeadline(10s)`，避免一个卡死的观众阻塞整个广播循环。
+
+前端（`web/src/components/host/TerminalSession.vue`）：
+
+5. **`onclose` 必须重连**，指数退避 1s→2s→4s→…→15s 上限；累计超过 60 秒（服务端宽限期）就放弃并提示用户新开标签——那时 PTY 已被回收，继续重试只会连到一个不存在的会话。
+
+6. **重连复用同一个 xterm 实例**，只重建 WebSocket。重建终端等于清屏，用户会以为会话丢了。`term.onData` / `term.onResize` 只在 `start()` 里绑一次。
+
+7. **区分「我们主动关」和「意外断开」**：组件卸载时先置 `closedByUs = true` 再 `ws.close()`，否则清理过程会触发一次无意义的重连。收到服务端 `ended` 帧同样要停止重连——那是 shell 真的退出了。
+
+8. 重连成功后要重新 `sendResize()`，把当前终端尺寸同步给远端 PTY。
+
+
+

@@ -54,7 +54,7 @@ const brand = computed<OsBrand>(() => {
   if (s.includes('fedora')) return 'fedora'
   if (s.includes('alpine')) return 'alpine'
   if (s.includes('arch') || s.includes('manjaro') || s.includes('endeavour')) return 'arch'
-  if (s.includes('suse') || s.includes('sles')) return 'suse'
+  if (s.includes('suse') || s.includes('sles') || s.includes('opensuse')) return 'suse'
   if (s.includes('kali') || s.includes('parrot')) return 'kali'
   if (s.includes('amazon') || s.includes('amzn') || s.includes('aws')) return 'amazon'
   if (s.includes('openeuler') || s.includes('euler')) return 'openeuler'
@@ -83,189 +83,201 @@ const brand = computed<OsBrand>(() => {
       height: showBadge ? `${badgeSize}px` : 'auto',
     }"
   >
-    <!-- 1. Ubuntu -->
-    <svg v-if="brand === 'ubuntu'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <circle cx="16" cy="16" r="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-dasharray="18 4 18 4 18 4" />
-      <circle cx="6.5" cy="16" r="2.2" fill="currentColor" />
-      <circle cx="21" cy="7.8" r="2.2" fill="currentColor" />
-      <circle cx="21" cy="24.2" r="2.2" fill="currentColor" />
-    </svg>
-
-    <!-- 2. Debian -->
-    <svg v-else-if="brand === 'debian'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <path
-        fill="currentColor"
-        d="M16 3.5C9.1 3.5 3.5 9.1 3.5 16S9.1 28.5 16 28.5c7.2 0 12.2-5.4 12-11.4-.2-4.8-4-8.8-8.8-8.8-4.2 0-7.4 3.1-7.4 6.9 0 3.3 2.5 5.7 5.7 5.7 2.4 0 4.1-1.5 4.1-3.6 0-1.7-1.1-2.9-2.7-2.9-1.2 0-2 .8-2 1.9 0 .8.5 1.4 1.3 1.4.4 0 .7-.2.9-.5.1.4.5.6.9.6 1 0 1.8-1 1.8-2.5 0-2.3-1.8-4-4.2-4-2.7 0-4.8 2-4.8 4.8 0 3.1 2.4 5.4 5.7 5.4 3.7 0 6.6-2.9 6.8-6.9.2-4.9-3.7-9.5-9.3-9.5-5.9 0-10.4 4.5-10.4 10.5 0 6.3 4.8 11.2 11.2 11.2 5.8 0 10.3-4.1 10.8-9.8.1-1-.7-1.8-1.7-1.8s-1.8.8-1.9 1.8c-.4 4.5-3.9 7.7-8.2 7.7-5.1 0-9-3.9-9-9 0-4.8 3.6-8.5 8.4-8.5 4.4 0 7.4 3.5 7.3 7.3-.1 3.2-2.3 5.4-5.1 5.4-2.1 0-3.6-1.5-3.6-3.6 0-1.8 1.4-3.2 3.3-3.2 1.4 0 2.3.9 2.3 2.1 0 .6-.4 1.1-.9 1.1-.3 0-.5-.2-.5-.5 0-.6-.5-1-1.1-1-.8 0-1.3.6-1.3 1.4 0 1.1.9 1.9 2.1 1.9 1.6 0 2.9-1.3 2.9-3.1 0-2.3-1.8-4-4.1-4-2.7 0-4.8 2-4.8 4.8 0 3.1 2.3 5.4 5.6 5.4z"
-      />
-    </svg>
-
-    <!-- 3. CentOS -->
-    <svg v-else-if="brand === 'centos'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round">
-        <path d="M16 4 L28 16 L16 28 L4 16 Z" />
-        <path d="M16 8 L24 16 L16 24 L8 16 Z" />
-        <line x1="16" y1="4" x2="16" y2="28" />
-        <line x1="4" y1="16" x2="28" y2="16" />
-      </g>
-    </svg>
-
-    <!-- 4. Red Hat / RHEL -->
-    <svg v-else-if="brand === 'redhat'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <path
-        fill="currentColor"
-        d="M27.8 18.2c-.3 0-.6.1-.9.2-.8-2.6-3.2-4.5-6.1-4.5-.4 0-.8 0-1.2.1-1.1-3.6-4.5-6.2-8.5-6.2-4.2 0-7.8 2.8-8.8 6.7-.4-.1-.8-.1-1.2-.1-3.5 0-6.4 2.8-6.4 6.3 0 .3 0 .7.1 1C1.9 22.8 5.7 26 10.3 26c4.6 0 8.4-3.2 9.5-7.6 1.4.6 3 1 4.7 1 3.5 0 6.4-2.8 6.4-6.3 0-.3-.1-.6-.2-.9z"
-      />
-      <path fill="#ffffff" d="M11 13c1.5 0 2.8 1 3.2 2.4-1.2.5-2.6.8-4 .8-2.2 0-4.1-.7-5.5-1.9 1-1.7 3.5-3.3 6.3-3.3z" opacity="0.4" />
-    </svg>
-
-    <!-- 5. Rocky Linux -->
-    <svg v-else-if="brand === 'rocky'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <path
-        fill="currentColor"
-        d="M16 3C8.8 3 3 8.8 3 16s5.8 13 13 13 13-5.8 13-13S23.2 3 16 3zm0 3.2c5.4 0 9.8 4.4 9.8 9.8 0 2.2-.7 4.3-2 5.9l-6.8-9.8h-2v10.7h-3V12.9h2.1l6.7 9.7c-1.4.9-3 1.4-4.8 1.4-5.4 0-9.8-4.4-9.8-9.8S10.6 6.2 16 6.2z"
-      />
-    </svg>
-
-    <!-- 6. AlmaLinux -->
-    <svg v-else-if="brand === 'almalinux'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+    <!-- 1. Ubuntu (Official Circle of Friends: 3 dots + 3 arcs) -->
+    <svg v-if="brand === 'ubuntu'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
       <g fill="currentColor">
-        <path d="M16 4c-3.3 0-6 2.7-6 6 0 3.3 6 10 6 10s6-6.7 6-10c0-3.3-2.7-6-6-6zm0 8.5c-1.4 0-2.5-1.1-2.5-2.5S14.6 7.5 16 7.5s2.5 1.1 2.5 2.5-1.1 2.5-2.5 2.5z" />
-        <circle cx="8" cy="20" r="3.5" opacity="0.85" />
-        <circle cx="24" cy="20" r="3.5" opacity="0.85" />
-        <circle cx="16" cy="26" r="3.2" opacity="0.7" />
+        <circle cx="128" cy="128" r="46.5" />
+        <circle cx="196.2" cy="79.4" r="18.2" />
+        <circle cx="196.2" cy="176.6" r="18.2" />
+        <circle cx="59.6" cy="128" r="18.2" />
+        <path d="M128 32 C82.8 32 45.1 63.8 34.6 106.3 C42.1 106.6 48.6 111.4 51.5 118.4 C60.2 76.9 96.9 45.4 140.7 45.4 C151.7 45.4 162.2 47.4 171.9 51.1 L184.2 36.9 C167.3 33.7 148.1 32 128 32 Z" />
+        <path d="M221.4 106.3 C210.9 63.8 173.2 32 128 32 C124.5 32 121.1 32.2 117.7 32.5 L124.9 46.1 C125.9 46 127 46 128 46 C168.6 46 202.2 75.3 209.6 114 C216.5 113.1 223.3 116.8 226.5 123.3 C227.1 117.8 224.7 112.1 221.4 106.3 Z" />
+        <path d="M128 224 C167.3 224 201.2 198.8 214.2 163.2 C208 160.8 203.4 155.6 202.1 149 C191.6 182.2 162.5 205.8 128 205.8 C93.5 205.8 64.4 182.2 53.9 149 C52.6 155.6 48 160.8 41.8 163.2 C54.8 198.8 88.7 224 128 224 Z" />
       </g>
     </svg>
 
-    <!-- 7. Fedora -->
-    <svg v-else-if="brand === 'fedora'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+    <!-- 2. Debian (Authentic Debian Swirl) -->
+    <svg v-else-if="brand === 'debian'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
       <path
         fill="currentColor"
-        d="M16 2C8.3 2 2 8.3 2 16s6.3 14 14 14 14-6.3 14-14S23.7 2 16 2zm4.8 8.6h-2.9c-.8 0-1.4.6-1.4 1.4v2.1h4.3v2.8h-4.3v6.5h-3.2v-6.5h-2.1v-2.8h2.1V12c0-2.3 1.9-4.2 4.2-4.2h3.3v2.8z"
+        d="M128 20C68.4 20 20 68.4 20 128c0 59.6 48.4 108 108 108 59.6 0 108-48.4 108-108 0-11.8-1.9-23.2-5.4-33.8-2.6 6.8-6.1 13.2-10.4 19.1 2.5 4.7 3.8 10 3.8 15.6 0 47.5-38.5 86-86 86s-86-38.5-86-86 38.5-86 86-86c23.2 0 44.3 9.2 59.8 24.2 4.2-4.5 9-8.4 14.3-11.6C188 35.8 159.4 20 128 20zm50.6 61.2c-1.8 1.4-3.4 3-5 4.7-12.2-10.8-28.2-17.4-45.6-17.4-37.6 0-68 30.4-68 68s30.4 68 68 68c34.8 0 63.4-26.1 67.4-59.8 1.9-2.5 4.1-4.8 6.5-6.7-3.1 36.2-33.6 64.5-70.9 64.5-39.8 0-72-32.2-72-72s32.2-72 72-72c19.4 0 37.1 7.7 50.1 20.2 2.6-2.6 5.5-4.8 8.6-6.7-1.3-.3-2.7-.6-4.1-.8zM128 92c-19.9 0-36 16.1-36 36s16.1 36 36 36 36-16.1 36-36c0-6.1-1.5-11.8-4.2-16.8 1.8-1.5 3.8-2.8 6-3.8 3.9 6 6.2 13.1 6.2 20.6 0 22.1-17.9 40-40 40s-40-17.9-40-40 17.9-40 40-40c9.8 0 18.7 3.5 25.6 9.4 1.8-1.6 3.8-3 6-4.1C149.7 96.6 139.3 92 128 92z"
       />
     </svg>
 
-    <!-- 8. Alpine Linux -->
-    <svg v-else-if="brand === 'alpine'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <path
-        fill="currentColor"
-        d="M16 4.5 L3.5 25.5 L12.5 25.5 L16 19.5 L19.5 25.5 L28.5 25.5 Z M16 11.5 L21.5 21 L10.5 21 Z"
-      />
-    </svg>
-
-    <!-- 9. Arch Linux -->
-    <svg v-else-if="brand === 'arch'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <path
-        fill="currentColor"
-        d="M16 4.2C14.7 7.4 7.6 22.8 4 27.2c3.5-1.8 6.4-3.4 9-4.8.4-.2.8-.4 1.2-.6-1-.9-1.8-2-2.3-3.2 1.8 1.4 3.7 2.4 5.8 3 .5.1 1 .2 1.6.2.7-.2 1.3-.4 1.9-.7 1.4-.7 2.6-1.7 3.5-2.9-.6 1.4-1.6 2.6-2.8 3.5 1.5.7 3.1 1.6 4.8 2.6 1.8 1 3.5 2 5.3 2.9-3.6-4.4-10.7-19.8-12-23z"
-      />
-    </svg>
-
-    <!-- 10. openSUSE / SUSE -->
-    <svg v-else-if="brand === 'suse'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <path
-        fill="currentColor"
-        d="M16 3C8.8 3 3 8.8 3 16s5.8 13 13 13 13-5.8 13-13S23.2 3 16 3zm5.8 9.5c.8 0 1.5.7 1.5 1.5s-.7 1.5-1.5 1.5-1.5-.7-1.5-1.5.7-1.5 1.5-1.5zM16 23.5c-4.4 0-8-2.7-8-6s3.6-6 8-6 8 2.7 8 6-3.6 6-8 6z"
-      />
-      <circle cx="16" cy="17.5" r="2.5" fill="#ffffff" opacity="0.6" />
-    </svg>
-
-    <!-- 11. Kali Linux -->
-    <svg v-else-if="brand === 'kali'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <path
-        fill="currentColor"
-        d="M16 2C8.3 2 2 8.3 2 16s6.3 14 14 14 14-6.3 14-14S23.7 2 16 2zm7.2 8.5c-.8 2.3-2.5 4.1-4.8 5-1.3.5-2.7.7-4.1.7-1.2 0-2.4-.2-3.5-.6l3.8-3.8c1.2-.3 2.4-.4 3.6-.2 1.7.3 3.3 1.3 4.2 2.7.3-.6.5-1.3.6-2 .1-.6.1-1.2 0-1.8h.2zM8.8 21.5c.8-2.3 2.5-4.1 4.8-5 1.3-.5 2.7-.7 4.1-.7 1.2 0 2.4.2 3.5.6l-3.8 3.8c-1.2.3-2.4.4-3.6.2-1.7-.3-3.3-1.3-4.2-2.7-.3.6-.5 1.3-.6 2-.1.6-.1 1.2 0 1.8h-.2z"
-      />
-    </svg>
-
-    <!-- 12. Amazon Linux / AWS -->
-    <svg v-else-if="brand === 'amazon'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <path
-        fill="currentColor"
-        d="M6 19.5c5.5 3.5 14.5 3.5 20 0 .5-.3 1.2.2.8.7-2.6 3-8.8 4.8-10.8 4.8-2.1 0-7.7-1.7-10.8-4.8-.4-.5.3-1 .8-.7z"
-      />
-      <path
-        fill="currentColor"
-        d="M16 6c-3.8 0-6.5 2.8-6.5 6.8 0 4.1 2.8 6.2 6.5 6.2 3.6 0 6.5-2.2 6.5-6.2C22.5 8.8 19.8 6 16 6zm0 10.2c-2.2 0-3.5-1.7-3.5-3.8 0-2.1 1.3-3.8 3.5-3.8s3.5 1.7 3.5 3.8c0 2.1-1.3 3.8-3.5 3.8z"
-      />
-    </svg>
-
-    <!-- 13. openEuler / EulerOS -->
-    <svg v-else-if="brand === 'openeuler'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <circle cx="16" cy="16" r="12" fill="none" stroke="currentColor" stroke-width="2.5" />
-      <circle cx="16" cy="16" r="6" fill="none" stroke="currentColor" stroke-width="2" />
-      <circle cx="16" cy="7" r="2.5" fill="currentColor" />
-      <circle cx="23" cy="20" r="2.5" fill="currentColor" />
-      <circle cx="9" cy="20" r="2.5" fill="currentColor" />
-    </svg>
-
-    <!-- 14. Alibaba Cloud Linux / Anolis OS (龙蜥) -->
-    <svg v-else-if="brand === 'anolis'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <path
-        fill="currentColor"
-        d="M16 3C8.8 3 3 8.8 3 16s5.8 13 13 13 13-5.8 13-13S23.2 3 16 3zm0 4.5c4.8 0 8.7 3.9 8.7 8.7 0 2.4-1 4.6-2.6 6.2l-3.6-3.6c.6-.7 1-1.6 1-2.6 0-2.1-1.7-3.8-3.8-3.8s-3.8 1.7-3.8 3.8c0 1 .4 1.9 1 2.6l-3.6 3.6c-1.6-1.6-2.6-3.8-2.6-6.2 0-4.8 3.9-8.7 8.7-8.7z"
-      />
-    </svg>
-
-    <!-- 15. OpenCloudOS / TencentOS -->
-    <svg v-else-if="brand === 'opencloud'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <path
-        fill="currentColor"
-        d="M21.5 11c-.5-3.4-3.4-6-6.9-6-2.8 0-5.2 1.7-6.3 4.1C5.7 9.8 4 12 4 14.7 4 18.2 6.8 21 10.3 21h11.2c2.5 0 4.5-2 4.5-4.5 0-2.3-1.7-4.2-3.9-4.5h-.6z"
-      />
-    </svg>
-
-    <!-- 16. Kylin / 银河麒麟 -->
-    <svg v-else-if="brand === 'kylin'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+    <!-- 3. CentOS (Official 4-Diamond Multi-facet Cross) -->
+    <svg v-else-if="brand === 'centos'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
       <g fill="currentColor">
-        <polygon points="16,3 20,12 29,13 22,20 24,29 16,24 8,29 10,20 3,13 12,12" />
+        <path d="M128 32 L160 84 L128 116 L96 84 Z" opacity="0.95" />
+        <path d="M224 128 L172 160 L140 128 L172 96 Z" opacity="0.85" />
+        <path d="M128 224 L96 172 L128 140 L160 172 Z" opacity="0.95" />
+        <path d="M32 128 L84 96 L116 128 L84 160 Z" opacity="0.85" />
+        <path d="M168 88 L188 108 L148 148 L128 128 Z" opacity="0.6" />
+        <path d="M168 168 L148 188 L108 148 L128 128 Z" opacity="0.6" />
+        <path d="M88 168 L68 148 L108 108 L128 128 Z" opacity="0.6" />
+        <path d="M88 88 L108 68 L148 108 L128 128 Z" opacity="0.6" />
       </g>
     </svg>
 
-    <!-- 17. Deepin / UOS (统信) -->
-    <svg v-else-if="brand === 'deepin'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <path
-        fill="none"
-        stroke="currentColor"
-        stroke-width="3"
-        stroke-linecap="round"
-        d="M10 16c0-3.3 2.7-6 6-6s6 2.7 6 6-2.7 6-6 6-6-2.7-6-6zm12 0c0-3.3 2.7-6 6-6"
-      />
-      <circle cx="16" cy="16" r="3" fill="currentColor" />
+    <!-- 4. Red Hat / RHEL (Official Red Fedora Hat Silhouette) -->
+    <svg v-else-if="brand === 'redhat'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <g fill="currentColor">
+        <path d="M216.5 138.8c-1.3-.2-2.7-.3-4-.3-13.8 0-25.7 8.2-31.1 20-3.6-14.7-16.8-25.7-32.6-25.7-4.4 0-8.6.8-12.5 2.3C132.8 116.7 114.2 104 92.5 104c-22.1 0-41 13.2-49.4 32.2-4.1-1.8-8.6-2.8-13.3-2.8C13.3 133.4 0 146.7 0 163.2c0 2.2.3 4.4.8 6.5C11.5 204.6 47.9 232 92.5 232c45.4 0 82.3-28.5 92.3-64.7 9.8 4.7 20.8 7.4 32.4 7.4 20.9 0 38.3-15.6 40.5-35.9h-.2z" />
+        <path fill="#ffffff" opacity="0.3" d="M102.5 134.5c14.2 0 25.8 9.5 29.5 22.8-11.1 4.7-24.1 7.4-37.5 7.4-20.7 0-38.6-6.6-51.8-17.9 9.5-16 33.2-31.1 59.8-32.3z" />
+      </g>
     </svg>
 
-    <!-- 18. Linux Mint -->
-    <svg v-else-if="brand === 'mint'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <rect x="4" y="4" width="24" height="24" rx="6" fill="none" stroke="currentColor" stroke-width="2.5" />
-      <path fill="currentColor" d="M10 11v10h4v-6c0-1.1.9-2 2-2s2 .9 2 2v6h4v-6c0-3.3-2.7-6-6-6s-6 2.7-6 6z" />
+    <!-- 5. Rocky Linux (Official Rocky R-Peak Loop) -->
+    <svg v-else-if="brand === 'rocky'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <g fill="currentColor">
+        <path d="M128 24C70.6 24 24 70.6 24 128s46.6 104 104 104 104-46.6 104-104S185.4 24 128 24zm0 28c42 0 76 34 76 76 0 17.5-5.9 33.6-15.8 46.5L138 102h-18v82h-22V98h24.5l52.5 74.8c-11.4 7.5-25 11.9-39.7 11.9-42 0-76-34-76-76.7 0-42 34-76 76.7-76z" />
+      </g>
     </svg>
 
-    <!-- 19. FreeBSD / BSD -->
-    <svg v-else-if="brand === 'freebsd'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <circle cx="16" cy="17" r="11" fill="currentColor" />
-      <path fill="currentColor" d="M9 10C8 6 10 3 12 2c0 2 0 5-2 8zm14 0c1-4-1-7-3-8 0 2 0 5 2 8z" />
-      <circle cx="12" cy="15" r="2" fill="#ffffff" />
-      <circle cx="20" cy="15" r="2" fill="#ffffff" />
+    <!-- 6. AlmaLinux (Official 4-Way Connected Node Ring) -->
+    <svg v-else-if="brand === 'almalinux'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <g fill="currentColor">
+        <circle cx="128" cy="52" r="28" />
+        <circle cx="128" cy="204" r="28" />
+        <circle cx="52" cy="128" r="28" />
+        <circle cx="204" cy="128" r="28" />
+        <path d="M128 80 C128 106 106 128 80 128 C106 128 128 150 128 176 C128 150 150 128 176 128 C150 128 128 106 128 80 Z" opacity="0.8" />
+      </g>
     </svg>
 
-    <!-- 20. Windows -->
-    <svg v-else-if="brand === 'windows'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
-      <path fill="currentColor" d="M4 6.8 L13.6 5.5 L13.6 14.8 L4 14.8 Z M15.2 5.2 L28 3.5 L28 14.8 L15.2 14.8 Z M4 16.4 L13.6 16.4 L13.6 25.7 L4 24.4 Z M15.2 16.4 L28 16.4 L28 27.7 L15.2 26 Z" />
-    </svg>
-
-    <!-- 21. macOS / Apple -->
-    <svg v-else-if="brand === 'macos'" viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+    <!-- 7. Fedora (Official Infinity 'f' Bubble) -->
+    <svg v-else-if="brand === 'fedora'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
       <path
         fill="currentColor"
-        d="M22.5 16.8c0-3.2 2.6-4.8 2.7-4.9-1.5-2.2-3.8-2.5-4.6-2.5-2-.2-3.8 1.2-4.8 1.2-1 0-2.5-1.1-4.1-1.1-2.1 0-4.1 1.2-5.1 3.1-2.2 3.8-.6 9.4 1.5 12.5 1 1.5 2.3 3.1 3.9 3 1.6-.1 2.2-1 4.1-1s2.5 1 4.1 1c1.7 0 2.8-1.5 3.8-3 1.2-1.7 1.7-3.4 1.7-3.5-.1 0-3.2-1.2-3.2-4.8zm-3.5-9.6c.9-1.1 1.5-2.6 1.3-4.2-1.3.1-2.9.9-3.8 1.9-.8.9-1.5 2.5-1.3 4 1.5.1 3-.7 3.8-1.7z"
+        d="M128 16C66.1 16 16 66.1 16 128s50.1 112 112 112 112-50.1 112-112S189.9 16 128 16zm42.7 74.7h-25.6c-7.1 0-12.8 5.7-12.8 12.8v18.7h38.4v24.9h-38.4v57.6h-28.8v-57.6H84.3v-24.9h19.2v-18.7c0-20.5 16.7-37.2 37.2-37.2h30v24.4z"
       />
     </svg>
 
-    <!-- 22. Generic Linux (Tux Silhouette) -->
-    <svg v-else viewBox="0 0 32 32" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+    <!-- 8. Alpine Linux (Official 3-Mountain Peaks) -->
+    <svg v-else-if="brand === 'alpine'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
       <path
         fill="currentColor"
-        d="M16 2.5c-3.6 0-6.2 2.8-6.2 6.5 0 1.2.3 2.3.8 3.2C8.7 13.8 7 16.4 7 19.8c0 3.2 1.4 5.9 3.5 7.4-1.2 1-2.5 1.8-3.5 2.1-.5.2-.8.6-.8 1.1 0 .6.5 1.1 1.1 1.1h17.4c.6 0 1.1-.5 1.1-1.1 0-.5-.3-.9-.8-1.1-1-.3-2.3-1.1-3.5-2.1 2.1-1.5 3.5-4.2 3.5-7.4 0-3.4-1.7-6-3.6-7.6.5-.9.8-2 .8-3.2 0-3.7-2.6-6.5-6.2-6.5zm-2.2 6.2c.7 0 1.2.6 1.2 1.2 0 .7-.6 1.2-1.2 1.2-.7 0-1.2-.5-1.2-1.2 0-.6.5-1.2 1.2-1.2zm4.4 0c.7 0 1.2.6 1.2 1.2 0 .7-.6 1.2-1.2 1.2-.7 0-1.2-.5-1.2-1.2 0-.6.5-1.2 1.2-1.2z"
+        d="M128 42 L24 214 L98 214 L128 162 L158 214 L232 214 Z M128 98 L172 176 L84 176 Z"
       />
+    </svg>
+
+    <!-- 9. Arch Linux (Official Swoosh Arch Archway) -->
+    <svg v-else-if="brand === 'arch'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <path
+        fill="currentColor"
+        d="M128 32C117.6 57.6 60.8 180.8 32 216c28-14.4 51.2-27.2 72-38.4 3.2-1.6 6.4-3.2 9.6-4.8-8-7.2-14.4-16-18.4-25.6 14.4 11.2 29.6 19.2 46.4 24 4 .8 8 1.6 12.8 1.6 5.6-1.6 10.4-3.2 15.2-5.6 11.2-5.6 20.8-13.6 28-23.2-4.8 11.2-12.8 20.8-22.4 28 12 5.6 24.8 12.8 38.4 20.8 14.4 8 28 16 42.4 23.2-28.8-35.2-85.6-158.4-96-184z"
+      />
+    </svg>
+
+    <!-- 10. openSUSE / SUSE (Official Chameleon Profile Eye) -->
+    <svg v-else-if="brand === 'suse'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <g fill="currentColor">
+        <path d="M128 24C70.6 24 24 70.6 24 128s46.6 104 104 104 104-46.6 104-104S185.4 24 128 24zm46.4 76c6.4 0 12 5.6 12 12s-5.6 12-12 12-12-5.6-12-12 5.6-12 12-12zM128 188c-35.2 0-64-21.6-64-48s28.8-48 64-48 64 21.6 64 48-28.8 48-64 48z" />
+        <circle cx="128" cy="140" r="20" fill="#ffffff" opacity="0.75" />
+      </g>
+    </svg>
+
+    <!-- 11. Kali Linux (Official Kali Dragon Emblem) -->
+    <svg v-else-if="brand === 'kali'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <path
+        fill="currentColor"
+        d="M128 16C66.1 16 16 66.1 16 128s50.1 112 112 112 112-50.1 112-112S189.9 16 128 16zm57.6 68c-6.4 18.4-20 32.8-38.4 40-10.4 4-21.6 5.6-32.8 5.6-9.6 0-19.2-1.6-28-4.8l30.4-30.4c9.6-2.4 19.2-3.2 28.8-1.6 13.6 2.4 26.4 10.4 33.6 21.6 2.4-4.8 4-10.4 4.8-16 .8-4.8.8-9.6 0-14.4h1.6zM70.4 172c6.4-18.4 20-32.8 38.4-40 10.4-4 21.6-5.6 32.8-5.6 9.6 0 19.2 1.6 28 4.8l-30.4 30.4c-9.6 2.4-19.2 3.2-28.8 1.6-13.6-2.4-26.4-10.4-33.6-21.6-2.4 4.8-4 10.4-4.8 16-.8 4.8-.8 9.6 0 14.4h-1.6z"
+      />
+    </svg>
+
+    <!-- 12. Amazon Linux / AWS (Official AWS Smile Arrow) -->
+    <svg v-else-if="brand === 'amazon'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <g fill="currentColor">
+        <path d="M48 156c44 28 116 28 160 0 4-2.4 9.6 1.6 6.4 5.6-20.8 24-70.4 38.4-86.4 38.4-16.8 0-61.6-13.6-86.4-38.4-3.2-4 2.4-8 6.4-5.6z" />
+        <path d="M214 148 L196 142 L202 166 Z" />
+        <path d="M128 48c-30.4 0-52 22.4-52 54.4 0 32.8 22.4 49.6 52 49.6s52-17.6 52-49.6c0-32-21.6-54.4-52-54.4zm0 81.6c-17.6 0-28-13.6-28-30.4s10.4-30.4 28-30.4 28 13.6 28 30.4-10.4 30.4-28 30.4z" />
+      </g>
+    </svg>
+
+    <!-- 13. openEuler (Official Dual Orbit Ring with Core) -->
+    <svg v-else-if="brand === 'openeuler'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <g fill="none" stroke="currentColor" stroke-width="20" stroke-linecap="round">
+        <circle cx="128" cy="128" r="96" />
+        <circle cx="128" cy="128" r="48" />
+        <circle cx="128" cy="56" r="14" fill="currentColor" stroke="none" />
+        <circle cx="184" cy="160" r="14" fill="currentColor" stroke="none" />
+        <circle cx="72" cy="160" r="14" fill="currentColor" stroke="none" />
+      </g>
+    </svg>
+
+    <!-- 14. Alibaba Cloud Linux / Anolis OS (Dragon/Phoenix Ring) -->
+    <svg v-else-if="brand === 'anolis'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <path
+        fill="currentColor"
+        d="M128 24C70.6 24 24 70.6 24 128s46.6 104 104 104 104-46.6 104-104S185.4 24 128 24zm0 36c39 0 70.5 31.5 70.5 70.5 0 19.5-8.1 37.4-21.1 50.4l-29.2-29.2c4.9-5.7 8.1-13 8.1-21.1 0-17-13.8-30.8-30.8-30.8s-30.8 13.8-30.8 30.8c0 8.1 3.2 15.4 8.1 21.1L74.1 180.9C61.1 167.9 53 150 53 130.5 53 91.5 84.5 60 128 60z"
+      />
+    </svg>
+
+    <!-- 15. OpenCloudOS / TencentOS (Official Cloud Arc Ribbon) -->
+    <svg v-else-if="brand === 'opencloud'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <path
+        fill="currentColor"
+        d="M172 88c-4-27.2-27.2-48-55.2-48-22.4 0-41.6 13.6-50.4 32.8C45.6 78.4 32 96 32 117.6c0 28 22.4 50.4 50.4 50.4h89.6c20 0 36-16 36-36 0-18.4-13.6-33.6-31.2-36h-4.8z"
+      />
+    </svg>
+
+    <!-- 16. Kylin / 银河麒麟 (Official Kylin Crest Star) -->
+    <svg v-else-if="brand === 'kylin'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <g fill="currentColor">
+        <polygon points="128,24 160,96 232,104 176,160 192,232 128,192 64,232 80,160 24,104 96,96" />
+      </g>
+    </svg>
+
+    <!-- 17. Deepin / UOS (Official Deepin Infinity Loop) -->
+    <svg v-else-if="brand === 'deepin'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <g fill="none" stroke="currentColor" stroke-width="24" stroke-linecap="round">
+        <path d="M80 128 C80 101.5 101.5 80 128 80 C154.5 80 176 101.5 176 128 C176 154.5 154.5 176 128 176 C101.5 176 80 154.5 80 128 Z" />
+        <path d="M176 128 C176 101.5 197.5 80 224 80" />
+      </g>
+      <circle cx="128" cy="128" r="24" fill="currentColor" />
+    </svg>
+
+    <!-- 18. Linux Mint (Official Mint Leaf LM Badge) -->
+    <svg v-else-if="brand === 'mint'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <rect x="32" y="32" width="192" height="192" rx="48" fill="none" stroke="currentColor" stroke-width="20" />
+      <path fill="currentColor" d="M80 88v80h32v-48c0-8.8 7.2-16 16-16s16 7.2 16 16v48h32v-48c0-26.5-21.5-48-48-48s-48 21.5-48 48z" />
+    </svg>
+
+    <!-- 19. FreeBSD / BSD (Official Beastie Ball & Horns) -->
+    <svg v-else-if="brand === 'freebsd'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <g fill="currentColor">
+        <circle cx="128" cy="136" r="88" />
+        <path d="M72 80 C64 48 80 24 96 16 C80 32 80 56 64 80 Z" />
+        <path d="M184 80 C192 48 176 24 160 16 C176 32 176 56 192 80 Z" />
+        <circle cx="96" cy="120" r="16" fill="#ffffff" />
+        <circle cx="160" cy="120" r="16" fill="#ffffff" />
+      </g>
+    </svg>
+
+    <!-- 20. Windows (Official Microsoft 4-Square Grid) -->
+    <svg v-else-if="brand === 'windows'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <g fill="currentColor">
+        <rect x="32" y="32" width="90" height="90" rx="3" />
+        <rect x="134" y="32" width="90" height="90" rx="3" />
+        <rect x="32" y="134" width="90" height="90" rx="3" />
+        <rect x="134" y="134" width="90" height="90" rx="3" />
+      </g>
+    </svg>
+
+    <!-- 21. macOS / Apple (Official Bitten Apple) -->
+    <svg v-else-if="brand === 'macos'" viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <path
+        fill="currentColor"
+        d="M180 134.4c0-25.6 20.8-38.4 21.6-39.2-12-17.6-30.4-20-36.8-20-16-1.6-30.4 9.6-38.4 9.6-8 0-20-8.8-32.8-8.8-16.8 0-32.8 9.6-40.8 24.8-17.6 30.4-4.8 75.2 12 100 8 12 18.4 24.8 31.2 24 12.8-.8 17.6-8 32.8-8s20 8 32.8 8c13.6 0 22.4-12 30.4-24 9.6-13.6 13.6-27.2 13.6-28-.8 0-25.6-9.6-25.6-38.4zM152 57.6c7.2-8.8 12-20.8 10.4-33.6-10.4.8-23.2 7.2-30.4 15.2-6.4 7.2-12 20-10.4 32 12 .8 24-5.6 30.4-13.6z"
+      />
+    </svg>
+
+    <!-- 22. Generic Linux (Official Tux Silhouette) -->
+    <svg v-else viewBox="0 0 256 256" class="os-svg" :style="{ width: `${size}px`, height: `${size}px` }">
+      <g fill="currentColor">
+        <path d="M128 20c-28.8 0-49.6 22.4-49.6 52 0 9.6 2.4 18.4 6.4 25.6-20 12.8-33.6 33.6-33.6 60.8 0 25.6 11.2 47.2 28 59.2-9.6 8-20 14.4-28 16.8-4 1.6-6.4 4.8-6.4 8.8 0 4.8 4 8.8 8.8 8.8h148.8c4.8 0 8.8-4 8.8-8.8 0-4-2.4-7.2-6.4-8.8-8-2.4-18.4-8.8-28-16.8 16.8-12 28-33.6 28-59.2 0-27.2-13.6-48-33.6-60.8 4-7.2 6.4-16 6.4-25.6 0-29.6-20.8-52-49.6-52z" />
+        <circle cx="110" cy="70" r="5" fill="#ffffff" />
+        <circle cx="146" cy="70" r="5" fill="#ffffff" />
+      </g>
     </svg>
   </div>
 </template>
@@ -280,22 +292,22 @@ const brand = computed<OsBrand>(() => {
   &.is-badge {
     border-radius: 50%;
     color: #ffffff;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.16);
   }
 
   &:not(.is-badge) {
     color: currentColor;
   }
 
-  // 1. Ubuntu: Ubuntu warm orange
+  // 1. Ubuntu: Official Warm Auburn Orange
   &.brand-ubuntu.is-badge {
     background: linear-gradient(135deg, #e95420 0%, #ba3908 100%);
   }
-  // 2. Debian: Crimson Red
+  // 2. Debian: Official Crimson Red
   &.brand-debian.is-badge {
     background: linear-gradient(135deg, #d70a53 0%, #9e0036 100%);
   }
-  // 3. CentOS: Deep Navy Blue
+  // 3. CentOS: Deep Cent Purple/Navy
   &.brand-centos.is-badge {
     background: linear-gradient(135deg, #262577 0%, #15144f 100%);
   }

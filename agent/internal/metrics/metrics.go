@@ -5,6 +5,7 @@ package metrics
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,8 +14,10 @@ import (
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/host"
+	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/shirou/gopsutil/v3/net"
+	"github.com/shirou/gopsutil/v3/process"
 )
 
 // Sender pushes agent->server messages.
@@ -30,11 +33,18 @@ type Manager struct {
 	cancel context.CancelFunc
 
 	// Previous cumulative counters for computing per-second rates.
-	prevNetRx    float64
-	prevNetTx    float64
-	prevDiskRead float64
+	prevNetRx     float64
+	prevNetTx     float64
+	prevDiskRead  float64
 	prevDiskWrite float64
-	prevTs       time.Time
+	prevTs        time.Time
+
+	// Monthly traffic accounting (persisted next to the agent state file).
+	traffic *trafficTracker
+
+	// CPU model is static — fetched once and cached.
+	cpuModelOnce sync.Once
+	cpuModel     string
 }
 
 func NewManager(log *slog.Logger) *Manager {
@@ -42,6 +52,12 @@ func NewManager(log *slog.Logger) *Manager {
 		log = slog.Default()
 	}
 	return &Manager{log: log}
+}
+
+// SetStateFile wires the monthly traffic tracker to persist alongside the
+// agent identity. resetDay is the billing-cycle reset day-of-month (1..28).
+func (m *Manager) SetStateFile(stateFile string, resetDay int) {
+	m.traffic = newTrafficTracker(stateFile, resetDay)
 }
 
 func (m *Manager) SetSender(s Sender) {
@@ -56,6 +72,20 @@ func (m *Manager) Handle(q *agentpb.MetricsQuery) {
 	} else {
 		m.sendSample()
 	}
+}
+
+// StartBackground begins periodic metrics sampling at the given interval
+// (seconds). This runs automatically when the agent connects so the server
+// always has fresh lastMetrics (including uptime) for the host list API,
+// without waiting for the browser to open the monitoring page.
+func (m *Manager) StartBackground(intervalSec int32) {
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.mu.Unlock()
+		return // already running (e.g. live mode triggered by frontend)
+	}
+	m.mu.Unlock()
+	m.startLive(intervalSec)
 }
 
 func (m *Manager) startLive(intervalSec int32) {
@@ -129,6 +159,41 @@ func (m *Manager) collect() *agentpb.MetricsSample {
 		sample.MemUsed = int64(vm.Used)
 	}
 
+	// Swap usage.
+	if sw, err := mem.SwapMemory(); err == nil {
+		sample.SwapTotal = int64(sw.Total)
+		sample.SwapUsed = int64(sw.Used)
+	}
+
+	// Load averages (Linux/macOS; unsupported on Windows → left at 0).
+	if lv, err := load.Avg(); err == nil {
+		sample.Load1 = lv.Load1
+		sample.Load5 = lv.Load5
+		sample.Load15 = lv.Load15
+	}
+
+	// Total process count.
+	if pids, err := process.Pids(); err == nil {
+		sample.ProcessCount = int32(len(pids))
+	}
+
+	// TCP ESTABLISHED + UDP socket counts.
+	if conns, err := net.Connections("tcp"); err == nil {
+		n := int32(0)
+		for _, c := range conns {
+			if c.Status == "ESTABLISHED" {
+				n++
+			}
+		}
+		sample.TcpEstablished = n
+	}
+	if conns, err := net.Connections("udp"); err == nil {
+		sample.UdpCount = int32(len(conns))
+	}
+
+	// CPU model name (static, cached after first lookup).
+	sample.CpuModel = m.cpuModelString()
+
 	// Network: gopsutil returns cumulative counters; compute per-second rates.
 	if io, err := net.IOCounters(false); err == nil && len(io) > 0 {
 		curRx := float64(io[0].BytesRecv)
@@ -144,6 +209,15 @@ func (m *Manager) collect() *agentpb.MetricsSample {
 		m.prevNetRx = curRx
 		m.prevNetTx = curTx
 		m.mu.Unlock()
+
+		// Monthly traffic accounting from the same cumulative counters.
+		if m.traffic != nil {
+			m.mu.Lock()
+			rx, tx := m.traffic.account(io[0].BytesRecv, io[0].BytesSent, now)
+			m.mu.Unlock()
+			sample.MonthRx = int64(rx)
+			sample.MonthTx = int64(tx)
+		}
 	}
 
 	// Disk IO: same — cumulative counters converted to per-second rates.
@@ -192,4 +266,19 @@ func max64(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// cpuModelString returns the CPU model name (cached after the first call;
+// empty string when unavailable).
+func (m *Manager) cpuModelString() string {
+	m.cpuModelOnce.Do(func() {
+		if infos, err := cpu.Info(); err == nil && len(infos) > 0 {
+			model := strings.TrimSpace(infos[0].ModelName)
+			// Collapse vendor-prefix whitespace variants like "AMD Ryzen 7 5800X 8-Core Processor".
+			if model != "" {
+				m.cpuModel = model
+			}
+		}
+	})
+	return m.cpuModel
 }

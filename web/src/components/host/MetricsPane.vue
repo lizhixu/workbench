@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref, watch, nextTick } from 'vue'
+import { onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch, nextTick, computed } from 'vue'
 import {
   NGrid,
   NGridItem,
@@ -11,7 +11,14 @@ import {
   NIcon,
 } from 'naive-ui'
 import { RefreshOutline } from '@vicons/ionicons5'
-import * as echarts from 'echarts'
+// 按需引入 echarts：整包 import 会把地图、3D、所有图表类型都打进来，这里只用到
+// 折线图和 tooltip/grid/title 三个组件。
+import * as echarts from 'echarts/core'
+import { LineChart } from 'echarts/charts'
+import { GridComponent, TooltipComponent, TitleComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
+
+echarts.use([LineChart, GridComponent, TooltipComponent, TitleComponent, CanvasRenderer])
 import { getMetrics, getMetricsHistory, type MetricPoint } from '../../api/hosts'
 import type { Metrics } from '../../api/types'
 import { useSettingsStore } from '../../stores/settings'
@@ -25,6 +32,20 @@ const timeSpan = ref<TimeSpan>('realtime')
 const loading = ref(true)
 const errorMsg = ref('')
 const currentMetrics = ref<Metrics | null>(null)
+
+// Swap usage percent for the stats strip.
+const swapPct = computed(() => {
+  const m = currentMetrics.value
+  if (!m || !m.swap_total) return null
+  return (m.swap_used ?? 0) / m.swap_total * 100
+})
+
+// Load average color: warn when approaching/exceeding core count.
+const loadColor = computed(() => {
+  const m = currentMetrics.value
+  if (!m || !m.load1) return 'var(--text-secondary)'
+  return '#16a34a'
+})
 
 // DOM refs for charts
 const cpuChartEl = ref<HTMLDivElement | null>(null)
@@ -399,6 +420,24 @@ onMounted(() => {
   }
 })
 
+// 页签被 KeepAlive 缓存后组件不会卸载，实时轮询会在后台一直打接口。
+// 切走时停掉，切回时重启并立刻取一次，图表不留一段空白。
+onDeactivated(() => {
+  if (timer) {
+    clearInterval(timer)
+    timer = null
+  }
+})
+
+onActivated(() => {
+  if (timeSpan.value === 'realtime' && !timer) {
+    fetchRealtimeMetrics()
+    timer = setInterval(fetchRealtimeMetrics, 3000)
+  }
+  // 隐藏期间容器尺寸可能变了，图表要重新按当前宽高绘制
+  nextTick(handleResize)
+})
+
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer)
   window.removeEventListener('resize', handleResize)
@@ -452,8 +491,63 @@ watch(() => settings.themeMode, () => {
 
     <NSpin v-if="loading && (!cpuChart || timeSpan !== 'realtime')" class="spin-box" />
 
+    <!-- 实时快捷指标条：负载 / Swap / 连接数 / 进程数 / CPU 型号 -->
+    <div v-if="currentMetrics" class="quick-stats-strip">
+      <div class="stat-chip">
+        <span class="chip-label">负载 (1/5/15m)</span>
+        <span class="chip-value mono" :style="{ color: loadColor }">
+          {{ (currentMetrics.load1 ?? 0).toFixed(2) }} / {{ (currentMetrics.load5 ?? 0).toFixed(2) }} / {{ (currentMetrics.load15 ?? 0).toFixed(2) }}
+        </span>
+      </div>
+      <div class="stat-chip">
+        <span class="chip-label">Swap</span>
+        <span class="chip-value mono">
+          <template v-if="swapPct !== null">{{ fmtBytes(currentMetrics.swap_used ?? 0) }} / {{ fmtBytes(currentMetrics.swap_total ?? 0) }} ({{ swapPct.toFixed(1) }}%)</template>
+          <template v-else>未启用</template>
+        </span>
+      </div>
+      <div class="stat-chip">
+        <span class="chip-label">TCP 连接</span>
+        <span class="chip-value mono">{{ currentMetrics.tcp_established ?? 0 }} <span class="chip-sub">ESTABLISHED</span></span>
+      </div>
+      <div class="stat-chip">
+        <span class="chip-label">UDP</span>
+        <span class="chip-value mono">{{ currentMetrics.udp_count ?? 0 }}</span>
+      </div>
+      <div class="stat-chip">
+        <span class="chip-label">进程数</span>
+        <span class="chip-value mono">{{ currentMetrics.process_count ?? 0 }}</span>
+      </div>
+      <div v-if="currentMetrics.cpu_model" class="stat-chip chip-wide">
+        <span class="chip-label">CPU 型号</span>
+        <span class="chip-value chip-model" :title="currentMetrics.cpu_model">{{ currentMetrics.cpu_model }}</span>
+      </div>
+    </div>
+
+    <!-- 月度流量统计 -->
+    <div v-if="currentMetrics && (currentMetrics.month_rx || currentMetrics.month_tx)" class="monthly-traffic-card">
+      <div class="traffic-header">
+        <span class="traffic-title">本月流量</span>
+        <span class="traffic-cycle">按账单周期累计 · Agent 重启/主机重启自动校正</span>
+      </div>
+      <div class="traffic-row">
+        <div class="traffic-item">
+          <span class="traffic-dir down">↓ 下行 (RX)</span>
+          <span class="traffic-value mono">{{ fmtBytes(currentMetrics.month_rx ?? 0) }}</span>
+        </div>
+        <div class="traffic-item">
+          <span class="traffic-dir up">↑ 上行 (TX)</span>
+          <span class="traffic-value mono">{{ fmtBytes(currentMetrics.month_tx ?? 0) }}</span>
+        </div>
+        <div class="traffic-item">
+          <span class="traffic-dir total">Σ 合计</span>
+          <span class="traffic-value mono">{{ fmtBytes((currentMetrics.month_rx ?? 0) + (currentMetrics.month_tx ?? 0)) }}</span>
+        </div>
+      </div>
+    </div>
+
     <div v-show="!loading || cpuChart" class="grid-4-container">
-      <NGrid :cols="2" :x-gap="14" :y-gap="14" responsive="screen">
+      <NGrid cols="1 s:2" :x-gap="14" :y-gap="14" responsive="screen">
         <!-- 1. CPU 监控 -->
         <NGridItem>
           <div class="chart-card">
@@ -514,6 +608,109 @@ watch(() => settings.themeMode, () => {
     }
   }
 
+  .quick-stats-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+
+    .stat-chip {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 8px 12px;
+      background-color: var(--bg-card-subtle);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      min-width: 120px;
+      box-shadow: var(--shadow-sm);
+
+      &.chip-wide {
+        flex: 1;
+        min-width: 200px;
+      }
+
+      .chip-label {
+        font-size: 11px;
+        color: var(--text-secondary);
+      }
+
+      .chip-value {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text-primary);
+
+        &.mono {
+          font-family: 'SFMono-Regular', Consolas, monospace;
+        }
+
+        .chip-sub {
+          font-size: 10px;
+          font-weight: 400;
+          color: var(--text-secondary);
+        }
+      }
+
+      .chip-model {
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+    }
+  }
+
+  .monthly-traffic-card {
+    background-color: var(--bg-card-subtle);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 10px 14px;
+    box-shadow: var(--shadow-sm);
+
+    .traffic-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+
+      .traffic-title {
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .traffic-cycle {
+        font-size: 11px;
+        color: var(--text-secondary);
+      }
+    }
+
+    .traffic-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 24px;
+
+      .traffic-item {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+
+        .traffic-dir {
+          font-size: 12px;
+          font-weight: 500;
+
+          &.down { color: #3b82f6; }
+          &.up { color: #8b5cf6; }
+          &.total { color: var(--text-secondary); }
+        }
+
+        .traffic-value {
+          font-size: 16px;
+          font-weight: 600;
+        }
+      }
+    }
+  }
+
   .grid-4-container {
     .chart-card {
       background-color: var(--bg-card-subtle);
@@ -539,6 +736,56 @@ watch(() => settings.themeMode, () => {
 
   .error-banner {
     margin-top: 8px;
+  }
+}
+
+/* ===================== 移动端适配 ===================== */
+@media (max-width: 768px) {
+  .metrics-pane-container {
+    .metrics-sub-toolbar {
+      flex-wrap: wrap;
+      gap: 6px;
+
+      .toolbar-left {
+        flex-wrap: wrap;
+        gap: 6px;
+
+        .mode-hint {
+          width: 100%;
+        }
+      }
+    }
+
+    .quick-stats-strip {
+      .stat-chip {
+        flex: 1 1 calc(50% - 8px);
+        min-width: 0;
+
+        &.chip-wide {
+          flex: 1 1 100%;
+        }
+      }
+    }
+
+    .monthly-traffic-card {
+      .traffic-row {
+        gap: 12px;
+
+        .traffic-item {
+          flex: 1 1 100%;
+
+          .traffic-value {
+            font-size: 14px;
+          }
+        }
+      }
+    }
+
+    .grid-4-container {
+      .chart-card {
+        height: 200px;
+      }
+    }
   }
 }
 </style>

@@ -9,6 +9,7 @@ import {
 import OsLogo from '../common/OsLogo.vue'
 import { execCommand } from '../../api/hosts'
 import type { Host } from '../../api/types'
+import { copyToClipboard } from '../../utils/clipboard'
 
 const props = defineProps<{
   host: Host
@@ -19,6 +20,54 @@ const expanded = ref(true)
 const powering = ref(false)
 
 const distro = computed(() => props.host.distro || props.host.os || '')
+
+function fmtArch(arch?: string): string {
+  const a = (arch || '').toLowerCase()
+  if (a === 'amd64' || a === 'x86_64' || a === 'x64') return 'x64'
+  if (a === 'arm64' || a === 'aarch64') return 'arm64'
+  if (a === '386' || a === 'x86') return 'x86'
+  return arch || 'x64'
+}
+
+function formatMem(bytes?: number): string {
+  if (!bytes || bytes <= 0) return '-'
+  const gb = bytes / (1024 * 1024 * 1024)
+  if (gb >= 1) {
+    return gb.toFixed(1) + ' GB'
+  }
+  const mb = bytes / (1024 * 1024)
+  return Math.round(mb) + ' MB'
+}
+
+const cpuCoresDisplay = computed(() => {
+  if (props.host.cpu_cores) {
+    return `${props.host.cpu_cores} 核`
+  }
+  return '-'
+})
+
+const ipDisplay = computed(() => {
+  const pub = props.host.public_ip
+  const priv = props.host.internal_ip
+  if (pub && priv && pub !== priv) {
+    return `${pub} / ${priv}`
+  }
+  return pub || priv || '-'
+})
+
+async function copyIp() {
+  const text = props.host.public_ip || props.host.internal_ip
+  if (!text) {
+    message.warning('无可用 IP 地址')
+    return
+  }
+  const ok = await copyToClipboard(text)
+  if (ok) {
+    message.success(`已复制 IP 地址 (${text}) 到剪贴板`)
+  } else {
+    message.error('复制失败，请手动选中复制')
+  }
+}
 
 // Uptime: prefer the real OS uptime (seconds since boot) reported by the
 // agent via metrics. Fall back to the registered→now span only when the
@@ -74,21 +123,42 @@ async function handlePowerOff() {
       <div class="host-identity-box">
         <OsLogo :os="host.os" :distro="host.distro" :badge-size="40" :size="24" />
         <div class="host-title-box">
-          <div class="host-name">{{ host.hostname }}</div>
+          <div class="host-name-row">
+            <span class="host-name">{{ host.hostname }}</span>
+            <span v-if="host.location" class="location-tag">{{ host.location }}</span>
+          </div>
           <div class="host-os">{{ distro || '-' }}</div>
         </div>
       </div>
 
-      <!-- Center Specifications (OS / Arch / Agent) -->
+      <!-- Center Specifications (IP / CPU / Arch / Memory / Agent / Group) -->
       <div v-if="expanded" class="host-specs-grid">
         <div class="spec-column">
           <div class="spec-row">
-            <span class="spec-label">OS</span>
-            <span class="spec-value">{{ host.os || '-' }}</span>
+            <span class="spec-label">IP 地址</span>
+            <span
+              class="spec-value mono-font copyable-ip"
+              :class="{ 'is-clickable': ipDisplay !== '-' }"
+              :title="ipDisplay !== '-' ? '点击复制 IP 地址' : ''"
+              @click="copyIp"
+            >
+              {{ ipDisplay }}
+            </span>
           </div>
           <div class="spec-row">
-            <span class="spec-label">Arch</span>
-            <span class="spec-value">{{ host.arch || '-' }}</span>
+            <span class="spec-label">系统架构</span>
+            <span class="spec-value">{{ fmtArch(host.arch) }}</span>
+          </div>
+        </div>
+
+        <div class="spec-column">
+          <div class="spec-row">
+            <span class="spec-label">CPU</span>
+            <span class="spec-value" :title="host.cpu_model ? `处理器型号: ${host.cpu_model}` : ''">{{ cpuCoresDisplay }}</span>
+          </div>
+          <div class="spec-row">
+            <span class="spec-label">内存</span>
+            <span class="spec-value">{{ formatMem(host.mem_total) }}</span>
           </div>
         </div>
 
@@ -98,7 +168,7 @@ async function handlePowerOff() {
             <span class="spec-value mono-font">{{ host.agent_version || '-' }}</span>
           </div>
           <div class="spec-row">
-            <span class="spec-label">分组</span>
+            <span class="spec-label">所属分组</span>
             <span class="spec-value">{{ host.group || '默认分组' }}</span>
           </div>
         </div>
@@ -106,22 +176,28 @@ async function handlePowerOff() {
 
       <!-- Right Status & Power Control -->
       <div class="host-status-box">
-        <div class="uptime-badge" :class="{ offline: host.status !== 'online' }">
-          {{ host.status === 'online' ? `已开机 ${uptimeText}` : '当前已离线' }}
+        <div class="status-indicator-box">
+          <div class="uptime-badge" :class="{ offline: host.status !== 'online' }">
+            <span class="status-dot" :class="host.status"></span>
+            {{ host.status === 'online' ? `已开机 ${uptimeText}` : '当前已离线' }}
+          </div>
+          <div v-if="host.load1 !== undefined && host.status === 'online'" class="load-badge">
+            负载: {{ host.load1 }}
+          </div>
         </div>
 
         <NPopconfirm @positive-click="handlePowerOff">
           <template #trigger>
-            <NButton circle quaternary size="medium" class="power-btn" :loading="powering">
+            <NButton circle quaternary size="medium" class="power-btn" :loading="powering" title="电源控制">
               <template #icon>
                 <NIcon size="20" color="#9ca3af"><PowerOutline /></NIcon>
               </template>
             </NButton>
           </template>
-          确认向主机发送电源关机/重启控制指令？
+          确认向受控主机发送电源关机指令？
         </NPopconfirm>
 
-        <button class="expand-toggle-btn" @click="expanded = !expanded">
+        <button class="expand-toggle-btn" :title="expanded ? '收起规格信息' : '展开规格信息'" @click="expanded = !expanded">
           <NIcon size="14">
             <ChevronUpOutline v-if="expanded" />
             <ChevronDownOutline v-else />
@@ -152,29 +228,35 @@ async function handlePowerOff() {
     display: flex;
     align-items: center;
     gap: 14px;
-
-    .host-icon-ring {
-      width: 44px;
-      height: 44px;
-      border-radius: 50%;
-      border: 2px solid #f97316;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: rgba(249, 115, 22, 0.1);
-    }
+    flex-shrink: 0;
 
     .host-title-box {
-      .host-name {
-        font-size: 16px;
-        font-weight: 700;
-        line-height: 1.2;
-        color: var(--text-primary);
+      .host-name-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+
+        .host-name {
+          font-size: 16px;
+          font-weight: 700;
+          line-height: 1.2;
+          color: var(--text-primary);
+        }
+
+        .location-tag {
+          font-size: 11px;
+          padding: 1px 6px;
+          border-radius: 4px;
+          background: rgba(99, 102, 241, 0.1);
+          color: #6366f1;
+          font-weight: 500;
+        }
       }
+
       .host-os {
         font-size: 12px;
         color: var(--text-secondary);
-        margin-top: 2px;
+        margin-top: 3px;
       }
     }
   }
@@ -182,8 +264,10 @@ async function handlePowerOff() {
   .host-specs-grid {
     display: flex;
     align-items: center;
-    gap: 40px;
+    gap: 32px;
     font-size: 13px;
+    flex: 1;
+    justify-content: center;
 
     .spec-column {
       display: flex;
@@ -194,16 +278,41 @@ async function handlePowerOff() {
     .spec-row {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
 
       .spec-label {
         color: var(--text-secondary);
-        width: 44px;
+        width: 52px;
+        flex-shrink: 0;
       }
 
       .spec-value {
         font-weight: 500;
         color: var(--text-primary);
+        white-space: nowrap;
+
+        &.mono-font {
+          font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+
+        &.copyable-ip.is-clickable {
+          cursor: pointer;
+          transition: color 0.15s ease, background-color 0.15s ease;
+          border-radius: 4px;
+          padding: 1px 4px;
+          margin-left: -4px;
+
+          &:hover {
+            color: #6366f1;
+            background-color: rgba(99, 102, 241, 0.08);
+          }
+        }
+
+        &.cpu-value {
+          max-width: 220px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
       }
     }
   }
@@ -212,14 +321,41 @@ async function handlePowerOff() {
     display: flex;
     align-items: center;
     gap: 14px;
+    flex-shrink: 0;
 
-    .uptime-badge {
-      font-size: 13px;
-      color: #10b981;
-      font-weight: 500;
+    .status-indicator-box {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 2px;
 
-      &.offline {
-        color: var(--text-muted);
+      .uptime-badge {
+        font-size: 13px;
+        color: #10b981;
+        font-weight: 500;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+
+        .status-dot {
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
+          background: #10b981;
+
+          &.offline {
+            background: var(--text-muted);
+          }
+        }
+
+        &.offline {
+          color: var(--text-muted);
+        }
+      }
+
+      .load-badge {
+        font-size: 11px;
+        color: var(--text-secondary);
       }
     }
 
@@ -242,6 +378,53 @@ async function handlePowerOff() {
       &:hover {
         background-color: var(--bg-hover);
         color: var(--text-primary);
+      }
+    }
+  }
+}
+
+/* ===================== 移动端适配 ===================== */
+@media (max-width: 1024px) {
+  .host-header-banner {
+    .host-specs-grid {
+      gap: 16px;
+
+      .spec-row .spec-value.cpu-value {
+        max-width: 140px;
+      }
+    }
+  }
+}
+
+@media (max-width: 768px) {
+  .host-header-banner {
+    padding: 10px 12px;
+    margin-bottom: 8px;
+
+    .banner-main-row {
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .host-specs-grid {
+      order: 3;
+      flex: 1 1 100%;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 12px;
+      flex-wrap: wrap;
+
+      .spec-row .spec-label {
+        width: 48px;
+      }
+    }
+
+    .host-status-box {
+      margin-left: auto;
+      gap: 8px;
+
+      .uptime-badge {
+        font-size: 12px;
       }
     }
   }

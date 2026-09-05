@@ -145,6 +145,9 @@ message FileOp {
   bytes data = 8;
   bool overwrite = 9;
   string dest_path = 10; // for move / copy
+  // sha256 is the hex digest the finished write must match. Sent with the
+  // initial write op; empty means the agent skips integrity verification.
+  string sha256 = 11;
 }
 
 message FileChunk {
@@ -190,6 +193,18 @@ message MetricsSample {
   double disk_write = 10; // bytes/s
   repeated Mount mounts = 11;
   int64 uptime = 12; // host uptime in seconds (real OS boot-derived)
+  // Extended metrics.
+  double load1 = 13; // 1/5/15-minute load averages (Linux; 0 elsewhere)
+  double load5 = 14;
+  double load15 = 15;
+  int64 swap_total = 16; // bytes
+  int64 swap_used = 17;  // bytes
+  int32 tcp_established = 18; // ESTABLISHED TCP connections
+  int32 udp_count = 19;      // UDP sockets
+  int32 process_count = 20;  // total processes
+  string cpu_model = 21;     // CPU model name (cached, static)
+  int64 month_rx = 22; // bytes received this billing cycle
+  int64 month_tx = 23; // bytes transmitted this billing cycle
 }
 
 message Mount {
@@ -201,7 +216,11 @@ message Mount {
 // ---- System info -----------------------------------------------------
 
 message SysInfoQuery {
-  string kind = 1; // process / port / user / login
+  string kind = 1; // process / port / user / login / osinfo / kill
+  // pid targets a single process; only meaningful for kind="kill".
+  int32 pid = 2;
+  // force selects SIGKILL over SIGTERM (taskkill /F on Windows).
+  bool force = 3;
 }
 
 // MetricsQuery asks the agent for current (or a single historical) metrics.
@@ -271,4 +290,7 @@ message Ack {
   bool ok = 1;
   string error = 2;
   string ref = 3; // optional correlation id
+  // sha256 is the hex digest the agent actually computed, set on file write
+  // acks so the caller can confirm the bytes landed intact.
+  string sha256 = 4;
 }

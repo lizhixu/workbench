@@ -1,13 +1,17 @@
 package api
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"watchman/proto/agentpb"
+	"watchman/server/internal/audit"
 	"watchman/server/internal/rpc"
 
 	"github.com/gin-gonic/gin"
@@ -94,6 +98,8 @@ func (h *handlers) fileDownload(c *gin.Context) {
 		return
 	}
 
+	h.recordAudit(c, "file_download", "host", c.Param("id"), "下载文件: "+path, audit.RiskLow, audit.ResultSuccess)
+
 	opID := randomToken(8)
 	chunkCh := make(chan *agentpb.FileChunk, 64)
 	done := make(chan struct{})
@@ -175,6 +181,11 @@ func (h *handlers) fileUpload(c *gin.Context) {
 
 	opID := randomToken(8)
 
+	// The agent verifies the finished file against this digest and discards a
+	// corrupt result rather than leaving a half-written file on the host.
+	sum := sha256.Sum256(data)
+	expected := hex.EncodeToString(sum[:])
+
 	// Register ack handler.
 	ackCh := make(chan *agentpb.Ack, 1)
 	hub.SetRespHandler(opID, func(msg *agentpb.AgentMessage) {
@@ -194,6 +205,7 @@ func (h *handlers) fileUpload(c *gin.Context) {
 				Path:      path,
 				Overwrite: true,
 				TotalSize: int64(len(data)),
+				Sha256:    expected,
 			},
 		},
 	})
@@ -232,10 +244,25 @@ func (h *handlers) fileUpload(c *gin.Context) {
 			return
 		}
 		if !ack.GetOk() {
+			h.recordAudit(c, "file_upload", "host", c.Param("id"),
+				fmt.Sprintf("上传文件失败 (%d 字节): %s (%s)", len(data), path, ack.GetError()),
+				audit.RiskLow, audit.ResultFailed)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": ack.GetError()})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"ok": true, "size": len(data)})
+		if got := ack.GetSha256(); got != "" && got != expected {
+			// The agent reported ok but with a different digest — treat it as a
+			// failed upload rather than silently accepting corrupt content.
+			h.recordAudit(c, "file_upload", "host", c.Param("id"),
+				fmt.Sprintf("上传文件校验失败 (%d 字节): %s (期望 %s, 实际 %s)", len(data), path, expected, got),
+				audit.RiskLow, audit.ResultFailed)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "sha256 校验失败"})
+			return
+		}
+		h.recordAudit(c, "file_upload", "host", c.Param("id"),
+			fmt.Sprintf("上传文件 (%d 字节): %s", len(data), path),
+			audit.RiskLow, audit.ResultSuccess)
+		c.JSON(http.StatusOK, gin.H{"ok": true, "size": len(data), "sha256": expected})
 	case <-time.After(60 * time.Second):
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "upload timeout"})
 	}
@@ -268,21 +295,29 @@ func (h *handlers) fileOpWithChunkResponse(c *gin.Context, op *agentpb.FileOp) {
 		return
 	}
 
-	resultCh := make(chan []byte, 1)
+	// A chunk carries the result; an Ack carries the agent's own error text (for
+	// example "no such file or directory"), which must reach the caller instead
+	// of being flattened into a generic transport failure.
+	type chunkResult struct {
+		data []byte
+		err  string
+	}
+	resultCh := make(chan chunkResult, 1)
 	hub.SetRespHandler(op.GetOpId(), func(msg *agentpb.AgentMessage) {
 		if msg == nil {
-			resultCh <- nil
+			resultCh <- chunkResult{err: "agent disconnected"}
 			return
 		}
-		fc := msg.GetFileChunk()
-		if fc != nil {
-			resultCh <- fc.GetData()
-		} else if ack := msg.GetAck(); ack != nil && !ack.GetOk() {
-			h.log.Warn("file op error from agent", "op", op.GetOp(), "err", ack.GetError())
-			resultCh <- nil
-		} else {
-			resultCh <- nil
+		if fc := msg.GetFileChunk(); fc != nil {
+			resultCh <- chunkResult{data: fc.GetData()}
+			return
 		}
+		if ack := msg.GetAck(); ack != nil && !ack.GetOk() {
+			h.log.Warn("file op error from agent", "op", op.GetOp(), "path", op.GetPath(), "err", ack.GetError())
+			resultCh <- chunkResult{err: ack.GetError()}
+			return
+		}
+		resultCh <- chunkResult{err: "empty response from agent"}
 	})
 
 	if !hub.Send(&agentpb.ServerMessage{
@@ -296,20 +331,40 @@ func (h *handlers) fileOpWithChunkResponse(c *gin.Context, op *agentpb.FileOp) {
 	defer hub.SetRespHandler(op.GetOpId(), nil)
 
 	select {
-	case data := <-resultCh:
-		if data == nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no response"})
+	case res := <-resultCh:
+		if res.data == nil {
+			c.JSON(fileErrStatus(res.err), gin.H{"error": res.err})
 			return
 		}
 		var parsed any
-		if json.Unmarshal(data, &parsed) == nil {
+		if json.Unmarshal(res.data, &parsed) == nil {
 			c.JSON(http.StatusOK, gin.H{"data": parsed})
 		} else {
-			c.JSON(http.StatusOK, gin.H{"raw": string(data)})
+			c.JSON(http.StatusOK, gin.H{"raw": string(res.data)})
 		}
 	case <-time.After(10 * time.Second):
 		h.log.Warn("file op timeout", "op", op.GetOp(), "path", op.GetPath(), "op_id", op.GetOpId())
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "timeout"})
+	}
+}
+
+// fileErrStatus maps an agent-side file error to an HTTP status so callers can
+// tell "this path is wrong" apart from "the agent is unreachable".
+func fileErrStatus(msg string) int {
+	switch {
+	case msg == "" || strings.Contains(msg, "disconnected") || strings.Contains(msg, "empty response"):
+		return http.StatusServiceUnavailable
+	case strings.Contains(msg, "no such file or directory") ||
+		strings.Contains(msg, "cannot find the file") || strings.Contains(msg, "cannot find the path"):
+		return http.StatusNotFound
+	case strings.Contains(msg, "permission denied") || strings.Contains(msg, "Access is denied"):
+		return http.StatusForbidden
+	case strings.Contains(msg, "not a directory") || strings.Contains(msg, "is a directory") ||
+		strings.Contains(msg, "file exists") || strings.Contains(msg, "directory not empty") ||
+		strings.Contains(msg, "unknown op") || strings.Contains(msg, "seq mismatch"):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
 	}
 }
 
@@ -342,13 +397,46 @@ func (h *handlers) fileOpWithAck(c *gin.Context, op *agentpb.FileOp) {
 			return
 		}
 		if !ack.GetOk() {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": ack.GetError()})
+			h.auditFileOp(c, op, audit.ResultFailed, ack.GetError())
+			c.JSON(fileErrStatus(ack.GetError()), gin.H{"error": ack.GetError()})
 			return
 		}
+		h.auditFileOp(c, op, audit.ResultSuccess, "")
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	case <-time.After(10 * time.Second):
+		h.auditFileOp(c, op, audit.ResultFailed, "timeout")
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "timeout"})
 	}
+}
+
+// auditFileOp records a mutating file operation to the unified audit trail.
+func (h *handlers) auditFileOp(c *gin.Context, op *agentpb.FileOp, result, errMsg string) {
+	if h.audit == nil {
+		return
+	}
+	labels := map[string]struct{ action, desc string }{
+		"mkdir":  {"file_mkdir", "新建目录"},
+		"move":   {"file_move", "移动/重命名"},
+		"copy":   {"file_copy", "复制"},
+		"remove": {"file_remove", "删除"},
+		"write":  {"file_upload", "上传文件"},
+	}
+	l, ok := labels[op.GetOp()]
+	if !ok {
+		return
+	}
+	detail := fmt.Sprintf("%s: %s", l.desc, op.GetPath())
+	if d := op.GetDestPath(); d != "" {
+		detail += " -> " + d
+	}
+	if errMsg != "" {
+		detail += " (" + errMsg + ")"
+	}
+	risk := audit.RiskLow
+	if op.GetOp() == "remove" {
+		risk = audit.RiskHigh
+	}
+	h.recordAudit(c, l.action, "host", c.Param("id"), detail, risk, result)
 }
 
 func baseName(path string) string {

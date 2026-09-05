@@ -95,28 +95,75 @@ func getMemTotal() int64 {
 	return 0
 }
 
+// virtualIfacePrefixes match interfaces that belong to container, VM or VPN
+// plumbing rather than to the host's own network. They must be skipped when
+// reporting the host address: Docker's bridge is 172.17.0.1, a perfectly valid
+// private address, so without this filter installing Docker silently changes
+// the IP the console shows for the host.
+var virtualIfacePrefixes = []string{
+	"docker", "br-", "veth", "virbr", "vmnet", "cni", "flannel", "kube",
+	"tailscale", "zt", "wg", "tun", "tap", "utun", "vethernet", "hyper-v",
+	"nebula", "wireguard", "zerotier",
+}
+
+func isVirtualIface(name string) bool {
+	n := strings.ToLower(name)
+	for _, p := range virtualIfacePrefixes {
+		if strings.HasPrefix(n, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPrivateLAN(ip string) bool {
+	if strings.HasPrefix(ip, "10.") || strings.HasPrefix(ip, "192.168.") {
+		return true
+	}
+	return strings.HasPrefix(ip, "172.") && is172Private(net.ParseIP(ip))
+}
+
+// getInternalIP reports the host's own IPv4 address, preferring a private LAN
+// address and ignoring container/VPN interfaces.
 func getInternalIP() string {
-	addrs, err := net.InterfaceAddrs()
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return ""
 	}
-	var fallbacks []string
-	for _, addr := range addrs {
-		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
-			if ip4 := ipNet.IP.To4(); ip4 != nil {
-				ipStr := ip4.String()
-				// Prefer standard private LAN IP blocks
-				if strings.HasPrefix(ipStr, "10.") ||
-					strings.HasPrefix(ipStr, "192.168.") ||
-					(strings.HasPrefix(ipStr, "172.") && is172Private(ip4)) {
-					return ipStr
-				}
-				fallbacks = append(fallbacks, ipStr)
+	var privateAddrs, publicAddrs []string
+	for _, ifi := range ifaces {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if isVirtualIface(ifi.Name) {
+			continue
+		}
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP.IsLoopback() || ipNet.IP.IsLinkLocalUnicast() {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil {
+				continue
+			}
+			s := ip4.String()
+			if isPrivateLAN(s) {
+				privateAddrs = append(privateAddrs, s)
+			} else {
+				publicAddrs = append(publicAddrs, s)
 			}
 		}
 	}
-	if len(fallbacks) > 0 {
-		return fallbacks[0]
+	if len(privateAddrs) > 0 {
+		return privateAddrs[0]
+	}
+	if len(publicAddrs) > 0 {
+		return publicAddrs[0]
 	}
 	return ""
 }

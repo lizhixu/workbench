@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, h, onMounted } from 'vue'
+import { ref, computed, h, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NGrid,
@@ -24,12 +24,14 @@ import {
   WarningOutline,
   CheckmarkCircleOutline,
   ShieldCheckmarkOutline,
-  ServerOutline,
   ScanOutline,
   DocumentTextOutline,
   PaperPlaneOutline,
   ChatbubbleEllipsesOutline,
+  CopyOutline,
 } from '@vicons/ionicons5'
+import { copyToClipboard } from '../../../utils/clipboard'
+import { useTablePagination } from '../../../composables/useTablePagination'
 import {
   triggerScan,
   listScans,
@@ -69,8 +71,6 @@ const scanTypeOptions = [
   { label: '漏洞扫描', value: 'vuln' },
 ]
 
-const severityOrder = ['critical', 'high', 'medium', 'low', 'info']
-
 function severityTagType(s: string): 'error' | 'warning' | 'info' | 'success' | 'default' {
   switch (s) {
     case 'critical':
@@ -101,6 +101,14 @@ const filteredFindings = computed(() => {
   if (severityFilter.value === 'all') return findings.value
   return findings.value.filter((f) => f.severity === severityFilter.value)
 })
+
+// 一次基线/漏洞扫描可能产出上百条发现（AGENTS.md 8.2）；改筛选级别时回到第一页。
+const findingCount = computed(() => filteredFindings.value.length)
+const { pagination: findingPagination, resetPage: resetFindingPage } = useTablePagination({
+  pageSize: 20,
+  rowCount: findingCount,
+})
+watch(severityFilter, resetFindingPage)
 
 const stats = computed(() => {
   const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 }
@@ -214,6 +222,16 @@ function sendToExec(rec: ScanRecommendationItem) {
   })
 }
 
+async function copyRecCommand(cmd?: string) {
+  if (!cmd) return
+  const ok = await copyToClipboard(cmd)
+  if (ok) {
+    message.success('已复制修复命令到剪贴板')
+  } else {
+    message.error('复制失败，请手动选中文本复制')
+  }
+}
+
 function formatTime(t?: string): string {
   if (!t) return '-'
   try {
@@ -314,7 +332,7 @@ onMounted(async () => {
     </div>
 
     <!-- 统计指标卡片 -->
-    <NGrid :cols="5" :x-gap="12" class="stat-cards-grid">
+    <NGrid cols="2 s:3 m:5" :x-gap="12" :y-gap="12" responsive="screen" class="stat-cards-grid">
       <NGridItem>
         <div class="vuln-stat-card critical">
           <div class="card-icon"><NIcon size="20"><WarningOutline /></NIcon></div>
@@ -362,8 +380,8 @@ onMounted(async () => {
       </NGridItem>
     </NGrid>
 
-    <!-- 当前扫描结果 -->
-    <div class="table-card">
+    <!-- 当前扫描结果：表头固定，仅数据区滚动（AGENTS.md 8.2） -->
+    <div class="table-card findings-card">
       <div class="table-card-header">
         <span class="section-title">
           扫描结果
@@ -372,7 +390,7 @@ onMounted(async () => {
             <NTag
               size="tiny"
               :type="currentJob.status === 'completed' ? 'success' : currentJob.status === 'failed' ? 'error' : 'info'"
-              bordered="false"
+              :bordered="false"
               style="margin-left: 8px"
             >
               {{ currentJob.status === 'completed' ? '已完成' : currentJob.status === 'failed' ? '失败' : '进行中' }}
@@ -387,8 +405,10 @@ onMounted(async () => {
         />
       </div>
       <NDataTable
+        flex-height
         :columns="findingColumns"
         :data="filteredFindings"
+        :pagination="findingPagination"
         size="small"
         :bordered="false"
         :row-key="(row: ScanFinding) => row.title + row.category"
@@ -399,14 +419,15 @@ onMounted(async () => {
       </NDataTable>
     </div>
 
-    <!-- 历史扫描记录 -->
-    <div v-if="jobs.length > 0" class="table-card">
+    <!-- 历史扫描记录：条数有限，按辅助表格限高（AGENTS.md 8.2 例外） -->
+    <div v-if="jobs.length > 0" class="table-card history-card">
       <div class="section-title" style="margin-bottom: 8px">历史扫描记录</div>
       <NDataTable
         :columns="historyColumns"
         :data="jobs"
         size="small"
         :bordered="false"
+        :max-height="200"
         :row-key="(row: ScanJob) => row.id"
       />
     </div>
@@ -427,7 +448,7 @@ onMounted(async () => {
             <div class="report-section-title">修复优先级</div>
             <div class="priority-list">
               <div v-for="(p, i) in report.priorities" :key="i" class="priority-item">
-                <NTag size="small" :type="severityTagType(p.level)" bordered="false">{{ severityLabel(p.level) }}</NTag>
+                <NTag size="small" :type="severityTagType(p.level)" :bordered="false">{{ severityLabel(p.level) }}</NTag>
                 <div class="priority-content">
                   <div class="priority-title">{{ p.title }}</div>
                   <div class="priority-reason">{{ p.reason }}</div>
@@ -447,23 +468,35 @@ onMounted(async () => {
                 :name="String(i)"
               >
                 <template #header-extra>
-                  <NTag size="tiny" :type="severityTagType(rec.severity)" bordered="false">{{ severityLabel(rec.severity) }}</NTag>
+                  <NTag size="tiny" :type="severityTagType(rec.severity)" :bordered="false">{{ severityLabel(rec.severity) }}</NTag>
                 </template>
                 <div class="rec-steps">{{ rec.steps }}</div>
                 <div v-if="rec.command" class="rec-command-block">
                   <div class="rec-command-label">修复命令：</div>
                   <pre class="rec-command-pre">{{ rec.command }}</pre>
-                  <NButton
-                    size="tiny"
-                    type="primary"
-                    ghost
-                    @click="sendToExec(rec)"
-                  >
-                    <template #icon>
-                      <NIcon><PaperPlaneOutline /></NIcon>
-                    </template>
-                    下发执行
-                  </NButton>
+                  <NSpace :size="8" style="margin-top: 6px">
+                    <NButton
+                      size="tiny"
+                      type="primary"
+                      ghost
+                      @click="sendToExec(rec)"
+                    >
+                      <template #icon>
+                        <NIcon><PaperPlaneOutline /></NIcon>
+                      </template>
+                      下发执行
+                    </NButton>
+                    <NButton
+                      size="tiny"
+                      secondary
+                      @click="copyRecCommand(rec.command)"
+                    >
+                      <template #icon>
+                        <NIcon><CopyOutline /></NIcon>
+                      </template>
+                      复制命令
+                    </NButton>
+                  </NSpace>
                 </div>
               </NCollapseItem>
             </NCollapse>
@@ -505,6 +538,15 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  /* 撑满面板高度，让扫描结果表按剩余空间滚动（AGENTS.md 8.2） */
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+
+  .vuln-header-bar,
+  .stat-cards-grid {
+    flex-shrink: 0;
+  }
 
   .vuln-header-bar {
     display: flex;
@@ -554,6 +596,24 @@ onMounted(async () => {
     }
   }
 
+  /* 扫描结果表：吃掉页面剩余高度，表头随之固定 */
+  .findings-card {
+    flex: 1;
+    min-height: 200px;
+    display: flex;
+    flex-direction: column;
+
+    :deep(.n-data-table) {
+      flex: 1;
+      min-height: 0;
+    }
+  }
+
+  /* 历史记录为辅助表格，固定限高、不与主表争抢空间 */
+  .history-card {
+    flex-shrink: 0;
+  }
+
   .table-card {
     border-radius: 6px;
 
@@ -562,6 +622,7 @@ onMounted(async () => {
       align-items: center;
       justify-content: space-between;
       margin-bottom: 8px;
+      flex-shrink: 0;
     }
 
     .section-title {

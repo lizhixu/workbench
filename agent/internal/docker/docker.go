@@ -26,16 +26,26 @@ type Manager struct {
 	sender Sender
 	log    *slog.Logger
 
-	// dockerAvailable is cached to avoid re-running LookPath on every op.
-	dockerChecked bool
-	dockerOk      bool
+	// The docker CLI lookup is cached so it does not run on every op. A
+	// positive result is kept for good; a negative one expires, because the
+	// console can install Docker on a running host (AGENTS.md 3.4) and a
+	// permanently cached "missing" would keep reporting it absent until the
+	// agent restarted.
+	dockerOk        bool
+	dockerCheckedAt time.Time
+
+	// lookPath is swappable in tests.
+	lookPath func(string) (string, error)
 }
+
+// negativeLookupTTL is how long a "docker is missing" answer stays cached.
+const negativeLookupTTL = 20 * time.Second
 
 func NewManager(log *slog.Logger) *Manager {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Manager{log: log}
+	return &Manager{log: log, lookPath: exec.LookPath}
 }
 
 func (m *Manager) SetSender(s Sender) {
@@ -49,15 +59,25 @@ func (m *Manager) Handle(op *agentpb.DockerOp) {
 	go m.run(op)
 }
 
-// dockerAvailable checks once (cached) whether the docker CLI is on PATH.
+// dockerAvailable reports whether the docker CLI is on PATH. A positive answer
+// is cached permanently; a negative one is re-probed after negativeLookupTTL so
+// a one-click Docker install becomes usable without restarting the agent.
 func (m *Manager) dockerAvailable() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.dockerChecked {
-		_, err := exec.LookPath("docker")
-		m.dockerOk = err == nil
-		m.dockerChecked = true
+	if m.dockerOk {
+		return true
 	}
+	if !m.dockerCheckedAt.IsZero() && time.Since(m.dockerCheckedAt) < negativeLookupTTL {
+		return false
+	}
+	look := m.lookPath
+	if look == nil {
+		look = exec.LookPath
+	}
+	_, err := look("docker")
+	m.dockerOk = err == nil
+	m.dockerCheckedAt = time.Now()
 	return m.dockerOk
 }
 
@@ -118,9 +138,9 @@ func (m *Manager) runPsImages(ctx context.Context, result *agentpb.DockerEvent) 
 	}
 
 	var (
-		cOut, iOut   []byte
-		cErr, iErr   error
-		wg           sync.WaitGroup
+		cOut, iOut []byte
+		cErr, iErr error
+		wg         sync.WaitGroup
 	)
 	wg.Add(2)
 	go func() {

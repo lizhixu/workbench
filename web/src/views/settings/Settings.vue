@@ -8,8 +8,6 @@ import {
   NDescriptionsItem,
   NTag,
   useMessage,
-  NTabs,
-  NTabPane,
   NInput,
   NSwitch,
   NFormItem,
@@ -23,6 +21,13 @@ import { getAIConfig, setAIConfig, testAIConfig, type AIConfig } from '../../api
 import { copyToClipboard } from '../../utils/clipboard'
 import { useWorkspaceStore } from '../../stores/workspace'
 import CommandPolicy from './CommandPolicy.vue'
+import CommandLibrary from './CommandLibrary.vue'
+import TerminalPrefs from './TerminalPrefs.vue'
+import BackupRestore from './BackupRestore.vue'
+import OsLogo from '../../components/common/OsLogo.vue'
+
+// KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
+defineOptions({ name: 'Settings' })
 
 const message = useMessage()
 const workspace = useWorkspaceStore()
@@ -307,8 +312,17 @@ onMounted(() => {
       </NSpace>
     </NCard>
 
+    <!-- Saved-command library -->
+    <CommandLibrary />
+
+    <!-- Per-user terminal preferences (theme / shell / font) -->
+    <TerminalPrefs />
+
     <!-- High-risk command control (P3) -->
     <CommandPolicy />
+
+    <!-- Control-plane backup / restore (admin only) -->
+    <BackupRestore />
 
     <!-- One-line Install -->
     <NCard :bordered="false">
@@ -316,13 +330,31 @@ onMounted(() => {
         <span style="font-size: 16px; font-weight: 700">一键安装 Agent</span>
       </template>
       <template #header-extra>
-        <NSpace align="center">
-          <span class="muted">目标系统:</span>
-          <NTabs v-model:value="osType" type="segment" size="small">
-            <NTabPane name="linux" tab="Linux" />
-            <NTabPane name="windows" tab="Windows" />
-          </NTabs>
-        </NSpace>
+        <div class="os-selector-wrap">
+          <span class="selector-label">目标系统:</span>
+          <div class="os-segment-group">
+            <button
+              type="button"
+              class="os-segment-btn"
+              :class="{ active: osType === 'linux' }"
+              @click="osType = 'linux'"
+            >
+              <OsLogo os="linux" :show-badge="false" :size="16" class="btn-logo" />
+              <span class="btn-text">Linux</span>
+              <span class="btn-sub">x86 / arm</span>
+            </button>
+            <button
+              type="button"
+              class="os-segment-btn"
+              :class="{ active: osType === 'windows' }"
+              @click="osType = 'windows'"
+            >
+              <OsLogo os="windows" :show-badge="false" :size="14" class="btn-logo win-logo" />
+              <span class="btn-text">Windows</span>
+              <span class="btn-sub">x64</span>
+            </button>
+          </div>
+        </div>
       </template>
 
       <NSpace vertical :size="16">
@@ -398,6 +430,87 @@ onMounted(() => {
 <style scoped lang="scss">
 .muted { color: var(--text-secondary); font-size: 13px; }
 code { font-size: 12px; }
+
+.os-selector-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+
+  .selector-label {
+    font-size: 13px;
+    color: var(--text-secondary);
+    font-weight: 500;
+  }
+
+  .os-segment-group {
+    display: inline-flex;
+    align-items: center;
+    background-color: var(--code-box-bg, rgba(0, 0, 0, 0.2));
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 3px;
+    gap: 4px;
+
+    .os-segment-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text-secondary);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      user-select: none;
+      outline: none;
+
+      .btn-logo {
+        transition: transform 0.2s ease;
+      }
+
+      .btn-text {
+        font-weight: 600;
+      }
+
+      .btn-sub {
+        font-size: 10.5px;
+        color: var(--text-tertiary, #9ca3af);
+        padding: 0 4px;
+        border-radius: 3px;
+        background-color: rgba(255, 255, 255, 0.06);
+        line-height: 1.4;
+      }
+
+      &:hover:not(.active) {
+        color: var(--text-primary);
+        background-color: rgba(255, 255, 255, 0.05);
+      }
+
+      &.active {
+        background-color: var(--bg-card);
+        color: #6366f1;
+        border-color: rgba(99, 102, 241, 0.35);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.24);
+
+        .btn-logo {
+          transform: scale(1.1);
+        }
+
+        .win-logo {
+          color: #0078d6;
+        }
+
+        .btn-sub {
+          color: #6366f1;
+          background-color: rgba(99, 102, 241, 0.12);
+        }
+      }
+    }
+  }
+}
 
 .token-box {
   display: flex;

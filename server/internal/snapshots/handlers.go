@@ -29,24 +29,33 @@ func NewHandlers(reg *rpc.Registry, store *Store, engine *Engine) *Handlers {
 func (h *Handlers) Register(readRG, writeRG *gin.RouterGroup) {
 	readRG.GET("/backups/jobs", h.listJobs)
 	readRG.GET("/backups/jobs/:id/archives", h.listArchives)
+	readRG.GET("/backups/s3-targets", h.listS3Targets)
+
 	writeRG.POST("/backups/jobs", h.createJob)
 	writeRG.PUT("/backups/jobs/:id", h.updateJob)
 	writeRG.DELETE("/backups/jobs/:id", h.deleteJob)
 	writeRG.POST("/backups/jobs/:id/run", h.runJob)
 	writeRG.POST("/backups/jobs/:id/archives/:archiveID/restore", h.restoreArchive)
 	writeRG.DELETE("/backups/jobs/:id/archives/:archiveID", h.deleteArchive)
+
+	// S3 storage targets
+	writeRG.POST("/backups/s3-targets", h.createS3Target)
+	writeRG.PUT("/backups/s3-targets/:id", h.updateS3Target)
+	writeRG.DELETE("/backups/s3-targets/:id", h.deleteS3Target)
+	writeRG.POST("/backups/s3-targets/:id/test", h.testS3Target)
 }
 
 type jobReq struct {
-	Name      string `json:"name"`
-	HostID    string `json:"host_id"`
-	Kind      string `json:"kind"` // dir | volume | database
-	Target    string `json:"target"`
-	DBType    string `json:"db_type"`
-	DBName    string `json:"db_name"`
-	Retention int    `json:"retention"`
-	Cron      string `json:"cron"`
-	Enabled   bool   `json:"enabled"`
+	Name          string `json:"name"`
+	HostID        string `json:"host_id"`
+	Kind          string `json:"kind"` // dir | volume | database
+	Target        string `json:"target"`
+	DBType        string `json:"db_type"`
+	DBName        string `json:"db_name"`
+	StorageTarget string `json:"storage_target"` // "default" | "local" | "s3_xxxx"
+	Retention     int    `json:"retention"`
+	Cron          string `json:"cron"`
+	Enabled       bool   `json:"enabled"`
 }
 
 func (r *jobReq) validate() error {
@@ -104,19 +113,20 @@ func (h *Handlers) createJob(c *gin.Context) {
 	if retention == 0 {
 		retention = 7
 	}
-	job := &Job{
-		ID:        "bk_" + randomToken(8),
-		Name:      strings.TrimSpace(req.Name),
-		HostID:    req.HostID,
-		Kind:      JobKind(req.Kind),
-		Target:    strings.TrimSpace(req.Target),
-		DBType:    strings.ToLower(req.DBType),
-		DBName:    strings.TrimSpace(req.DBName),
-		Retention: retention,
-		Schedule:  Schedule{Cron: strings.TrimSpace(req.Cron)},
-		Enabled:   req.Enabled,
-		CreatedAt: time.Now(),
-	}
+		job := &Job{
+			ID:            "bk_" + randomToken(8),
+			Name:          strings.TrimSpace(req.Name),
+			HostID:        req.HostID,
+			Kind:          JobKind(req.Kind),
+			Target:        strings.TrimSpace(req.Target),
+			DBType:        strings.ToLower(req.DBType),
+			DBName:        strings.TrimSpace(req.DBName),
+			StorageTarget: strings.TrimSpace(req.StorageTarget),
+			Retention:     retention,
+			Schedule:      Schedule{Cron: strings.TrimSpace(req.Cron)},
+			Enabled:       req.Enabled,
+			CreatedAt:     time.Now(),
+		}
 	if err := h.store.PutJob(job); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -137,6 +147,9 @@ func (h *Handlers) updateJob(c *gin.Context) {
 		j.Target = strings.TrimSpace(req.Target)
 		j.DBType = strings.ToLower(req.DBType)
 		j.DBName = strings.TrimSpace(req.DBName)
+		if req.StorageTarget != "" {
+			j.StorageTarget = req.StorageTarget
+		}
 		if req.Retention > 0 {
 			j.Retention = req.Retention
 		}
@@ -234,6 +247,131 @@ func (h *Handlers) deleteArchive(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ---- S3 Storage Targets Handlers ----
+
+func (h *Handlers) listS3Targets(c *gin.Context) {
+	targets := h.store.ListS3Targets()
+	if targets == nil {
+		targets = []*S3Target{}
+	}
+	c.JSON(http.StatusOK, gin.H{"data": targets})
+}
+
+type s3TargetReq struct {
+	Name           string `json:"name" binding:"required"`
+	Provider       string `json:"provider"`
+	Endpoint       string `json:"endpoint" binding:"required"`
+	Region         string `json:"region"`
+	Bucket         string `json:"bucket" binding:"required"`
+	Prefix         string `json:"prefix"`
+	AccessKey      string `json:"access_key" binding:"required"`
+	SecretKey      string `json:"secret_key"`
+	ForcePathStyle bool   `json:"force_path_style"`
+	IsDefault      bool   `json:"is_default"`
+}
+
+func (h *Handlers) createS3Target(c *gin.Context) {
+	var req s3TargetReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请填写完整 S3 配置参数"})
+		return
+	}
+	if strings.TrimSpace(req.SecretKey) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "SecretKey 不能为空"})
+		return
+	}
+
+	target := &S3Target{
+		ID:             "s3_" + randomToken(6),
+		Name:           strings.TrimSpace(req.Name),
+		Provider:       firstNonEmpty(req.Provider, "custom"),
+		Endpoint:       strings.TrimSpace(req.Endpoint),
+		Region:         firstNonEmpty(req.Region, "auto"),
+		Bucket:         strings.TrimSpace(req.Bucket),
+		Prefix:         strings.Trim(strings.TrimSpace(req.Prefix), "/"),
+		AccessKey:      strings.TrimSpace(req.AccessKey),
+		SecretKey:      strings.TrimSpace(req.SecretKey),
+		ForcePathStyle: req.ForcePathStyle,
+		IsDefault:      req.IsDefault,
+		CreatedAt:      time.Now(),
+	}
+
+	if err := h.store.PutS3Target(target); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": target.Redacted()})
+}
+
+func (h *Handlers) updateS3Target(c *gin.Context) {
+	id := c.Param("id")
+	target, ok := h.store.GetS3Target(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "s3 target not found"})
+		return
+	}
+
+	var req s3TargetReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	target.Name = strings.TrimSpace(req.Name)
+	if req.Provider != "" {
+		target.Provider = req.Provider
+	}
+	target.Endpoint = strings.TrimSpace(req.Endpoint)
+	if req.Region != "" {
+		target.Region = req.Region
+	}
+	target.Bucket = strings.TrimSpace(req.Bucket)
+	target.Prefix = strings.Trim(strings.TrimSpace(req.Prefix), "/")
+	target.AccessKey = strings.TrimSpace(req.AccessKey)
+	if req.SecretKey != "" && !strings.Contains(req.SecretKey, "••") {
+		target.SecretKey = strings.TrimSpace(req.SecretKey)
+	}
+	target.ForcePathStyle = req.ForcePathStyle
+	target.IsDefault = req.IsDefault
+
+	if err := h.store.PutS3Target(target); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": target.Redacted()})
+}
+
+func (h *Handlers) deleteS3Target(c *gin.Context) {
+	if err := h.store.DeleteS3Target(c.Param("id")); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *Handlers) testS3Target(c *gin.Context) {
+	target, ok := h.store.GetS3Target(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "s3 target not found"})
+		return
+	}
+	client := NewS3Client(target)
+	if err := client.TestBucket(c.Request.Context()); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "S3 存储桶连通性测试成功"})
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 func randomToken(n int) string {

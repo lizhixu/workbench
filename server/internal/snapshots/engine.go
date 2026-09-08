@@ -76,6 +76,32 @@ func (e *Engine) Run(job *Job) (*Archive, error) {
 		e.logWarn("backup markers missing", job, string(res.GetStdout()))
 	}
 
+	// Resolve storage destination (default / local / specific S3 target).
+	storageID := "local"
+	storagePath := archivePath
+	s3Target := e.resolveS3Target(job)
+
+	if s3Target != nil {
+		s3Client := NewS3Client(s3Target)
+		s3Key := s3Client.ObjectKey(id + ".tar.gz")
+		putURL, err := s3Client.PresignPut(s3Key, 2*time.Hour)
+		if err != nil {
+			e.logWarn("generate S3 presigned PUT URL failed", job, err.Error())
+		} else {
+			// Upload directly from host via curl
+			uploadScript := fmt.Sprintf(`curl -fsSL -X PUT -T %s %s`,
+				shellQuote(archivePath), shellQuote(putURL))
+			upRes, upErr := execOnAgent(hub, "s3-up-"+id[:min(20, len(id))], uploadScript, 600)
+			if upErr != nil || upRes.GetExitCode() != 0 {
+				e.logWarn("S3 direct upload failed, archive retained locally", job, fmt.Sprintf("%v", upErr))
+			} else {
+				storageID = s3Target.ID
+				storagePath = s3Key
+				e.log.Info("archive uploaded to S3", "job", job.ID, "target", s3Target.Name, "key", s3Key)
+			}
+		}
+	}
+
 	// Retention prune: keep the newest N archives of this job.
 	if job.Retention > 0 {
 		if _, err := execOnAgent(hub, "prune-"+job.ID, pruneScript(job.ID, job.Retention), 60); err != nil {
@@ -84,14 +110,16 @@ func (e *Engine) Run(job *Job) (*Archive, error) {
 	}
 
 	arch := &Archive{
-		ID:        id,
-		JobID:     job.ID,
-		HostName:  job.HostID,
-		Kind:      job.Kind,
-		Target:    job.Target,
-		Size:      size,
-		SHA256:    sum,
-		CreatedAt: ts,
+		ID:            id,
+		JobID:         job.ID,
+		HostName:      job.HostID,
+		Kind:          job.Kind,
+		Target:        job.Target,
+		StorageTarget: storageID,
+		StoragePath:   storagePath,
+		Size:          size,
+		SHA256:        sum,
+		CreatedAt:     ts,
 	}
 	if err := e.store.AddArchive(arch); err != nil {
 		return nil, err
@@ -198,6 +226,29 @@ ls -1 %s-*.tar.gz 2>/dev/null | sort -r | tail -n +$(("%d"+1)) | while read f; d
 		shellQuote(backupRoot), jobID, keep)
 }
 
+// resolveS3Target resolves the S3 target for a job:
+// if job specifies an explicit target (s3_xxx), look it up;
+// if "default" or empty, look up the default S3 target;
+// if none found, returns nil (meaning local backup).
+func (e *Engine) resolveS3Target(job *Job) *S3Target {
+	tgt := job.StorageTarget
+	if tgt == "" || tgt == "default" {
+		def, ok := e.store.GetDefaultS3Target()
+		if ok {
+			return def
+		}
+		return nil
+	}
+	if tgt == "local" {
+		return nil
+	}
+	t, ok := e.store.GetS3Target(tgt)
+	if ok {
+		return t
+	}
+	return nil
+}
+
 // Restore unpacks an archive back to its target. Following the control-plane
 // backup module's safety principle, the current state is archived first so a
 // mistaken restore is recoverable.
@@ -207,6 +258,27 @@ func (e *Engine) Restore(job *Job, arch *Archive) error {
 		return fmt.Errorf("目标主机 Agent 不在线")
 	}
 	archivePath := filepath.ToSlash(filepath.Join(backupRoot, arch.ID+".tar.gz"))
+
+	// If the archive was stored in S3, download it to the host first via presigned GET URL
+	if arch.StorageTarget != "" && arch.StorageTarget != "local" {
+		if s3Target, ok := e.store.GetS3Target(arch.StorageTarget); ok {
+			s3Client := NewS3Client(s3Target)
+			s3Key := arch.StoragePath
+			if s3Key == "" {
+				s3Key = s3Client.ObjectKey(arch.ID + ".tar.gz")
+			}
+			getURL, err := s3Client.PresignGet(s3Key, 2*time.Hour)
+			if err != nil {
+				return fmt.Errorf("生成 S3 下载地址失败: %w", err)
+			}
+			dlScript := fmt.Sprintf(`mkdir -p %s && curl -fsSL -o %s %s`,
+				shellQuote(backupRoot), shellQuote(archivePath), shellQuote(getURL))
+			dlRes, dlErr := execOnAgent(hub, "s3-dl-"+arch.ID[:min(20, len(arch.ID))], dlScript, 600)
+			if dlErr != nil || dlRes.GetExitCode() != 0 {
+				return fmt.Errorf("从 S3 下载归档失败: %v", dlErr)
+			}
+		}
+	}
 
 	var restoreCmd string
 	switch job.Kind {

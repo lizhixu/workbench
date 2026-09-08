@@ -49,6 +49,8 @@ type Job struct {
 	DBType string `json:"db_type,omitempty"`
 	// DBName limits the dump to one database (mysql/postgres/mongo).
 	DBName string `json:"db_name,omitempty"`
+	// StorageTarget: "default" | "local" | "s3_xxxx"
+	StorageTarget string `json:"storage_target,omitempty"`
 	// Retention is how many archives to keep per job on the host.
 	Retention int      `json:"retention"`
 	Schedule  Schedule `json:"schedule"`
@@ -59,30 +61,34 @@ type Job struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// Archive is one completed backup on a managed host.
+// Archive is one completed backup on a managed host or S3 bucket.
 type Archive struct {
-	ID        string    `json:"id"` // job id + timestamp, also the file stem
-	JobID     string    `json:"job_id"`
-	HostName  string    `json:"host_id"`
-	Kind      JobKind   `json:"kind"`
-	Target    string    `json:"target"`
-	Size      int64     `json:"size"` // bytes
-	SHA256    string    `json:"sha256,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	ID            string    `json:"id"` // job id + timestamp, also the file stem
+	JobID         string    `json:"job_id"`
+	HostName      string    `json:"host_id"`
+	Kind          JobKind   `json:"kind"`
+	Target        string    `json:"target"`
+	StorageTarget string    `json:"storage_target,omitempty"` // "local" | "s3_xxxx"
+	StoragePath   string    `json:"storage_path,omitempty"`   // S3 key or host path
+	Size          int64     `json:"size"`                     // bytes
+	SHA256        string    `json:"sha256,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
-// Store persists backup jobs and archive metadata (control-plane side).
+// Store persists backup jobs, archive metadata and S3 storage targets.
 type Store struct {
-	mu       sync.RWMutex
-	dir      string
-	log      *slog.Logger
-	jobs     map[string]*Job
-	archives map[string][]*Archive // job_id -> archives, newest first
+	mu        sync.RWMutex
+	dir       string
+	log       *slog.Logger
+	jobs      map[string]*Job
+	archives  map[string][]*Archive // job_id -> archives, newest first
+	s3Targets map[string]*S3Target
 }
 
 const (
 	jobsFile          = "snapshots.json"
 	archivesFile      = "snapshot_archives.jsonl"
+	s3TargetsFile     = "s3_targets.json"
 	maxArchiveHistory = 500 // per job, metadata records only
 )
 
@@ -92,12 +98,16 @@ func NewStore(dataDir string, log *slog.Logger) (*Store, error) {
 		log = slog.Default()
 	}
 	s := &Store{
-		dir:      dataDir,
-		log:      log,
-		jobs:     make(map[string]*Job),
-		archives: make(map[string][]*Archive),
+		dir:       dataDir,
+		log:       log,
+		jobs:      make(map[string]*Job),
+		archives:  make(map[string][]*Archive),
+		s3Targets: make(map[string]*S3Target),
 	}
 	if err := s.loadJobs(); err != nil {
+		return nil, err
+	}
+	if err := s.loadS3Targets(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -282,4 +292,118 @@ func (s *Store) rewriteArchivesLocked() error {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(s.dir, archivesFile))
+}
+
+// ---- S3 Storage Targets ----
+
+func (s *Store) s3TargetsPath() string {
+	return filepath.Join(s.dir, s3TargetsFile)
+}
+
+func (s *Store) loadS3Targets() error {
+	b, err := os.ReadFile(s.s3TargetsPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read %s: %w", s3TargetsFile, err)
+	}
+	var list []*S3Target
+	if err := json.Unmarshal(b, &list); err != nil {
+		s.log.Warn("s3_targets.json corrupted, starting empty", "err", err)
+		return nil
+	}
+	for _, t := range list {
+		s.s3Targets[t.ID] = t
+	}
+	return nil
+}
+
+func (s *Store) saveS3TargetsLocked() error {
+	list := make([]*S3Target, 0, len(s.s3Targets))
+	for _, t := range s.s3Targets {
+		list = append(list, t)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
+	b, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(s.dir, fmt.Sprintf("%s.tmp.%d", s3TargetsFile, time.Now().UnixNano()))
+	if err := os.WriteFile(tmp, b, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.s3TargetsPath())
+}
+
+// ListS3Targets returns all S3 targets with SecretKey masked.
+func (s *Store) ListS3Targets() []*S3Target {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list := make([]*S3Target, 0, len(s.s3Targets))
+	for _, t := range s.s3Targets {
+		list = append(list, t.Redacted())
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
+	return list
+}
+
+// GetS3Target returns one S3 target with full credentials for server-side S3 operations.
+func (s *Store) GetS3Target(id string) (*S3Target, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.s3Targets[id]
+	if !ok {
+		return nil, false
+	}
+	cp := *t
+	return &cp, true
+}
+
+// GetDefaultS3Target returns the target marked as default.
+func (s *Store) GetDefaultS3Target() (*S3Target, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, t := range s.s3Targets {
+		if t.IsDefault {
+			cp := *t
+			return &cp, true
+		}
+	}
+	return nil, false
+}
+
+// PutS3Target creates or updates an S3 storage target.
+func (s *Store) PutS3Target(t *S3Target) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t.ID == "" {
+		t.ID = "s3_" + randomHex(8)
+	}
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = time.Now()
+	}
+	// If marked default, clear default from others
+	if t.IsDefault {
+		for _, existing := range s.s3Targets {
+			existing.IsDefault = false
+		}
+	}
+	s.s3Targets[t.ID] = t
+	return s.saveS3TargetsLocked()
+}
+
+// DeleteS3Target removes an S3 storage target.
+func (s *Store) DeleteS3Target(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.s3Targets[id]; !ok {
+		return fmt.Errorf("s3 target %s not found", id)
+	}
+	delete(s.s3Targets, id)
+	return s.saveS3TargetsLocked()
+}
+
+func randomHex(n int) string {
+	return fmt.Sprintf("%x", time.Now().UnixNano())[:n]
 }

@@ -43,3 +43,11 @@ docker_ps.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Temporary testing scripts and screenshot crops
+*.png
+*.jpg
+*.ps1
+*.py
+__pycache__/
+web/web-dist.tar.gz

@@ -331,3 +331,18 @@ export function sessionRecordingUrl(id: string): string {
   const token = localStorage.getItem('watchman_token') || ''
   return `${baseURL}/sessions/${id}/recording?token=${encodeURIComponent(token)}`
 }
+
+export interface UpgradeAgentResult {
+  ok: boolean
+  version: string
+  message: string
+}
+
+// upgradeAgent triggers in-place self-upgrade on a target managed host.
+// The agent downloads the latest binary for its platform from the server,
+// verifies sha256, replaces itself, and reboots seamlessly.
+export function upgradeAgent(hostId: string, version = '', sha256 = '') {
+  return unwrap<UpgradeAgentResult>(
+    http.post(`/hosts/${hostId}/upgrade`, { version, sha256 }, { timeout: 130000 }),
+  )
+}

@@ -33,15 +33,19 @@ import {
   CopyOutline,
   CheckmarkCircleOutline,
   LayersOutline,
+  ArrowUpCircleOutline,
+  GitNetworkOutline,
 } from '@vicons/ionicons5'
 import OsLogo from '../../components/common/OsLogo.vue'
 import { useHostsStore } from '../../stores/hosts'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { useAuthStore } from '../../stores/auth'
-import { enroll, deleteHost, setHostGroup } from '../../api/hosts'
+import { enroll, deleteHost, setHostGroup, upgradeAgent } from '../../api/hosts'
+import { listNetworkNodes } from '../../api/network'
 import { listGroups, type HostGroup } from '../../api/groups'
 import { copyToClipboard } from '../../utils/clipboard'
 import type { Host } from '../../api/types'
+import type { NetworkNode } from '../../api/network'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'HostList' })
@@ -65,6 +69,20 @@ const groupFilter = ref<string>('')
 const showGroupModal = ref(false)
 const groupTarget = ref<Host | null>(null)
 const groupChoice = ref<string>('')
+const networkNodesMap = ref<Record<string, NetworkNode>>({})
+
+async function loadNetworkNodes() {
+  try {
+    const list = await listNetworkNodes()
+    const map: Record<string, NetworkNode> = {}
+    for (const node of list) {
+      map[node.host_id] = node
+    }
+    networkNodesMap.value = map
+  } catch {
+    networkNodesMap.value = {}
+  }
+}
 
 const groupFilterOptions = computed(() => [
   { label: '全部分组', value: '' },
@@ -220,6 +238,15 @@ function goAudit() {
 function handleMenuSelect(key: string, host: Host) {
   if (key === 'detail') {
     goDetail(host, 'metrics')
+  } else if (key === 'network') {
+    workspace.openTab({
+      key: '/network',
+      title: '异地组网',
+      path: '/network',
+      closable: true,
+      viewName: 'NetworkList',
+    })
+    router.push('/network')
   } else if (key === 'terminal') {
     goDetail(host, 'terminal')
   } else if (key === 'files') {
@@ -230,6 +257,27 @@ function handleMenuSelect(key: string, host: Host) {
     goExec()
   } else if (key === 'group') {
     openGroupModal(host)
+  } else if (key === 'upgrade') {
+    if (host.status !== 'online') {
+      message.warning('主机已离线，无法下发在线升级指令')
+      return
+    }
+    dialog.info({
+      title: '升级 Agent 确认',
+      content: `确定将主机 "${host.hostname}" 的 Agent 升级至控制端最新版本吗？\n升级过程中 Agent 将下载最新对应平台二进制，校验并平滑重启服务。`,
+      positiveText: '开始升级',
+      negativeText: '取消',
+      onPositiveClick: async () => {
+        message.loading('正在下发升级指令并等待 Agent 替换重启…', { duration: 6000 })
+        try {
+          const res = await upgradeAgent(host.id)
+          message.success(res.message || 'Agent 升级成功，正在重启自愈连线！')
+          setTimeout(() => store.fetchList(), 4000)
+        } catch (e: any) {
+          message.error(e.message || 'Agent 升级失败')
+        }
+      },
+    })
   } else if (key === 'unbind') {
     dialog.warning({
       title: '解绑主机确认',
@@ -254,6 +302,11 @@ const menuOptions = [
     label: '运维监控',
     key: 'detail',
     icon: () => h(NIcon, null, { default: () => h(PulseOutline) }),
+  },
+  {
+    label: '异地组网 (Tailscale)',
+    key: 'network',
+    icon: () => h(NIcon, { color: '#10b981' }, { default: () => h(GitNetworkOutline) }),
   },
   {
     label: '在线终端',
@@ -283,6 +336,11 @@ const menuOptions = [
     label: '设置分组',
     key: 'group',
     icon: () => h(NIcon, null, { default: () => h(LayersOutline) }),
+  },
+  {
+    label: '升级 Agent',
+    key: 'upgrade',
+    icon: () => h(NIcon, { color: '#6366f1' }, { default: () => h(ArrowUpCircleOutline) }),
   },
   {
     label: '解绑主机',
@@ -338,13 +396,14 @@ async function copyIp(ip?: string) {
 }
 
 async function refresh() {
-  await Promise.all([store.fetchList(), loadGroups()])
+  await Promise.all([store.fetchList(), loadGroups(), loadNetworkNodes()])
 }
 
 onMounted(() => {
   workspace.setActiveKey('/hosts')
   store.fetchList().catch((e) => message.error(e.message))
   loadGroups()
+  loadNetworkNodes()
 })
 </script>
 
@@ -472,8 +531,17 @@ onMounted(() => {
               </div>
             </div>
 
-            <!-- 5. 内网与外网 IP + 地理位置 -->
+            <!-- 5. 内网与外网 IP + 组网 IP + 地理位置 -->
             <div class="col-ips">
+              <div
+                v-if="networkNodesMap[host.id]?.online && networkNodesMap[host.id]?.ip"
+                class="ip-line is-copyable text-emerald-wrap"
+                :title="`点击复制异地组网虚拟 IP (${networkNodesMap[host.id].ip})`"
+                @click.stop="copyIp(networkNodesMap[host.id].ip)"
+              >
+                <span class="ip-label ip-label-net">网</span>
+                <span class="ip-value ip-value-net">{{ networkNodesMap[host.id].ip }}</span>
+              </div>
               <div
                 class="ip-line"
                 :class="{ 'is-copyable': host.internal_ip && host.internal_ip !== '-' }"
@@ -756,6 +824,25 @@ onMounted(() => {
 
                   .ip-value {
                     color: #6366f1;
+                  }
+                }
+              }
+
+              &.text-emerald-wrap {
+                .ip-label-net {
+                  color: #10b981;
+                  font-weight: 600;
+                }
+                .ip-value-net {
+                  color: #10b981;
+                  font-weight: 600;
+                  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+                }
+                &:hover {
+                  color: #059669;
+                  background-color: rgba(16, 185, 129, 0.08);
+                  .ip-value-net {
+                    color: #059669;
                   }
                 }
               }

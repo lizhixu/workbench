@@ -678,3 +678,29 @@ func randomToken(n int) string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+// MockConnectForTest marks the hub as connected for unit tests without a real gRPC stream.
+func (h *Hub) MockConnectForTest() {
+	h.mu.Lock()
+	h.stream = &mockConnectServer{}
+	h.mu.Unlock()
+}
+
+type mockConnectServer struct {
+	agentpb.AgentService_ConnectServer
+}
+
+// RecvForTest reads the next message sent to the agent's outbound channel.
+func (h *Hub) RecvForTest(timeout time.Duration) (*agentpb.ServerMessage, bool) {
+	select {
+	case msg := <-h.sendCh:
+		return msg, true
+	case <-time.After(timeout):
+		return nil, false
+	}
+}
+
+// DispatchRespForTest dispatches a mock agent response to registered handlers.
+func (h *Hub) DispatchRespForTest(ref string, msg *agentpb.AgentMessage) {
+	h.dispatchResp(ref, msg)
+}

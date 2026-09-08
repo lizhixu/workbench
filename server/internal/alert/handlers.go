@@ -115,10 +115,6 @@ func (h *Handlers) clearEvents(c *gin.Context) {
 
 func (h *Handlers) getWebhook(c *gin.Context) {
 	w := h.store.GetWebhook()
-	// Don't expose the secret in full.
-	if w.Secret != "" {
-		w.Secret = "********"
-	}
 	c.JSON(http.StatusOK, gin.H{"data": w})
 }
 

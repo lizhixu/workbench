@@ -323,7 +323,12 @@ async function loadRules() {
 
 async function loadWebhook() {
   try {
-    webhook.value = await getWebhook()
+    const loaded = await getWebhook()
+    webhook.value = {
+      url: loaded.url || '',
+      secret: loaded.secret || '',
+      enabled: !!loaded.enabled,
+    }
   } catch (e: any) {
     message.error(e.message)
   }
@@ -412,7 +417,7 @@ async function saveWebhook() {
   try {
     await setWebhook(webhook.value)
     message.success('Webhook 配置已保存')
-    loadWebhook()
+    await loadWebhook()
   } catch (e: any) {
     message.error(e.message)
   }
@@ -421,6 +426,7 @@ async function saveWebhook() {
 // Webhook 测试推送状态
 const testingWebhook = ref(false)
 const webhookTestResult = ref<WebhookTestResult | null>(null)
+const showWebhookPreview = ref(false)
 
 const detectedWebhookPlatform = computed(() => {
   const u = (webhook.value.url || '').toLowerCase().trim()
@@ -458,6 +464,67 @@ async function doTestWebhook() {
     testingWebhook.value = false
   }
 }
+
+const webhookPreview = computed(() => {
+  const platform = detectedWebhookPlatform.value
+  const url = webhook.value.url?.trim() || ''
+  const secret = webhook.value.secret?.trim() || ''
+  const maskedURL = url
+    ? url.replace(/(access_token=|key=|token=)[^&]+/gi, '$1••••••••')
+    : '等待输入 Webhook URL'
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  const payload: Record<string, unknown> = {
+    event: {
+      id: 'preview-event',
+      rule_name: 'Webhook 告警通知',
+      severity: 'info',
+      hostname: 'watchman-console',
+      message: '这是一条告警消息预览，真实发送时会替换为实际事件内容。',
+      fired_at: '发送时动态生成',
+    },
+    timestamp: '发送时动态生成',
+  }
+  let body: Record<string, unknown> = payload
+  let signing = '不使用签名'
+  if (platform?.name.includes('钉钉')) {
+    signing = secret
+      ? '已配置 Secret；发送时生成 timestamp + HmacSHA256 sign，并追加到 URL'
+      : '未配置 Secret，不会生成签名'
+    body = {
+      msgtype: 'markdown',
+      markdown: {
+        title: '[🔔] Webhook 告警通知: watchman-console',
+        text: '### 🔔 Webhook 告警通知\\n\\n- **告警级别**: INFO 信息\\n- **关联主机**: `watchman-console`\\n- **详情说明**: 这是一条告警消息预览。',
+      },
+    }
+  } else if (platform?.name.includes('企业微信')) {
+    signing = '按企业微信机器人协议发送 Markdown'
+    body = {
+      msgtype: 'markdown',
+      markdown: { content: '### Watchman 告警通知\\n> 告警级别: <font color=\\"comment\\">信息</font>' },
+    }
+  } else if (platform?.name.includes('飞书')) {
+    signing = secret
+      ? (secret === '********'
+        ? '已配置 Secret；发送时生成 timestamp + HmacSHA256 sign'
+        : '发送时生成 timestamp + HmacSHA256 sign')
+      : '未配置 Secret，不会生成签名'
+    body = {
+      msg_type: 'text',
+      content: { text: '🛡️ Watchman 告警通知\\n【规则名称】Webhook 告警通知' },
+    }
+  } else if (secret && secret !== '********') {
+    headers['X-Webhook-Secret'] = '••••••••'
+  }
+  return {
+    platform: platform?.name || '未识别平台',
+    url: maskedURL,
+    method: 'POST',
+    headers,
+    signing,
+    body: JSON.stringify(body, null, 2),
+  }
+})
 
 async function doAckEvent(id: string) {
   try {
@@ -737,21 +804,55 @@ onMounted(() => {
               </NForm>
 
               <NSpace justify="space-between" align="center" style="margin-top: 16px">
-                <NButton
-                  secondary
-                  type="info"
-                  :loading="testingWebhook"
-                  :disabled="!webhook.url"
-                  @click="doTestWebhook"
-                >
-                  <template #icon><NIcon :component="PaperPlaneOutline" /></template>
-                  发送测试消息
-                </NButton>
+                <NSpace align="center" :size="8">
+                  <NButton
+                    secondary
+                    type="info"
+                    :loading="testingWebhook"
+                    :disabled="!webhook.url"
+                    @click="doTestWebhook"
+                  >
+                    <template #icon><NIcon :component="PaperPlaneOutline" /></template>
+                    发送测试消息
+                  </NButton>
+                  <NButton
+                    quaternary
+                    size="small"
+                    :disabled="!webhook.url"
+                    @click="showWebhookPreview = !showWebhookPreview"
+                  >
+                    <template #icon><NIcon :component="InformationCircleOutline" /></template>
+                    {{ showWebhookPreview ? '收起请求预览' : '查看请求预览' }}
+                  </NButton>
+                </NSpace>
                 <NButton type="primary" @click="saveWebhook">
                   <template #icon><NIcon :component="NotificationsOutline" /></template>
                   保存配置
                 </NButton>
               </NSpace>
+
+              <!-- 实际请求预览：仅展示将发送的结构，签名在发送瞬间动态生成，不展示失效静态签名 -->
+              <div v-if="showWebhookPreview" class="webhook-preview-box">
+                <div class="preview-head">
+                  <div class="preview-title">
+                    <NIcon size="15" color="#6366f1"><InformationCircleOutline /></NIcon>
+                    请求预览
+                  </div>
+                  <span class="preview-note">预览不发送请求</span>
+                </div>
+                <div class="preview-grid">
+                  <div class="preview-label">目标平台</div>
+                  <div class="preview-value"><NTag size="tiny" type="info" round>{{ webhookPreview.platform }}</NTag></div>
+                  <div class="preview-label">请求</div>
+                  <div class="preview-value mono">{{ webhookPreview.method }} {{ webhookPreview.url }}</div>
+                  <div class="preview-label">签名处理</div>
+                  <div class="preview-value">{{ webhookPreview.signing }}</div>
+                  <div class="preview-label">请求头</div>
+                  <pre class="preview-code">{{ JSON.stringify(webhookPreview.headers, null, 2) }}</pre>
+                  <div class="preview-label">消息体</div>
+                  <pre class="preview-code">{{ webhookPreview.body }}</pre>
+                </div>
+              </div>
 
               <!-- 测试推送结果反馈卡片 -->
               <div v-if="webhookTestResult" class="test-result-box" :class="{ success: webhookTestResult.ok, error: !webhookTestResult.ok }">
@@ -1072,6 +1173,78 @@ onMounted(() => {
       font-size: 13px;
       color: var(--text-secondary);
       line-height: 1.5;
+    }
+
+    .webhook-preview-box {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: 6px;
+      background: rgba(99, 102, 241, 0.045);
+      border: 1px solid rgba(99, 102, 241, 0.2);
+
+      .preview-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding-bottom: 8px;
+        margin-bottom: 8px;
+        border-bottom: 1px solid var(--border-color);
+
+        .preview-title {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 13px;
+          font-weight: 600;
+          color: var(--text-primary);
+        }
+
+        .preview-note {
+          font-size: 11px;
+          color: var(--text-secondary);
+        }
+      }
+
+      .preview-grid {
+        display: grid;
+        grid-template-columns: 72px minmax(0, 1fr);
+        align-items: start;
+        gap: 8px 10px;
+        font-size: 12px;
+
+        .preview-label {
+          color: var(--text-secondary);
+          line-height: 1.5;
+        }
+
+        .preview-value {
+          min-width: 0;
+          color: var(--text-primary);
+          line-height: 1.5;
+
+          &.mono {
+            font-family: var(--font-mono, monospace);
+            color: #10b981;
+            word-break: break-all;
+          }
+        }
+
+        .preview-code {
+          min-width: 0;
+          max-height: 150px;
+          margin: 0;
+          padding: 7px 9px;
+          border-radius: 4px;
+          overflow: auto;
+          background: var(--code-box-bg);
+          color: var(--text-primary);
+          font-family: var(--font-mono, monospace);
+          font-size: 11px;
+          line-height: 1.45;
+          white-space: pre-wrap;
+          word-break: break-all;
+        }
+      }
     }
 
     .test-result-box {

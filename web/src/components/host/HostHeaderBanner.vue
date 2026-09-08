@@ -1,33 +1,63 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { NButton, NIcon, NPopconfirm, useMessage } from 'naive-ui'
 import {
   PowerOutline,
   ChevronUpOutline,
   ChevronDownOutline,
+  ArrowUpCircleOutline,
 } from '@vicons/ionicons5'
 import OsLogo from '../common/OsLogo.vue'
-import { execCommand } from '../../api/hosts'
+import { execCommand, upgradeAgent } from '../../api/hosts'
+import { listNetworkNodes } from '../../api/network'
 import type { Host } from '../../api/types'
+import type { NetworkNode } from '../../api/network'
 import { copyToClipboard } from '../../utils/clipboard'
+import { useAuthStore } from '../../stores/auth'
 
 const props = defineProps<{
   host: Host
 }>()
+const emit = defineEmits<{
+  (e: 'refresh'): void
+}>()
 
 const message = useMessage()
+const auth = useAuthStore()
+const isAdmin = computed(() => auth.role === 'admin')
 const expanded = ref(true)
 const powering = ref(false)
+const upgrading = ref(false)
+const tailscaleIp = ref<string>('')
+
+async function fetchTailscaleIp() {
+  try {
+    const nodes = await listNetworkNodes()
+    const found = nodes.find((n: NetworkNode) => n.host_id === props.host.id)
+    if (found && found.online && found.ip) {
+      tailscaleIp.value = found.ip
+    } else {
+      tailscaleIp.value = ''
+    }
+  } catch {
+    tailscaleIp.value = ''
+  }
+}
+
+onMounted(fetchTailscaleIp)
+watch(() => props.host.id, fetchTailscaleIp)
+
+async function copyTailscaleIp() {
+  if (!tailscaleIp.value) return
+  const ok = await copyToClipboard(tailscaleIp.value)
+  if (ok) {
+    message.success(`已复制异地组网虚拟 IP (${tailscaleIp.value})`)
+  } else {
+    message.warning('复制失败')
+  }
+}
 
 const distro = computed(() => props.host.distro || props.host.os || '')
-
-function fmtArch(arch?: string): string {
-  const a = (arch || '').toLowerCase()
-  if (a === 'amd64' || a === 'x86_64' || a === 'x64') return 'x64'
-  if (a === 'arm64' || a === 'aarch64') return 'arm64'
-  if (a === '386' || a === 'x86') return 'x86'
-  return arch || 'x64'
-}
 
 function formatMem(bytes?: number): string {
   if (!bytes || bytes <= 0) return '-'
@@ -99,21 +129,39 @@ async function handlePowerOff() {
     message.warning('主机离线，无法下发指令')
     return
   }
-  powering.value = true
-  try {
-    // Execute a shutdown command via the real exec API.
-    const cmd =
-      (props.host.os || '').toLowerCase().includes('windows')
-        ? 'shutdown /s /t 0'
-        : 'shutdown -h now'
-    await execCommand(props.host.id, cmd)
-    message.success('已向受控 Agent 下发关机指令')
-  } catch (e: any) {
-    message.error(e.message || '关机指令下发失败')
-  } finally {
-    powering.value = false
-  }
-}
+	  powering.value = true
+	  try {
+	    // Execute a shutdown command via the real exec API.
+	    const cmd =
+	      (props.host.os || '').toLowerCase().includes('windows')
+	        ? 'shutdown /s /t 0'
+	        : 'shutdown -h now'
+	    await execCommand(props.host.id, cmd)
+	    message.success('已向受控 Agent 下发关机指令')
+	  } catch (e: any) {
+	    message.error(e.message || '关机指令下发失败')
+	  } finally {
+	    powering.value = false
+	  }
+	}
+
+	async function handleUpgradeAgent() {
+	  if (props.host.status !== 'online') {
+	    message.warning('主机已离线，无法下发在线升级指令')
+	    return
+	  }
+	  upgrading.value = true
+	  message.info('正在向 Agent 下发热升级任务，下载并替换二进制中…')
+	  try {
+	    const res = await upgradeAgent(props.host.id)
+	    message.success(res.message || 'Agent 升级成功，正在重启自愈连线！')
+	    emit('refresh')
+	  } catch (e: any) {
+	    message.error(e.message || 'Agent 升级失败')
+	  } finally {
+	    upgrading.value = false
+	  }
+	}
 </script>
 
 <template>
@@ -146,8 +194,11 @@ async function handlePowerOff() {
             </span>
           </div>
           <div class="spec-row">
-            <span class="spec-label">系统架构</span>
-            <span class="spec-value">{{ fmtArch(host.arch) }}</span>
+            <span class="spec-label">异地组网</span>
+            <span v-if="tailscaleIp" class="spec-value mono-font copyable-ip is-clickable text-emerald" title="点击复制 Tailscale 虚拟 IP" @click="copyTailscaleIp">
+              {{ tailscaleIp }}
+            </span>
+            <span v-else class="spec-value text-muted" style="font-size: 12px">未连接</span>
           </div>
         </div>
 
@@ -165,7 +216,24 @@ async function handlePowerOff() {
         <div class="spec-column">
           <div class="spec-row">
             <span class="spec-label">Agent</span>
-            <span class="spec-value mono-font">{{ host.agent_version || '-' }}</span>
+            <div class="agent-version-wrap">
+              <span class="spec-value mono-font">{{ host.agent_version || '-' }}</span>
+              <NPopconfirm v-if="isAdmin && host.status === 'online'" @positive-click="handleUpgradeAgent">
+                <template #trigger>
+                  <button
+                    class="upgrade-agent-btn"
+                    :class="{ 'is-loading': upgrading }"
+                    :disabled="upgrading"
+                    title="一键热升级 Agent 到控制端最新版本"
+                  >
+                    <NIcon size="13" :component="ArrowUpCircleOutline" />
+                    <span>{{ upgrading ? '升级中' : '升级' }}</span>
+                  </button>
+                </template>
+                确认将主机 {{ host.hostname }} 的 Agent 升级至控制端最新版本？<br/>
+                升级过程将下载适配该系统架构的二进制，校验并平滑重启服务。
+              </NPopconfirm>
+            </div>
           </div>
           <div class="spec-row">
             <span class="spec-label">所属分组</span>
@@ -308,10 +376,53 @@ async function handlePowerOff() {
           }
         }
 
+        &.text-emerald {
+          color: #10b981;
+          font-weight: 600;
+
+          &:hover {
+            color: #059669;
+            background-color: rgba(16, 185, 129, 0.08);
+          }
+        }
+
         &.cpu-value {
           max-width: 220px;
           overflow: hidden;
           text-overflow: ellipsis;
+        }
+      }
+
+      .agent-version-wrap {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+
+        .upgrade-agent-btn {
+          display: inline-flex;
+          align-items: center;
+          gap: 2px;
+          padding: 1px 6px;
+          border-radius: 4px;
+          border: 1px solid rgba(99, 102, 241, 0.3);
+          background: rgba(99, 102, 241, 0.1);
+          color: #6366f1;
+          font-size: 11px;
+          font-weight: 500;
+          cursor: pointer;
+          transition: all 0.15s ease;
+          outline: none;
+
+          &:hover:not(:disabled) {
+            background: #6366f1;
+            color: #ffffff;
+          }
+
+          &.is-loading,
+          &:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+          }
         }
       }
     }

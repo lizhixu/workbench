@@ -40,6 +40,10 @@ import {
   BarChartOutline,
   ChevronBackOutline,
   ChevronForwardOutline,
+  GitNetworkOutline,
+  RocketOutline,
+  ShieldCheckmarkOutline,
+  ArchiveOutline,
 } from '@vicons/ionicons5'
 
 const router = useRouter()
@@ -77,6 +81,10 @@ const navEntries: NavEntry[] = [
   { key: '/audit', title: '操作审计', path: '/audit', icon: DocumentTextOutline, adminOnly: true, viewName: 'AuditList' },
   { key: '/alerts', title: '消息中心', path: '/alerts', icon: NotificationsOutline, viewName: 'AlertList' },
   { key: '/vault', title: '凭据金库', path: '/vault', icon: KeyOutline, adminOnly: true, viewName: 'CredentialList' },
+  { key: '/network', title: '异地组网', path: '/network', icon: GitNetworkOutline, viewName: 'NetworkList' },
+  { key: '/apps', title: '应用发布', path: '/apps', icon: RocketOutline, viewName: 'AppList' },
+  { key: '/certs', title: '证书中心', path: '/certs', icon: ShieldCheckmarkOutline, viewName: 'CertList' },
+  { key: '/snapshots', title: '快照备份', path: '/snapshots', icon: ArchiveOutline, viewName: 'SnapshotList' },
   { key: '/groups', title: '分组权限', path: '/groups', icon: LayersOutline, viewName: 'GroupList' },
   { key: '/users', title: '用户管理', path: '/users', icon: PeopleOutline, adminOnly: true, viewName: 'UserList' },
   { key: '/ai/chat', title: 'AI 助手', path: '/ai/chat', icon: SparklesOutline, viewName: 'AiChat' },
@@ -342,9 +350,7 @@ function handleUser(key: string) {
     <NLayoutHeader class="app-top-header">
       <div class="header-left">
         <div class="brand-logo" @click="router.push('/hosts')">
-          <div class="logo-badge">
-            <NIcon size="18" color="#ffffff"><ServerOutline /></NIcon>
-          </div>
+          <img src="/k-works.png" class="logo-img" alt="Logo" />
           <span class="brand-title">牧云主机管理助手</span>
         </div>
 
@@ -555,17 +561,21 @@ function handleUser(key: string) {
   .brand-logo {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 10px;
     cursor: pointer;
+    user-select: none;
 
-    .logo-badge {
-      width: 28px;
-      height: 28px;
-      border-radius: 6px;
-      background: linear-gradient(135deg, #6366f1 0%, #3b82f6 100%);
-      display: flex;
-      align-items: center;
-      justify-content: center;
+    .logo-img {
+      width: 30px;
+      height: 30px;
+      object-fit: contain;
+      border: none;
+      box-shadow: none;
+      transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    &:hover .logo-img {
+      transform: scale(1.08);
     }
 
     .brand-title {

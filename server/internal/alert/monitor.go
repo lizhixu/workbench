@@ -38,11 +38,13 @@ type Monitor struct {
 	log          *slog.Logger
 	stop         chan struct{}
 
-	mu           sync.Mutex
-	startTime    time.Time
-	bootGrace    time.Duration
-	bootstrapped bool
-	prevStatus   map[string]string // hostID -> "online" | "offline"
+	mu        sync.Mutex
+	startTime time.Time
+	bootGrace time.Duration
+	ready     bool
+
+	prevStatus           map[string]string // hostID -> "online" | "offline"
+	startupOnlinePending map[string]bool   // known-at-start offline hosts: suppress first reconnect
 }
 
 // NewMonitor creates a monitor that evaluates rules every interval.
@@ -53,15 +55,16 @@ func NewMonitor(store *Store, provider HostProvider, metricsStore *metrics.Store
 		log = slog.Default()
 	}
 	return &Monitor{
-		store:        store,
-		provider:     provider,
-		metricsStore: metricsStore,
-		aiAssistant:  aiAssistant,
-		log:          log,
-		stop:         make(chan struct{}),
-		startTime:    time.Now(),
-		bootGrace:    90 * time.Second, // aligns with reaper window (heartbeatSec 30s * heartbeatGraceFactor 3)
-		prevStatus:   make(map[string]string),
+		store:                store,
+		provider:             provider,
+		metricsStore:         metricsStore,
+		aiAssistant:          aiAssistant,
+		log:                  log,
+		stop:                 make(chan struct{}),
+		startTime:            time.Now(),
+		bootGrace:            90 * time.Second, // aligns with reaper window (heartbeatSec 30s * heartbeatGraceFactor 3)
+		prevStatus:           make(map[string]string),
+		startupOnlinePending: make(map[string]bool),
 	}
 }
 
@@ -103,12 +106,12 @@ func (m *Monitor) evaluate() {
 	hosts := m.provider.ListHosts()
 
 	m.mu.Lock()
-	firstRun := !m.bootstrapped
-	isBootstrapping := firstRun || time.Since(m.startTime) < m.bootGrace
+	firstRun := !m.ready && len(m.prevStatus) == 0
+	isBootstrapping := !m.ready && time.Since(m.startTime) < m.bootGrace
+	boundaryRun := false
 	if firstRun {
-		// First evaluation on startup: establish baseline for all currently
-		// known hosts. Pre-seed online firing state so already-online hosts
-		// do not fire "host online" notifications.
+		// Establish a baseline from the persisted registry. Hosts may be loaded
+		// as offline and reconnect asynchronously; none of this is an alert.
 		for _, host := range hosts {
 			m.prevStatus[host.ID] = host.Status
 			if host.Status == "online" {
@@ -119,7 +122,23 @@ func (m *Monitor) evaluate() {
 				}
 			}
 		}
-		m.bootstrapped = true
+	}
+	if !isBootstrapping && !m.ready {
+		// The first tick after the grace window is a synchronization boundary,
+		// not a notification tick. This catches agents that reconnect just after
+		// the grace deadline and prevents a false offline -> online transition.
+		for _, host := range hosts {
+			m.prevStatus[host.ID] = host.Status
+			if host.Status == "online" {
+				for _, rule := range rules {
+					if rule.Type == RuleOnline {
+						m.store.setFiring(rule.ID+":"+host.ID, true)
+					}
+				}
+			}
+		}
+		m.ready = true
+		boundaryRun = true
 	}
 	m.mu.Unlock()
 
@@ -127,10 +146,9 @@ func (m *Monitor) evaluate() {
 		if !rule.Enabled {
 			continue
 		}
-		// Cold-start suppression: during the boot grace period, do not fire
-		// online notifications or offline alarms. This gives agents time to
-		// reconnect after a server restart without false alarms.
-		if isBootstrapping && (rule.Type == RuleOnline || rule.Type == RuleOffline) {
+		// During startup and on the first post-startup synchronization tick,
+		// suppress both edge rules. Resource rules continue to be evaluated.
+		if (isBootstrapping || boundaryRun) && (rule.Type == RuleOnline || rule.Type == RuleOffline) {
 			continue
 		}
 		for _, host := range hosts {
@@ -141,16 +159,8 @@ func (m *Monitor) evaluate() {
 		}
 	}
 
-	// Update host status tracking and seed online firing state during bootstrap.
 	m.mu.Lock()
 	for _, host := range hosts {
-		if isBootstrapping && host.Status == "online" {
-			for _, rule := range rules {
-				if rule.Type == RuleOnline {
-					m.store.setFiring(rule.ID+":"+host.ID, true)
-				}
-			}
-		}
 		m.prevStatus[host.ID] = host.Status
 	}
 	m.mu.Unlock()
@@ -237,30 +247,38 @@ func (m *Monitor) checkRule(rule *Rule, host HostInfo) {
 	triggered := false
 	message := ""
 
-		switch rule.Type {
-		case RuleOffline:
-			if host.Status != "online" {
+	switch rule.Type {
+	case RuleOffline:
+		if host.Status != "online" {
+			triggered = true
+			message = fmt.Sprintf("主机 %s 已离线", host.Hostname)
+		}
+	case RuleOnline:
+		m.mu.Lock()
+		prev, hasPrev := m.prevStatus[host.ID]
+		startupPending := m.startupOnlinePending[host.ID]
+		booting := !m.ready
+		m.mu.Unlock()
+		if host.Status == "online" {
+			if booting && startupPending {
+				// The host was already known before this server boot and has
+				// merely reconnected during the grace window; never notify.
+				break
+			}
+
+			// Edge-triggered: fire ONLY if previously observed as offline,
+			// or if newly discovered (hasPrev == false).
+			if (hasPrev && prev != "online") || !hasPrev {
 				triggered = true
-				message = fmt.Sprintf("主机 %s 已离线", host.Hostname)
+				message = fmt.Sprintf("主机 %s 已上线", host.Hostname)
+			} else if m.store.isFiring(key) {
+				// Steady-state online: keep triggered=true so the monitor does
+				// not treat it as cleared and call resolveEvent/clearFiring.
+				triggered = true
+				message = fmt.Sprintf("主机 %s 已上线", host.Hostname)
 			}
-		case RuleOnline:
-			m.mu.Lock()
-			prev, hasPrev := m.prevStatus[host.ID]
-			m.mu.Unlock()
-			if host.Status == "online" {
-				// Edge-triggered: fire ONLY if previously observed as offline,
-				// or if newly discovered (hasPrev == false).
-				if (hasPrev && prev != "online") || !hasPrev {
-					triggered = true
-					message = fmt.Sprintf("主机 %s 已上线", host.Hostname)
-				} else if m.store.isFiring(key) {
-					// Steady-state online: keep triggered=true so the monitor does
-					// not treat it as cleared and call resolveEvent/clearFiring.
-					triggered = true
-					message = fmt.Sprintf("主机 %s 已上线", host.Hostname)
-				}
-			}
-		case RuleCPUHigh:
+		}
+	case RuleCPUHigh:
 		if host.Metrics != nil && host.Metrics.GetCpuUsage() > rule.Threshold {
 			triggered = true
 			message = fmt.Sprintf("主机 %s CPU 使用率 %.1f%% 超过阈值 %.0f%%", host.Hostname, host.Metrics.GetCpuUsage(), rule.Threshold)

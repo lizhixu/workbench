@@ -10,6 +10,7 @@ import {
   ShieldCheckmarkOutline,
   TerminalOutline,
   StorefrontOutline,
+  GitNetworkOutline,
 } from '@vicons/ionicons5'
 import { getHost } from '../../api/hosts'
 import type { Host } from '../../api/types'
@@ -28,6 +29,7 @@ const TerminalPane = defineAsyncComponent(() => import('../../components/host/Te
 const DockerView = defineAsyncComponent(() => import('../docker/Docker.vue'))
 const AppStoreView = defineAsyncComponent(() => import('../apps/AppStore.vue'))
 const VulnerabilitiesView = defineAsyncComponent(() => import('./tabs/Vulnerabilities.vue'))
+const HostNetworkPane = defineAsyncComponent(() => import('../../components/host/HostNetworkPane.vue'))
 
 const route = useRoute()
 const router = useRouter()
@@ -45,6 +47,7 @@ const subNavItems = [
   { key: 'docker', label: 'Docker', icon: CubeOutline },
   { key: 'apps', label: '应用市场', icon: StorefrontOutline },
   { key: 'vulnerabilities', label: '漏洞管理', icon: ShieldCheckmarkOutline },
+  { key: 'network', label: '异地组网', icon: GitNetworkOutline },
 ]
 
 const validTabs = subNavItems.map((i) => i.key)
@@ -117,7 +120,7 @@ onMounted(load)
     <NSpin v-if="loading" class="spin-center" />
     <template v-else-if="host">
       <!-- 顶部固定主机 Header 横幅 -->
-      <HostHeaderBanner :host="host" />
+      <HostHeaderBanner :host="host" @refresh="load" />
 
       <!-- 下部主内容区：左侧窄版二级 Icon 导航 + 右侧模块面板 -->
       <div class="detail-body-container">
@@ -181,6 +184,14 @@ onMounted(load)
 
               <!-- 漏洞管理 (P3) -->
               <VulnerabilitiesView v-else-if="activeSubTab === 'vulnerabilities'" :host-id="host.id" />
+
+              <!-- 异地组网 (Tailscale) -->
+              <HostNetworkPane
+                v-else-if="activeSubTab === 'network'"
+                :host-id="host.id"
+                :hostname="host.hostname"
+                :os="host.os"
+              />
             </template>
             <template #fallback>
               <div class="pane-loading">

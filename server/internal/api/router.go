@@ -3,13 +3,17 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -21,14 +25,17 @@ import (
 	"watchman/server/internal/audit"
 	"watchman/server/internal/auth"
 	"watchman/server/internal/backup"
+	"watchman/server/internal/cert"
 	"watchman/server/internal/commands"
 	"watchman/server/internal/groups"
 	"watchman/server/internal/metrics"
+	"watchman/server/internal/network"
 	"watchman/server/internal/policy"
 	"watchman/server/internal/prefs"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/session"
+	"watchman/server/internal/snapshots"
 	"watchman/server/internal/vault"
 	"watchman/server/internal/ws"
 
@@ -36,6 +43,10 @@ import (
 )
 
 // HostDTO is the public representation of a managed host.
+// CurrentAgentVersion is the latest release version of the Watchman Agent binary
+// built into or hosted by this control server.
+const CurrentAgentVersion = "0.1.0-dev"
+
 type HostDTO struct {
 	ID         string   `json:"id"`
 	Hostname   string   `json:"hostname"`
@@ -71,7 +82,7 @@ type HostDTO struct {
 // authorization, prefsStore backs per-user terminal preferences and
 // backupStore backs control-plane backup/restore; all may be nil to disable
 // those features.
-func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, prefsStore *prefs.Store, backupStore *backup.Store) *gin.Engine {
+func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, prefsStore *prefs.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine) *gin.Engine {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -149,6 +160,48 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	apps.NewHandlers(reg).Register(authed,
 		authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator), h.auditMutation()))
 
+	// Git-linked applications (Dokploy-style lifecycle: link repo, auto
+	// deploy on push, rollback, build log). Mutations are audited; the
+	// webhook endpoint is public with its own per-app token.
+	if appStore != nil {
+		appWrite := authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator), h.auditMutation())
+		appHandlers := apps.NewAppHandlers(reg, appStore, appEngine)
+			if aiAssistant != nil {
+				appHandlers.SetAI(func(ctx context.Context, command, stdout, stderr string, exitCode int32) (any, error) {
+					return aiAssistant.AnalyzeExecResult(ctx, command, stdout, stderr, exitCode)
+				})
+			}
+		appHandlers.RegisterAppRoutes(
+			authed.Group(""),
+			appWrite,
+			v1)
+		// Reverse-proxy domain binding (cert + nginx vhost distribution),
+		// available when both the app store and the cert hub are wired.
+		if certHub != nil {
+			apps.NewProxyHandler(reg, appStore, certHub).Register(appWrite)
+		}
+	}
+
+	// SSL certificate hub (ACME DNS-01 via dns-mng). Certificate material is
+	// sensitive, so mutations (config, issue, renew, delete) stay admin-only
+	// and audited; reads are open to every authenticated role.
+	if certHub != nil {
+		cert.NewHandlers(certHub).Register(
+			authed.Group(""),
+			adminOnly.Group("", h.auditMutation()),
+		)
+	}
+
+	// Host & container volume snapshots / database hot-backup (阶段 3).
+	// Mutations execute commands on the managed host, so they require
+	// hostWrite and are audited.
+	if snapshotStore != nil {
+		snapshots.NewHandlers(reg, snapshotStore, snapshotEngine).Register(
+			authed.Group(""),
+			hostWrite.Group("", h.auditMutation()),
+		)
+	}
+
 	// Security scanning.
 	if scanStore != nil {
 		scan.NewHandlers(reg, scanStore, log).Register(authed, hostWrite)
@@ -164,8 +217,11 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// Health.
 	authed.GET("/system/health", h.health)
 
-	// Agent upgrade.
-	adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
+		// Agent upgrade.
+		adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
+
+		// Control-server binary hot self-upgrade (upload base64 binary).
+		adminOnly.POST("/system/upgrade", h.systemUpgrade)
 
 	// User management (admin-only for mutating routes). Deleting an account
 	// also drops its terminal preferences, so a recreated account starts fresh.
@@ -223,14 +279,22 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		prefs.NewHandlers(prefsStore).Register(authed)
 	}
 
-	// Control-plane backup / restore. An archive contains every credential,
-	// recording and audit entry the server holds, and a restore rewrites all of
-	// them, so these routes are admin-only and always audited.
-	if backupStore != nil {
-		backup.NewHandlers(backupStore).Register(
-			authed.Group("", auth.RequireRole(auth.RoleAdmin), h.auditMutation()),
-		)
-	}
+		// Control-plane backup / restore. An archive contains every credential,
+		// recording and audit entry the server holds, and a restore rewrites all of
+		// them, so these routes are admin-only and always audited.
+		if backupStore != nil {
+			backup.NewHandlers(backupStore).Register(
+				authed.Group("", auth.RequireRole(auth.RoleAdmin), h.auditMutation()),
+			)
+		}
+
+		// Overlay networking (Tailscale / Headscale).
+		if networkStore != nil {
+			network.NewHandlers(networkStore, reg, auditStore).Register(
+				authed.Group(""),
+				hostWrite.Group("", h.auditMutation()),
+			)
+		}
 
 	// WebSocket endpoint (token via query param, since browsers can't set
 	// Authorization headers on WebSocket upgrades easily; also supports share_token or code).
@@ -1193,9 +1257,15 @@ func parseNDJSON(raw []byte) []any {
 // ---- Agent Upgrade ---------------------------------------------------
 
 func (h *handlers) upgradeAgent(c *gin.Context) {
-	hub := h.reg.Hub(c.Param("id"))
+	agentID := c.Param("id")
+	hub := h.reg.Hub(agentID)
 	if hub == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline"})
+		return
+	}
+	a := h.reg.GetAgent(agentID)
+	if a == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "host not found"})
 		return
 	}
 
@@ -1204,15 +1274,27 @@ func (h *handlers) upgradeAgent(c *gin.Context) {
 		Sha256  string `json:"sha256"`
 	}
 	_ = c.ShouldBindJSON(&body)
+	if body.Version == "" {
+		body.Version = CurrentAgentVersion
+	}
 
 	// Build the binary download URL from the server's own address.
 	scheme := "http"
-	if c.Request.TLS != nil {
+	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
 		scheme = "https"
 	}
 	host := c.Request.Host
+
+	osName := strings.ToLower(a.OS)
+	if osName == "" {
+		osName = "linux"
+	}
+	archName := strings.ToLower(a.Arch)
+	if archName == "" {
+		archName = "amd64"
+	}
 	binaryURL := fmt.Sprintf("%s://%s/api/v1/agent/binary?os=%s&arch=%s",
-		scheme, host, "linux", "amd64") // agent OS; for MVP we assume linux agents
+		scheme, host, osName, archName)
 
 	// Collect upgrade progress messages.
 	progressCh := make(chan *agentpb.UpgradeProgress, 16)
@@ -1403,8 +1485,11 @@ func (h *handlers) getRecording(c *gin.Context) {
 
 	// Serve cached recording if available.
 	if path := h.sess.RecordingPath(sid); path != "" {
-		c.File(path)
-		return
+		if raw, err := os.ReadFile(path); err == nil && len(raw) > 0 {
+			normalized := normalizeCastRecording(raw, sess.Duration)
+			c.Data(http.StatusOK, "application/json", normalized)
+			return
+		}
 	}
 
 	// Fetch from agent: the agent records to <recordDir>/<sid>.cast. We request
@@ -1486,7 +1571,70 @@ loop:
 
 	// Cache it.
 	_ = h.sess.SaveRecording(sid, allData)
-	c.Data(http.StatusOK, "application/json", allData)
+	normalized := normalizeCastRecording(allData, sess.Duration)
+	c.Data(http.StatusOK, "application/json", normalized)
+}
+
+// normalizeCastRecording inspects an asciicast v2 file, ensures the header contains
+// the session duration, and appends a closing event timestamp if missing, so the
+// replay player's scrubber accurately covers the entire session lifetime rather
+// than stopping after the last keyboard activity.
+func normalizeCastRecording(raw []byte, durationSec int64) []byte {
+	if len(raw) == 0 {
+		return raw
+	}
+	lines := bytes.Split(raw, []byte("\n"))
+	if len(lines) == 0 {
+		return raw
+	}
+
+	// Parse header
+	var header map[string]any
+	if err := json.Unmarshal(lines[0], &header); err != nil {
+		return raw
+	}
+
+	if durationSec > 0 {
+		header["duration"] = float64(durationSec)
+		if hb, err := json.Marshal(header); err == nil {
+			lines[0] = hb
+		}
+	}
+
+	// Find the timestamp of the last event
+	var lastEventTime float64
+	for i := len(lines) - 1; i >= 1; i-- {
+		line := bytes.TrimSpace(lines[i])
+		if len(line) == 0 {
+			continue
+		}
+		var evt []any
+		if err := json.Unmarshal(line, &evt); err == nil && len(evt) >= 2 {
+			if t, ok := evt[0].(float64); ok {
+				lastEventTime = t
+				break
+			}
+		}
+	}
+
+	// If the recorded events cut off earlier than the session duration, append
+	// an EOF close frame so the player timeline reaches the full duration.
+	if durationSec > 0 && float64(durationSec) > lastEventTime {
+		closeEvt := []any{float64(durationSec), "o", ""}
+		if cb, err := json.Marshal(closeEvt); err == nil {
+			// Find trailing non-empty line
+			var filtered [][]byte
+			for _, l := range lines {
+				if len(bytes.TrimSpace(l)) > 0 {
+					filtered = append(filtered, l)
+				}
+			}
+			filtered = append(filtered, cb)
+			return append(bytes.Join(filtered, []byte("\n")), '\n')
+		}
+	}
+
+	return raw
 }
 
 func (h *handlers) deleteSession(c *gin.Context) {
@@ -1506,9 +1654,10 @@ func (h *handlers) deleteSession(c *gin.Context) {
 
 func (h *handlers) health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"ok":      true,
-		"agents":  len(h.reg.ListAgents()),
-		"version": "0.1.0-dev",
+		"ok":                   true,
+		"agents":               len(h.reg.ListAgents()),
+		"version":              "0.1.0-dev",
+		"agent_latest_version": CurrentAgentVersion,
 	})
 }
 
@@ -1604,3 +1753,60 @@ func randomToken(n int) string {
 
 // avoid unused import
 var _ = fmt.Sprintf
+
+// UpgradePayload defines the JSON body for uploading a new server binary.
+type UpgradePayload struct {
+	Data string `json:"data"` // Base64 encoded binary
+}
+
+// systemUpgrade accepts a base64-encoded binary, replaces the running
+// watchman-server binary atomically, and then instructs the operator to restart
+// the process (e.g. via systemd or supervisor) to complete the deployment.
+func (h *handlers) systemUpgrade(c *gin.Context) {
+	var body UpgradePayload
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	raw, err := base64.StdEncoding.DecodeString(body.Data)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid base64 data"})
+		return
+	}
+
+	self, err := os.Executable()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	target, err := filepath.EvalSymlinks(self)
+	if err != nil {
+		target = self
+	}
+
+	dir := filepath.Dir(target)
+	tmp := filepath.Join(dir, fmt.Sprintf("watchman-server.upgrade.%d", time.Now().UnixNano()))
+	if err := os.WriteFile(tmp, raw, 0755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("写入临时文件失败: %v", err)})
+		return
+	}
+
+	// Atomic rename to replace the running binary (Linux allows renaming a running text file).
+	if err := os.Rename(tmp, target); err != nil {
+		os.Remove(tmp)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("原子替换二进制失败: %v", err)})
+		return
+	}
+
+	h.recordAudit(c, "update", "system", "server_binary",
+		"一键更新控制端二进制 (system self-upgrade)",
+		audit.RiskHigh, audit.ResultSuccess)
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      true,
+		"message": "二进制已上传并原子替换完成！请通过 systemd 或 supervisor 立即重启 watchman-server 以加载新版本。",
+		"path":    target,
+		"size":    len(raw),
+	})
+}

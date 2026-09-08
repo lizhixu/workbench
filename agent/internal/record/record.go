@@ -71,7 +71,8 @@ func (r *Recorder) WriteOutput(data []byte) error {
 	return r.writer.Flush()
 }
 
-// Close finalizes the recording.
+// Close finalizes the recording and emits an EOF timing event so the cast file's
+// total duration reflects the true session lifetime, preventing premature replay cutoff.
 func (r *Recorder) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -79,6 +80,18 @@ func (r *Recorder) Close() error {
 		return nil
 	}
 	r.closed = true
+
+	// Record the final session close timestamp so asciinema-player knows the
+	// complete timeline span, matching the session's recorded duration.
+	elapsed := time.Since(r.start).Seconds()
+	if elapsed > 0 {
+		endEntry := []any{elapsed, "o", ""}
+		if eb, err := json.Marshal(endEntry); err == nil {
+			r.writer.Write(eb)
+			r.writer.WriteByte('\n')
+		}
+	}
+
 	r.writer.Flush()
 	return r.file.Close()
 }

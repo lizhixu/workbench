@@ -34,7 +34,16 @@ async function handleLogin() {
 
 <template>
   <div class="login-bg">
-    <NCard class="login-card" title="Watchman 云堡垒机" size="large" :bordered="true">
+    <NCard class="login-card" size="large" :bordered="true">
+      <template #header>
+        <div class="login-header">
+          <img src="/k-works.png" class="login-logo-img" alt="Logo" />
+          <div class="login-title-wrap">
+            <h1 class="login-title">Watchman 云堡垒机</h1>
+            <span class="login-sub">主机管理与安全运维审计平台</span>
+          </div>
+        </div>
+      </template>
       <NForm @keyup.enter="handleLogin">
         <NFormItem label="用户名">
           <NInput v-model:value="username" placeholder="用户名" />
@@ -75,8 +84,45 @@ async function handleLogin() {
   box-sizing: border-box;
 }
 .login-card {
-  width: 380px;
+  width: 400px;
   max-width: 100%;
+  border-radius: 12px;
+  box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+
+  .login-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 0;
+
+    .login-logo-img {
+      width: 44px;
+      height: 44px;
+      object-fit: contain;
+      border: none;
+      box-shadow: none;
+      flex-shrink: 0;
+    }
+
+    .login-title-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+
+      .login-title {
+        margin: 0;
+        font-size: 17px;
+        font-weight: 700;
+        color: var(--text-primary);
+        line-height: 1.3;
+      }
+
+      .login-sub {
+        font-size: 11.5px;
+        color: var(--text-secondary);
+      }
+    }
+  }
 }
 .hint {
   margin-top: 12px;

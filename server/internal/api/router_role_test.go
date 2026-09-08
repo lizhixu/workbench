@@ -87,7 +87,7 @@ func newTestRouter(t *testing.T) (*gin.Engine, *auth.Store) {
 
 	r := Router(rpc.NewRegistry(dir, log), log, authStore, sessStore, alertStore, vaultStore,
 		nil, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore,
-		prefsStore, backupStore, networkStore, appStore, appEngine, nil, nil, nil)
+		prefsStore, backupStore, networkStore, appStore, appEngine, nil, nil, nil, nil)
 	return r, authStore
 }
 

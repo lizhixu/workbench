@@ -23,10 +23,11 @@ type Application struct {
 	WebhookToken string `json:"webhook_token,omitempty"` // secret path segment for /apps/webhook/:token
 
 	// Build configuration.
-	BuildType    string `json:"build_type,omitempty"`    // "dockerfile" | "compose"
-	Dockerfile   string `json:"dockerfile,omitempty"`    // relative path, default "Dockerfile"
-	BuildContext string `json:"build_context,omitempty"` // relative dir, default "."
-	BuildTimeout int32  `json:"build_timeout_sec,omitempty"`
+	BuildType      string `json:"build_type,omitempty"`      // "dockerfile" | "compose"
+	Dockerfile     string `json:"dockerfile,omitempty"`      // relative path, default "Dockerfile"
+	BuildContext   string `json:"build_context,omitempty"`   // relative dir, default "."
+	BuildTimeout   int32  `json:"build_timeout_sec,omitempty"`
+	ComposeContent string `json:"compose_content,omitempty"` // raw compose.yaml for source_type == "raw_compose"
 
 	// Runtime configuration.
 	Image          string            `json:"image,omitempty"`    // resolved image for source_type=image / after build

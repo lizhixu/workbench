@@ -15,7 +15,7 @@ import {
 } from '@vicons/ionicons5'
 import {
   deployApp, diagnoseDeployment, getApp, getAppStatus, listDeployments, restartApp,
-  rollbackApp, startApp, stopApp, type AppEntity, type AppStatus, type Deployment,
+  rollbackApp, startApp, stopApp, updateApp, type AppEntity, type AppStatus, type Deployment,
   type AIDiagnosis,
 } from '../../api/apps'
 import { bindProxy, unbindProxy, type Certificate } from '../../api/certs'
@@ -156,11 +156,36 @@ const webhookURL = computed(() => {
   return `${base}/api/v1/apps/webhook/${app.value.webhook_token}`
 })
 
+const composeEditContent = ref('')
+const savingCompose = ref(false)
+
 async function loadApp() {
   try {
     app.value = await getApp(appId.value)
+    if (app.value.compose_content) {
+      composeEditContent.value = app.value.compose_content
+    }
   } catch (e: any) {
     message.error(e.message || '获取应用信息失败')
+  }
+}
+
+async function saveAndRedeployCompose() {
+  if (!composeEditContent.value.trim()) {
+    message.warning('Compose 内容不能为空')
+    return
+  }
+  savingCompose.value = true
+  try {
+    await updateApp(appId.value, {
+      compose_content: composeEditContent.value,
+    })
+    message.success('配置已保存，正在重新部署...')
+    await doDeploy()
+  } catch (e: any) {
+    message.error(e.message || '保存失败')
+  } finally {
+    savingCompose.value = false
   }
 }
 
@@ -559,6 +584,25 @@ onDeactivated(() => {
                 </NPopconfirm>
               </NSpace>
             </NForm>
+          </div>
+        </NTabPane>
+
+        <NTabPane v-if="app.source_type === 'raw_compose' || app.compose_content" name="compose" tab="Compose 编排">
+          <div class="overview-scroll" style="max-width: 800px">
+            <NAlert type="info" :show-icon="true" style="margin-bottom: 12px">
+              当前应用为 Docker Compose 复合微服务栈。您可直接在此修改 YAML 编排内容，保存后系统会自动在目标主机更新配置并重新发布。
+            </NAlert>
+            <NInput
+              v-model:value="composeEditContent"
+              type="textarea"
+              :rows="16"
+              style="font-family: 'JetBrains Mono', Consolas, monospace; font-size: 12px"
+            />
+            <NSpace style="margin-top: 12px" justify="end">
+              <NButton type="primary" :loading="savingCompose || deploying" @click="saveAndRedeployCompose">
+                保存并重新部署
+              </NButton>
+            </NSpace>
           </div>
         </NTabPane>
 

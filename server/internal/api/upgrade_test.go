@@ -44,7 +44,7 @@ func TestUpgradeAgentDynamicURLAndDefaults(t *testing.T) {
 		t.Fatalf("auth: %v", err)
 	}
 
-	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	// In background, wait for the UpgradeRequest sent to the hub and respond with progress
 	var receivedURL string

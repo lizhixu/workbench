@@ -12,17 +12,27 @@ import (
 	"watchman/server/internal/vault"
 )
 
+type gitTokenProvider interface {
+	GetToken() (string, bool)
+}
+
 // Engine executes build+rollout deployments on managed hosts through the
 // existing agent gRPC channel (ExecRequest / DockerOp), one deployment per
 // application at a time (Dokploy-style serial build queue).
 type Engine struct {
-	reg   *rpc.Registry
-	store *Store
-	vault *vault.Store
-	log   *slog.Logger
+	reg         *rpc.Registry
+	store       *Store
+	vault       *vault.Store
+	gitProvider gitTokenProvider
+	log         *slog.Logger
 
 	mu      sync.Mutex
 	running map[string]bool // app_id -> a deployment is executing
+}
+
+// SetGitProvider injects a token provider (e.g. GitHub connection) for auto-cloning.
+func (e *Engine) SetGitProvider(gp gitTokenProvider) {
+	e.gitProvider = gp
 }
 
 // NewEngine creates the deployment engine. A nil log falls back to the
@@ -158,6 +168,32 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 	buildTimeout := app.BuildTimeout
 	if buildTimeout <= 0 {
 		buildTimeout = 900
+	}
+
+	// Branch for raw Docker Compose applications (online YAML editor):
+	if app.SourceType == "raw_compose" {
+		e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
+		logBuf.WriteString("$ deploy raw docker compose stack\n")
+		composePath := fmt.Sprintf("/var/lib/watchman/apps/%s/compose.yaml", app.ID)
+		if err := writeFileOnAgent(hub, composePath, []byte(app.ComposeContent)); err != nil {
+			fail("写入 Compose 配置文件失败: %v", err)
+			return
+		}
+		composeCmd := fmt.Sprintf("docker compose -f %s -p watchman-%s up -d --remove-orphans",
+			shellQuote(composePath), app.ID)
+		logBuf.WriteString("$ " + composeCmd + "\n")
+		res, err := execOnAgent(hub, "compose-up-"+randomToken(4), composeCmd, buildTimeout)
+		if err != nil {
+			fail("Docker Compose 启动失败: %v", err)
+			return
+		}
+		logBuf.WriteResult(res, nil, res.GetStderr())
+		if res.GetExitCode() != 0 {
+			fail("Docker Compose 启动失败 (exit %d)", res.GetExitCode())
+			return
+		}
+		e.finishDeploySuccess(app, dep, "compose", imageTag, app.ContainerName, logBuf)
+		return
 	}
 
 	// Step 1: fetch or clone the linked repository, then check out the branch
@@ -423,14 +459,21 @@ func (e *Engine) resolveEnvArgs(app *Application, logBuf *logBuffer) []string {
 }
 
 func (e *Engine) gitToken(app *Application) (string, error) {
-	if app.AuthVaultID == "" || e.vault == nil {
-		return "", nil
+	if app.AuthVaultID != "" && e.vault != nil {
+		cred, ok := e.vault.Get(app.AuthVaultID)
+		if !ok {
+			return "", fmt.Errorf("vault credential %q not found", app.AuthVaultID)
+		}
+		return cred.Secret, nil
 	}
-	cred, ok := e.vault.Get(app.AuthVaultID)
-	if !ok {
-		return "", fmt.Errorf("vault credential %q not found", app.AuthVaultID)
+	// If no explicit Vault credential is configured, but this is a GitHub repository
+	// and the GitHub Provider is connected, automatically use the GitHub account token.
+	if e.gitProvider != nil && strings.Contains(strings.ToLower(app.RepoURL), "github.com") {
+		if tok, ok := e.gitProvider.GetToken(); ok && tok != "" {
+			return tok, nil
+		}
 	}
-	return cred.Secret, nil
+	return "", nil
 }
 
 func (e *Engine) removeContainer(hub *rpc.Hub, name string) {

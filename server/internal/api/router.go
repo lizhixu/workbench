@@ -27,6 +27,7 @@ import (
 	"watchman/server/internal/backup"
 	"watchman/server/internal/cert"
 	"watchman/server/internal/commands"
+	"watchman/server/internal/gitprovider"
 	"watchman/server/internal/groups"
 	"watchman/server/internal/metrics"
 	"watchman/server/internal/network"
@@ -82,7 +83,7 @@ type HostDTO struct {
 // authorization, prefsStore backs per-user terminal preferences and
 // backupStore backs control-plane backup/restore; all may be nil to disable
 // those features.
-func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, prefsStore *prefs.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine) *gin.Engine {
+func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, prefsStore *prefs.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine, gitProviderStore *gitprovider.Store) *gin.Engine {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -197,6 +198,14 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// hostWrite and are audited.
 	if snapshotStore != nil {
 		snapshots.NewHandlers(reg, snapshotStore, snapshotEngine).Register(
+			authed.Group(""),
+			hostWrite.Group("", h.auditMutation()),
+		)
+	}
+
+	// Git provider integration (GitHub account authorization & repo selector).
+	if gitProviderStore != nil {
+		gitprovider.NewHandlers(gitProviderStore).Register(
 			authed.Group(""),
 			hostWrite.Group("", h.auditMutation()),
 		)

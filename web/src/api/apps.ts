@@ -9,7 +9,7 @@ export interface AppEntity {
   id: string
   name: string
   host_id: string
-  source_type: 'git' | 'image' | 'compose'
+  source_type: 'git' | 'image' | 'compose' | 'raw_compose'
   repo_url?: string
   branch?: string
   auth_vault_id?: string
@@ -19,6 +19,7 @@ export interface AppEntity {
   dockerfile?: string
   build_context?: string
   build_timeout_sec?: number
+  compose_content?: string
   image?: string
   env_vars?: Record<string, string>
   ports?: PortMapping[]
@@ -52,14 +53,16 @@ export interface Deployment {
 export interface AppCreateRequest {
   name: string
   host_id: string
-  repo_url: string
-  branch: string
+  source_type?: 'git' | 'raw_compose'
+  repo_url?: string
+  branch?: string
   auth_vault_id?: string
-  auto_deploy: boolean
+  auto_deploy?: boolean
   build_type?: 'dockerfile' | 'compose'
   dockerfile?: string
   build_context?: string
   build_timeout_sec?: number
+  compose_content?: string
   env_vars?: Record<string, string>
   ports?: PortMapping[]
   volumes?: string[]

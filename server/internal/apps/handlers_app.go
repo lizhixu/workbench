@@ -77,13 +77,16 @@ func (h *AppHandlers) getApp(c *gin.Context) {
 type createAppReq struct {
 	Name           string            `json:"name"`
 	HostID         string            `json:"host_id"`
+	SourceType     string            `json:"source_type"` // "git" | "raw_compose"
 	RepoURL        string            `json:"repo_url"`
 	Branch         string            `json:"branch"`
 	AuthVaultID    string            `json:"auth_vault_id"`
 	AutoDeploy     bool              `json:"auto_deploy"`
+	BuildType      string            `json:"build_type"`
 	Dockerfile     string            `json:"dockerfile"`
 	BuildContext   string            `json:"build_context"`
 	BuildTimeout   int32             `json:"build_timeout_sec"`
+	ComposeContent string            `json:"compose_content"` // raw compose.yaml
 	EnvVars        map[string]string `json:"env_vars"`
 	Ports          []PortMapping     `json:"ports"`
 	Volumes        []string          `json:"volumes"`
@@ -97,6 +100,12 @@ func (r *createAppReq) validate() error {
 	}
 	if r.HostID == "" {
 		return fmt.Errorf("必须选择目标主机")
+	}
+	if r.SourceType == "raw_compose" {
+		if strings.TrimSpace(r.ComposeContent) == "" {
+			return fmt.Errorf("Docker Compose 内容不能为空")
+		}
+		return nil
 	}
 	if strings.TrimSpace(r.RepoURL) == "" {
 		return fmt.Errorf("Git 仓库地址不能为空")
@@ -132,20 +141,34 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 		return
 	}
 
+	srcType := req.SourceType
+	if srcType == "" {
+		srcType = "git"
+	}
+	buildType := req.BuildType
+	if buildType == "" {
+		if srcType == "raw_compose" {
+			buildType = "compose"
+		} else {
+			buildType = "dockerfile"
+		}
+	}
+
 	app := &Application{
 		ID:             "app_" + randomToken(8),
 		Name:           strings.TrimSpace(req.Name),
 		HostID:         req.HostID,
-		SourceType:     "git",
+		SourceType:     srcType,
 		RepoURL:        strings.TrimSpace(req.RepoURL),
 		Branch:         firstNonEmpty(req.Branch, "main"),
 		AuthVaultID:    req.AuthVaultID,
 		AutoDeploy:     req.AutoDeploy,
 		WebhookToken:   randomToken(16),
-		BuildType:      "dockerfile",
+		BuildType:      buildType,
 		Dockerfile:     firstNonEmpty(req.Dockerfile, "Dockerfile"),
 		BuildContext:   firstNonEmpty(req.BuildContext, "."),
 		BuildTimeout:   req.BuildTimeout,
+		ComposeContent: req.ComposeContent,
 		EnvVars:        req.EnvVars,
 		Ports:          req.Ports,
 		Volumes:        req.Volumes,
@@ -196,6 +219,12 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 		}
 		if req.Volumes != nil {
 			a.Volumes = req.Volumes
+		}
+		if req.ComposeContent != "" {
+			a.ComposeContent = req.ComposeContent
+		}
+		if req.BuildType != "" {
+			a.BuildType = req.BuildType
 		}
 		a.HealthcheckURL = req.HealthcheckURL
 		return nil

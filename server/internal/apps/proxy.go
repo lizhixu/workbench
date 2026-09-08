@@ -304,15 +304,14 @@ func writeFileOnAgent(hub *rpc.Hub, path string, data []byte) error {
 		},
 	})
 
-	// The agent expects the initial op followed by data chunks; mirror the
-	// upload handler's chunking.
+	// The agent expects the initial op followed by data chunks; chunk sequence
+	// starts at 0.
 	seq := uint32(0)
 	for offset := 0; offset < len(data); offset += writeChunkSize {
 		end := offset + writeChunkSize
 		if end > len(data) {
 			end = len(data)
 		}
-		seq++
 		hub.Send(&agentpb.ServerMessage{
 			Payload: &agentpb.ServerMessage_FileOp{
 				FileOp: &agentpb.FileOp{
@@ -325,6 +324,7 @@ func writeFileOnAgent(hub *rpc.Hub, path string, data []byte) error {
 				},
 			},
 		})
+		seq++
 	}
 
 	select {

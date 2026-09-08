@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
@@ -13,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -157,4 +159,65 @@ func makeCSR(key *ecdsa.PrivateKey, domains []string) ([]byte, error) {
 		SignatureAlgorithm: x509.ECDSAWithSHA256,
 	}
 	return x509.CreateCertificateRequest(rand.Reader, tmpl, key)
+}
+
+// computeEAB builds the RFC 8555 Section 7.3.4 externalAccountBinding object:
+// an HS256-signed JWS where the payload is the JWK of the new ACME account key,
+// and the key is the MAC key supplied by the CA (Google, ZeroSSL, SSL.com).
+func computeEAB(newAccountURL, kid, hmacKeyStr string, pub crypto.PublicKey) (map[string]string, error) {
+	macKey, err := decodeHMACKey(hmacKeyStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid EAB HMAC key: %w", err)
+	}
+
+	jwk, err := jwkJSON(pub)
+	if err != nil {
+		return nil, err
+	}
+	payloadJSON, err := json.Marshal(jwk)
+	if err != nil {
+		return nil, err
+	}
+	payloadB64 := base64.RawURLEncoding.EncodeToString(payloadJSON)
+
+	protected := map[string]string{
+		"alg": "HS256",
+		"kid": kid,
+		"url": newAccountURL,
+	}
+	protectedJSON, err := json.Marshal(protected)
+	if err != nil {
+		return nil, err
+	}
+	protectedB64 := base64.RawURLEncoding.EncodeToString(protectedJSON)
+
+	sigInput := protectedB64 + "." + payloadB64
+	mac := hmac.New(sha256.New, macKey)
+	mac.Write([]byte(sigInput))
+	sigB64 := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	return map[string]string{
+		"protected": protectedB64,
+		"payload":   payloadB64,
+		"signature": sigB64,
+	}, nil
+}
+
+// decodeHMACKey attempts base64 URL-safe, base64 standard, and raw string fallback.
+func decodeHMACKey(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil && len(b) > 0 {
+		return b, nil
+	}
+	if b, err := base64.URLEncoding.DecodeString(s); err == nil && len(b) > 0 {
+		return b, nil
+	}
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil && len(b) > 0 {
+		return b, nil
+	}
+	if b, err := base64.RawStdEncoding.DecodeString(s); err == nil && len(b) > 0 {
+		return b, nil
+	}
+	// Fallback to literal bytes if not base64
+	return []byte(s), nil
 }

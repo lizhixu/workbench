@@ -1,9 +1,7 @@
 // Package cert implements the SSL certificate hub: it obtains and renews
-// certificates via ACME (Let's Encrypt style), delegating the DNS-01 challenge
-// to an external dns-mng instance (D:\codes\ai-api\dns-mng sibling project)
-// through its HTTP API. Certificates are persisted under the data dir and can
-// be distributed to managed gateway hosts together with generated Nginx
-// reverse-proxy configuration (application domain -> app upstream).
+// certificates via ACME (Let's Encrypt, ZeroSSL, Google Trust Services, SSL.com, LiteSSL),
+// delegating the DNS-01 challenge to an external dns-mng instance (D:\codes\ai-api\dns-mng)
+// through its HTTP API.
 package cert
 
 import (
@@ -25,27 +23,20 @@ import (
 	"time"
 )
 
-// Config is the dns-mng integration settings, edited from the UI settings.
+// Config is the dns-mng integration settings.
 type Config struct {
-	// Enabled turns the whole certificate hub on.
-	Enabled bool `json:"enabled"`
-	// BaseURL is the dns-mng service address, e.g. "http://10.0.0.2:8080".
-	BaseURL string `json:"base_url"`
-	// Username/Password are the dns-mng HTTP Basic Auth credentials for its
-	// /api/acme/dns01/present|cleanup endpoints.
-	Username string `json:"username"`
-	Password string `json:"password"`
-	// DirectoryURL is the ACME directory endpoint. Empty = Let's Encrypt prod.
-	DirectoryURL string `json:"directory_url"`
-	// Email is the ACME account contact.
-	Email     string    `json:"email"`
+	Enabled   bool      `json:"enabled"`
+	BaseURL   string    `json:"base_url"`
+	Username  string    `json:"username"`
+	Password  string    `json:"password"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Certificate is one issued certificate with its PEM material.
 type Certificate struct {
 	ID        string    `json:"id"`
-	Domains   []string  `json:"domains"` // SANs, e.g. ["*.example.com", "example.com"]
+	AccountID string    `json:"account_id,omitempty"` // ID of the ACMEAccount that issued this cert
+	Domains   []string  `json:"domains"`             // SANs, e.g. ["*.example.com", "example.com"]
 	CertPEM   string    `json:"-"`
 	KeyPEM    string    `json:"-"`
 	NotBefore time.Time `json:"not_before"`
@@ -63,13 +54,14 @@ const DefaultDirectoryURL = "https://acme-v02.api.letsencrypt.org/directory"
 // ErrDisabled is returned when the hub is not configured yet.
 var ErrDisabled = errors.New("certificate hub disabled: dns-mng not configured")
 
-// Hub manages the dns-mng config, certificates and renewal scheduling.
+// Hub manages dns-mng settings, multiple ACME accounts, certificates and renewals.
 type Hub struct {
-	mu    sync.RWMutex
-	dir   string
-	log   *slog.Logger
-	cfg   Config
-	certs map[string]*Certificate
+	mu       sync.RWMutex
+	dir      string
+	log      *slog.Logger
+	cfg      Config
+	accounts map[string]*ACMEAccount
+	certs    map[string]*Certificate
 }
 
 // NewHub loads or initializes the hub under dataDir.
@@ -78,14 +70,18 @@ func NewHub(dataDir string, log *slog.Logger) (*Hub, error) {
 		log = slog.Default()
 	}
 	h := &Hub{
-		dir:   filepath.Join(dataDir, "certs"),
-		log:   log,
-		certs: make(map[string]*Certificate),
+		dir:      filepath.Join(dataDir, "certs"),
+		log:      log,
+		accounts: make(map[string]*ACMEAccount),
+		certs:    make(map[string]*Certificate),
 	}
 	if err := os.MkdirAll(h.dir, 0700); err != nil {
 		return nil, err
 	}
 	if err := h.loadConfig(); err != nil {
+		return nil, err
+	}
+	if err := h.loadAccounts(); err != nil {
 		return nil, err
 	}
 	if err := h.loadCerts(); err != nil {
@@ -94,7 +90,11 @@ func NewHub(dataDir string, log *slog.Logger) (*Hub, error) {
 	return h, nil
 }
 
-func (h *Hub) configPath() string { return filepath.Join(h.dir, "hub.json") }
+func (h *Hub) configPath() string   { return filepath.Join(h.dir, "hub.json") }
+func (h *Hub) accountsPath() string { return filepath.Join(h.dir, "accounts.json") }
+func (h *Hub) certIndexPath() string { return filepath.Join(h.dir, "index.json") }
+func (h *Hub) certFile(id string) string { return filepath.Join(h.dir, id+".crt") }
+func (h *Hub) keyFile(id string) string  { return filepath.Join(h.dir, id+".key") }
 
 func (h *Hub) loadConfig() error {
 	b, err := os.ReadFile(h.configPath())
@@ -135,6 +135,144 @@ func (h *Hub) UpdateConfig(cfg Config) error {
 	return h.saveConfigLocked()
 }
 
+// ---- ACME Accounts Storage ----
+
+func (h *Hub) loadAccounts() error {
+	b, err := os.ReadFile(h.accountsPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Auto-seed default Let's Encrypt account
+			def := &ACMEAccount{
+				ID:           "acc_letsencrypt",
+				Name:         "Let's Encrypt (默认)",
+				ProviderID:   "letsencrypt",
+				DirectoryURL: DefaultDirectoryURL,
+				Email:        "admin@watchman.local",
+				IsDefault:    true,
+				CreatedAt:    time.Now(),
+			}
+			h.accounts[def.ID] = def
+			_ = h.saveAccountsLocked()
+			return nil
+		}
+		return fmt.Errorf("read acme accounts: %w", err)
+	}
+	var list []*ACMEAccount
+	if err := unmarshalJSON(b, &list); err != nil {
+		h.log.Warn("acme accounts corrupted, starting fresh", "err", err)
+		return nil
+	}
+	for _, acc := range list {
+		h.accounts[acc.ID] = acc
+	}
+	if len(h.accounts) == 0 {
+		def := &ACMEAccount{
+			ID:           "acc_letsencrypt",
+			Name:         "Let's Encrypt (默认)",
+			ProviderID:   "letsencrypt",
+			DirectoryURL: DefaultDirectoryURL,
+			Email:        "admin@watchman.local",
+			IsDefault:    true,
+			CreatedAt:    time.Now(),
+		}
+		h.accounts[def.ID] = def
+		_ = h.saveAccountsLocked()
+	}
+	return nil
+}
+
+func (h *Hub) saveAccountsLocked() error {
+	list := make([]*ACMEAccount, 0, len(h.accounts))
+	for _, acc := range h.accounts {
+		list = append(list, acc)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
+	b, err := marshalJSON(list)
+	if err != nil {
+		return err
+	}
+	tmp := h.accountsPath() + fmt.Sprintf(".tmp.%d", time.Now().UnixNano())
+	if err := os.WriteFile(tmp, b, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, h.accountsPath())
+}
+
+// ListAccounts returns all configured ACME accounts (redacted HMAC keys).
+func (h *Hub) ListAccounts() []*ACMEAccount {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]*ACMEAccount, 0, len(h.accounts))
+	for _, a := range h.accounts {
+		out = append(out, a.Redacted())
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// GetAccount returns one account with full credentials for server-side signing.
+func (h *Hub) GetAccount(id string) (*ACMEAccount, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	a, ok := h.accounts[id]
+	if !ok {
+		return nil, false
+	}
+	cp := *a
+	return &cp, true
+}
+
+// PutAccount creates or replaces an ACME account.
+func (h *Hub) PutAccount(acc *ACMEAccount) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if acc.ID == "" {
+		acc.ID = "acc_" + randomHex(6)
+	}
+	if acc.CreatedAt.IsZero() {
+		acc.CreatedAt = time.Now()
+	}
+	// If set as default, clear previous defaults
+	if acc.IsDefault {
+		for _, a := range h.accounts {
+			a.IsDefault = false
+		}
+	}
+	h.accounts[acc.ID] = acc
+	return h.saveAccountsLocked()
+}
+
+// DeleteAccount deletes an ACME account.
+func (h *Hub) DeleteAccount(id string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.accounts[id]; !ok {
+		return fmt.Errorf("account %s not found", id)
+	}
+	delete(h.accounts, id)
+	_ = os.Remove(filepath.Join(h.dir, "acme-account-"+id+".key"))
+	return h.saveAccountsLocked()
+}
+
+// GetDefaultAccount returns the default ACME account or the first available.
+func (h *Hub) GetDefaultAccount() (*ACMEAccount, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, a := range h.accounts {
+		if a.IsDefault {
+			cp := *a
+			return &cp, nil
+		}
+	}
+	for _, a := range h.accounts {
+		cp := *a
+		return &cp, nil
+	}
+	return nil, fmt.Errorf("no ACME accounts configured")
+}
+
+// ---- Certificates Storage ----
+
 func (h *Hub) loadCerts() error {
 	b, err := os.ReadFile(h.certIndexPath())
 	if err != nil {
@@ -149,8 +287,6 @@ func (h *Hub) loadCerts() error {
 		return nil
 	}
 	for _, c := range list {
-		// PEM material lives beside the index in per-cert files; a missing
-		// file leaves the record visible but unusable (re-issue fixes it).
 		certB, errCert := os.ReadFile(h.certFile(c.ID))
 		keyB, errKey := os.ReadFile(h.keyFile(c.ID))
 		if errCert == nil && errKey == nil {
@@ -164,15 +300,11 @@ func (h *Hub) loadCerts() error {
 	return nil
 }
 
-func (h *Hub) certIndexPath() string     { return filepath.Join(h.dir, "index.json") }
-func (h *Hub) certFile(id string) string { return filepath.Join(h.dir, id+".crt") }
-func (h *Hub) keyFile(id string) string  { return filepath.Join(h.dir, id+".key") }
-
 func (h *Hub) saveCertsLocked() error {
 	list := make([]*Certificate, 0, len(h.certs))
 	for _, c := range h.certs {
 		cp := *c
-		cp.CertPEM, cp.KeyPEM = "", "" // never persist PEM in the index
+		cp.CertPEM, cp.KeyPEM = "", ""
 		list = append(list, &cp)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
@@ -187,7 +319,7 @@ func (h *Hub) saveCertsLocked() error {
 	return os.Rename(tmp, h.certIndexPath())
 }
 
-// List returns all certificates (without PEM material).
+// List returns all certificates.
 func (h *Hub) List() []*Certificate {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -201,7 +333,7 @@ func (h *Hub) List() []*Certificate {
 	return list
 }
 
-// Get returns one certificate including PEM material (server-side use).
+// Get returns one certificate including PEM material.
 func (h *Hub) Get(id string) (*Certificate, bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -213,14 +345,14 @@ func (h *Hub) Get(id string) (*Certificate, bool) {
 	return &cp, true
 }
 
-// FindByDomain returns the first certificate covering the given domain.
+// FindByDomain returns the first certificate covering domain.
 func (h *Hub) FindByDomain(domain string) (*Certificate, bool) {
 	domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for _, c := range h.certs {
 		for _, san := range c.Domains {
-			if san == domain || strings.HasPrefix(san, "*.") && strings.HasSuffix(domain, strings.TrimPrefix(san, "*")) {
+			if san == domain || (strings.HasPrefix(san, "*.") && strings.HasSuffix(domain, strings.TrimPrefix(san, "*"))) {
 				cp := *c
 				return &cp, true
 			}
@@ -229,7 +361,7 @@ func (h *Hub) FindByDomain(domain string) (*Certificate, bool) {
 	return nil, false
 }
 
-// Delete removes one certificate from the hub (records only).
+// Delete removes one certificate from the hub.
 func (h *Hub) Delete(id string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -242,8 +374,7 @@ func (h *Hub) Delete(id string) error {
 	return h.saveCertsLocked()
 }
 
-// storeResult persists a newly issued certificate.
-func (h *Hub) storeResult(id string, domains []string, certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string) error {
+func (h *Hub) storeResult(id string, accountID string, domains []string, certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string) error {
 	if err := os.WriteFile(h.certFile(id), certPEM, 0600); err != nil {
 		return err
 	}
@@ -254,6 +385,7 @@ func (h *Hub) storeResult(id string, domains []string, certPEM, keyPEM []byte, n
 	defer h.mu.Unlock()
 	h.certs[id] = &Certificate{
 		ID:        id,
+		AccountID: accountID,
 		Domains:   domains,
 		CertPEM:   string(certPEM),
 		KeyPEM:    string(keyPEM),
@@ -266,7 +398,6 @@ func (h *Hub) storeResult(id string, domains []string, certPEM, keyPEM []byte, n
 	return h.saveCertsLocked()
 }
 
-// markError records a failure on an existing certificate record.
 func (h *Hub) markError(id, msg string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -277,48 +408,47 @@ func (h *Hub) markError(id, msg string) {
 	}
 }
 
-// issueDNS01 runs the full ACME DNS-01 flow against dns-mng:
-// register/reuse account key -> order -> authorizations -> TXT via dns-mng ->
-// finalize -> download. It returns the issued certificate PEM chain + key.
-func (h *Hub) issueDNS01(domains []string) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
+// issueDNS01 runs the ACME DNS-01 flow using the specified account.
+func (h *Hub) issueDNS01(acc *ACMEAccount, domains []string) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
 	cfg := h.GetConfig()
 	if !cfg.Enabled || cfg.BaseURL == "" {
 		return nil, nil, time.Time{}, time.Time{}, "", ErrDisabled
 	}
-	dirURL := cfg.DirectoryURL
+	dirURL := acc.DirectoryURL
 	if dirURL == "" {
 		dirURL = DefaultDirectoryURL
 	}
 
 	acmeClient := &acmeClient{
 		directoryURL: dirURL,
-		email:        cfg.Email,
+		email:        acc.Email,
+		eabKeyID:     acc.EABKeyID,
+		eabHMACKey:   acc.EABHMACKey,
 		http:         &http.Client{Timeout: 30 * time.Second},
 		log:          h.log,
 	}
 
-	// Account key: persisted so renewals reuse the same ACME account.
-	accountKey, err := h.loadOrCreateAccountKey()
+	accountKey, err := h.loadOrCreateAccountKey(acc.ID)
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("account key: %w", err)
 	}
 	if err := acmeClient.ensureAccount(accountKey); err != nil {
-		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("acme account: %w", err)
+		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("acme account (%s): %w", acc.Name, err)
 	}
 
-	// Order + authorize each domain with DNS-01 via dns-mng.
 	challenger := &dnsMngChallenge{baseURL: cfg.BaseURL, username: cfg.Username, password: cfg.Password, http: acmeClient.http}
 	certPEM, keyPEM, notBefore, notAfter, issuer, err = acmeClient.obtainCertificate(accountKey, domains, challenger)
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", err
 	}
+	if issuer == "" {
+		issuer = acc.Name
+	}
 	return certPEM, keyPEM, notBefore, notAfter, issuer, nil
 }
 
-// Issue requests a new certificate for the domains. The call blocks (DNS-01
-// propagation + ACME validation take tens of seconds); callers run it in a
-// goroutine and poll.
-func (h *Hub) Issue(domains []string) (*Certificate, error) {
+// Issue requests a new certificate using a specific or default ACME account.
+func (h *Hub) Issue(domains []string, accountID string) (*Certificate, error) {
 	clean := make([]string, 0, len(domains))
 	for _, d := range domains {
 		d = strings.TrimSpace(strings.ToLower(d))
@@ -329,20 +459,35 @@ func (h *Hub) Issue(domains []string) (*Certificate, error) {
 	if len(clean) == 0 {
 		return nil, fmt.Errorf("至少需要一个域名")
 	}
-	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueDNS01(clean)
+
+	var acc *ACMEAccount
+	if accountID != "" {
+		got, ok := h.GetAccount(accountID)
+		if !ok {
+			return nil, fmt.Errorf("ACME 机构账户 %s 不存在", accountID)
+		}
+		acc = got
+	} else {
+		got, err := h.GetDefaultAccount()
+		if err != nil {
+			return nil, err
+		}
+		acc = got
+	}
+
+	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueDNS01(acc, clean)
 	if err != nil {
 		return nil, err
 	}
 	id := "crt_" + randomHex(8)
-	if err := h.storeResult(id, clean, certPEM, keyPEM, notBefore, notAfter, issuer); err != nil {
+	if err := h.storeResult(id, acc.ID, clean, certPEM, keyPEM, notBefore, notAfter, issuer); err != nil {
 		return nil, err
 	}
 	c, _ := h.Get(id)
 	return c, nil
 }
 
-// Renew re-issues a certificate. When it succeeds the record is replaced in
-// place; the old material is overwritten.
+// Renew re-issues an existing certificate using its original ACME account.
 func (h *Hub) Renew(id string) (*Certificate, error) {
 	c, ok := h.Get(id)
 	if !ok {
@@ -360,12 +505,27 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 	}
 	h.mu.Unlock()
 
-	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueDNS01(c.Domains)
+	var acc *ACMEAccount
+	if c.AccountID != "" {
+		if got, ok := h.GetAccount(c.AccountID); ok {
+			acc = got
+		}
+	}
+	if acc == nil {
+		got, err := h.GetDefaultAccount()
+		if err != nil {
+			h.markError(id, err.Error())
+			return nil, err
+		}
+		acc = got
+	}
+
+	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueDNS01(acc, c.Domains)
 	if err != nil {
 		h.markError(id, err.Error())
 		return nil, err
 	}
-	if err := h.storeResult(id, c.Domains, certPEM, keyPEM, notBefore, notAfter, issuer); err != nil {
+	if err := h.storeResult(id, acc.ID, c.Domains, certPEM, keyPEM, notBefore, notAfter, issuer); err != nil {
 		h.markError(id, err.Error())
 		return nil, err
 	}
@@ -373,8 +533,7 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 	return updated, nil
 }
 
-// RunRenewalLoop periodically renews certificates expiring within the window.
-// It returns immediately after launching the loop goroutine.
+// RunRenewalLoop periodically renews expiring certificates.
 func (h *Hub) RunRenewalLoop(stop <-chan struct{}) {
 	go func() {
 		ticker := time.NewTicker(6 * time.Hour)
@@ -407,9 +566,13 @@ func (h *Hub) renewExpiring() {
 	}
 }
 
-// loadOrCreateAccountKey keeps one ECDSA account key for all orders.
-func (h *Hub) loadOrCreateAccountKey() (crypto.Signer, error) {
-	path := filepath.Join(h.dir, "acme-account.key")
+// loadOrCreateAccountKey maintains a private key per ACME account.
+func (h *Hub) loadOrCreateAccountKey(accountID string) (crypto.Signer, error) {
+	keyName := "acme-account.key"
+	if accountID != "" {
+		keyName = "acme-account-" + accountID + ".key"
+	}
+	path := filepath.Join(h.dir, keyName)
 	if b, err := os.ReadFile(path); err == nil {
 		block, _ := pem.Decode(b)
 		if block != nil {

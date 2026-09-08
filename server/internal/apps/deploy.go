@@ -1,6 +1,7 @@
 package apps
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -174,11 +175,18 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 	if app.SourceType == "raw_compose" {
 		e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
 		logBuf.WriteString("$ deploy raw docker compose stack\n")
-		composePath := fmt.Sprintf("/var/lib/watchman/apps/%s/compose.yaml", app.ID)
-		if err := writeFileOnAgent(hub, composePath, []byte(app.ComposeContent)); err != nil {
+		appDir := fmt.Sprintf("/var/lib/watchman/apps/%s", app.ID)
+		composePath := fmt.Sprintf("%s/compose.yaml", appDir)
+
+		// Safely write compose.yaml via base64 decoding on agent.
+		b64Content := base64.StdEncoding.EncodeToString([]byte(app.ComposeContent))
+		writeScript := fmt.Sprintf(`mkdir -p %s && echo %s | base64 -d > %s`,
+			shellQuote(appDir), shellQuote(b64Content), shellQuote(composePath))
+		if res, err := execOnAgent(hub, "write-compose-"+randomToken(4), writeScript, 30); err != nil || res.GetExitCode() != 0 {
 			fail("写入 Compose 配置文件失败: %v", err)
 			return
 		}
+
 		composeCmd := fmt.Sprintf("docker compose -f %s -p watchman-%s up -d --remove-orphans",
 			shellQuote(composePath), app.ID)
 		logBuf.WriteString("$ " + composeCmd + "\n")

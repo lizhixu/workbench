@@ -5,13 +5,32 @@ export interface CertHubConfig {
   base_url: string
   username: string
   password: string
+  updated_at?: string
+}
+
+export interface ACMEPreset {
+  id: string
+  name: string
+  directory_url: string
+  requires_eab: boolean
+  description: string
+}
+
+export interface ACMEAccount {
+  id: string
+  name: string
+  provider_id: string
   directory_url: string
   email: string
-  updated_at?: string
+  eab_key_id?: string
+  eab_hmac_key?: string
+  is_default: boolean
+  created_at: string
 }
 
 export interface Certificate {
   id: string
+  account_id?: string
   domains: string[]
   not_before: string
   not_after: string
@@ -30,12 +49,34 @@ export function updateCertConfig(cfg: CertHubConfig) {
   return unwrap<{ data: CertHubConfig }>(http.put('/certs/config', cfg)).then((r) => r.data)
 }
 
+export function listPresets() {
+  return unwrap<{ data: ACMEPreset[] }>(http.get('/certs/presets')).then((r) => r.data)
+}
+
+export function listACMEAccounts() {
+  return unwrap<{ data: ACMEAccount[] }>(http.get('/certs/accounts')).then((r) => r.data)
+}
+
+export function createACMEAccount(req: Partial<ACMEAccount>) {
+  return unwrap<{ data: ACMEAccount }>(http.post('/certs/accounts', req)).then((r) => r.data)
+}
+
+export function updateACMEAccount(id: string, req: Partial<ACMEAccount>) {
+  return unwrap<{ data: ACMEAccount }>(http.put(`/certs/accounts/${id}`, req)).then((r) => r.data)
+}
+
+export function deleteACMEAccount(id: string) {
+  return unwrap<{ ok: boolean }>(http.delete(`/certs/accounts/${id}`))
+}
+
 export function listCerts() {
   return unwrap<{ data: Certificate[] }>(http.get('/certs')).then((r) => r.data)
 }
 
-export function issueCert(domains: string[]) {
-  return unwrap<{ ok: boolean; message: string }>(http.post('/certs/issue', { domains }))
+export function issueCert(domains: string[], accountId?: string) {
+  return unwrap<{ ok: boolean; message: string }>(
+    http.post('/certs/issue', { domains, account_id: accountId }),
+  )
 }
 
 export function renewCert(id: string) {

@@ -89,6 +89,8 @@ func (d *dnsMngChallenge) CleanUp(fqdn, value string) error {
 type acmeClient struct {
 	directoryURL string
 	email        string
+	eabKeyID     string
+	eabHMACKey   string
 	http         *http.Client
 	log          *slog.Logger
 
@@ -141,6 +143,13 @@ func (a *acmeClient) ensureAccount(accountKey crypto.Signer) error {
 	payload := map[string]any{
 		"termsOfServiceAgreed": true,
 		"contact":              []string{"mailto:" + a.email},
+	}
+	if a.eabKeyID != "" && a.eabHMACKey != "" {
+		eabJWS, err := computeEAB(dir["newAccount"], a.eabKeyID, a.eabHMACKey, accountKey.Public())
+		if err != nil {
+			return fmt.Errorf("compute EAB: %w", err)
+		}
+		payload["externalAccountBinding"] = eabJWS
 	}
 	body, location, status, err := a.jwsRequest(dir["newAccount"], payload, "", accountKey, true)
 	if err != nil {

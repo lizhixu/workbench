@@ -240,7 +240,7 @@ async function runFrom(startIdx: number) {
   running.value = false
   finished.value = true
   currentStep.value = -1
-  echo(`\r\n\x1b[32m╰─ 任务「${plan.value.title}」全部步骤执行完成 🎉\x1b[0m\r\n`)
+  echo(`\r\n\x1b[32m╰─ 任务「${plan.value.title}」全部步骤执行完成\x1b[0m\r\n`)
   message.success('任务执行完成')
 }
 

@@ -489,8 +489,8 @@ const webhookPreview = computed(() => {
     body = {
       msgtype: 'markdown',
       markdown: {
-        title: '[🔔] Webhook 告警通知: watchman-console',
-        text: '### 🔔 Webhook 告警通知\\n\\n- **告警级别**: INFO 信息\\n- **关联主机**: `watchman-console`\\n- **详情说明**: 这是一条告警消息预览。',
+        title: '[告警通知] Webhook 告警通知: watchman-console',
+        text: '### [告警通知] Webhook 告警通知\\n\\n- **告警级别**: INFO 信息\\n- **关联主机**: `watchman-console`\\n- **详情说明**: 这是一条告警消息预览。',
       },
     }
   } else if (platform?.name.includes('企业微信')) {
@@ -507,7 +507,7 @@ const webhookPreview = computed(() => {
       : '未配置 Secret，不会生成签名'
     body = {
       msg_type: 'text',
-      content: { text: '🛡️ Watchman 告警通知\\n【规则名称】Webhook 告警通知' },
+      content: { text: '[告警通知] Watchman 告警通知\\n【规则名称】Webhook 告警通知' },
     }
   } else if (secret && secret !== '********') {
     headers['X-Webhook-Secret'] = '••••••••'

@@ -126,7 +126,7 @@ const vaultOptions = computed(() => [
 
 const repoOptions = computed(() =>
   githubRepos.value.map((r) => ({
-    label: `${r.full_name}${r.private ? ' 🔒 (私有)' : ''}${r.description ? ' - ' + r.description : ''}`,
+    label: `${r.full_name}${r.private ? ' [私有]' : ''}${r.description ? ' - ' + r.description : ''}`,
     value: r.full_name,
   })),
 )

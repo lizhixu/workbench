@@ -589,12 +589,28 @@ onMounted(loadData)
       v-model:show="showAuthModal"
       preset="card"
       title="连接 GitHub 账号"
-      style="width: 540px; max-width: 94vw"
+      style="width: 620px; max-width: 94vw"
     >
       <NSpace vertical size="medium">
         <NAlert type="info" :show-icon="true">
-          请输入您的 GitHub Personal Access Token (Classic 或 Fine-grained)。
-          需勾选 <b>repo</b> 权限以便读取私有仓库和分支代码。
+          <div style="font-weight: 600; margin-bottom: 6px">Token 权限配置说明（满足以下任一方式即可）：</div>
+          <div style="font-size: 13px; line-height: 1.6">
+            <div>
+              <b>1. 细粒度 Token（Fine-grained，官方推荐）</b>：
+              <ul style="margin: 2px 0 6px 18px; padding: 0">
+                <li><b>Repository access</b>：选择目标仓库或 <i>All repositories</i></li>
+                <li><b>Permissions -> Contents</b>：设置为 <b>Read-only</b>（用于读取代码与 Compose 编排）</li>
+                <li><i>(可选)</i> <b>Permissions -> Webhooks</b>：设置为 <b>Read and write</b>（用于提交自动触发重部署）</li>
+              </ul>
+            </div>
+            <div>
+              <b>2. 传统 Token（Tokens classic）</b>：
+              <ul style="margin: 2px 0 0 18px; padding: 0">
+                <li>私有仓库勾选 <b>repo</b>（公开仓库仅需 <b>public_repo</b>）</li>
+                <li><i>(可选)</i> 勾选 <b>admin:repo_hook</b>（用于自动注册 Push Webhook）</li>
+              </ul>
+            </div>
+          </div>
         </NAlert>
 
         <NFormItem label="GitHub Personal Access Token" required>
@@ -602,7 +618,7 @@ onMounted(loadData)
             v-model:value="githubTokenInput"
             type="password"
             show-password-on="click"
-            placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+            placeholder="github_pat_xxx 或 ghp_xxx"
           />
         </NFormItem>
 

@@ -148,30 +148,30 @@ func (h *Handlers) checkNode(c *gin.Context) {
 		return
 	}
 
-	// 1. Check version & installation
-	resVer, err := h.runExec(hub, "tailscale version", 15)
-	if err != nil || resVer.ExitCode != 0 {
-		st := NodeStatus{
-			HostID:       hostID,
-			Installed:    false,
-			Online:       false,
-			ErrorMessage: "Tailscale 未安装或未加入 PATH",
-			LastChecked:  time.Now(),
+		// 1. Check version & installation
+		resVer, err := h.runExec(hub, hostID, "tailscale version", 15)
+		if err != nil || resVer.ExitCode != 0 {
+			st := NodeStatus{
+				HostID:       hostID,
+				Installed:    false,
+				Online:       false,
+				ErrorMessage: "Tailscale 未安装或未加入 PATH",
+				LastChecked:  time.Now(),
+			}
+			_ = h.store.SetNodeStatus(st)
+			c.JSON(http.StatusOK, gin.H{"data": st})
+			return
 		}
-		_ = h.store.SetNodeStatus(st)
-		c.JSON(http.StatusOK, gin.H{"data": st})
-		return
-	}
 
-	verStr := strings.TrimSpace(string(resVer.Stdout))
-	verLines := strings.Split(verStr, "\n")
-	cleanVer := ""
-	if len(verLines) > 0 {
-		cleanVer = strings.TrimSpace(verLines[0])
-	}
+		verStr := strings.TrimSpace(string(resVer.Stdout))
+		verLines := strings.Split(verStr, "\n")
+		cleanVer := ""
+		if len(verLines) > 0 {
+			cleanVer = strings.TrimSpace(verLines[0])
+		}
 
-	// 2. Check tailscale status --json
-	resStatus, err := h.runExec(hub, "tailscale status --json", 20)
+		// 2. Check tailscale status --json
+		resStatus, err := h.runExec(hub, hostID, "tailscale status --json", 20)
 	if err != nil || resStatus.ExitCode != 0 {
 		// Possibly daemon not running
 		errMsg := string(resStatus.Stderr)
@@ -259,16 +259,14 @@ func (h *Handlers) installNode(c *gin.Context) {
 		return
 	}
 
+	shell := agentShellFor(agent)
 	var cmd string
-	var shell string
-	if strings.ToLower(agent.OS) == "windows" {
-		shell = "powershell"
+	switch shell {
+	case "powershell":
 		cmd = `$msi = "$env:TEMP\tailscale-setup.msi"; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi', $msi); Start-Process msiexec.exe -Wait -ArgumentList "/i ` + "`\"$msi`\"" + ` /qn /norestart"; Start-Sleep -Seconds 3; Start-Service Tailscale`
-	} else if strings.Contains(strings.ToLower(agent.Distro), "alpine") {
-		shell = "sh"
+	case "sh":
 		cmd = `rm -rf /tmp/tailscale* /tmp/lighter-installer*; apk update && apk add tailscale && rc-update add tailscale default 2>/dev/null; rc-service tailscale restart`
-	} else {
-		shell = "bash"
+	default:
 		cmd = `curl -fsSL https://tailscale.com/install.sh | sh && systemctl enable --now tailscaled`
 	}
 
@@ -315,7 +313,7 @@ type JoinRequest struct {
 	AuthKey           string `json:"auth_key"`
 	ServerURL         string `json:"server_url"`
 	AcceptRoutes      *bool  `json:"accept_routes"`
-	AdvertiseRoutes   string `json:"advertise_routes"`   // e.g. "192.168.1.0/24"
+	AdvertiseRoutes   string `json:"advertise_routes"`    // e.g. "192.168.1.0/24"
 	AdvertiseExitNode bool   `json:"advertise_exit_node"` // e.g. "--advertise-exit-node"
 	Hostname          string `json:"hostname"`
 	Reset             bool   `json:"reset"`
@@ -372,6 +370,10 @@ func (h *Handlers) joinNode(c *gin.Context) {
 	if acceptRoutes {
 		args = append(args, "--accept-routes=true")
 	}
+	// Always disable MagicDNS override on managed servers to prevent host DNS hijacking
+	// and avoid deadlock loops with Docker containers relying on public DNS.
+	args = append(args, "--accept-dns=false")
+
 	if req.AdvertiseRoutes != "" {
 		args = append(args, fmt.Sprintf("--advertise-routes=%s", req.AdvertiseRoutes))
 	}
@@ -381,18 +383,24 @@ func (h *Handlers) joinNode(c *gin.Context) {
 	if req.Hostname != "" {
 		args = append(args, fmt.Sprintf("--hostname=%s", req.Hostname))
 	}
-	args = append(args, "--reset")
+	// `--reset` discards the local node state and re-enrolls the node with a NEW
+	// node key, so the control plane treats it as a brand new node and hands out
+	// a different 100.x.y.z address. That is why re-joining after a failure used
+	// to silently change the mesh IP. Only reset when explicitly requested
+	// (e.g. the node key is genuinely corrupted or the host was re-imaged).
+	if req.Reset {
+		args = append(args, "--reset")
+	}
 
 	cmd := strings.Join(args, " ")
 
+	// Remember the previous address so we can report whether it changed.
+	prevStatus, _ := h.store.GetNodeStatus(hostID)
+	prevIP := prevStatus.IP
+
 	h.recordAudit(c, "join", "network_node", hostID, "执行 tailscale up 加入异地组网")
 
-	agentShell := "bash"
-	if strings.ToLower(agent.OS) == "windows" {
-		agentShell = "powershell"
-	} else if strings.Contains(strings.ToLower(agent.Distro), "alpine") {
-		agentShell = "sh"
-	}
+	agentShell := agentShellFor(agent)
 
 	res, err := h.runExecWithTimeout(hub, cmd, agentShell, 90)
 	if err != nil {
@@ -419,30 +427,67 @@ func (h *Handlers) joinNode(c *gin.Context) {
 		return
 	}
 
-	// Give it a brief moment to assign IP, then read IP
+	// Give it a brief moment to assign IP, then read it back.
 	time.Sleep(2 * time.Second)
-	resIP, _ := h.runExec(hub, "tailscale ip -4", 10)
-	ipStr := ""
-	if resIP != nil && resIP.ExitCode == 0 {
-		ipStr = strings.TrimSpace(string(resIP.Stdout))
-	}
+	ipStr, ip6Str := h.querySelfIPs(hub, agentShell, hostID)
 
-	st, _ := h.store.GetNodeStatus(hostID)
+	st := prevStatus
 	st.HostID = hostID
 	st.Installed = true
 	st.Online = true
 	if ipStr != "" {
 		st.IP = ipStr
 	}
+	if ip6Str != "" {
+		st.IPv6 = ip6Str
+	}
 	st.LastChecked = time.Now()
 	_ = h.store.SetNodeStatus(st)
 
+	ipChanged := prevIP != "" && ipStr != "" && prevIP != ipStr
+
 	c.JSON(http.StatusOK, gin.H{
-		"ok":      true,
-		"message": "成功加入异地虚拟网络！",
-		"ip":      ipStr,
-		"data":    st,
+		"ok":          true,
+		"message":     "成功加入异地虚拟网络！",
+		"ip":          ipStr,
+		"previous_ip": prevIP,
+		"ip_changed":  ipChanged,
+		"data":        st,
 	})
+}
+
+// querySelfIPs reads the node's own Tailscale addresses.
+//
+// `tailscale status --json` is preferred because it returns IPv4 and IPv6 in one
+// round-trip and also works when `tailscale ip` is missing from older builds.
+func (h *Handlers) querySelfIPs(hub *rpc.Hub, shell, hostID string) (string, string) {
+	if res, err := h.runExecWithTimeout(hub, "tailscale status --json", shell, 20); err == nil && res != nil && res.ExitCode == 0 {
+		var st struct {
+			Self struct {
+				TailscaleIPs []string `json:"TailscaleIPs"`
+			} `json:"Self"`
+		}
+		if err := json.Unmarshal(res.Stdout, &st); err == nil {
+			var v4, v6 string
+			for _, ip := range st.Self.TailscaleIPs {
+				ip = strings.TrimSpace(ip)
+				if strings.Contains(ip, ":") {
+					if v6 == "" {
+						v6 = ip
+					}
+				} else if v4 == "" {
+					v4 = ip
+				}
+			}
+			if v4 != "" || v6 != "" {
+				return v4, v6
+			}
+		}
+	}
+	if res, err := h.runExecWithTimeout(hub, "tailscale ip -4", shell, 10); err == nil && res != nil && res.ExitCode == 0 {
+		return strings.TrimSpace(string(res.Stdout)), ""
+	}
+	return "", ""
 }
 
 // leaveNode executes `tailscale down` or `tailscale logout`.
@@ -464,7 +509,7 @@ func (h *Handlers) leaveNode(c *gin.Context) {
 
 	h.recordAudit(c, "leave", "network_node", hostID, fmt.Sprintf("执行 %s 退出/断开异地组网", cmd))
 
-	res, err := h.runExec(hub, cmd, 30)
+	res, err := h.runExec(hub, hostID, cmd, 30)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -511,52 +556,182 @@ func (h *Handlers) pingNode(c *gin.Context) {
 		req.Count = 3
 	}
 
-	cmd := fmt.Sprintf("tailscale ping -c %d %s", req.Count, req.Target)
+	target := shellQuoteArg(req.Target)
+	// `--until-direct=false`: since v1.24 `tailscale ping` defaults to
+	// until-direct=true, i.e. it keeps probing until a direct path is
+	// established. The first probes almost always traverse DERP, so the command
+	// hangs well past its budget and returns nothing useful.
+	// `--timeout`: bound each probe so a black-holed target cannot stall the call.
+	cmd := fmt.Sprintf("tailscale ping --until-direct=false -c %d --timeout=5s %s", req.Count, target)
 
-	res, err := h.runExecWithTimeout(hub, cmd, "bash", 30)
+	shell := agentShellFor(h.reg.GetAgent(hostID))
+	res, err := h.runExecWithTimeout(hub, cmd, shell, 40)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ping 测速超时: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Ping 测速失败: " + err.Error(),
+			"hint":  "Agent 未在超时时间内返回结果，通常是 tailscaled 未运行或主机负载过高",
+		})
 		return
 	}
 
-	stdout := string(res.Stdout)
-	stderr := string(res.Stderr)
-	output := strings.TrimSpace(stdout)
+	output := strings.TrimSpace(string(res.Stdout))
+	stderr := strings.TrimSpace(string(res.Stderr))
 	if output == "" {
-		output = strings.TrimSpace(stderr)
+		output = stderr
 	}
 
-	// Parse direct or relay info
-	// Example: "pong from 100.64.1.2 via DERP(syd) in 120ms" or "pong from 100.64.1.2 via 1.2.3.4:41641 in 15ms"
-	direct := strings.Contains(output, "direct") || (!strings.Contains(output, "DERP") && strings.Contains(output, "via"))
-	derp := ""
-	if strings.Contains(output, "DERP(") {
-		re := regexp.MustCompile(`DERP\(([a-zA-Z0-9]+)\)`)
-		if matches := re.FindStringSubmatch(output); len(matches) > 1 {
-			derp = "DERP(" + matches[1] + ")"
+	// Older Tailscale builds (<1.24) do not know --until-direct/--timeout.
+	// Retry with the minimal flag set instead of failing outright.
+	if res.ExitCode != 0 && looksLikeUnknownFlag(output) {
+		legacy := fmt.Sprintf("tailscale ping -c %d %s", req.Count, target)
+		if res2, err2 := h.runExecWithTimeout(hub, legacy, shell, 40); err2 == nil && res2 != nil {
+			res = res2
+			output = strings.TrimSpace(string(res2.Stdout))
+			if output == "" {
+				output = strings.TrimSpace(string(res2.Stderr))
+			}
 		}
-	} else if direct {
+	}
+
+	direct, derp, latency := parsePingOutput(output)
+
+	resp := pingResult{
+		OK:        res.ExitCode == 0 && strings.Contains(output, "pong from"),
+		Output:    output,
+		Direct:    direct,
+		DERP:      derp,
+		LatencyMS: latency,
+	}
+	if res.Error != "" {
+		resp.Error = res.Error
+	}
+	if !resp.OK {
+		resp.Hint = pingFailureHint(output, res.Error)
+	} else if !direct {
+		resp.Hint = "当前经 DERP 中继转发，尚未建立 P2P 直连（检查 UDP 41641 是否被防火墙/NAT 拦截）"
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// pingResult is the payload returned by the connectivity probe.
+type pingResult struct {
+	OK        bool    `json:"ok"`
+	Output    string  `json:"output"`
+	Direct    bool    `json:"direct"`
+	DERP      string  `json:"derp"`
+	LatencyMS float64 `json:"latency_ms"`
+	Error     string  `json:"error,omitempty"`
+	Hint      string  `json:"hint,omitempty"`
+}
+
+var (
+	rePingPong   = regexp.MustCompile(`pong\s+from\s+.*`)
+	rePingDERP   = regexp.MustCompile(`DERP\(([^)]+)\)`)
+	rePingLatMS  = regexp.MustCompile(`in\s+([0-9]+(?:\.[0-9]+)?)\s*ms`)
+	rePingLatSec = regexp.MustCompile(`in\s+([0-9]+(?:\.[0-9]+)?)\s*s\b`)
+)
+
+// looksLikeUnknownFlag reports whether a CLI failure was caused by an
+// unsupported flag, so we can retry with a compatible command.
+func looksLikeUnknownFlag(output string) bool {
+	low := strings.ToLower(output)
+	return strings.Contains(low, "unknown flag") ||
+		strings.Contains(low, "flag provided but not defined") ||
+		strings.Contains(low, "unknown long flag") ||
+		strings.Contains(low, "unknown shorthand flag")
+}
+
+// parsePingOutput extracts link type and latency from `tailscale ping` output.
+//
+// Real-world shapes it must handle:
+//
+//	pong from 100.64.1.2 via DERP(syd) in 120ms                 (legacy)
+//	pong from 100.64.1.2 via 1.2.3.4:41641 in 15ms              (direct)
+//	pong from node-a (100.64.1.2) via DERP(nyc) in 30ms         (modern)
+//	pong from node-a (100.64.1.2) via direct in 12ms
+func parsePingOutput(output string) (direct bool, derp string, latency float64) {
+	line := ""
+	for _, l := range strings.Split(output, "\n") {
+		if rePingPong.MatchString(l) {
+			line = strings.TrimSpace(l) // keep the LAST successful probe
+		}
+	}
+	if line == "" {
+		return false, "", 0
+	}
+
+	if m := rePingDERP.FindStringSubmatch(line); len(m) > 1 {
+		derp = "DERP(" + m[1] + ") 中继"
+		direct = false
+	} else if strings.Contains(line, "via") {
+		direct = true
 		derp = "Direct (P2P 直连)"
 	}
 
-	// Extract latency ms
-	var latency float64
-	reLat := regexp.MustCompile(`in\s+([0-9\.]+)\s*ms`)
-	if m := reLat.FindStringSubmatch(output); len(m) > 1 {
+	if m := rePingLatMS.FindStringSubmatch(line); len(m) > 1 {
 		latency, _ = strconv.ParseFloat(m[1], 64)
+	} else if m := rePingLatSec.FindStringSubmatch(line); len(m) > 1 {
+		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+			latency = v * 1000
+		}
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"ok":         res.ExitCode == 0,
-		"output":     output,
-		"direct":     direct,
-		"derp":       derp,
-		"latency_ms": latency,
-	})
+	return direct, derp, latency
 }
 
-func (h *Handlers) runExec(hub *rpc.Hub, cmd string, timeoutSec int) (*agentpb.ExecResult, error) {
-	return h.runExecWithTimeout(hub, cmd, "bash", timeoutSec)
+// pingFailureHint turns an empty/cryptic failure into an actionable message.
+func pingFailureHint(output, execErr string) string {
+	low := strings.ToLower(output + " " + execErr)
+	switch {
+	case strings.Contains(low, "timeout") || strings.Contains(low, "timed out"):
+		return "命令超时：tailscaled 可能未运行，或目标节点长时间无响应"
+	case strings.Contains(low, "no reply"), strings.Contains(low, "no response"):
+		return "目标无响应：对方可能离线、ACL 未放行，或 UDP 被防火墙拦截"
+	case strings.Contains(low, "unknown node"), strings.Contains(low, "not found"), strings.Contains(low, "no such host"):
+		return "目标 IP/节点名不在当前 Tailnet 内，请确认地址是否正确且对方已加入组网"
+	case strings.Contains(low, "not logged in"), strings.Contains(low, "needslogin"):
+		return "本机 Tailscale 尚未登录，请先执行「加入组网」"
+	case strings.Contains(low, "not found"), strings.Contains(low, "command not found"):
+		return "本机未找到 tailscale 命令，请先安装客户端"
+	case strings.TrimSpace(output) == "":
+		return "命令无任何输出：请确认本机已安装 tailscale 且已加入组网（可用「探测」按钮复核状态）"
+	default:
+		return "请展开原始输出查看 tailscale 的报错详情"
+	}
+}
+
+// shellQuoteArg quotes a value so it survives being embedded in a shell command.
+func shellQuoteArg(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(s, " \t\n'\"$&|;<>()\\`*?[]#!{}~") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// agentShellFor returns the shell used to run commands on a given agent.
+//
+// Hardcoding "bash" breaks Windows (no bash) and Alpine/BusyBox hosts (bash not
+// installed by default): the command fails instantly with "executable file not
+// found", which made status/ping probes look like a network problem.
+func agentShellFor(agent *rpc.Agent) string {
+	if agent == nil {
+		return "bash"
+	}
+	if strings.Contains(strings.ToLower(agent.OS), "windows") {
+		return "powershell"
+	}
+	distro := strings.ToLower(agent.Distro)
+	if strings.Contains(distro, "alpine") || strings.Contains(distro, "busybox") {
+		return "sh"
+	}
+	return "bash"
+}
+
+// runExec runs cmd on hostID using a shell that matches the host OS.
+func (h *Handlers) runExec(hub *rpc.Hub, hostID, cmd string, timeoutSec int) (*agentpb.ExecResult, error) {
+	return h.runExecWithTimeout(hub, cmd, agentShellFor(h.reg.GetAgent(hostID)), timeoutSec)
 }
 
 func (h *Handlers) runExecWithTimeout(hub *rpc.Hub, cmd, shell string, timeoutSec int) (*agentpb.ExecResult, error) {

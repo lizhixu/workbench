@@ -3,7 +3,7 @@ import { ref, onMounted } from 'vue'
 import {
   NCard, NSpace, NTag, NButton, NInput, NSwitch, NAlert, NPopconfirm,
   NIcon, useMessage, NDescriptions, NDescriptionsItem, NSpin, NForm, NFormItem,
-  NModal,
+  NModal, NText,
 } from 'naive-ui'
 import {
   GitNetworkOutline, RefreshOutline, CheckmarkCircleOutline,
@@ -41,6 +41,7 @@ const joinForm = ref({
   accept_routes: true,
   advertise_routes: '',
   advertise_exit_node: false,
+  reset: false,
 })
 
 // Ping 测速弹窗
@@ -114,6 +115,7 @@ function openJoinModal() {
     accept_routes: config.value?.accept_routes ?? true,
     advertise_routes: '',
     advertise_exit_node: config.value?.advertise_exit_node ?? false,
+    reset: false,
   }
   showJoinModal.value = true
 }
@@ -131,8 +133,16 @@ async function doJoin() {
       accept_routes: joinForm.value.accept_routes,
       advertise_routes: joinForm.value.advertise_routes.trim(),
       advertise_exit_node: joinForm.value.advertise_exit_node,
+      reset: joinForm.value.reset,
     })
-    message.success(res.message || '成功加入虚拟局域网！')
+    if (res.ip_changed) {
+      message.warning(
+        `注意：组网 IP 已从 ${res.previous_ip} 变为 ${res.ip}（本次启用了状态重置）`,
+        { duration: 8000 },
+      )
+    } else {
+      message.success(res.message || '成功加入虚拟局域网！')
+    }
     showJoinModal.value = false
     await handleCheck()
   } catch (e: any) {
@@ -215,10 +225,16 @@ onMounted(loadData)
                 一键安装 Tailscale
               </NButton>
 
-              <NButton v-else-if="!node?.online" type="primary" @click="openJoinModal">
-                <template #icon><NIcon :component="PlayOutline" /></template>
-                一键连接 Up
-              </NButton>
+              <template v-else-if="!node?.online">
+                <NButton type="primary" @click="openJoinModal">
+                  <template #icon><NIcon :component="PlayOutline" /></template>
+                  一键连接 Up
+                </NButton>
+                <NButton type="info" secondary @click="openPing">
+                  <template #icon><NIcon :component="RadioOutline" /></template>
+                  Ping 测速
+                </NButton>
+              </template>
 
               <template v-else>
                 <NButton type="info" secondary @click="openPing">
@@ -329,6 +345,16 @@ onMounted(loadData)
             placeholder="留空表示不广播子网路由"
           />
         </NFormItem>
+
+        <NFormItem>
+          <template #label>
+            重置节点状态 (--reset)
+            <NText depth="3" style="font-weight: normal; margin-left: 6px; font-size: 12px">
+              默认关闭。开启后会丢弃原节点身份重新注册，组网 IP 会发生变化
+            </NText>
+          </template>
+          <NSwitch v-model:value="joinForm.reset" />
+        </NFormItem>
       </NForm>
 
       <template #footer>
@@ -369,7 +395,7 @@ onMounted(loadData)
         <div v-if="pingResult" class="ping-box">
           <div class="result-bar">
             <NTag :type="pingResult.ok ? 'success' : 'error'" size="small">
-              {{ pingResult.ok ? '探测连通' : '超时' }}
+              {{ pingResult.ok ? (pingResult.direct ? '连通 (P2P 直连)' : '连通 (DERP 中继)') : '探测超时或失败' }}
             </NTag>
             <span v-if="pingResult.latency_ms > 0" class="latency-lbl">
               往返耗时: {{ pingResult.latency_ms }} ms
@@ -378,7 +404,19 @@ onMounted(loadData)
               链路: {{ pingResult.derp }}
             </NTag>
           </div>
-          <pre class="ping-raw">{{ pingResult.output }}</pre>
+          <NAlert
+            v-if="pingResult.hint || pingResult.error"
+            :type="pingResult.ok ? 'warning' : 'error'"
+            size="small"
+            style="margin-bottom: 8px"
+            :show-icon="true"
+          >
+            {{ pingResult.hint }}
+            <template v-if="pingResult.error">
+              <br />{{ pingResult.error }}
+            </template>
+          </NAlert>
+          <pre class="ping-raw">{{ pingResult.output || '(命令无输出)' }}</pre>
         </div>
       </NForm>
 

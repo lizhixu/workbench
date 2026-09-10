@@ -11,7 +11,6 @@ import {
   useMessage,
 } from 'naive-ui'
 import {
-  DocumentTextOutline,
   RefreshOutline,
   SparklesOutline,
   TimeOutline,
@@ -152,9 +151,7 @@ onMounted(() => {
     <!-- Header -->
     <div class="report-header">
       <div class="header-left">
-        <NIcon size="20" color="#6366f1"><DocumentTextOutline /></NIcon>
-        <span class="page-title">AI 运维报告</span>
-        <span class="page-desc">自动聚合主机健康度、告警与资源趋势，AI 撰写摘要与建议</span>
+        <h2 class="page-title">AI 运维报告</h2>
       </div>
       <div class="header-right">
         <NSelect
@@ -328,14 +325,10 @@ onMounted(() => {
       gap: 8px;
 
       .page-title {
+        margin: 0;
         font-size: 18px;
         font-weight: 700;
         color: var(--text-primary);
-      }
-
-      .page-desc {
-        font-size: 12px;
-        color: var(--text-secondary);
       }
     }
 
@@ -603,10 +596,6 @@ onMounted(() => {
     .report-header {
       flex-wrap: wrap;
       gap: 8px;
-
-      .header-left .page-desc {
-        display: none;
-      }
 
       .header-right {
         width: 100%;

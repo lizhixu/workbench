@@ -2,11 +2,11 @@
 import { onMounted, ref, computed } from 'vue'
 import {
   NButton, NSpace, NTag, NModal, NForm, NFormItem,
-  NInput, NSelect, NSwitch, useMessage, NIcon, NAlert, NPopconfirm,
+  NInput, NSelect, NSwitch, useMessage, NIcon, NAlert, NPopconfirm, NText,
   NSpin, NEmpty,
 } from 'naive-ui'
 import {
-  GitNetworkOutline, RefreshOutline,
+  RefreshOutline,
   CheckmarkCircleOutline, CloseCircleOutline, PlayOutline,
   CloudUploadOutline,
   SettingsOutline, CopyOutline, SearchOutline, RadioOutline,
@@ -46,6 +46,9 @@ const joinForm = ref({
   accept_routes: true,
   advertise_routes: '',
   advertise_exit_node: false,
+  // 默认关闭：--reset 会丢弃节点状态并以新节点身份重新注册，
+  // Headscale 会重新分配 100.x.y.z，导致组网 IP 变化。
+  reset: false,
 })
 const joining = ref(false)
 
@@ -178,6 +181,7 @@ function openJoinModal(node: NetworkNode) {
     accept_routes: config.value.accept_routes,
     advertise_routes: '',
     advertise_exit_node: config.value.advertise_exit_node,
+    reset: false,
   }
   showJoinModal.value = true
 }
@@ -196,8 +200,16 @@ async function doJoin() {
       accept_routes: joinForm.value.accept_routes,
       advertise_routes: joinForm.value.advertise_routes.trim(),
       advertise_exit_node: joinForm.value.advertise_exit_node,
+      reset: joinForm.value.reset,
     })
-    message.success(res.message || '成功加入虚拟网络！')
+    if (res.ip_changed) {
+      message.warning(
+        `注意：组网 IP 已从 ${res.previous_ip} 变为 ${res.ip}（本次启用了状态重置）`,
+        { duration: 8000 },
+      )
+    } else {
+      message.success(res.message || '成功加入虚拟网络！')
+    }
     showJoinModal.value = false
     await handleCheck(targetNode.value)
   } catch (e: any) {
@@ -255,8 +267,7 @@ onMounted(loadData)
     <div class="network-header">
       <div class="header-left">
         <div class="title-wrap">
-          <NIcon size="22" color="#10b981"><GitNetworkOutline /></NIcon>
-          <h2 class="page-title">异地组网 (Tailscale / Headscale)</h2>
+          <h2 class="page-title">异地组网</h2>
           <NTag size="small" :bordered="false" round type="success">
             {{ config.control_plane === 'headscale' ? 'Headscale 自托管' : 'Tailscale 官方' }}
           </NTag>
@@ -264,9 +275,6 @@ onMounted(loadData)
             {{ config.server_url }}
           </NTag>
         </div>
-        <p class="page-desc">
-          基于 WireGuard 构建跨物理地域的端到端加密虚拟网（100.64.0.0/10）。无公网 IP 节点之间打洞直连，跨机房、家庭内网、云上服务器极速免端口互通。
-        </p>
       </div>
 
       <div class="header-right">
@@ -471,6 +479,16 @@ onMounted(loadData)
               </NButton>
               <NButton
                 size="small"
+                type="info"
+                secondary
+                :disabled="!row.agent_online"
+                @click="openPingModal(row)"
+              >
+                <template #icon><NIcon :component="RadioOutline" /></template>
+                Ping 测速
+              </NButton>
+              <NButton
+                size="small"
                 quaternary
                 :loading="checkingIds[row.host_id]"
                 :disabled="!row.agent_online"
@@ -614,6 +632,16 @@ onMounted(loadData)
             placeholder="留空表示不广播子网，多段用逗号分隔"
           />
         </NFormItem>
+
+        <NFormItem>
+          <template #label>
+            重置节点状态 (--reset)
+            <NText depth="3" style="font-weight: normal; margin-left: 6px; font-size: 12px">
+              默认关闭。开启后会丢弃原节点身份重新注册，组网 IP 会发生变化
+            </NText>
+          </template>
+          <NSwitch v-model:value="joinForm.reset" />
+        </NFormItem>
       </NForm>
 
       <template #footer>
@@ -654,7 +682,7 @@ onMounted(loadData)
         <div v-if="pingResult" class="ping-result-box">
           <div class="result-header">
             <NTag :type="pingResult.ok ? 'success' : 'error'" size="small">
-              {{ pingResult.ok ? '连通探测成功' : '探测超时或失败' }}
+              {{ pingResult.ok ? (pingResult.direct ? '连通 (P2P 直连)' : '连通 (DERP 中继)') : '探测超时或失败' }}
             </NTag>
             <span v-if="pingResult.latency_ms > 0" class="latency-tag">
               往返耗时: {{ pingResult.latency_ms }} ms
@@ -663,7 +691,19 @@ onMounted(loadData)
               链路: {{ pingResult.derp }}
             </NTag>
           </div>
-          <pre class="ping-output">{{ pingResult.output }}</pre>
+          <NAlert
+            v-if="pingResult.hint || pingResult.error"
+            :type="pingResult.ok ? 'warning' : 'error'"
+            size="small"
+            style="margin-bottom: 8px"
+            :show-icon="true"
+          >
+            {{ pingResult.hint }}
+            <template v-if="pingResult.error">
+              <br />{{ pingResult.error }}
+            </template>
+          </NAlert>
+          <pre class="ping-output">{{ pingResult.output || '(命令无输出)' }}</pre>
         </div>
       </NForm>
 

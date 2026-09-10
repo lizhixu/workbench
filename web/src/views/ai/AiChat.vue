@@ -105,9 +105,7 @@ onMounted(() => {
 <template>
   <div class="ai-chat-view">
     <div class="chat-header">
-      <NIcon size="20" color="#6366f1"><SparklesOutline /></NIcon>
-      <span class="chat-title">AI 运维助手</span>
-      <span class="chat-desc">用自然语言查询主机状态、告警、资源使用等信息</span>
+      <h2 class="page-title">AI 运维助手</h2>
     </div>
 
     <div class="chat-body">
@@ -204,16 +202,11 @@ onMounted(() => {
     gap: 8px;
     flex-shrink: 0;
 
-    .chat-title {
+    .page-title {
+      margin: 0;
       font-size: 18px;
       font-weight: 700;
       color: var(--text-primary);
-    }
-
-    .chat-desc {
-      font-size: 12px;
-      color: var(--text-secondary);
-      margin-left: 8px;
     }
   }
 
@@ -407,12 +400,8 @@ onMounted(() => {
     gap: 8px;
 
     .chat-header {
-      .chat-title {
+      .page-title {
         font-size: 16px;
-      }
-
-      .chat-desc {
-        display: none;
       }
     }
 

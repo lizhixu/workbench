@@ -287,13 +287,14 @@ onMounted(load)
 
       &.is-terminal {
         overflow: hidden;
-        padding: 0;
+        padding: var(--card-padding);
       }
 
       .terminal-pane-wrapper {
         height: 100%;
         min-height: 100%;
         background: var(--code-box-bg);
+        border: 1px solid var(--border-color);
         border-radius: 6px;
         overflow: hidden;
       }

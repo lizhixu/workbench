@@ -3,6 +3,10 @@
 > 参考对象：长亭百川云「牧云·主机管理助手 / 云堡垒机」
 > 参考来源：<https://rivers.chaitin.cn/product/co1som8hp38s73e07jog> 及其官方文档 `/docs/zh/cloudwalker/{intro,function,start}`
 > 背景：原 SaaS 服务说停就停、不提供服务，数据与可用性不可控，故自研一套可自部署的等价系统，核心目标是「自己掌控、永久可用、不依赖第三方 SaaS」。
+>
+> **必读 + 维护约定**：
+> 1. 本文档**每次会话/每次任务开工前必须完整阅读**，并且**必须严格遵循其中的全部约束**（§7 代码质量校验、§8 前端布局规范、§8.5 终端断线重连、§8.6 维护握手与告警防抖等）。开工前先读、改代码时对照，不得凭印象或惯例行事；与文档冲突时以文档为准，若文档确实过时则先更新文档再改代码。
+> 2. 本文档是需求与设计的唯一事实来源。**所有需求的改动和新增，实现代码的同时必须同步维护本文档**——涉及协议字段、数据模型、REST/WS 接口、配置项、前端布局与交互规范、构建与部署方式的，都要在对应章节补齐或更正，不允许只改代码不更新文档。
 
 ---
 
@@ -115,6 +119,8 @@
 ### 3.11 监控告警
 
 - **内置监控项**：默认提供「主机上线」「主机离线」告警。
+- **月流量超额预警（内置，非规则）**：基于每台主机在「财务与规格」中配置的「流量限制 (GB)」与「月流量计算类型」（双向/仅上行/仅下行）自动判定：达到 80% 触发警告、达到 100% 触发严重告警（触发 ID 为 `builtin-traffic-80` / `builtin-traffic-100`），回落后自动标记解决。**不存在也不允许再创建 `traffic_high` 类型的告警规则**——流量配额是主机属性而非全局规则，告警中心的规则类型选项中已移除该项。未配置流量限制的主机不产生流量告警。
+- **到期续费提醒（内置，非规则）**：主机在「财务与规格」中配置了「到期时间」后，距到期不足 30 天时自动发起一次续费提醒（触发 ID `builtin-expiry-remind`，警告级别，走告警中心与 webhook 通知）；到期时间在 30 天以外的主机不提醒，续费（到期时间推后）后提醒自动解除，逾期未续保持提醒且不重复触发。
 - **自定义监控项**：可添加监控参数并设置告警条件。
 - **消息通知**：支持配置告警通知方式（邮件/Webhook 等，可扩展）。
 - **秒级感知**：主机状态变化及时告警。
@@ -539,6 +545,7 @@ message SysInfoSnapshot {
 - **多路复用**：所有业务在一条 `Connect` bidi stream 上以 oneof 分发；终端/文件等高频通道按 `session_id`/`op_id` 路由，互不阻塞。
 - **会话恢复**：控制端按 `session_id` 持有路由表，Agent 短暂断连时保留 PTY ~60s，重连续接。
 - **未开放端口**：Agent 仅出站，不监听任何端口。
+- **维护握手**：控制端重启前下发 `MaintenanceNotice`，Agent 自升级前落盘 `reconnect_reason = "upgrade"`，重连带理由消解告警（见 8.6）。
 
 ## B.3 数据模型（核心表）
 
@@ -1085,6 +1092,77 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
 7. **区分「我们主动关」和「意外断开」**：组件卸载时先置 `closedByUs = true` 再 `ws.close()`，否则清理过程会触发一次无意义的重连。收到服务端 `ended` 帧同样要停止重连——那是 shell 真的退出了。
 
 8. 重连成功后要重新 `sendResize()`，把当前终端尺寸同步给远端 PTY。
+
+### 8.6 维护握手与告警防抖规范
+
+控制端重启升级与被控端 Agent 在线自升级是运维高频动作，绝不能因为短暂的断线与重连导致告警引擎向运维人员推送大面积虚假的「主机离线 / 主机上线」轰炸。系统必须采用**「双向维护握手信令（Controlled Maintenance Handshake）」**闭环机制。
+
+实现约定：
+
+1. **协议信令支撑（`proto/agent.proto`）**：
+   - `ServerMessage` 增加 `MaintenanceNotice { reason, expected_duration_sec }`；
+   - `RegisterRequest` 增加 `reconnect_reason`（支持 `"upgrade"` / `"maintenance"`）。
+
+2. **控制端优雅退出广播（Server 重启/升级场景）**：
+   - 控制端（`server/cmd/watchman/main.go`）捕获 `SIGTERM` / `SIGINT` 时，在调用 `GracefulStop` 之前，必须通过 `Registry.BroadcastMaintenance("server_restart", 120)` 向所有在线 Agent 广播下发维护预告帧；
+   - Agent 收到后将 `reconnect_reason = "maintenance"` 落盘至 `agent-state.json`；
+   - 控制端拉起后，在维护窗口内连回并携带 `reconnect_reason = "maintenance"` 的 Agent，告警引擎必须静默对齐状态，**严禁触发上线通知**。
+
+3. **被控端在线自升级（Agent 自升级场景）**：
+   - 控制端在 `/api/v1/hosts/:id/upgrade` 发出升级指令前，必须自动调用 `alertMonitor.SetHostMaintenance(hostID, 180s, "agent_upgrade")`，为目标主机开启专属维护静默期；
+   - 处于维护期内的主机，告警引擎在 `checkRule` 中评估 `RuleOffline` 时直接静默跳过，**严禁触发离线告警**；
+   - Agent 在 `upgrade.Manager` 完成二进制自替换、准备 `os.Exit(0)` 重启前，必须将 `reconnect_reason = "upgrade"` 写入本地持久化状态；
+   - Agent 重启后发送携带 `reconnect_reason = "upgrade"` 的 `RegisterRequest`；控制端收到后清除维护标记，平滑同步为在线，**严禁触发上线通知**。
+
+4. **一次性理由自愈消费**：
+   - Agent 收到服务端的 `RegisterResponse`（即鉴权注册成功）后，必须立即在本地状态文件中清空 `reconnect_reason`，确保后续运行过程中的异常掉线能恢复常规告警感知。
+
+5. **版本号必须是构建产物，不能硬编码**：
+   - Agent 上报的 `RegisterRequest.agent_version` 与控制端的 `CurrentAgentVersion` 一律取自 `internal/version`（`version.Get()`），发布时用 `make VERSION=v1.2.3 build-all` 注入（`-ldflags -X watchman/internal/version.Version=...`）。
+   - 若两处都写死同一个常量（例如都是 `0.1.0-dev`），「哪些 Agent 需要升级」的判定恒为 false，批量升级与前端「需升级」提示会永久失效；此场景可用批量升级接口的 `force=true` 强制重推。
+   - Agent 本地状态（含 `reconnect_reason`）只能经 `config.Update` / `SetReconnectReason` 读写（带互斥锁 + 临时文件原子落盘），升级回调、收包协程、注册协程会并发访问。
+
+6. **广播维护通知不得持锁下发**：
+   - `Registry.BroadcastMaintenance` 先在 `r.mu.RLock()` 内快照 hub 列表，解锁后并发发送，并用 `broadcastTimeout` 兜底；`Hub.Send` 单台最多阻塞 5s，持锁发送会拖垮 `ListAgents`/HTTP 请求与告警 tick。
+
+### 8.7 异地组网（Tailscale/Headscale）实现约定
+
+实现位置：`server/internal/network/`（handlers/store）+ `web/src/views/network/NetworkList.vue`。
+
+1. **`--reset` 必须显式授权，严禁默认携带**：
+   - `tailscale up --reset` 会丢弃本地节点状态并以**新节点身份**重新注册（新 node key），控制面（Headscale）会重新分配 100.x.y.z —— 这正是「重新组网后 IP 变化」的根因。
+   - `joinNode` 仅在请求体 `reset: true`（前端弹窗默认关闭的开关）时追加 `--reset`；日常重连/失败重试绝不能带。
+   - 加入成功后须回报 `ip` / `previous_ip` / `ip_changed`，前端在 IP 变化时给出醒目提示。
+
+2. **下发到 Agent 的命令必须按主机 OS 选择 shell，严禁硬编码 `bash`**：
+   - 统一使用 `agentShellFor(agent)`（Windows→powershell，Alpine/BusyBox→sh，其余→bash）；`runExec(hub, hostID, cmd, timeout)` 内部已按 hostID 解析。
+   - 硬编码 bash 会让 Windows/Alpine 主机上所有探测（status/ping）立即失败，表现为「功能坏了」而非报错。
+
+3. **连通性测速（`tailscale ping`）命令与解析约定**：
+   - 命令必须加 `--until-direct=false --timeout=5s`（v1.24+ 默认 until-direct=true，会持续探测直到直连，导致命令长时间不退出）；目标值须经 `shellQuoteArg` 转义。
+   - 解析须兼容新旧输出：`pong from X via DERP(tok) in Nms`（旧）、`pong from node (100.x.y.z) via 1.2.3.4:41641 in Nms` / `via direct in Nms`（新），取**最后一条** pong 行，latency 支持 ms 与 s 两种单位。
+   - 命令因不认识的 flag 失败时（老版本），降级为 `tailscale ping -c N <target>` 重试。
+   - 失败时返回 `hint`（`pingFailureHint`：no reply / unknown node / not logged in 等），前端展示诊断建议，不能只给一个空白结果框。
+   - 「Ping 测速」入口在**未连接**分支也要渲染（Agent 在线即可测），否则弱网/掉线节点无诊断入口。
+
+### 8.8 组件选用与页面布局进阶规范
+
+1. **优先使用 Naive UI 原生组件，非必要不封装**：
+   - 凡能由 Naive UI 官方组件（`NCard`, `NDataTable`, `NTabs`, `NTabPane`, `NSpace`, `NButton`, `NModal`, `NAlert`, `NInput` 等）满足的交互与视觉结构，**一律优先直接使用官方组件**，严禁在外部包裹多层无意义的自定义 `div` 模拟组件结构；
+   - 杜绝低效套壳封装，非跨多页面特化的高复用业务逻辑（如终端 `TerminalPane` 等）严禁私自封装，统一由 Naive UI 原生组件绑定全局主题变量（如 `var(--bg-card)`）。
+
+2. **页面主标题统一为外层单文字**：
+   - 独立页面的主标题统一在视口顶部 `.page-header` 中使用单文字 `<h2 class="page-title">标题</h2>`，右侧配合 `NSpace` 放页面级全局操作；
+   - 严禁图标与文字混排、严禁中英文杂糅（如消除括号英文）、严禁在标题下放置冗余副标题说明、严禁将页面主标题塞在卡片内置标题中。
+
+3. **Tab 栏与表格卡片必须彻底分层**：
+   - 以消息与告警中心（`AlertList.vue`）为基准拓扑，全局 Tab 栏（`<NTabs>`）必须外置在 `.tabs-container` 中，**严禁将 Tab 与表格混放在同一个卡片容器内**；
+   - 各个 `NTabPane` 内部由 `.tab-pane-content` 垂直弹性承载，提示用 `NAlert`，表格独立包裹在 `<NCard :bordered="false" class="table-flex-fill">` 中，实现表头与分页条固钉、仅数据区滚动。
+
+4. **表格卡片背景色与无边框规范**：
+   - 所有承载表格的卡片容器背景统一绑定为 `var(--bg-card)`，杜绝因未定义 `--n-color` 导致回退到发灰的伪透明背景；
+   - 消除表格外层硬编码的 `border: 1px solid var(--border-color)` 与内缩 `padding`，保持平整、沉浸的控制台无边框视觉。
+
 
 
 

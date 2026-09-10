@@ -60,7 +60,15 @@ func main() {
 	d.SetMetricsManager(mm)
 	d.SetSysInfoManager(sysinfo.NewManager(log))
 	d.SetDockerManager(docker.NewManager(log))
-	d.SetUpgradeManager(upgrade.NewManager(log))
+	um := upgrade.NewManager(log)
+	um.SetOnSuccess(func() {
+		// Record the planned restart before exiting so the control plane can
+		// suppress the reconnect alert (AGENTS.md 8.6.3).
+		if err := cfg.SetReconnectReason("upgrade"); err != nil {
+			log.Warn("save state with upgrade reason", "err", err)
+		}
+	})
+	d.SetUpgradeManager(um)
 	d.SetScanManager(scan.NewManager(log))
 
 	go d.Run(ctx)

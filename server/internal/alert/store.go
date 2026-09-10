@@ -26,7 +26,6 @@ const (
 	RuleMemHigh     RuleType = "mem_high"     // memory usage > threshold % for duration
 	RuleDiskHigh    RuleType = "disk_high"    // any mount usage > threshold %
 	RuleAnomaly     RuleType = "anomaly"      // AI/statistical anomaly: value deviates > threshold × σ from recent mean
-	RuleTrafficHigh RuleType = "traffic_high" // monthly traffic > threshold % of QuotaGB
 )
 
 // Severity classifies alert events.
@@ -44,10 +43,9 @@ type Rule struct {
 	Name        string    `json:"name"`
 	Type        RuleType  `json:"type"`
 	Severity    Severity  `json:"severity"`
-	Threshold   float64   `json:"threshold"`          // e.g. 90 for 90%; for anomaly = σ multiplier (e.g. 3); for traffic = percent of quota
-	Duration    int       `json:"duration"`           // seconds the condition must hold (0 = immediate)
-	Metric      string    `json:"metric,omitempty"`   // for anomaly: cpu / mem / net_rx / net_tx / disk_read / disk_write
-	QuotaGB     float64   `json:"quota_gb,omitempty"` // for traffic_high: monthly quota in GiB
+	Threshold   float64   `json:"threshold"`        // e.g. 90 for 90%; for anomaly = σ multiplier (e.g. 3)
+	Duration    int       `json:"duration"`         // seconds the condition must hold (0 = immediate)
+	Metric      string    `json:"metric,omitempty"` // for anomaly: cpu / mem / net_rx / net_tx / disk_read / disk_write
 	HostFilter  string    `json:"host_filter"`        // empty = all hosts; otherwise hostname substring
 	GroupFilter string    `json:"group_filter"`       // empty = all groups
 	Enabled     bool      `json:"enabled"`

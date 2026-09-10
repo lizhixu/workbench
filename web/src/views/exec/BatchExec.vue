@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, h } from 'vue'
+import { ref, computed, onMounted, watch, h } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   NCard, NSpace, NButton, NInput, NSelect, NCheckbox, NDataTable,
@@ -164,8 +164,15 @@ async function copyResult(r: BatchExecResult) {
 }
 
 const hostColumns = [
+  { type: 'selection' as const },
   { title: '主机名', key: 'hostname' },
   { title: '系统', key: 'os', width: 80 },
+  {
+    title: 'IP 地址',
+    key: 'ip',
+    width: 150,
+    render: (row: Host) => row.public_ip || row.internal_ip || '-',
+  },
   {
     title: '状态', key: 'status', width: 80,
     render: (row: Host) => row.status === 'online'
@@ -173,6 +180,22 @@ const hostColumns = [
       : h(NTag, { type: 'default', size: 'small', bordered: false }, { default: () => '离线' }),
   },
 ]
+
+function rowProps(row: Host) {
+  return {
+    style: 'cursor: pointer',
+    onClick: (e: MouseEvent) => {
+      // 避免点在 checkbox 自身时触发双重 toggle
+      if ((e.target as HTMLElement)?.closest('.n-checkbox')) return
+      const idx = selectedHostIds.value.indexOf(row.id)
+      if (idx === -1) {
+        selectedHostIds.value = [...selectedHostIds.value, row.id]
+      } else {
+        selectedHostIds.value = selectedHostIds.value.filter((id) => id !== row.id)
+      }
+    },
+  }
+}
 
 const resultColumns = [
   { title: '主机ID', key: 'host_id', width: 120, ellipsis: { tooltip: true } },
@@ -213,9 +236,7 @@ const resultColumns = [
   },
 ]
 
-onMounted(async () => {
-  await loadHosts()
-  // Support prefill from query params (e.g. "send to exec" from AI scan report).
+function applyRouteQuery() {
   if (route.query.command) {
     command.value = String(route.query.command)
   }
@@ -223,15 +244,35 @@ onMounted(async () => {
     shell.value = String(route.query.shell)
   }
   if (route.query.host_id) {
-    selectedHostIds.value = [String(route.query.host_id)]
+    const hid = String(route.query.host_id)
+    if (!selectedHostIds.value.includes(hid)) {
+      selectedHostIds.value = [hid]
+    }
   }
+}
+
+watch(
+  () => route.query,
+  () => {
+    if (route.name !== 'batch-exec') return
+    applyRouteQuery()
+  },
+  { deep: true },
+)
+
+onMounted(async () => {
+  await loadHosts()
+  applyRouteQuery()
 })
 </script>
 
 <template>
   <div class="batch-exec-view">
+    <div class="batch-exec-toolbar">
+      <h2 class="page-title">推送命令</h2>
+    </div>
     <NSpace vertical :size="16">
-      <NCard title="推送命令" :bordered="false">
+      <NCard :bordered="false">
         <NSpace vertical :size="12">
           <NSpace align="center">
             <span>Shell:</span>
@@ -268,6 +309,7 @@ onMounted(async () => {
           :data="hosts.filter(h => h.status === 'online')"
           :row-key="(r: Host) => r.id"
           v-model:checked-row-keys="selectedHostIds"
+          :row-props="rowProps"
           :bordered="false"
           size="small"
           :max-height="240"
@@ -321,6 +363,15 @@ onMounted(async () => {
   overflow-y: auto;
   box-sizing: border-box;
   -webkit-overflow-scrolling: touch;
+}
+.batch-exec-toolbar {
+  margin-bottom: 16px;
+}
+.page-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
 }
 .muted { color: #9ca3af; font-size: 13px; }
 

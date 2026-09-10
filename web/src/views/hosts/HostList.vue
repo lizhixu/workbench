@@ -35,8 +35,10 @@ import {
   LayersOutline,
   ArrowUpCircleOutline,
   GitNetworkOutline,
+  CardOutline,
 } from '@vicons/ionicons5'
 import OsLogo from '../../components/common/OsLogo.vue'
+import HostBillingModal from '../../components/host/HostBillingModal.vue'
 import { useHostsStore } from '../../stores/hosts'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { useAuthStore } from '../../stores/auth'
@@ -62,6 +64,8 @@ const showEnroll = ref(false)
 const enrollToken = ref('')
 const enrollCmd = ref('')
 const enrolling = ref(false)
+const showBillingModal = ref(false)
+const selectedBillingHost = ref<Host | null>(null)
 
 // Host grouping: filter bar + per-host assignment modal.
 const groups = ref<HostGroup[]>([])
@@ -193,14 +197,42 @@ function goDetail(host: Host, tab = 'metrics') {
   router.push({ path: `/hosts/${host.id}`, query: { tab } })
 }
 
-function goExec() {
+function formatPrice(h: Host): string {
+  if (h.price === undefined && !h.billing_cycle) return '-'
+  const curMap: Record<string, string> = { CNY: '¥', USD: '$', EUR: '€', HKD: 'HK$', JPY: '¥', GBP: '£', USDT: 'USDT ' }
+  const cur = curMap[h.currency || 'CNY'] || `${h.currency || ''} `
+  const p = h.price !== undefined ? `${cur}${h.price}` : ''
+  const c = h.billing_cycle ? ` / ${h.billing_cycle}` : ''
+  return `${p}${c}`.trim()
+}
+
+function formatHostTraffic(h: Host): string {
+  if (!h.traffic_limit_gb) return '-'
+  let used = (h.month_rx || 0) + (h.month_tx || 0)
+  if (h.traffic_calc_type === 'out') used = h.month_tx || 0
+  else if (h.traffic_calc_type === 'in') used = h.month_rx || 0
+  const usedGB = used / (1024 * 1024 * 1024)
+  const pct = Math.round((usedGB / h.traffic_limit_gb) * 100)
+  return `${usedGB.toFixed(1)}G/${h.traffic_limit_gb}G (${pct}%)`
+}
+
+function getExpiryClass(exp?: string): string {
+  if (!exp) return ''
+  const days = (new Date(exp).getTime() - Date.now()) / (1000 * 3600 * 24)
+  if (days < 0) return 'text-error'
+  if (days <= 7) return 'text-warning'
+  return ''
+}
+
+function goExec(host?: Host) {
+  const query = host && typeof host === 'object' && host.id ? `?host_id=${host.id}` : ''
   workspace.openTab({
     key: '/batch-exec',
     title: '推送命令',
-    path: '/batch-exec',
+    path: `/batch-exec${query}`,
     closable: true,
   })
-  router.push('/batch-exec')
+  router.push(`/batch-exec${query}`)
 }
 
 function goAiChat() {
@@ -254,7 +286,10 @@ function handleMenuSelect(key: string, host: Host) {
   } else if (key === 'docker') {
     goDetail(host, 'docker')
   } else if (key === 'exec') {
-    goExec()
+    goExec(host)
+  } else if (key === 'billing') {
+    selectedBillingHost.value = host
+    showBillingModal.value = true
   } else if (key === 'group') {
     openGroupModal(host)
   } else if (key === 'upgrade') {
@@ -327,6 +362,11 @@ const menuOptions = [
     label: '推送命令',
     key: 'exec',
     icon: () => h(NIcon, null, { default: () => h(PaperPlaneOutline) }),
+  },
+  {
+    label: '财务与规格',
+    key: 'billing',
+    icon: () => h(NIcon, { color: '#6366f1' }, { default: () => h(CardOutline) }),
   },
   {
     type: 'divider',
@@ -441,7 +481,7 @@ onMounted(() => {
             绑定主机
           </NButton>
 
-          <NButton secondary type="primary" size="small" @click="goExec">
+          <NButton secondary type="primary" size="small" @click="() => goExec()">
             <template #icon>
               <NIcon :component="PaperPlaneOutline" />
             </template>
@@ -565,7 +605,23 @@ onMounted(() => {
               </div>
             </div>
 
-            <!-- 6. 右侧更多操作按钮 -->
+            <!-- 6. 财务与流量规格 (若有配置) -->
+            <div v-if="host.price !== undefined || host.expires_at || host.traffic_limit_gb" class="col-billing">
+              <div v-if="host.price !== undefined || host.billing_cycle" class="billing-line">
+                <span class="billing-label">资费</span>
+                <span class="billing-value">{{ formatPrice(host) }}</span>
+              </div>
+              <div v-if="host.traffic_limit_gb" class="billing-line">
+                <span class="billing-label">流量</span>
+                <span class="billing-value">{{ formatHostTraffic(host) }}</span>
+              </div>
+              <div v-if="host.expires_at" class="billing-line">
+                <span class="billing-label">到期</span>
+                <span class="billing-value" :class="getExpiryClass(host.expires_at)">{{ host.expires_at }}</span>
+              </div>
+            </div>
+
+            <!-- 7. 右侧更多操作按钮 -->
             <div class="col-actions" @click.stop>
               <NDropdown
                 trigger="click"
@@ -637,6 +693,13 @@ onMounted(() => {
         </NSpace>
       </template>
     </NModal>
+
+    <!-- 财务与规格编辑弹窗 -->
+    <HostBillingModal
+      v-model:show="showBillingModal"
+      :host="selectedBillingHost"
+      @saved="refresh"
+    />
   </div>
 </template>
 
@@ -810,6 +873,9 @@ onMounted(() => {
             .ip-line {
               display: flex;
               align-items: center;
+              // 收缩为内容实际宽度，避免 hover 高亮铺满整个富余列宽
+              width: fit-content;
+              max-width: 100%;
 
               &.is-copyable {
                 cursor: pointer;
@@ -869,8 +935,47 @@ onMounted(() => {
             }
           }
 
-          // 6. 更多操作按钮
-          .col-actions {
+	          // 6. 财务与规格概要
+	          .col-billing {
+	            flex: 0 0 170px;
+	            display: flex;
+	            flex-direction: column;
+	            gap: 4px;
+	            font-size: 13px;
+	            padding-right: 12px;
+
+	            .billing-line {
+	              display: flex;
+	              align-items: center;
+
+	              .billing-label {
+	                color: var(--text-tertiary, #8c8c8c);
+	                width: 36px;
+	                flex-shrink: 0;
+	              }
+
+	              .billing-value {
+	                color: var(--text-primary);
+	                font-weight: 500;
+	                white-space: nowrap;
+	                overflow: hidden;
+	                text-overflow: ellipsis;
+
+	                &.text-error {
+	                  color: #ef4444;
+	                  font-weight: 600;
+	                }
+
+	                &.text-warning {
+	                  color: #f59e0b;
+	                  font-weight: 600;
+	                }
+	              }
+	            }
+	          }
+
+	          // 7. 更多操作按钮
+	          .col-actions {
             flex: 0 0 44px;
             display: flex;
             align-items: center;

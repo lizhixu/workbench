@@ -351,7 +351,7 @@ function handleUser(key: string) {
       <div class="header-left">
         <div class="brand-logo" @click="router.push('/hosts')">
           <img src="/k-works.png" class="logo-img" alt="Logo" />
-          <span class="brand-title">牧云主机管理助手</span>
+          <span class="brand-title">Watchman 云堡垒机</span>
         </div>
 
         <!-- 顶部 Workspace 多页签栏 -->
@@ -392,9 +392,10 @@ function handleUser(key: string) {
         />
       </div>
 
-      <!-- 顶栏右侧辅助工具与用户菜单 -->
+      <!-- 顶栏右侧辅助工具与用户菜单：flex-shrink: 0 + 不换行，
+           避免页签过多时按钮被挤到第二行错乱 -->
       <div class="header-right">
-        <NSpace align="center" :size="12">
+        <NSpace align="center" :size="12" :wrap="false">
           <!-- 消息中心 -->
           <NTooltip trigger="hover">
             <template #trigger>
@@ -555,6 +556,9 @@ function handleUser(key: string) {
     align-items: center;
     gap: 16px;
     height: 100%;
+    // 占满剩余空间并允许内部页签横向滚动，把挤压全部留在左侧
+    flex: 1 1 auto;
+    min-width: 0;
     overflow: hidden;
   }
 
@@ -564,6 +568,8 @@ function handleUser(key: string) {
     gap: 10px;
     cursor: pointer;
     user-select: none;
+    // 品牌区固定不收缩，页签再多也不被挤变形
+    flex-shrink: 0;
 
     .logo-img {
       width: 30px;
@@ -591,6 +597,9 @@ function handleUser(key: string) {
     align-items: center;
     gap: 6px;
     height: 100%;
+    // 允许收缩到 0 并内部滚动，保证品牌区与右侧按钮区不受挤压
+    flex: 1 1 auto;
+    min-width: 0;
     overflow-x: auto;
     overflow-y: hidden;
     scrollbar-width: none;
@@ -672,6 +681,9 @@ function handleUser(key: string) {
   .header-right {
     display: flex;
     align-items: center;
+    // 右侧工具按钮区永不收缩，页签再多也不换行错乱
+    flex-shrink: 0;
+    margin-left: 12px;
 
     .tool-btn {
       font-size: 12px;

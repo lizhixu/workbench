@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, h, onActivated, onDeactivated, onMounted, reactive, ref } from 'vue'
 import {
-  NAlert, NButton, NDataTable, NForm, NFormItem, NIcon, NInput,
+  NAlert, NButton, NCard, NDataTable, NForm, NFormItem, NIcon, NInput,
   NModal, NPopconfirm, NSelect, NSpace, NSwitch,
   NTabPane, NTabs, NTag, useMessage,
 } from 'naive-ui'
@@ -411,68 +411,80 @@ onDeactivated(() => {
 
 <template>
   <div class="certs-view page-flex-column">
-    <div class="table-toolbar">
-      <NSpace align="center">
-        <NButton secondary @click="showConfig = true">
-          <template #icon>
-            <NIcon><LockClosedOutline /></NIcon>
-          </template>
-          dns-mng 集成{{ configReady ? ' (已配置)' : ' (未配置)' }}
-        </NButton>
-        <NButton :loading="loadingCerts || loadingAccounts" @click="() => { loadAccounts(); loadCerts() }">
-          <template #icon>
-            <NIcon><RefreshOutline /></NIcon>
-          </template>
-          刷新
-        </NButton>
-      </NSpace>
-
-      <NSpace align="center">
-        <NButton v-if="activeMainTab === 'accounts'" type="primary" @click="openCreateAccount">
-          <template #icon>
-            <NIcon><AddCircleOutline /></NIcon>
-          </template>
-          添加 ACME 机构
-        </NButton>
-        <NButton v-else type="primary" @click="openIssue">
-          <template #icon>
-            <NIcon><ShieldCheckmarkOutline /></NIcon>
-          </template>
-          申请 SSL 证书
-        </NButton>
-      </NSpace>
+    <!-- Header -->
+    <div class="page-header">
+      <div class="header-left">
+        <h2 class="page-title">证书中心</h2>
+      </div>
+      <div class="header-right">
+        <NSpace align="center" :size="10">
+          <NButton secondary @click="showConfig = true">
+            <template #icon>
+              <NIcon><LockClosedOutline /></NIcon>
+            </template>
+            dns-mng 集成{{ configReady ? ' (已配置)' : ' (未配置)' }}
+          </NButton>
+          <NButton :loading="loadingCerts || loadingAccounts" @click="() => { loadAccounts(); loadCerts() }">
+            <template #icon>
+              <NIcon><RefreshOutline /></NIcon>
+            </template>
+            刷新
+          </NButton>
+          <NButton v-if="activeMainTab === 'accounts'" type="primary" @click="openCreateAccount">
+            <template #icon>
+              <NIcon><AddCircleOutline /></NIcon>
+            </template>
+            添加 ACME 机构
+          </NButton>
+          <NButton v-else type="primary" @click="openIssue">
+            <template #icon>
+              <NIcon><ShieldCheckmarkOutline /></NIcon>
+            </template>
+            申请 SSL 证书
+          </NButton>
+        </NSpace>
+      </div>
     </div>
 
     <NAlert v-if="!configReady" type="warning" :show-icon="true" style="flex-shrink: 0">
       证书中心需依赖 dns-mng（同级项目）：ACME DNS-01 验证将通过 dns-mng 的接口在 11 家主流云厂商（Cloudflare、阿里云、腾讯云等）自动添加与清理 TXT 解析。请先配置 dns-mng。
     </NAlert>
 
-    <div class="table-card table-flex-fill">
-      <NTabs v-model:value="activeMainTab" type="line" style="height: 100%; display: flex; flex-direction: column">
-        <NTabPane name="certs" tab="已签发证书" style="height: 100%; min-height: 0">
-          <div style="height: 100%; min-height: 0; display: flex; flex-direction: column">
-            <NDataTable
-              flex-height
-              :columns="certColumns"
-              :data="certs"
-              :row-key="(r: Certificate) => r.id"
-              :pagination="{ pageSize: 20 }"
-            />
+    <!-- Tabs Container：Tab 与表格分层，完全对齐 AlertList 规范 -->
+    <div class="tabs-container">
+      <NTabs v-model:value="activeMainTab" type="line">
+        <NTabPane name="certs" tab="已签发证书">
+          <div class="tab-pane-content">
+            <NCard :bordered="false" class="table-flex-fill">
+              <NDataTable
+                flex-height
+                :columns="certColumns"
+                :data="certs"
+                :row-key="(r: Certificate) => r.id"
+                :pagination="{ pageSize: 20 }"
+                :bordered="false"
+                size="small"
+              />
+            </NCard>
           </div>
         </NTabPane>
 
-        <NTabPane name="accounts" tab="ACME 机构账户 (Let's Encrypt / Google / ZeroSSL / SSL.com 等)" style="height: 100%; min-height: 0">
-          <div style="height: 100%; min-height: 0; display: flex; flex-direction: column">
+        <NTabPane name="accounts" tab="ACME 机构账户 (Let's Encrypt / Google / ZeroSSL / SSL.com 等)">
+          <div class="tab-pane-content">
             <NAlert type="info" :show-icon="true" style="margin-bottom: 10px; flex-shrink: 0">
               系统支持多 CA 机构并存。配置 Google Trust Services、ZeroSSL、SSL.com 等机构时需填入官方颁发的 EAB (External Account Binding) 凭据。
             </NAlert>
-            <NDataTable
-              flex-height
-              :columns="accountColumns"
-              :data="accounts"
-              :row-key="(r: ACMEAccount) => r.id"
-              :pagination="{ pageSize: 20 }"
-            />
+            <NCard :bordered="false" class="table-flex-fill">
+              <NDataTable
+                flex-height
+                :columns="accountColumns"
+                :data="accounts"
+                :row-key="(r: ACMEAccount) => r.id"
+                :pagination="{ pageSize: 20 }"
+                :bordered="false"
+                size="small"
+              />
+            </NCard>
           </div>
         </NTabPane>
       </NTabs>
@@ -610,19 +622,64 @@ onDeactivated(() => {
 
 <style scoped lang="scss">
 .certs-view {
-  gap: 12px;
-}
+  gap: 14px;
+  overflow: hidden;
 
-.table-toolbar {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
+  .page-header {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
 
-.table-card {
-  background: var(--n-color, rgba(128, 128, 128, 0.06));
-  border-radius: 8px;
-  padding: 4px;
+    .header-left {
+      display: flex;
+      align-items: center;
+
+      .page-title {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 600;
+        color: var(--text-primary);
+      }
+    }
+  }
+
+  .tabs-container {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+
+    :deep(.n-tabs) {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    :deep(.n-tabs-pane-wrapper) {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    :deep(.n-tab-pane) {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+  }
+
+  .tab-pane-content {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
 }
 </style>

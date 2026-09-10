@@ -174,7 +174,11 @@ code, .mono-font {
   overflow: hidden;
 
   /* 包了 NCard 时，卡片内容区也要具备同样的 flex 能力。
-     naive-ui 的类名是 n-card-content（单连字符），不是 n-card__content。 */
+     naive-ui 的类名是 n-card-content（单连字符），不是 n-card__content。
+     注意：无 header 的卡片，naive-ui 会额外给 .n-card-content:first-child 加
+     padding-top: var(--n-padding-bottom)，且其运行时注入的样式排在 global.scss
+     之后，同优先级下会覆盖这里的 padding: 0，导致表头上方多出一条空白。
+     因此这里必须用 !important 压制，:first-child 也要显式清零。 */
   :deep(.n-card-content),
   .n-card-content {
     flex: 1;
@@ -182,7 +186,11 @@ code, .mono-font {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    padding: 0;
+    padding: 0 !important;
+
+    &:first-child {
+      padding-top: 0 !important;
+    }
   }
 
   /* 表格自身占满容器，由 flex-height 计算内部滚动区 */
@@ -190,6 +198,14 @@ code, .mono-font {
   .n-data-table {
     flex: 1;
     min-height: 0;
+
+    /* 内置分页条统一样式与对称间距，防止顶到卡片底边或下拉遮挡 */
+    .n-data-table__pagination {
+      padding: 12px 16px;
+      margin: 0;
+      border-top: 1px solid var(--border-color);
+      box-sizing: border-box;
+    }
   }
 }
 

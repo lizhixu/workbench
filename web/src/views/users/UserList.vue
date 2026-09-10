@@ -262,6 +262,7 @@ onMounted(() => {
 <style scoped lang="scss">
 .user-view {
   gap: 16px;
+  overflow: hidden;
 }
 .user-toolbar {
   flex-shrink: 0;
@@ -280,5 +281,11 @@ onMounted(() => {
 :deep(.muted) {
   color: var(--text-secondary);
   font-size: 13px;
+}
+:deep(.n-data-table__pagination) {
+  padding: 12px 16px;
+  margin: 0 !important;
+  border-top: 1px solid var(--border-color);
+  box-sizing: border-box;
 }
 </style>

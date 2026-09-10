@@ -301,12 +301,7 @@ onMounted(() => {
 <template>
   <div class="group-view page-flex-column">
     <div class="group-toolbar">
-      <div>
-        <h2 class="page-title">分组与权限</h2>
-        <p class="page-desc">
-          分组用于组织主机并对用户授权。未被授权任何分组的用户可访问全部主机，一旦获得授权则仅能访问所授权分组下的主机。
-        </p>
-      </div>
+      <h2 class="page-title">分组与权限</h2>
       <NSpace align="center" :size="12">
         <span class="muted">共 {{ groupCount }} 个分组</span>
         <NButton :loading="loading" @click="refresh">
@@ -489,19 +484,13 @@ onMounted(() => {
 .group-toolbar {
   flex-shrink: 0;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 16px;
 }
 .page-title {
   margin: 0;
   font-size: 18px;
-}
-.page-desc {
-  margin: 6px 0 0;
-  font-size: 12px;
-  color: var(--text-secondary);
-  max-width: 720px;
 }
 .group-name,
 :deep(.group-name) {

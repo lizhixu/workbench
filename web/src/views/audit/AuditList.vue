@@ -11,6 +11,7 @@ import {
   NPagination,
   NSelect,
   NTag,
+  NTooltip,
   useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
@@ -22,6 +23,8 @@ import {
   type AuditEntry,
   type AuditStats,
 } from '../../api/audit'
+import { listHosts } from '../../api/hosts'
+import type { Host } from '../../api/types'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'AuditList' })
@@ -34,6 +37,9 @@ const loading = ref(false)
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(50)
+
+// 主机映射字典：以 host_id / agent_id 为 key，映射 hostname 与 IP
+const hostMap = ref<Record<string, Host>>({})
 
 // Filters
 const filterUser = ref('')
@@ -75,8 +81,31 @@ const riskOptions = [
 const detailEntry = ref<AuditEntry | null>(null)
 const showDetailModal = ref(false)
 
-function fmtTime(ts: string) {
-  return ts.replace('T', ' ').replace(/([+-]\d{2}:\d{2}|Z)$/, '')
+function fmtTime(ts?: string) {
+  if (!ts) return '-'
+  return ts.slice(0, 19).replace('T', ' ')
+}
+
+function formatTarget(row?: AuditEntry | null) {
+  if (!row || !row.target_id) return '-'
+  const tid = row.target_id
+  const hInfo = hostMap.value[tid]
+  if (hInfo) {
+    const ip = hInfo.public_ip || hInfo.internal_ip
+    return ip ? `${hInfo.hostname} (${ip})` : hInfo.hostname
+  }
+  return tid
+}
+
+function targetTooltip(row?: AuditEntry | null) {
+  if (!row || !row.target_id) return ''
+  const tid = row.target_id
+  const hInfo = hostMap.value[tid]
+  if (hInfo) {
+    const ip = hInfo.public_ip || hInfo.internal_ip
+    return `主机名: ${hInfo.hostname} | IP: ${ip || '-'} | ID: ${tid}`
+  }
+  return tid
 }
 
 function resultTagType(result: string) {
@@ -115,9 +144,23 @@ const columns: DataTableColumns<AuditEntry> = [
   {
     title: '目标',
     key: 'target_id',
-    width: 160,
+    width: 170,
     ellipsis: { tooltip: true },
-    render: (row) => row.target_id || '-',
+    render: (row) => {
+      const text = formatTarget(row)
+      const tip = targetTooltip(row)
+      if (tip && tip !== text) {
+        return h(
+          NTooltip,
+          { trigger: 'hover' },
+          {
+            trigger: () => h('span', { class: 'target-text' }, text),
+            default: () => tip,
+          },
+        )
+      }
+      return h('span', { class: 'target-text' }, text)
+    },
   },
   {
     title: '详情',
@@ -158,10 +201,28 @@ function buildQuery(offset = (page.value - 1) * pageSize.value) {
   return q
 }
 
+async function loadHostsMap() {
+  try {
+    const res = await listHosts()
+    const list = res.data || res
+    const map: Record<string, Host> = {}
+    for (const hItem of list) {
+      if (hItem.id) map[hItem.id] = hItem
+      if (hItem.hostname) map[hItem.hostname] = hItem
+    }
+    hostMap.value = map
+  } catch {
+    // 忽略加载主机失败，降级展示原始 ID
+  }
+}
+
 async function load() {
   loading.value = true
   try {
-    const res = await listAudit(buildQuery())
+    const [res] = await Promise.all([
+      listAudit(buildQuery()),
+      Object.keys(hostMap.value).length === 0 ? loadHostsMap() : Promise.resolve(),
+    ])
     entries.value = res.data
     stats.value = res.stats
     total.value = res.stats.total
@@ -294,7 +355,7 @@ onMounted(load)
           <div class="detail-label">目标类型</div>
           <div>{{ detailEntry.target_type }}</div>
           <div class="detail-label">目标</div>
-          <div class="mono-font">{{ detailEntry.target_id || '-' }}</div>
+          <div class="mono-font">{{ formatTarget(detailEntry) }}</div>
           <div class="detail-label">风险等级</div>
           <div>{{ detailEntry.risk_level }}</div>
           <div class="detail-label">结果</div>
@@ -372,6 +433,11 @@ onMounted(load)
 .mono-font {
   font-family: 'SFMono-Regular', Consolas, monospace;
   font-size: 12px;
+}
+
+.target-text {
+  font-weight: 500;
+  color: var(--text-primary);
 }
 
 .detail-grid {

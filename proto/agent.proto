@@ -51,6 +51,7 @@ message ServerMessage {
     DockerOp docker_op = 11; // (P2)
     ScanRequest scan = 12; // (P3)
     UpgradeRequest upgrade = 13; // (P3)
+    MaintenanceNotice maintenance = 14; // server restarting / maintenance announcement
   }
 }
 
@@ -75,6 +76,9 @@ message RegisterRequest {
   string internal_ip = 11; // local private IP (e.g. 172.20.69.191)
   string public_ip = 12; // external public IP (e.g. 183.159.65.120)
   string location = 13; // geo location (e.g. 浙江省-杭州市)
+  // reconnect_reason indicates why the agent is connecting/reconnecting:
+  // "upgrade" (post agent self-upgrade), "maintenance" (post server restart), or empty.
+  string reconnect_reason = 14;
 }
 
 message RegisterResponse {
@@ -282,6 +286,15 @@ message UpgradeProgress {
   string stage = 1; // downloading / verifying / replacing / restarting
   double progress = 2; // 0..1
   string error = 3;
+}
+
+// ---- Maintenance handshake ------------------------------------------
+
+message MaintenanceNotice {
+  // reason explains the maintenance: "server_restart", "agent_upgrade", "host_maintenance".
+  string reason = 1;
+  // expected_duration_sec is how long the server/agent anticipates being offline (e.g. 120s).
+  int32 expected_duration_sec = 2;
 }
 
 // ---- Generic ack -----------------------------------------------------

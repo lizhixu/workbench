@@ -23,7 +23,9 @@ import (
 	"watchman/agent/internal/scan"
 	"watchman/agent/internal/shell"
 	"watchman/agent/internal/sysinfo"
+
 	"watchman/agent/internal/upgrade"
+	"watchman/internal/version"
 	"watchman/proto/agentpb"
 
 	"google.golang.org/grpc"
@@ -136,9 +138,9 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 	client := agentpb.NewAgentServiceClient(cc)
 
 	callCtx := ctx
-	if d.cfg.State.AuthToken != "" {
+	if authToken := d.cfg.Snapshot().AuthToken; authToken != "" {
 		callCtx = metadata.AppendToOutgoingContext(ctx,
-			"authorization", "Bearer "+d.cfg.State.AuthToken)
+			"authorization", "Bearer "+authToken)
 	}
 
 	stream, err := client.Connect(callCtx)
@@ -146,21 +148,29 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 		return fmt.Errorf("open stream: %w", err)
 	}
 
+	// Take a consistent snapshot: the upgrade callback and the maintenance
+	// handler mutate the state from other goroutines.
+	st := d.cfg.Snapshot()
 	hwInfo := CollectHostHardwareInfo()
+	reconnectReason := st.ReconnectReason
 	reg := &agentpb.RegisterRequest{
-		EnrollToken:  d.cfg.EnrollToken,
-		AgentId:      d.cfg.State.AgentID,
-		Hostname:     hostname(),
-		Os:           runtime.GOOS,
-		Arch:         runtime.GOARCH,
-		Distro:       hwInfo.Distro,
-		AgentVersion: "0.1.0-dev",
-		Uptime:       hwInfo.Uptime,
-		CpuCores:     hwInfo.CPUCores,
-		MemTotal:     hwInfo.MemTotal,
-		InternalIp:   hwInfo.InternalIP,
-		PublicIp:     hwInfo.PublicIP,
-		Location:     hwInfo.Location,
+		EnrollToken:     d.cfg.EnrollToken,
+		AgentId:         st.AgentID,
+		Hostname:        hostname(),
+		Os:              runtime.GOOS,
+		Arch:            runtime.GOARCH,
+		Distro:          hwInfo.Distro,
+		AgentVersion:    version.Get(),
+		Uptime:          hwInfo.Uptime,
+		CpuCores:        hwInfo.CPUCores,
+		MemTotal:        hwInfo.MemTotal,
+		InternalIp:      hwInfo.InternalIP,
+		PublicIp:        hwInfo.PublicIP,
+		Location:        hwInfo.Location,
+		ReconnectReason: reconnectReason,
+	}
+	if reconnectReason != "" {
+		d.log.Info("sending register with reconnect reason", "reason", reconnectReason)
 	}
 	if err := stream.Send(&agentpb.AgentMessage{
 		Payload: &agentpb.AgentMessage_Register{Register: reg},
@@ -182,12 +192,23 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 	}
 
 	if regResp.GetAuthToken() != "" {
-		d.cfg.State.AgentID = regResp.GetAgentId()
-		d.cfg.State.AuthToken = regResp.GetAuthToken()
-		if err := d.cfg.Save(); err != nil {
+		newID := regResp.GetAgentId()
+		if err := d.cfg.Update(func(s *config.State) {
+			s.AgentID = newID
+			s.AuthToken = regResp.GetAuthToken()
+			// One-shot: consume the reason so a later unexpected drop
+			// resumes normal alerting (AGENTS.md 8.6.4).
+			s.ReconnectReason = ""
+		}); err != nil {
 			d.log.Warn("save state", "err", err)
 		}
-		d.log.Info("registered, identity persisted", "agent_id", d.cfg.State.AgentID)
+		d.log.Info("registered, identity persisted", "agent_id", newID)
+	} else if d.cfg.ReconnectReason() != "" {
+		// Already known to the server (no new token issued): still consume
+		// any pending reason.
+		if err := d.cfg.Update(func(s *config.State) { s.ReconnectReason = "" }); err != nil {
+			d.log.Warn("clear reconnect reason", "err", err)
+		}
 	}
 
 	hub := &Hub{
@@ -332,6 +353,16 @@ func (d *Dialer) handleServerMessage(msg *agentpb.ServerMessage) error {
 			return fmt.Errorf("scan not available")
 		}
 		d.scan.Handle(p.Scan)
+		return nil
+
+	// Maintenance notice from server (e.g. server restart). Persist it so the
+	// reconnect after the restart carries the reason and stays quiet.
+	case *agentpb.ServerMessage_Maintenance:
+		m := p.Maintenance
+		d.log.Info("server announced maintenance", "reason", m.GetReason(), "duration_sec", m.GetExpectedDurationSec())
+		if err := d.cfg.SetReconnectReason("maintenance"); err != nil {
+			d.log.Warn("persist maintenance reason", "err", err)
+		}
 		return nil
 
 	default:

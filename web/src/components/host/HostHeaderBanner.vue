@@ -6,8 +6,10 @@ import {
   ChevronUpOutline,
   ChevronDownOutline,
   ArrowUpCircleOutline,
+  CardOutline,
 } from '@vicons/ionicons5'
 import OsLogo from '../common/OsLogo.vue'
+import HostBillingModal from './HostBillingModal.vue'
 import { execCommand, upgradeAgent } from '../../api/hosts'
 import { listNetworkNodes } from '../../api/network'
 import type { Host } from '../../api/types'
@@ -28,6 +30,7 @@ const isAdmin = computed(() => auth.role === 'admin')
 const expanded = ref(true)
 const powering = ref(false)
 const upgrading = ref(false)
+const showBillingModal = ref(false)
 const tailscaleIp = ref<string>('')
 
 async function fetchTailscaleIp() {
@@ -145,23 +148,87 @@ async function handlePowerOff() {
 	  }
 	}
 
-	async function handleUpgradeAgent() {
-	  if (props.host.status !== 'online') {
-	    message.warning('主机已离线，无法下发在线升级指令')
-	    return
-	  }
-	  upgrading.value = true
-	  message.info('正在向 Agent 下发热升级任务，下载并替换二进制中…')
-	  try {
-	    const res = await upgradeAgent(props.host.id)
-	    message.success(res.message || 'Agent 升级成功，正在重启自愈连线！')
-	    emit('refresh')
-	  } catch (e: any) {
-	    message.error(e.message || 'Agent 升级失败')
-	  } finally {
-	    upgrading.value = false
-	  }
-	}
+		async function handleUpgradeAgent() {
+		  if (props.host.status !== 'online') {
+		    message.warning('主机已离线，无法下发在线升级指令')
+		    return
+		  }
+		  upgrading.value = true
+		  message.info('正在向 Agent 下发热升级任务，下载并替换二进制中…')
+		  try {
+		    const res = await upgradeAgent(props.host.id)
+		    message.success(res.message || 'Agent 升级成功，正在重启自愈连线！')
+		    emit('refresh')
+		  } catch (e: any) {
+		    message.error(e.message || 'Agent 升级失败')
+		  } finally {
+		    upgrading.value = false
+		  }
+		}
+
+const hasBillingOrTraffic = computed(() => {
+  const h = props.host
+  return (
+    h.price !== undefined ||
+    !!h.billing_cycle ||
+    !!h.expires_at ||
+    h.traffic_limit_gb !== undefined ||
+    !!h.renewal_url ||
+    !!h.notes
+  )
+})
+
+const priceDisplay = computed(() => {
+  const h = props.host
+  if (h.price === undefined && !h.billing_cycle) return '-'
+  const curMap: Record<string, string> = { CNY: '¥', USD: '$', EUR: '€', HKD: 'HK$', JPY: '¥', GBP: '£', USDT: 'USDT ' }
+  const curSymbol = curMap[h.currency || 'CNY'] || `${h.currency || ''} `
+  const pStr = h.price !== undefined ? `${curSymbol}${h.price}` : ''
+  const cycle = h.billing_cycle ? ` / ${h.billing_cycle}` : ''
+  return `${pStr}${cycle}`.trim() || '-'
+})
+
+const trafficDisplay = computed(() => {
+  const h = props.host
+  if (!h.traffic_limit_gb) return '-'
+  let usedBytes = (h.month_rx || 0) + (h.month_tx || 0)
+  let calcLabel = '双向'
+  if (h.traffic_calc_type === 'out') {
+    usedBytes = h.month_tx || 0
+    calcLabel = '出向'
+  } else if (h.traffic_calc_type === 'in') {
+    usedBytes = h.month_rx || 0
+    calcLabel = '入向'
+  }
+  const usedGB = usedBytes / (1024 * 1024 * 1024)
+  const pct = ((usedGB / h.traffic_limit_gb) * 100).toFixed(1)
+  return `${usedGB.toFixed(1)} / ${h.traffic_limit_gb} GB (${pct}%, ${calcLabel})`
+})
+
+const trafficTooltip = computed(() => {
+  const h = props.host
+  if (!h.traffic_limit_gb) return ''
+  const rxGB = ((h.month_rx || 0) / (1024 * 1024 * 1024)).toFixed(2)
+  const txGB = ((h.month_tx || 0) / (1024 * 1024 * 1024)).toFixed(2)
+  return `本月入向: ${rxGB} GB | 本月出向: ${txGB} GB | 重置日: 每月 ${h.traffic_reset_day || 1} 号`
+})
+
+const expiryClass = computed(() => {
+  const exp = props.host.expires_at
+  if (!exp) return ''
+  const diffDays = (new Date(exp).getTime() - Date.now()) / (1000 * 3600 * 24)
+  if (diffDays < 0) return 'text-error font-semibold'
+  if (diffDays <= 7) return 'text-warning font-semibold'
+  return ''
+})
+
+const expiryTooltip = computed(() => {
+  const exp = props.host.expires_at
+  if (!exp) return ''
+  const diffDays = Math.ceil((new Date(exp).getTime() - Date.now()) / (1000 * 3600 * 24))
+  if (diffDays < 0) return `已逾期 ${Math.abs(diffDays)} 天`
+  return `距离到期剩余 ${diffDays} 天`
+})
 </script>
 
 <template>
@@ -240,6 +307,31 @@ async function handlePowerOff() {
             <span class="spec-value">{{ host.group || '默认分组' }}</span>
           </div>
         </div>
+
+        <!-- 财务与流量配额 (若有配置) -->
+        <div v-if="hasBillingOrTraffic" class="spec-column">
+          <div v-if="host.price !== undefined || host.billing_cycle" class="spec-row">
+            <span class="spec-label">资费</span>
+            <span class="spec-value">{{ priceDisplay }}</span>
+          </div>
+          <div v-if="host.expires_at" class="spec-row">
+            <span class="spec-label">到期</span>
+            <span class="spec-value" :class="expiryClass" :title="expiryTooltip">
+              {{ host.expires_at }}
+              <span v-if="host.auto_renewal" class="tag-auto-renew">(自续)</span>
+            </span>
+          </div>
+          <div v-if="host.traffic_limit_gb" class="spec-row">
+            <span class="spec-label">月流量</span>
+            <span class="spec-value" :title="trafficTooltip">{{ trafficDisplay }}</span>
+          </div>
+          <div v-if="host.renewal_url" class="spec-row">
+            <span class="spec-label">续费</span>
+            <a :href="host.renewal_url" target="_blank" rel="noopener noreferrer" class="renewal-link">
+              跳转控制台 ↗
+            </a>
+          </div>
+        </div>
       </div>
 
       <!-- Right Status & Power Control -->
@@ -253,6 +345,19 @@ async function handlePowerOff() {
             负载: {{ host.load1 }}
           </div>
         </div>
+
+        <NButton
+          circle
+          quaternary
+          size="medium"
+          class="power-btn"
+          title="配置财务资费、流量限额与续费备注"
+          @click="showBillingModal = true"
+        >
+          <template #icon>
+            <NIcon size="18" color="#6366f1"><CardOutline /></NIcon>
+          </template>
+        </NButton>
 
         <NPopconfirm @positive-click="handlePowerOff">
           <template #trigger>
@@ -273,6 +378,13 @@ async function handlePowerOff() {
         </button>
       </div>
     </div>
+
+    <!-- 财务与规格编辑弹窗 -->
+    <HostBillingModal
+      v-model:show="showBillingModal"
+      :host="host"
+      @saved="emit('refresh')"
+    />
   </div>
 </template>
 
@@ -474,6 +586,30 @@ async function handlePowerOff() {
       &:hover {
         background-color: rgba(239, 68, 68, 0.15);
       }
+    }
+
+    .renewal-link {
+      color: #6366f1;
+      text-decoration: none;
+      font-size: 12px;
+      font-weight: 500;
+      &:hover {
+        text-decoration: underline;
+      }
+    }
+
+    .tag-auto-renew {
+      font-size: 11px;
+      color: #10b981;
+      margin-left: 4px;
+    }
+
+    .text-error {
+      color: #ef4444 !important;
+    }
+
+    .text-warning {
+      color: #f59e0b !important;
     }
 
     .expand-toggle-btn {

@@ -47,6 +47,8 @@ export interface PingResult {
   direct: boolean
   derp: string
   latency_ms: number
+  error?: string
+  hint?: string
 }
 
 export function getNetworkConfig() {
@@ -72,9 +74,14 @@ export function installNetworkNode(hostId: string) {
 }
 
 export function joinNetworkNode(hostId: string, req: JoinRequest) {
-  return unwrap<{ ok: boolean; message: string; ip?: string; data: NetworkNode }>(
-    http.post(`/network/nodes/${hostId}/join`, req),
-  )
+  return unwrap<{
+    ok: boolean
+    message: string
+    ip?: string
+    previous_ip?: string
+    ip_changed?: boolean
+    data: NetworkNode
+  }>(http.post(`/network/nodes/${hostId}/join`, req))
 }
 
 export function leaveNetworkNode(hostId: string, action: 'down' | 'logout' = 'down') {

@@ -318,6 +318,10 @@ onMounted(loadContainers)
 
 <template>
   <div class="docker-view page-flex-column">
+    <div class="docker-toolbar">
+      <h2 class="page-title">Docker 管理</h2>
+    </div>
+
     <!-- 未安装 Docker 时的引导卡片 -->
     <NAlert
       v-if="dockerNotInstalled"
@@ -341,7 +345,7 @@ onMounted(loadContainers)
       </div>
     </NAlert>
 
-    <NCard title="Docker 管理" :bordered="false" class="docker-card">
+    <NCard :bordered="false" class="docker-card">
       <NTabs
         v-model:value="tab"
         type="line"
@@ -467,6 +471,17 @@ onMounted(loadContainers)
 <style scoped lang="scss">
 .docker-view {
   gap: 12px;
+}
+
+.docker-toolbar {
+  flex-shrink: 0;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
 }
 
 .docker-alert {

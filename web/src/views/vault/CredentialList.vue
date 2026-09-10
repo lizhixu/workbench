@@ -207,9 +207,9 @@ const columns = computed<DataTableColumns<Credential>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 200,
+    width: 250,
     render: (c) =>
-      h(NSpace, { size: 6, wrapItem: false }, {
+      h(NSpace, { size: 6, wrap: false, wrapItem: false }, {
         default: () => [
           h(
             NButton,
@@ -337,17 +337,13 @@ onMounted(refresh)
 
 <template>
   <div class="cred-view page-flex-column">
-    <!-- Header: 标题 + 说明 + 刷新/新建 -->
+    <!-- Header: 标题 + 刷新/新建 -->
     <div class="cred-header">
       <div class="header-left">
         <div class="title-wrap">
-          <NIcon size="22" color="#6366f1"><ShieldCheckmarkOutline /></NIcon>
           <h2 class="page-title">凭据金库</h2>
           <NTag size="small" :bordered="false" round type="info">AES-256-GCM 硬件加密</NTag>
         </div>
-        <p class="page-desc">
-          安全存储 SSH 密码、API Key、数据库密码等敏感鉴权凭据，落盘全量强加密。凭据仅可在自动化流程中使用，明文绝不回传浏览器。
-        </p>
       </div>
       <div class="header-right">
         <NSpace align="center" :size="10">
@@ -575,14 +571,6 @@ onMounted(refresh)
         font-weight: 600;
         color: var(--text-primary);
       }
-    }
-
-    .page-desc {
-      margin: 2px 0 0;
-      font-size: 12px;
-      color: var(--text-secondary);
-      line-height: 1.5;
-      max-width: 820px;
     }
   }
 

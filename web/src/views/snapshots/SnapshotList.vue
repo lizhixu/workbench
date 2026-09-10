@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, h, onActivated, onMounted, reactive, ref } from 'vue'
 import {
-  NAlert, NButton, NDataTable, NForm, NFormItem, NIcon, NInput,
+  NAlert, NButton, NCard, NDataTable, NForm, NFormItem, NIcon, NInput,
   NInputNumber, NModal, NPopconfirm, NRadio, NRadioGroup, NSelect,
   NSpace, NSwitch, NTabPane, NTabs, NTag, useMessage,
 } from 'naive-ui'
@@ -586,60 +586,72 @@ onActivated(() => {
 
 <template>
   <div class="snapshots-view page-flex-column">
-    <div class="table-toolbar">
-      <NSpace align="center">
-        <NButton :loading="loading || loadingS3" @click="() => { loadData(); loadS3() }">
-          <template #icon>
-            <NIcon><RefreshOutline /></NIcon>
-          </template>
-          刷新
-        </NButton>
-      </NSpace>
-
-      <NSpace align="center">
-        <NButton v-if="activeTab === 's3'" type="primary" @click="openCreateS3">
-          <template #icon>
-            <NIcon><CloudUploadOutline /></NIcon>
-          </template>
-          添加 S3 存储桶
-        </NButton>
-        <NButton v-else type="primary" @click="showCreate = true">
-          <template #icon>
-            <NIcon><AddCircleOutline /></NIcon>
-          </template>
-          新建备份任务
-        </NButton>
-      </NSpace>
+    <!-- Header -->
+    <div class="page-header">
+      <div class="header-left">
+        <h2 class="page-title">快照备份</h2>
+      </div>
+      <div class="header-right">
+        <NSpace align="center" :size="10">
+          <NButton :loading="loading || loadingS3" @click="() => { loadData(); loadS3() }">
+            <template #icon>
+              <NIcon><RefreshOutline /></NIcon>
+            </template>
+            刷新
+          </NButton>
+          <NButton v-if="activeTab === 's3'" type="primary" @click="openCreateS3">
+            <template #icon>
+              <NIcon><CloudUploadOutline /></NIcon>
+            </template>
+            添加 S3 存储桶
+          </NButton>
+          <NButton v-else type="primary" @click="showCreate = true">
+            <template #icon>
+              <NIcon><AddCircleOutline /></NIcon>
+            </template>
+            新建备份任务
+          </NButton>
+        </NSpace>
+      </div>
     </div>
 
-    <div class="table-card table-flex-fill">
-      <NTabs v-model:value="activeTab" type="line" style="height: 100%; display: flex; flex-direction: column">
+    <!-- Tabs Container：Tab 与表格分层，完全对齐 AlertList 规范 -->
+    <div class="tabs-container">
+      <NTabs v-model:value="activeTab" type="line">
         <!-- 备份任务列表 -->
-        <NTabPane name="jobs" tab="备份任务列表" style="height: 100%; min-height: 0">
-          <div style="height: 100%; min-height: 0; display: flex; flex-direction: column">
-            <NDataTable
-              flex-height
-              :columns="columns"
-              :data="jobs"
-              :row-key="(r: BackupJob) => r.id"
-              :pagination="{ pageSize: 20 }"
-            />
+        <NTabPane name="jobs" tab="备份任务列表">
+          <div class="tab-pane-content">
+            <NCard :bordered="false" class="table-flex-fill">
+              <NDataTable
+                flex-height
+                :columns="columns"
+                :data="jobs"
+                :row-key="(r: BackupJob) => r.id"
+                :pagination="{ pageSize: 20 }"
+                :bordered="false"
+                size="small"
+              />
+            </NCard>
           </div>
         </NTabPane>
 
         <!-- S3 存储配置 -->
-        <NTabPane name="s3" tab="S3 异地存储配置 (Cloudflare R2 / MinIO / AWS S3 等)" style="height: 100%; min-height: 0">
-          <div style="height: 100%; min-height: 0; display: flex; flex-direction: column">
+        <NTabPane name="s3" tab="S3 异地存储配置 (Cloudflare R2 / MinIO / AWS S3 等)">
+          <div class="tab-pane-content">
             <NAlert type="info" :show-icon="true" style="margin-bottom: 10px; flex-shrink: 0">
               配置多个 S3 存储桶后，可设置默认存储位置。每个备份任务可选择使用默认、本地主机或指定某个具体的 S3 目标进行异地备份上云。
             </NAlert>
-            <NDataTable
-              flex-height
-              :columns="s3Columns"
-              :data="s3Targets"
-              :row-key="(r: S3Target) => r.id"
-              :pagination="{ pageSize: 20 }"
-            />
+            <NCard :bordered="false" class="table-flex-fill">
+              <NDataTable
+                flex-height
+                :columns="s3Columns"
+                :data="s3Targets"
+                :row-key="(r: S3Target) => r.id"
+                :pagination="{ pageSize: 20 }"
+                :bordered="false"
+                size="small"
+              />
+            </NCard>
           </div>
         </NTabPane>
       </NTabs>
@@ -821,19 +833,64 @@ onActivated(() => {
 
 <style scoped lang="scss">
 .snapshots-view {
-  gap: 12px;
-}
+  gap: 14px;
+  overflow: hidden;
 
-.table-toolbar {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
+  .page-header {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
 
-.table-card {
-  background: var(--n-color, rgba(128, 128, 128, 0.06));
-  border-radius: 8px;
-  padding: 4px;
+    .header-left {
+      display: flex;
+      align-items: center;
+
+      .page-title {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 600;
+        color: var(--text-primary);
+      }
+    }
+  }
+
+  .tabs-container {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+
+    :deep(.n-tabs) {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    :deep(.n-tabs-pane-wrapper) {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    :deep(.n-tab-pane) {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+  }
+
+  .tab-pane-content {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
 }
 </style>

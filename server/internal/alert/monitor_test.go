@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"testing"
 	"time"
+
+	"watchman/proto/agentpb"
 )
 
 type mockProvider struct {
@@ -191,5 +193,177 @@ func TestStoreDedupHistoricalOnlineEvents(t *testing.T) {
 	}
 	if remaining[1].ID != "e4" {
 		t.Errorf("event[1] = %s, want e4 (latest)", remaining[1].ID)
+	}
+}
+
+// TestMonitorMaintenanceSuppression verifies that when an agent is in maintenance
+// or reconnects after upgrade/maintenance, offline/online notifications are suppressed.
+func TestMonitorMaintenanceSuppression(t *testing.T) {
+	store := newTestStore(t)
+	prov := &mockProvider{
+		hosts: []HostInfo{
+			{ID: "h1", Hostname: "host-alpha", Status: "online"},
+		},
+	}
+
+	mon := NewMonitor(store, prov, nil, nil, slog.Default())
+	mon.SetBootGraceForTest(0)
+	mon.evaluate() // steady state
+
+	// 1. Host enters scheduled maintenance (e.g. upgrade)
+	mon.SetHostMaintenance("h1", 120*time.Second, "upgrade")
+
+	// Host goes offline during maintenance
+	prov.hosts[0].Status = "offline"
+	mon.evaluate()
+
+	events := store.ListEvents(100)
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events while offline in maintenance, got %d", len(events))
+	}
+
+	// 2. Host reconnects carrying ReconnectReason="upgrade"
+	prov.hosts[0].Status = "online"
+	prov.hosts[0].ReconnectReason = "upgrade"
+	mon.evaluate()
+
+	events = store.ListEvents(100)
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events when reconnecting after upgrade, got %d", len(events))
+	}
+
+	// 3. The reason is one-shot: the same host going offline again must alert
+	// normally once maintenance has ended.
+	mon.ClearHostMaintenance("h1")
+	prov.hosts[0].ReconnectReason = ""
+	prov.hosts[0].Status = "offline"
+	mon.evaluate()
+
+	events = store.ListEvents(100)
+	if len(events) != 1 {
+		t.Fatalf("expected offline alert after maintenance ended, got %d events", len(events))
+	}
+}
+
+// TestMonitorMaintenanceExpiry verifies a maintenance window stops suppressing
+// once it elapses, so a real outage is never permanently silenced by a stale window.
+func TestMonitorMaintenanceExpiry(t *testing.T) {
+	store := newTestStore(t)
+	prov := &mockProvider{
+		hosts: []HostInfo{{ID: "h1", Hostname: "host-beta", Status: "online"}},
+	}
+
+	mon := NewMonitor(store, prov, nil, nil, slog.Default())
+	mon.SetBootGraceForTest(0)
+	mon.evaluate() // baseline
+
+	mon.SetHostMaintenance("h1", 50*time.Millisecond, "agent_upgrade")
+	prov.hosts[0].Status = "offline"
+	mon.evaluate()
+	if got := len(store.ListEvents(100)); got != 0 {
+		t.Fatalf("expected 0 events inside the maintenance window, got %d", got)
+	}
+
+	time.Sleep(80 * time.Millisecond) // let the window lapse
+	mon.evaluate()
+	if got := len(store.ListEvents(100)); got != 1 {
+		t.Fatalf("expected offline alert once maintenance expired, got %d events", got)
+	}
+		if mon.InMaintenance("h1") {
+			t.Error("InMaintenance should report false after the window expired")
+		}
+	}
+
+func TestMonitorHostSpecificTrafficAlert(t *testing.T) {
+	tmp := t.TempDir()
+	store, _ := NewStore(tmp)
+
+	prov := &mockProvider{
+		hosts: []HostInfo{
+			{
+				ID:       "h1",
+				Hostname: "no-quota-host",
+				Status:   "online",
+				Metrics: &agentpb.MetricsSample{
+					MonthRx: 90 * (1 << 30),
+					MonthTx: 90 * (1 << 30),
+				},
+			},
+			{
+				ID:             "h2",
+				Hostname:       "has-quota-host",
+				Status:         "online",
+				TrafficLimitGB: 100,
+				Metrics: &agentpb.MetricsSample{
+					MonthRx: 45 * (1 << 30),
+					MonthTx: 45 * (1 << 30),
+				},
+			},
+			{
+				ID:              "h3",
+				Hostname:        "out-only-host",
+				Status:          "online",
+				TrafficLimitGB:  100,
+				TrafficCalcType: "out",
+				Metrics: &agentpb.MetricsSample{
+					MonthRx: 60 * (1 << 30),
+					MonthTx: 50 * (1 << 30),
+				},
+			},
+		},
+	}
+
+	mon := NewMonitor(store, prov, nil, nil, slog.Default())
+	mon.SetBootGraceForTest(0)
+	mon.evaluate()
+
+	events := store.ListEvents(100)
+	if len(events) != 1 {
+		t.Fatalf("expected exactly 1 traffic event (for h2), got %d", len(events))
+	}
+	if events[0].HostID != "h2" {
+		t.Errorf("expected event for h2, got %s", events[0].HostID)
+	}
+}
+
+func TestMonitorHostExpiryReminder(t *testing.T) {
+	tmp := t.TempDir()
+	store, _ := NewStore(tmp)
+
+	in15 := time.Now().AddDate(0, 0, 15).Format("2006/01/02")
+	in60 := time.Now().AddDate(0, 0, 60).Format("2006/01/02")
+
+	prov := &mockProvider{
+		hosts: []HostInfo{
+			{ID: "h1", Hostname: "expiring-soon", Status: "online", ExpiresAt: in15},
+			{ID: "h2", Hostname: "expiring-later", Status: "online", ExpiresAt: in60},
+			{ID: "h3", Hostname: "no-expiry", Status: "online"},
+		},
+	}
+
+	mon := NewMonitor(store, prov, nil, nil, slog.Default())
+	mon.SetBootGraceForTest(0)
+	mon.evaluate()
+
+	// 只有 30 天内到期的 h1 触发提醒，未到期与未配置的主机不触发
+	events := store.ListEvents(100)
+	if len(events) != 1 {
+		t.Fatalf("expected exactly 1 expiry reminder (for h1), got %d", len(events))
+	}
+	if events[0].HostID != "h1" {
+		t.Errorf("expected reminder for h1, got %s", events[0].HostID)
+	}
+
+	// 到期前 30 天内的重复评估不重复提醒
+	mon.evaluate()
+	if events := store.ListEvents(100); len(events) != 1 {
+		t.Fatalf("expected no duplicate reminder, got %d events", len(events))
+	}
+
+	// 续费（到期时间推后到 30 天以外）后提醒自动解除，且不产生新事件
+	prov.hosts[0].ExpiresAt = in60
+	mon.evaluate()
+	if events := store.ListEvents(100); len(events) != 1 {
+		t.Fatalf("expected no new events after renewal, got %d", len(events))
 	}
 }

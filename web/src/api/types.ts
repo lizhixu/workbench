@@ -51,6 +51,30 @@ export interface Host {
   swap_usage?: number
   month_rx?: number
   month_tx?: number
+  // Optional billing & traffic quota configurations
+  price?: number
+  currency?: string
+  billing_cycle?: string
+  expires_at?: string
+  auto_renewal?: boolean
+  traffic_limit_gb?: number
+  traffic_calc_type?: 'both' | 'out' | 'in' | string
+  traffic_reset_day?: number
+  renewal_url?: string
+  notes?: string
+}
+
+export interface HostBillingConfig {
+  price?: number
+  currency?: string
+  billing_cycle?: string
+  expires_at?: string
+  auto_renewal?: boolean
+  traffic_limit_gb?: number
+  traffic_calc_type?: 'both' | 'out' | 'in' | string
+  traffic_reset_day?: number
+  renewal_url?: string
+  notes?: string
 }
 
 export interface ListResponse<T> {
@@ -61,7 +85,11 @@ export interface ListResponse<T> {
 export interface HealthResponse {
   ok: boolean
   agents: number
+  online_agents?: number
   version: string
+  agent_latest_version?: string
+  os?: string
+  arch?: string
 }
 
 // ---- Terminal ----

@@ -14,10 +14,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"watchman/internal/version"
 	"watchman/proto/agentpb"
 	"watchman/server/internal/ai"
 	"watchman/server/internal/alert"
@@ -43,11 +45,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// HostDTO is the public representation of a managed host.
-// CurrentAgentVersion is the latest release version of the Watchman Agent binary
-// built into or hosted by this control server.
-const CurrentAgentVersion = "0.1.0-dev"
+// CurrentAgentVersion is the latest release version of the Watchman Agent
+// binary built into or hosted by this control server. It comes from the linker
+// (see internal/version) so releasing a new agent only requires rebuilding with
+// -ldflags, never editing a hardcoded string.
+var CurrentAgentVersion = version.Get()
 
+// HostDTO is the public representation of a managed host.
 type HostDTO struct {
 	ID         string   `json:"id"`
 	Hostname   string   `json:"hostname"`
@@ -63,10 +67,21 @@ type HostDTO struct {
 	Uptime     int64    `json:"uptime"`
 	CPUCores   int32    `json:"cpu_cores"`
 	MemTotal   int64    `json:"mem_total"`
-	InternalIP string   `json:"internal_ip"`
-	PublicIP   string   `json:"public_ip"`
-	Location   string   `json:"location"`
-	// Extended live metrics (from the agent's latest sample).
+		InternalIP string   `json:"internal_ip"`
+		PublicIP   string   `json:"public_ip"`
+		Location   string   `json:"location"`
+		// Optional billing & traffic quota configurations
+		Price           float64 `json:"price,omitempty"`
+		Currency        string  `json:"currency,omitempty"`
+		BillingCycle    string  `json:"billing_cycle,omitempty"`
+		ExpiresAt       string  `json:"expires_at,omitempty"`
+		AutoRenewal     bool    `json:"auto_renewal,omitempty"`
+		TrafficLimitGB  float64 `json:"traffic_limit_gb,omitempty"`
+		TrafficCalcType string  `json:"traffic_calc_type,omitempty"`
+		TrafficResetDay int     `json:"traffic_reset_day,omitempty"`
+		RenewalURL      string  `json:"renewal_url,omitempty"`
+		Notes           string  `json:"notes,omitempty"`
+		// Extended live metrics (from the agent's latest sample).
 	CpuModel  string  `json:"cpu_model,omitempty"`
 	Load1     float64 `json:"load1"`
 	SwapUsage float64 `json:"swap_usage"`
@@ -83,7 +98,7 @@ type HostDTO struct {
 // authorization, prefsStore backs per-user terminal preferences and
 // backupStore backs control-plane backup/restore; all may be nil to disable
 // those features.
-func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, prefsStore *prefs.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine, gitProviderStore *gitprovider.Store) *gin.Engine {
+func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, prefsStore *prefs.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine, gitProviderStore *gitprovider.Store, alertMon *alert.Monitor) *gin.Engine {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -92,7 +107,7 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	r.Use(gin.Recovery(), requestLogger(log))
 
 	v1 := r.Group("/api/v1")
-	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, prefs: prefsStore}
+	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, prefs: prefsStore, alertMon: alertMon}
 
 	// ---- Public routes (no auth) ----
 	// Auth login.
@@ -120,8 +135,9 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	authed.GET("/hosts", h.listHosts)
 	authed.GET("/hosts/:id", h.getHost)
 	adminOnly.DELETE("/hosts/:id", h.deleteHost)
-	adminOnly.PUT("/hosts/:id/group", h.setHostGroup)
-	adminOnly.PUT("/hosts/:id/tags", h.setHostTags)
+		adminOnly.PUT("/hosts/:id/group", h.setHostGroup)
+		adminOnly.PUT("/hosts/:id/tags", h.setHostTags)
+		adminOnly.PUT("/hosts/:id/billing", h.setHostBilling)
 
 	// Terminal. An interactive shell is full write access to the host.
 	hostWrite.POST("/hosts/:id/terminals", h.openTerminal)
@@ -167,11 +183,11 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	if appStore != nil {
 		appWrite := authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator), h.auditMutation())
 		appHandlers := apps.NewAppHandlers(reg, appStore, appEngine)
-			if aiAssistant != nil {
-				appHandlers.SetAI(func(ctx context.Context, command, stdout, stderr string, exitCode int32) (any, error) {
-					return aiAssistant.AnalyzeExecResult(ctx, command, stdout, stderr, exitCode)
-				})
-			}
+		if aiAssistant != nil {
+			appHandlers.SetAI(func(ctx context.Context, command, stdout, stderr string, exitCode int32) (any, error) {
+				return aiAssistant.AnalyzeExecResult(ctx, command, stdout, stderr, exitCode)
+			})
+		}
 		appHandlers.RegisterAppRoutes(
 			authed.Group(""),
 			appWrite,
@@ -226,11 +242,13 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// Health.
 	authed.GET("/system/health", h.health)
 
-		// Agent upgrade.
-		adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
+	// Agent upgrade.
+	adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
 
-		// Control-server binary hot self-upgrade (upload base64 binary).
-		adminOnly.POST("/system/upgrade", h.systemUpgrade)
+	// Control-server binary hot self-upgrade (upload file/base64 binary).
+	adminOnly.POST("/system/upgrade", h.systemUpgrade)
+	adminOnly.POST("/system/restart", h.systemRestart)
+	adminOnly.POST("/system/upgrade-agents", h.upgradeAgentsBatch)
 
 	// User management (admin-only for mutating routes). Deleting an account
 	// also drops its terminal preferences, so a recreated account starts fresh.
@@ -288,22 +306,22 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		prefs.NewHandlers(prefsStore).Register(authed)
 	}
 
-		// Control-plane backup / restore. An archive contains every credential,
-		// recording and audit entry the server holds, and a restore rewrites all of
-		// them, so these routes are admin-only and always audited.
-		if backupStore != nil {
-			backup.NewHandlers(backupStore).Register(
-				authed.Group("", auth.RequireRole(auth.RoleAdmin), h.auditMutation()),
-			)
-		}
+	// Control-plane backup / restore. An archive contains every credential,
+	// recording and audit entry the server holds, and a restore rewrites all of
+	// them, so these routes are admin-only and always audited.
+	if backupStore != nil {
+		backup.NewHandlers(backupStore).Register(
+			authed.Group("", auth.RequireRole(auth.RoleAdmin), h.auditMutation()),
+		)
+	}
 
-		// Overlay networking (Tailscale / Headscale).
-		if networkStore != nil {
-			network.NewHandlers(networkStore, reg, auditStore).Register(
-				authed.Group(""),
-				hostWrite.Group("", h.auditMutation()),
-			)
-		}
+	// Overlay networking (Tailscale / Headscale).
+	if networkStore != nil {
+		network.NewHandlers(networkStore, reg, auditStore).Register(
+			authed.Group(""),
+			hostWrite.Group("", h.auditMutation()),
+		)
+	}
 
 	// WebSocket endpoint (token via query param, since browsers can't set
 	// Authorization headers on WebSocket upgrades easily; also supports share_token or code).
@@ -337,15 +355,16 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 }
 
 type handlers struct {
-	reg     *rpc.Registry
-	log     *slog.Logger
-	sess    *session.Store
-	auth    *auth.Store
-	metrics *metrics.Store
-	policy  *policy.Store
-	audit   *audit.Store
-	groups  *groups.Store
-	prefs   *prefs.Store
+	reg      *rpc.Registry
+	log      *slog.Logger
+	sess     *session.Store
+	auth     *auth.Store
+	metrics  *metrics.Store
+	policy   *policy.Store
+	audit    *audit.Store
+	groups   *groups.Store
+	prefs    *prefs.Store
+	alertMon *alert.Monitor
 }
 
 // canSeeHost reports whether the caller is allowed to reach the given host,
@@ -494,6 +513,20 @@ func (h *handlers) setHostTags(c *gin.Context) {
 		return
 	}
 	h.recordAudit(c, "host_tags", "host", c.Param("id"), "更新标签", audit.RiskLow, audit.ResultSuccess)
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *handlers) setHostBilling(c *gin.Context) {
+	var body rpc.HostBillingConfig
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.reg.SetAgentBilling(c.Param("id"), body); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	h.recordAudit(c, "host_billing", "host", c.Param("id"), "更新主机财务与流量配置", audit.RiskLow, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -1318,6 +1351,11 @@ func (h *handlers) upgradeAgent(c *gin.Context) {
 	})
 	defer hub.SetRespHandler("upgrade", nil)
 
+	// Suppress offline and reconnect alerts for this host during the upgrade window
+	if h.alertMon != nil {
+		h.alertMon.SetHostMaintenance(agentID, 180*time.Second, "agent_upgrade")
+	}
+
 	hub.Send(&agentpb.ServerMessage{
 		Payload: &agentpb.ServerMessage_Upgrade{
 			Upgrade: &agentpb.UpgradeRequest{
@@ -1665,8 +1703,11 @@ func (h *handlers) health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ok":                   true,
 		"agents":               len(h.reg.ListAgents()),
-		"version":              "0.1.0-dev",
+		"version":              version.Get(),
 		"agent_latest_version": CurrentAgentVersion,
+		"os":                   runtime.GOOS,
+		"arch":                 runtime.GOARCH,
+		"online_agents":        h.reg.CountOnline(),
 	})
 }
 
@@ -1692,11 +1733,21 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 		Uptime:     a.Uptime,
 		CPUCores:   a.CPUCores,
 		MemTotal:   a.MemTotal,
-		InternalIP: a.InternalIP,
-		PublicIP:   a.PublicIP,
-		Location:   a.Location,
-	}
-	// Surface the real OS uptime and latest metrics
+			InternalIP:      a.InternalIP,
+			PublicIP:        a.PublicIP,
+			Location:        a.Location,
+			Price:           a.Price,
+			Currency:        a.Currency,
+			BillingCycle:    a.BillingCycle,
+			ExpiresAt:       a.ExpiresAt,
+			AutoRenewal:     a.AutoRenewal,
+			TrafficLimitGB:  a.TrafficLimitGB,
+			TrafficCalcType: a.TrafficCalcType,
+			TrafficResetDay: a.TrafficResetDay,
+			RenewalURL:      a.RenewalURL,
+			Notes:           a.Notes,
+		}
+		// Surface the real OS uptime and latest metrics
 	if hub := h.reg.Hub(a.ID); hub != nil {
 		if m := hub.LastMetrics(); m != nil {
 			if m.GetUptime() > 0 {
@@ -1768,22 +1819,10 @@ type UpgradePayload struct {
 	Data string `json:"data"` // Base64 encoded binary
 }
 
-// systemUpgrade accepts a base64-encoded binary, replaces the running
-// watchman-server binary atomically, and then instructs the operator to restart
-// the process (e.g. via systemd or supervisor) to complete the deployment.
+// systemUpgrade accepts either a multipart/form-data upload or a base64-encoded binary,
+// replaces the running watchman-server binary atomically, announces maintenance to all agents,
+// and instructs the operator or system to restart the process.
 func (h *handlers) systemUpgrade(c *gin.Context) {
-	var body UpgradePayload
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	raw, err := base64.StdEncoding.DecodeString(body.Data)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid base64 data"})
-		return
-	}
-
 	self, err := os.Executable()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1796,26 +1835,201 @@ func (h *handlers) systemUpgrade(c *gin.Context) {
 
 	dir := filepath.Dir(target)
 	tmp := filepath.Join(dir, fmt.Sprintf("watchman-server.upgrade.%d", time.Now().UnixNano()))
-	if err := os.WriteFile(tmp, raw, 0755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("写入临时文件失败: %v", err)})
-		return
+
+	var fileSize int64
+	contentType := c.GetHeader("Content-Type")
+
+	if strings.Contains(contentType, "multipart/form-data") {
+		fileHeader, err := c.FormFile("file")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请选择上传的文件: " + err.Error()})
+			return
+		}
+		fileSize = fileHeader.Size
+		src, err := fileHeader.Open()
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "打开上传文件失败: " + err.Error()})
+			return
+		}
+		defer src.Close()
+
+		dst, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("创建临时文件失败: %v", err)})
+			return
+		}
+		defer dst.Close()
+
+		if _, err := io.Copy(dst, src); err != nil {
+			os.Remove(tmp)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("写入文件失败: %v", err)})
+			return
+		}
+	} else {
+		// Fallback: JSON base64
+		var body UpgradePayload
+		if err := c.ShouldBindJSON(&body); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的上传参数"})
+			return
+		}
+		raw, err := base64.StdEncoding.DecodeString(body.Data)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid base64 data"})
+			return
+		}
+		fileSize = int64(len(raw))
+		if err := os.WriteFile(tmp, raw, 0755); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("写入临时文件失败: %v", err)})
+			return
+		}
 	}
 
-	// Atomic rename to replace the running binary (Linux allows renaming a running text file).
+	// Safety backup of existing binary
+	bakPath := filepath.Join(dir, fmt.Sprintf("watchman-server.bak.%d", time.Now().Unix()))
+	_ = os.Rename(target, bakPath)
+
+	// Atomic rename to replace the running binary
 	if err := os.Rename(tmp, target); err != nil {
+		// Rollback if possible
+		_ = os.Rename(bakPath, target)
 		os.Remove(tmp)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("原子替换二进制失败: %v", err)})
 		return
 	}
+	_ = os.Chmod(target, 0755)
+
+	// Broadcast maintenance notice to all agents beforehand
+	h.reg.BroadcastMaintenance("server_upgrade", 180)
 
 	h.recordAudit(c, "update", "system", "server_binary",
-		"一键更新控制端二进制 (system self-upgrade)",
+		fmt.Sprintf("上传新版本控制端二进制并原子替换 (大小: %d 字节)", fileSize),
+		audit.RiskHigh, audit.ResultSuccess)
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":       true,
+		"message":  "控制端二进制已成功替换并备份旧版！系统已向全网 Agent 下发维护预告，请点击平滑重启生效。",
+		"path":     target,
+		"size":     fileSize,
+		"bak_path": bakPath,
+	})
+}
+
+// systemRestart initiates graceful server restart under systemd / supervisor.
+func (h *handlers) systemRestart(c *gin.Context) {
+	h.reg.BroadcastMaintenance("server_restart", 120)
+	h.recordAudit(c, "restart", "system", "watchman-server",
+		"触发控制端平滑重启流程 (maintenance handshake)",
 		audit.RiskHigh, audit.ResultSuccess)
 
 	c.JSON(http.StatusOK, gin.H{
 		"ok":      true,
-		"message": "二进制已上传并原子替换完成！请通过 systemd 或 supervisor 立即重启 watchman-server 以加载新版本。",
-		"path":    target,
-		"size":    len(raw),
+		"message": "已广播停机维护预告，正在触发控制端平滑重载...",
+	})
+
+	go func() {
+		time.Sleep(1 * time.Second)
+		p, err := os.FindProcess(os.Getpid())
+		if err == nil {
+			_ = p.Signal(os.Interrupt)
+		}
+	}()
+}
+
+// upgradeAgentsBatch pushes an upgrade to several hosts at once. Every target
+// gets a maintenance window first so the restart does not page anyone.
+func (h *handlers) upgradeAgentsBatch(c *gin.Context) {
+	var body struct {
+		HostIDs []string `json:"host_ids"` // optional; empty = all outdated online hosts
+		Force   bool     `json:"force"`    // re-push even to hosts already on the current version
+	}
+	_ = c.ShouldBindJSON(&body)
+
+	allAgents := h.reg.ListAgents()
+	var targets []*rpc.Agent
+
+	if len(body.HostIDs) > 0 {
+		targetMap := make(map[string]bool)
+		for _, id := range body.HostIDs {
+			targetMap[id] = true
+		}
+		for _, a := range allAgents {
+			if targetMap[a.ID] && a.Status == "online" {
+				targets = append(targets, a)
+			}
+		}
+	} else {
+		for _, a := range allAgents {
+			// Force is needed for dev builds, where every binary reports the
+			// same version and nothing would ever look outdated.
+			if a.Status != "online" {
+				continue
+			}
+			if body.Force || a.Version != CurrentAgentVersion {
+				targets = append(targets, a)
+			}
+		}
+	}
+
+	if len(targets) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"ok":      true,
+			"message": "没有需要升级的在线 Agent 主机",
+			"count":   0,
+		})
+		return
+	}
+
+	scheme := "http"
+	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
+		scheme = "https"
+	}
+	// TODO(server.public_url): the download URL is derived from the request's
+	// Host header, which a client controls. Once the documented
+	// server.public_url setting exists it must take precedence here, otherwise
+	// a crafted Host header can point agents at an attacker-supplied binary.
+	hostHeader := c.Request.Host
+
+	dispatched := make([]string, 0, len(targets))
+	for _, a := range targets {
+		hub := h.reg.Hub(a.ID)
+		if hub == nil {
+			continue
+		}
+
+		// Suppress offline/online alert noise during the upgrade
+		if h.alertMon != nil {
+			h.alertMon.SetHostMaintenance(a.ID, 180*time.Second, "agent_upgrade")
+		}
+
+		osName := strings.ToLower(a.OS)
+		if osName == "" {
+			osName = "linux"
+		}
+		archName := strings.ToLower(a.Arch)
+		if archName == "" {
+			archName = "amd64"
+		}
+		binaryURL := fmt.Sprintf("%s://%s/api/v1/agent/binary?os=%s&arch=%s", scheme, hostHeader, osName, archName)
+
+		hub.Send(&agentpb.ServerMessage{
+			Payload: &agentpb.ServerMessage_Upgrade{
+				Upgrade: &agentpb.UpgradeRequest{
+					Version: CurrentAgentVersion,
+					Url:     binaryURL,
+				},
+			},
+		})
+		dispatched = append(dispatched, a.Hostname)
+	}
+
+	h.recordAudit(c, "batch_upgrade", "system", "agents",
+		fmt.Sprintf("批量升级 %d 台在线 Agent 到最新版本 %s", len(dispatched), CurrentAgentVersion),
+		audit.RiskMedium, audit.ResultSuccess)
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      true,
+		"message": fmt.Sprintf("已成功向 %d 台主机下发升级任务，已自动开启 3 分钟维护静默期", len(dispatched)),
+		"count":   len(dispatched),
+		"hosts":   dispatched,
 	})
 }

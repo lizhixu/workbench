@@ -1,5 +1,5 @@
 import { http, unwrap } from './http'
-import type { EnrollResponse, HealthResponse, Host, ListResponse, SessionRecord } from './types'
+import type { EnrollResponse, HealthResponse, Host, HostBillingConfig, ListResponse, SessionRecord } from './types'
 
 export function listHosts() {
   return unwrap<ListResponse<Host>>(http.get('/hosts'))
@@ -27,6 +27,10 @@ export function setHostGroup(id: string, group: string) {
 
 export function setHostTags(id: string, tags: string[]) {
   return unwrap<{ ok: boolean }>(http.put(`/hosts/${id}/tags`, { tags }))
+}
+
+export function updateHostBilling(id: string, billing: HostBillingConfig) {
+  return unwrap<{ ok: boolean }>(http.put(`/hosts/${id}/billing`, billing))
 }
 
 // ---- Terminal ----

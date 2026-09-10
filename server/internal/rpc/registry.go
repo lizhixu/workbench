@@ -33,12 +33,23 @@ type persistedAgent struct {
 	Uptime     int64     `json:"uptime"`
 	CPUCores   int32     `json:"cpu_cores"`
 	MemTotal   int64     `json:"mem_total"`
-	InternalIP string    `json:"internal_ip"`
-	PublicIP   string    `json:"public_ip"`
-	Location   string    `json:"location"`
-	// AuthToken is the long-lived token issued at registration; kept here
-	// (NOT in r.tokens) so a server restart doesn't invalidate it.
-	AuthToken string `json:"auth_token"`
+		InternalIP string    `json:"internal_ip"`
+		PublicIP   string    `json:"public_ip"`
+		Location   string    `json:"location"`
+		// Optional billing & traffic quota configurations
+		Price           float64 `json:"price,omitempty"`
+		Currency        string  `json:"currency,omitempty"`
+		BillingCycle    string  `json:"billing_cycle,omitempty"`
+		ExpiresAt       string  `json:"expires_at,omitempty"`
+		AutoRenewal     bool    `json:"auto_renewal,omitempty"`
+		TrafficLimitGB  float64 `json:"traffic_limit_gb,omitempty"`
+		TrafficCalcType string  `json:"traffic_calc_type,omitempty"`
+		TrafficResetDay int     `json:"traffic_reset_day,omitempty"`
+		RenewalURL      string  `json:"renewal_url,omitempty"`
+		Notes           string  `json:"notes,omitempty"`
+		// AuthToken is the long-lived token issued at registration; kept here
+		// (NOT in r.tokens) so a server restart doesn't invalidate it.
+		AuthToken string `json:"auth_token"`
 }
 
 // Registry holds all known agents (online and recently offline) and the live
@@ -78,9 +89,22 @@ type Agent struct {
 	Uptime     int64 // real OS uptime in seconds (since boot), from registration/metrics
 	CPUCores   int32
 	MemTotal   int64
-	InternalIP string
-	PublicIP   string
-	Location   string
+		InternalIP string
+		PublicIP   string
+		Location   string
+		// Optional billing & traffic quota configurations
+		Price           float64
+		Currency        string
+		BillingCycle    string
+		ExpiresAt       string
+		AutoRenewal     bool
+		TrafficLimitGB  float64
+		TrafficCalcType string
+		TrafficResetDay int
+		RenewalURL      string
+		Notes           string
+		// ReconnectReason is the reason sent by the agent on its most recent registration.
+		ReconnectReason string
 	// AuthToken is the long-lived token; persisted with the agent so the
 	// server can validate reconnects after a restart.
 	AuthToken string
@@ -88,12 +112,12 @@ type Agent struct {
 
 // Hub is the live connection state for a connected agent.
 type Hub struct {
-	AgentID    string
-	heartbeat  int32
-	lastSeen   time.Time
-	sendCh     chan *agentpb.ServerMessage
-	stream     agentpb.AgentService_ConnectServer
-	mu         sync.Mutex
+	AgentID      string
+	heartbeat    int32
+	lastSeen     time.Time
+	sendCh       chan *agentpb.ServerMessage
+	stream       agentpb.AgentService_ConnectServer
+	mu           sync.Mutex
 	termHandlers map[string]func(*agentpb.TerminalOutput)
 	// Generic response handlers keyed by op_id / exec_id / session_id.
 	respHandlers map[string]func(*agentpb.AgentMessage)
@@ -171,11 +195,21 @@ func (r *Registry) loadAgents() error {
 			Uptime:     p.Uptime,
 			CPUCores:   p.CPUCores,
 			MemTotal:   p.MemTotal,
-			InternalIP: p.InternalIP,
-			PublicIP:   p.PublicIP,
-			Location:   p.Location,
-			AuthToken:  p.AuthToken,
-		}
+				InternalIP:      p.InternalIP,
+				PublicIP:        p.PublicIP,
+				Location:        p.Location,
+				Price:           p.Price,
+				Currency:        p.Currency,
+				BillingCycle:    p.BillingCycle,
+				ExpiresAt:       p.ExpiresAt,
+				AutoRenewal:     p.AutoRenewal,
+				TrafficLimitGB:  p.TrafficLimitGB,
+				TrafficCalcType: p.TrafficCalcType,
+				TrafficResetDay: p.TrafficResetDay,
+				RenewalURL:      p.RenewalURL,
+				Notes:           p.Notes,
+				AuthToken:       p.AuthToken,
+			}
 		if a.Tags == nil {
 			a.Tags = []string{}
 		}
@@ -207,11 +241,21 @@ func (r *Registry) persistAgentsLocked() error {
 			Uptime:     a.Uptime,
 			CPUCores:   a.CPUCores,
 			MemTotal:   a.MemTotal,
-			InternalIP: a.InternalIP,
-			PublicIP:   a.PublicIP,
-			Location:   a.Location,
-			AuthToken:  a.AuthToken,
-		}
+				InternalIP:      a.InternalIP,
+				PublicIP:        a.PublicIP,
+				Location:        a.Location,
+				Price:           a.Price,
+				Currency:        a.Currency,
+				BillingCycle:    a.BillingCycle,
+				ExpiresAt:       a.ExpiresAt,
+				AutoRenewal:     a.AutoRenewal,
+				TrafficLimitGB:  a.TrafficLimitGB,
+				TrafficCalcType: a.TrafficCalcType,
+				TrafficResetDay: a.TrafficResetDay,
+				RenewalURL:      a.RenewalURL,
+				Notes:           a.Notes,
+				AuthToken:       a.AuthToken,
+			}
 	}
 	data, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
@@ -262,10 +306,10 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 		hub := newHub(agentID, heartbeatSec, r)
 		r.hubs[agentID] = hub
 		return hub, &agentpb.RegisterResponse{
-			Ok:                  true,
-			AgentId:             agentID,
+			Ok:                   true,
+			AgentId:              agentID,
 			HeartbeatIntervalSec: heartbeatSec,
-			SessionKeepSec:      sessionKeep,
+			SessionKeepSec:       sessionKeep,
 		}, nil
 	}
 
@@ -305,11 +349,11 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 	r.hubs[agentID] = hub
 	r.log.Info("agent registered", "agent_id", agentID, "hostname", req.GetHostname())
 	return hub, &agentpb.RegisterResponse{
-		Ok:                  true,
-		AgentId:             agentID,
-		AuthToken:           authTokenNew,
+		Ok:                   true,
+		AgentId:              agentID,
+		AuthToken:            authTokenNew,
 		HeartbeatIntervalSec: heartbeatSec,
-		SessionKeepSec:      sessionKeep,
+		SessionKeepSec:       sessionKeep,
 	}, nil
 }
 
@@ -347,6 +391,7 @@ func applyReg(a *Agent, req *agentpb.RegisterRequest) {
 	if v := req.GetLocation(); v != "" {
 		a.Location = v
 	}
+	a.ReconnectReason = req.GetReconnectReason()
 }
 
 func (r *Registry) ListAgents() []*Agent {
@@ -412,6 +457,52 @@ func (r *Registry) SetAgentTags(id string, tags []string) error {
 	return nil
 }
 
+// HostBillingConfig carries optional user-managed finance, traffic quota and note configs for a host.
+type HostBillingConfig struct {
+	Price           float64 `json:"price"`
+	Currency        string  `json:"currency"`
+	BillingCycle    string  `json:"billing_cycle"`
+	ExpiresAt       string  `json:"expires_at"`
+	AutoRenewal     bool    `json:"auto_renewal"`
+	TrafficLimitGB  float64 `json:"traffic_limit_gb"`
+	TrafficCalcType string  `json:"traffic_calc_type"`
+	TrafficResetDay int     `json:"traffic_reset_day"`
+	RenewalURL      string  `json:"renewal_url"`
+	Notes           string  `json:"notes"`
+}
+
+// SetAgentBilling updates optional billing, traffic limits and notes for a host.
+func (r *Registry) SetAgentBilling(id string, b HostBillingConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.agents[id]
+	if !ok {
+		return fmt.Errorf("agent not found")
+	}
+	a.Price = b.Price
+	a.Currency = b.Currency
+	a.BillingCycle = b.BillingCycle
+	a.ExpiresAt = b.ExpiresAt
+	a.AutoRenewal = b.AutoRenewal
+	a.TrafficLimitGB = b.TrafficLimitGB
+	if b.TrafficCalcType == "" {
+		a.TrafficCalcType = "both"
+	} else {
+		a.TrafficCalcType = b.TrafficCalcType
+	}
+	if b.TrafficResetDay <= 0 {
+		a.TrafficResetDay = 1
+	} else if b.TrafficResetDay > 31 {
+		a.TrafficResetDay = 31
+	} else {
+		a.TrafficResetDay = b.TrafficResetDay
+	}
+	a.RenewalURL = b.RenewalURL
+	a.Notes = b.Notes
+	_ = r.persistAgentsLocked()
+	return nil
+}
+
 // RenameGroup rewrites every agent whose group is oldName to newName and
 // returns how many records changed. Passing an empty newName clears the group
 // (used when a group is deleted) so hosts are never left pointing at a group
@@ -431,6 +522,76 @@ func (r *Registry) RenameGroup(oldName, newName string) int {
 	}
 	if n > 0 {
 		_ = r.persistAgentsLocked()
+	}
+	return n
+}
+
+// broadcastTimeout bounds a maintenance broadcast so a shutdown is never
+// blocked by a slow or wedged agent connection.
+const broadcastTimeout = 3 * time.Second
+
+// BroadcastMaintenance sends a maintenance notice to all currently connected agents.
+// Called prior to graceful server shutdown or restart so agents persist a
+// "maintenance" reconnect reason and the alert engine stays quiet (see AGENTS.md 8.6).
+//
+// The hub list is snapshotted under the read lock but frames are sent outside
+// it: Hub.Send may block up to 5s per agent when the outbound channel is full,
+// and holding r.mu across that would stall ListAgents/Hub — and therefore every
+// HTTP request that resolves a host — for the whole broadcast.
+func (r *Registry) BroadcastMaintenance(reason string, durationSec int) {
+	r.mu.RLock()
+	hubs := make([]*Hub, 0, len(r.hubs))
+	for _, hub := range r.hubs {
+		if hub != nil {
+			hubs = append(hubs, hub)
+		}
+	}
+	r.mu.RUnlock()
+
+	if len(hubs) == 0 {
+		return
+	}
+	r.log.Info("broadcasting maintenance notice", "reason", reason, "agents", len(hubs))
+
+	done := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(len(hubs))
+		for _, hub := range hubs {
+			go func(h *Hub) {
+				defer wg.Done()
+				// Build a fresh message per hub; protobuf messages must not be
+				// shared across goroutines that may lazily populate caches.
+				h.Send(&agentpb.ServerMessage{
+					Payload: &agentpb.ServerMessage_Maintenance{
+						Maintenance: &agentpb.MaintenanceNotice{
+							Reason:              reason,
+							ExpectedDurationSec: int32(durationSec),
+						},
+					},
+				})
+			}(hub)
+		}
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(broadcastTimeout):
+		r.log.Warn("maintenance broadcast timed out", "reason", reason, "agents", len(hubs))
+	}
+}
+
+// CountOnline returns how many agents are currently connected.
+func (r *Registry) CountOnline() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, a := range r.agents {
+		if a.Status == "online" {
+			n++
+		}
 	}
 	return n
 }
@@ -595,16 +756,16 @@ func (h *Hub) handleAgentMessage(msg *agentpb.AgentMessage) error {
 	case *agentpb.AgentMessage_ExecResult:
 		h.dispatchResp(p.ExecResult.GetExecId(), msg)
 		return nil
-		case *agentpb.AgentMessage_Metrics:
-			h.mu.Lock()
-			h.lastMetrics = p.Metrics
-			h.mu.Unlock()
-			if h.registry != nil && p.Metrics.GetUptime() > 0 {
-				h.registry.updateAgentMetrics(h.AgentID, p.Metrics)
-			}
-			h.dispatchResp("metrics-live", msg)
-			h.dispatchResp("metrics-poll", msg)
-			return nil
+	case *agentpb.AgentMessage_Metrics:
+		h.mu.Lock()
+		h.lastMetrics = p.Metrics
+		h.mu.Unlock()
+		if h.registry != nil && p.Metrics.GetUptime() > 0 {
+			h.registry.updateAgentMetrics(h.AgentID, p.Metrics)
+		}
+		h.dispatchResp("metrics-live", msg)
+		h.dispatchResp("metrics-poll", msg)
+		return nil
 	case *agentpb.AgentMessage_Sysinfo:
 		// SysInfo responses are keyed by kind in the query; we use the kind as ref.
 		h.dispatchResp("sysinfo:"+p.Sysinfo.GetKind(), msg)

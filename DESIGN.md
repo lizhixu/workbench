@@ -450,3 +450,33 @@ web/
 ### 8.2 代码质量与编译零错误防线 (与 Agent.md 第 7 节对齐)
 - **严格类型校验**：Vue Template 与 TS 脚本严格无类型错误，避免使用废弃 Emoji 表情或断句字符。
 - **构建验证**：任何前端改动须通过 `vue-tsc --noEmit` 与 `vite build` 验证，确保编译零 Error / 零 Warning。
+
+---
+
+## 9. 前端页面布局与组件开发规范
+
+### 9.1 组件选用准则：优先使用 Naive UI 原生组件，非必要不封装
+- **核心原则**：所有视图与交互设计中，**一律优先使用 Naive UI 原生组件库**（`NCard`, `NDataTable`, `NTabs`, `NTabPane`, `NButton`, `NSpace`, `NTag`, `NModal`, `NAlert`, `NInput`, `NSelect`, `NRadioGroup` 等），**非必要绝不二次封装**或手写自定义 `div` 模拟组件结构。
+- **杜绝低效套壳**：严禁无意义地对 Naive UI 原生控件包一层壳作为私有组件；业务组件仅在跨多页面复用高度特化业务逻辑时方可封装（如终端 `TerminalPane`、资源曲线 `MetricsPane` 等）。
+- **统一主题感知**：原生组件深度绑定 Naive UI 的运行时暗色/亮色主题与 CSS 变量（如 `--bg-card`, `--border-color`, `--text-primary` 等），杜绝因私自定义类脱离主题变量而导致的色彩断层或样式漂移。
+
+### 9.2 页面标题规范：外层单文字标题体系
+- **标准语法**：凡具备独立页面标题的视图，统一在主视口外层顶栏左侧使用单文字 `<h2 class="page-title">标题名</h2>`，右侧配合 `NSpace` 承载页面级全局操作按钮组（如刷新、新增等）。
+- **四项杜绝规范**：
+  1. **杜绝中英文混排**：禁止出现 `(Tailscale / Headscale)` 等冗长括号英文，统一使用简炼中文（如 `异地组网`）。
+  2. **杜绝图标混排**：标题文字前禁止附加各类修饰性 `NIcon`，保持极简统一的纯文本层级。
+  3. **杜绝标题下方副标题说明**：取消标题下方的 `page-desc` 说明段落，界面交互以直观功能为主，必要说明使用 `NAlert` 或字段 Tooltip 呈现。
+  4. **杜绝文字塞在卡片内部**：严禁将整页主标题写在 `<NCard title="推送命令">` 或内层卡片中；主标题必须外提至视口顶部，卡片内仅保留表单/表格内容。
+
+### 9.3 多页签与表格布局规范：Tab 与表格卡片分层架构
+- **标准参考**：以「消息与告警中心（`AlertList.vue`）」为标准布局规范模板（快照备份 `SnapshotList.vue`、证书中心 `CertList.vue` 均已完成对齐）。
+- **分层拓扑架构**：
+  1. **顶层容器**：`.page-flex-column` 纵向 flex 撑满视口，`overflow: hidden`。
+  2. **页面顶栏**：`.page-header`（左侧单文字标题，右侧操作按钮组）。
+  3. **全局 Tab 栏**：使用独立的 `.tabs-container` 包裹 `<NTabs type="line">`，**严禁将 Tab 塞进表格内部或放在卡片容器内**。
+  4. **页签内容区**：各个 `NTabPane` 内部由 `.tab-pane-content` 承载，若有指引则上方放 `NAlert`，下方紧跟 `<NCard :bordered="false" class="table-flex-fill">`。
+  5. **表格自适应撑满**：表格统一设置 `flex-height` 和 `:bordered="false"`，结合 `.table-flex-fill` 与全局 flex 穿透样式，让表头与分页条牢牢钉在视口两端，仅数据区纵向滚动。
+
+### 9.4 表格容器视觉规范：统一背景色与消除多余外边框
+- **背景色绝对统一**：表格与主容器卡片一律统一使用系统标准卡片背景变量 `var(--bg-card)`（暗色 `#131b2e`，亮色 `#ffffff`），严禁使用任意无主题感知的 `rgba(128, 128, 128, 0.06)` 等伪背景。
+- **消除多余外边框**：表格卡片容器严禁添加外层实线边框（如禁止出现 `border: 1px solid var(--border-color);` 与外层生硬的 `padding`），消除突兀内缩矩形框，保持平整、沉浸的云控制台视觉风格。

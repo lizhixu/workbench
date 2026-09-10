@@ -28,9 +28,10 @@ type Sender interface {
 
 // Manager handles a single upgrade at a time.
 type Manager struct {
-	log    *slog.Logger
-	sender Sender
-	busy   bool
+	log       *slog.Logger
+	sender    Sender
+	busy      bool
+	onSuccess func() // callback before exit/restart, e.g. record state
 }
 
 // NewManager creates an upgrade manager.
@@ -39,6 +40,11 @@ func NewManager(log *slog.Logger) *Manager {
 		log = slog.Default()
 	}
 	return &Manager{log: log}
+}
+
+// SetOnSuccess registers a callback executed just before restart.
+func (m *Manager) SetOnSuccess(fn func()) {
+	m.onSuccess = fn
 }
 
 // SetSender wires the live connection.
@@ -97,6 +103,10 @@ func (m *Manager) doUpgrade(req *agentpb.UpgradeRequest) {
 	m.progress("restarting", 0, "")
 	m.log.Info("upgrade complete, restarting", "version", req.GetVersion())
 	m.progress("restarting", 1, "")
+
+	if m.onSuccess != nil {
+		m.onSuccess()
+	}
 
 	// Trigger restart in a separate goroutine so the progress message can flush.
 	go func() {

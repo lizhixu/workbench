@@ -16,11 +16,16 @@ import (
 
 // HostInfo is a snapshot of an agent's state used for rule evaluation.
 type HostInfo struct {
-	ID       string
-	Hostname string
-	Group    string
-	Status   string // online / offline
-	Metrics  *agentpb.MetricsSample
+	ID              string
+	Hostname        string
+	Group           string
+	Status          string // online / offline
+	Metrics         *agentpb.MetricsSample
+	ReconnectReason string // "upgrade", "maintenance"
+	TrafficLimitGB  float64
+	TrafficCalcType string
+	TrafficResetDay int
+	ExpiresAt       string // 资费到期时间（yyyy/MM/dd，来自主机财务与规格配置）
 }
 
 // HostProvider supplies the current host list to the monitor. The registry
@@ -43,8 +48,9 @@ type Monitor struct {
 	bootGrace time.Duration
 	ready     bool
 
-	prevStatus           map[string]string // hostID -> "online" | "offline"
-	startupOnlinePending map[string]bool   // known-at-start offline hosts: suppress first reconnect
+	prevStatus           map[string]string    // hostID -> "online" | "offline"
+	startupOnlinePending map[string]bool      // known-at-start offline hosts: suppress first reconnect
+	maintenanceUntil     map[string]time.Time // hostID -> maintenance expiration time
 }
 
 // NewMonitor creates a monitor that evaluates rules every interval.
@@ -65,6 +71,54 @@ func NewMonitor(store *Store, provider HostProvider, metricsStore *metrics.Store
 		bootGrace:            90 * time.Second, // aligns with reaper window (heartbeatSec 30s * heartbeatGraceFactor 3)
 		prevStatus:           make(map[string]string),
 		startupOnlinePending: make(map[string]bool),
+		maintenanceUntil:     make(map[string]time.Time),
+	}
+}
+
+// SetHostMaintenance sets a maintenance suppression window for a host (e.g. during upgrade).
+// While active, online and offline state changes will not trigger alert events.
+func (m *Monitor) SetHostMaintenance(hostID string, duration time.Duration, reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	until := time.Now().Add(duration)
+	m.maintenanceUntil[hostID] = until
+	m.log.Info("host placed into scheduled maintenance", "host_id", hostID, "duration", duration, "reason", reason, "until", until)
+}
+
+// InMaintenance checks if a host is currently within an active maintenance window.
+func (m *Monitor) InMaintenance(hostID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	until, ok := m.maintenanceUntil[hostID]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(m.maintenanceUntil, hostID)
+		return false
+	}
+	return true
+}
+
+// ClearHostMaintenance ends a maintenance window early (e.g. the host is
+// unbound or the upgrade was cancelled).
+func (m *Monitor) ClearHostMaintenance(hostID string) {
+	m.mu.Lock()
+	delete(m.maintenanceUntil, hostID)
+	m.mu.Unlock()
+}
+
+// sweepMaintenance drops expired maintenance windows. InMaintenance only
+// cleans up the entries it happens to be asked about, so without this sweep
+// hosts that go away (unbound, never evaluated again) leak map entries.
+func (m *Monitor) sweepMaintenance() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	for id, until := range m.maintenanceUntil {
+		if now.After(until) {
+			delete(m.maintenanceUntil, id)
+		}
 	}
 }
 
@@ -101,6 +155,7 @@ func (m *Monitor) evaluate() {
 	// Alert storm suppression: if >20 events fired in the last 5 minutes,
 	// collapse them into a single summary event and downgrade the rest.
 	m.suppressStorm()
+	m.sweepMaintenance()
 
 	rules := m.store.ListRules()
 	hosts := m.provider.ListHosts()
@@ -151,16 +206,23 @@ func (m *Monitor) evaluate() {
 		if (isBootstrapping || boundaryRun) && (rule.Type == RuleOnline || rule.Type == RuleOffline) {
 			continue
 		}
-		for _, host := range hosts {
-			if !matchesFilter(host, rule) {
-				continue
+			for _, host := range hosts {
+				if !matchesFilter(host, rule) {
+					continue
+				}
+				m.checkRule(rule, host)
 			}
-			m.checkRule(rule, host)
 		}
-	}
 
-	m.mu.Lock()
-	for _, host := range hosts {
+		// 评估各主机的专属月流量配额超标（达到80%警告，达到100%严重）
+		for _, host := range hosts {
+			m.checkHostTraffic(host)
+			// 到期时间前 30 天发起一次续费提醒
+			m.checkHostExpiry(host)
+		}
+
+		m.mu.Lock()
+		for _, host := range hosts {
 		m.prevStatus[host.ID] = host.Status
 	}
 	m.mu.Unlock()
@@ -242,6 +304,123 @@ func indexOf(s, sub string) int {
 	return -1
 }
 
+// checkHostTraffic directly evaluates host-specific traffic quotas (80% warning, 100% critical)
+// without requiring manual setup in the global alert rule list.
+func (m *Monitor) checkHostTraffic(host HostInfo) {
+	quotaGB := host.TrafficLimitGB
+	if quotaGB <= 0 || host.Metrics == nil {
+		return
+	}
+
+	var used int64
+	calcDesc := "双向"
+	switch host.TrafficCalcType {
+	case "out":
+		used = host.Metrics.GetMonthTx()
+		calcDesc = "出向"
+	case "in":
+		used = host.Metrics.GetMonthRx()
+		calcDesc = "入向"
+	default:
+		used = host.Metrics.GetMonthRx() + host.Metrics.GetMonthTx()
+		calcDesc = "双向"
+	}
+
+	quotaBytes := quotaGB * (1 << 30) // GiB
+	pct := float64(used) / quotaBytes * 100
+
+	// We define two tiers: 100% (critical) and 80% (warning)
+	checkTier := func(tierName string, threshold float64, sev Severity) {
+		key := "builtin-traffic-" + tierName + ":" + host.ID
+		if pct >= threshold {
+			if !m.store.isFiring(key) {
+				m.store.setFiring(key, true)
+				msg := fmt.Sprintf("主机 %s 本月流量(%s) %s 已达到配额 %s 的 %.1f%% (告警阈值 %.0f%%)",
+					host.Hostname, calcDesc, fmtGiB(float64(used)/(1<<30)), fmtGiB(quotaGB), pct, threshold)
+				event := &Event{
+					ID:       randomID(),
+					RuleID:   "builtin-traffic-" + tierName,
+					RuleName: "月流量超额预警 (" + tierName + ")",
+					Severity: sev,
+					HostID:   host.ID,
+					Hostname: host.Hostname,
+					Message:  msg,
+					FiredAt:  time.Now(),
+				}
+				m.store.addEvent(event)
+				_ = m.store.persist()
+				m.log.Warn("traffic quota alert fired", "host", host.Hostname, "severity", sev, "msg", msg)
+				m.notify(event)
+				m.interpretAsync(event)
+			}
+		} else {
+			if m.store.isFiring(key) {
+				m.store.setFiring(key, false)
+				m.resolveEvent("builtin-traffic-"+tierName, host.ID)
+			}
+		}
+	}
+
+	checkTier("80", 80, SeverityWarning)
+	checkTier("100", 100, SeverityCritical)
+}
+
+// checkHostExpiry 在主机配置的到期时间前 30 天发起一次续费提醒（告警中心 + webhook），
+// 只触发一次；续费使到期时间重新推后到 30 天以外后自动解除，逾期未续则保持提醒不重复打扰。
+func (m *Monitor) checkHostExpiry(host HostInfo) {
+	if host.ExpiresAt == "" {
+		return
+	}
+	expiry, err := parseBillingDate(host.ExpiresAt)
+	if err != nil {
+		return
+	}
+	daysLeft := int(math.Ceil(time.Until(expiry).Hours() / 24))
+	key := "builtin-expiry-remind:" + host.ID
+	if daysLeft <= 30 {
+		if !m.store.isFiring(key) {
+			m.store.setFiring(key, true)
+			var msg string
+			switch {
+			case daysLeft < 0:
+				msg = fmt.Sprintf("主机 %s 资费已于 %s 到期，请尽快续费", host.Hostname, host.ExpiresAt)
+			case daysLeft == 0:
+				msg = fmt.Sprintf("主机 %s 资费将于今天 (%s) 到期，请及时续费", host.Hostname, host.ExpiresAt)
+			default:
+				msg = fmt.Sprintf("主机 %s 资费将于 %s 到期（剩余 %d 天），请提前安排续费", host.Hostname, host.ExpiresAt, daysLeft)
+			}
+			event := &Event{
+				ID:       randomID(),
+				RuleID:   "builtin-expiry-remind",
+				RuleName: "主机到期续费提醒",
+				Severity: SeverityWarning,
+				HostID:   host.ID,
+				Hostname: host.Hostname,
+				Message:  msg,
+				FiredAt:  time.Now(),
+			}
+			m.store.addEvent(event)
+			_ = m.store.persist()
+			m.log.Info("host expiry reminder fired", "host", host.Hostname, "expires_at", host.ExpiresAt, "days_left", daysLeft)
+			m.notify(event)
+		}
+	} else if m.store.isFiring(key) {
+		// 已续费（到期时间推后到 30 天以外），解除提醒
+		m.store.setFiring(key, false)
+		m.resolveEvent("builtin-expiry-remind", host.ID)
+	}
+}
+
+// parseBillingDate 解析「财务与规格」中配置的到期日期（yyyy/MM/dd，兼容 yyyy-MM-dd）。
+func parseBillingDate(s string) (time.Time, error) {
+	for _, layout := range []string{"2006/01/02", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unrecognized date format: %s", s)
+}
+
 func (m *Monitor) checkRule(rule *Rule, host HostInfo) {
 	key := rule.ID + ":" + host.ID
 	triggered := false
@@ -250,6 +429,15 @@ func (m *Monitor) checkRule(rule *Rule, host HostInfo) {
 	switch rule.Type {
 	case RuleOffline:
 		if host.Status != "online" {
+			// Suppress offline alert if the host is in an active maintenance window.
+			if m.InMaintenance(host.ID) {
+				// Reset the sustain window: without this a Duration rule keeps
+				// banking time while suppressed and fires immediately once
+				// maintenance ends, even for a fresh outage.
+				m.store.clearPending(key)
+				m.log.Debug("suppressing offline alert during maintenance", "host_id", host.ID, "hostname", host.Hostname)
+				return
+			}
 			triggered = true
 			message = fmt.Sprintf("主机 %s 已离线", host.Hostname)
 		}
@@ -260,6 +448,20 @@ func (m *Monitor) checkRule(rule *Rule, host HostInfo) {
 		booting := !m.ready
 		m.mu.Unlock()
 		if host.Status == "online" {
+			// If host reconnected after upgrade or maintenance, clear maintenance and suppress online alert
+			if host.ReconnectReason == "upgrade" || host.ReconnectReason == "maintenance" {
+				m.mu.Lock()
+				delete(m.maintenanceUntil, host.ID)
+				m.mu.Unlock()
+				m.store.setFiring(key, true)
+				m.log.Info("host reconnected with planned reason, suppressing online alert", "host_id", host.ID, "hostname", host.Hostname, "reason", host.ReconnectReason)
+				break
+			}
+			if m.InMaintenance(host.ID) {
+				m.store.setFiring(key, true)
+				m.log.Debug("suppressing online alert during maintenance", "host_id", host.ID, "hostname", host.Hostname)
+				break
+			}
 			if booting && startupPending {
 				// The host was already known before this server boot and has
 				// merely reconnected during the grace window; never notify.
@@ -311,17 +513,6 @@ func (m *Monitor) checkRule(rule *Rule, host HostInfo) {
 	case RuleAnomaly:
 		if m.metricsStore != nil && host.Metrics != nil {
 			triggered, message = m.detectAnomaly(rule, host)
-		}
-	case RuleTrafficHigh:
-		if host.Metrics != nil && rule.QuotaGB > 0 {
-			quotaBytes := rule.QuotaGB * (1 << 30) // GiB
-			used := host.Metrics.GetMonthRx() + host.Metrics.GetMonthTx()
-			pct := float64(used) / quotaBytes * 100
-			if pct > rule.Threshold {
-				triggered = true
-				message = fmt.Sprintf("主机 %s 本月流量 %s 已达配额 %s 的 %.1f%%（阈值 %.0f%%）",
-					host.Hostname, fmtGiB(float64(used)/(1<<30)), fmtGiB(rule.QuotaGB), pct, rule.Threshold)
-			}
 		}
 	}
 
@@ -557,12 +748,17 @@ func (a *registryAdapter) ListHosts() []HostInfo {
 	agents := a.reg.ListAgents()
 	out := make([]HostInfo, 0, len(agents))
 	for _, ag := range agents {
-		hi := HostInfo{
-			ID:       ag.ID,
-			Hostname: ag.Hostname,
-			Group:    ag.Group,
-			Status:   ag.Status,
-		}
+			hi := HostInfo{
+				ID:              ag.ID,
+				Hostname:        ag.Hostname,
+				Group:           ag.Group,
+				Status:          ag.Status,
+				ReconnectReason: ag.ReconnectReason,
+				TrafficLimitGB:  ag.TrafficLimitGB,
+				TrafficCalcType: ag.TrafficCalcType,
+				TrafficResetDay: ag.TrafficResetDay,
+				ExpiresAt:       ag.ExpiresAt,
+			}
 		hub := a.reg.Hub(ag.ID)
 		if hub != nil {
 			hi.Metrics = hub.LastMetrics()

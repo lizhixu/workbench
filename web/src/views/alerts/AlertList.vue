@@ -88,7 +88,6 @@ const ruleForm = ref({
   threshold: 90,
   duration: 0,
   metric: 'cpu',
-  quota_gb: 100,
   host_filter: '',
   group_filter: '',
   enabled: true,
@@ -104,7 +103,6 @@ const ruleTypeOptions = [
   { label: '内存使用率高', value: 'mem_high' },
   { label: '磁盘使用率高', value: 'disk_high' },
   { label: 'AI 异常检测', value: 'anomaly' },
-  { label: '月流量超配额', value: 'traffic_high' },
 ]
 
 const anomalyMetricOptions = [
@@ -349,7 +347,6 @@ function openCreateRule() {
     threshold: 90,
     duration: 0,
     metric: 'cpu',
-    quota_gb: 100,
     host_filter: '',
     group_filter: '',
     enabled: true,
@@ -366,7 +363,6 @@ function openEditRule(r: AlertRule) {
     threshold: r.threshold,
     duration: r.duration,
     metric: r.metric || 'cpu',
-    quota_gb: r.quota_gb || 100,
     host_filter: r.host_filter,
     group_filter: r.group_filter,
     enabled: r.enabled,
@@ -586,11 +582,7 @@ onMounted(() => {
     <!-- Header -->
     <div class="page-header">
       <div class="header-left">
-        <div class="title-wrap">
-          <NIcon size="22" color="#6366f1"><NotificationsOutline /></NIcon>
-          <h2 class="page-title">消息与告警中心</h2>
-        </div>
-        <span class="page-desc">聚合展示主机上下线、系统告警与运维事件</span>
+        <h2 class="page-title">消息与告警中心</h2>
       </div>
       <div class="header-right">
         <NSpace :size="10">
@@ -737,7 +729,6 @@ onMounted(() => {
                     <td>{{
                       r.type === 'offline' ? '心跳中断'
                       : r.type === 'anomaly' ? `> ${r.threshold}σ`
-                      : r.type === 'traffic_high' ? `≥ ${r.threshold}% × ${r.quota_gb || '-'} GiB`
                       : `> ${r.threshold}%`
                     }}</td>
                     <td>{{ r.host_filter || '全部主机' }}</td>
@@ -904,7 +895,7 @@ onMounted(() => {
             :options="severityOptions.filter((o) => o.value !== 'all')"
           />
         </NFormItem>
-        <NFormItem label="阈值 (%)" v-if="ruleForm.type !== 'offline' && ruleForm.type !== 'online' && ruleForm.type !== 'anomaly' && ruleForm.type !== 'traffic_high'">
+        <NFormItem label="阈值 (%)" v-if="ruleForm.type !== 'offline' && ruleForm.type !== 'online' && ruleForm.type !== 'anomaly'">
           <NInputNumber v-model:value="ruleForm.threshold" :min="1" :max="100" style="width: 100%" />
         </NFormItem>
         <NFormItem label="监控指标" v-if="ruleForm.type === 'anomaly'">
@@ -913,13 +904,6 @@ onMounted(() => {
         <NFormItem label="偏离倍数 (σ)" v-if="ruleForm.type === 'anomaly'">
           <NInputNumber v-model:value="ruleForm.threshold" :min="1" :max="10" :step="0.5" style="width: 100%" />
           <span class="muted-text" style="margin-left: 8px">当前值偏离均值超过 {{ ruleForm.threshold }}σ 时触发</span>
-        </NFormItem>
-        <NFormItem label="月流量配额 (GiB)" v-if="ruleForm.type === 'traffic_high'">
-          <NInputNumber v-model:value="ruleForm.quota_gb" :min="1" :step="10" style="width: 100%" />
-        </NFormItem>
-        <NFormItem label="触发阈值 (%)" v-if="ruleForm.type === 'traffic_high'">
-          <NInputNumber v-model:value="ruleForm.threshold" :min="1" :max="100" style="width: 100%" />
-          <span class="muted-text" style="margin-left: 8px">本月流量（下行+上行）达到配额 {{ ruleForm.quota_gb }} GiB 的 {{ ruleForm.threshold }}% 时告警</span>
         </NFormItem>
         <NFormItem label="主机过滤 (主机名包含，留空则匹配全部)">
           <NInput v-model:value="ruleForm.host_filter" placeholder="例如：prod 或 web" />
@@ -961,25 +945,13 @@ onMounted(() => {
 
     .header-left {
       display: flex;
-      flex-direction: column;
-      gap: 4px;
+      align-items: center;
 
-      .title-wrap {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-
-        .page-title {
-          margin: 0;
-          font-size: 18px;
-          font-weight: 600;
-          color: var(--text-primary);
-        }
-      }
-
-      .page-desc {
-        font-size: 12px;
-        color: var(--text-secondary);
+      .page-title {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 600;
+        color: var(--text-primary);
       }
     }
   }
@@ -1060,10 +1032,13 @@ onMounted(() => {
 
   .table-card {
     background-color: var(--bg-card);
-    border: 1px solid var(--border-color);
     border-radius: 8px;
     padding: 12px 16px;
     box-shadow: var(--shadow-sm);
+
+    &.table-flex-fill {
+      padding: 0;
+    }
 
     // 消息表格改用 NDataTable，单元格由 render 函数生成，样式需穿透 scoped。
     :deep(.unread-row td) {

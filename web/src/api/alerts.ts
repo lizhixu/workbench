@@ -1,6 +1,6 @@
 import { http, unwrap } from './http'
 
-export type RuleType = 'offline' | 'online' | 'cpu_high' | 'mem_high' | 'disk_high' | 'anomaly' | 'traffic_high'
+export type RuleType = 'offline' | 'online' | 'cpu_high' | 'mem_high' | 'disk_high' | 'anomaly'
 export type Severity = 'info' | 'warning' | 'critical'
 
 export interface AlertRule {
@@ -11,7 +11,6 @@ export interface AlertRule {
   threshold: number
   duration: number
   metric?: string
-  quota_gb?: number
   host_filter: string
   group_filter: string
   enabled: boolean

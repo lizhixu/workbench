@@ -1,5 +1,6 @@
 # Local session/cache directories (per-session sandbox state)
 .zcode/
+.workbuddy/
 260814094426488/
 tmp/
 reports/
@@ -8,8 +9,10 @@ reports/
 bin/
 watchman*.exe
 watchman*.exe~
-watchman
-watchman.exe
+# Anchored to the repo root: these are compiled binaries, not the
+# server/cmd/watchman source directory (a bare `watchman` pattern ignored it).
+/watchman
+/watchman.exe
 
 # Runtime data (DB, JSON stores, recordings, metrics history)
 data/

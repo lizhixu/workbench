@@ -279,7 +279,7 @@ onDeactivated(() => {
 }
 
 .table-card {
-  background: var(--n-color, rgba(128, 128, 128, 0.06));
+  background: var(--bg-card);
   border-radius: 8px;
   padding: 4px;
 }

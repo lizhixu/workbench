@@ -24,6 +24,7 @@ import CommandPolicy from './CommandPolicy.vue'
 import CommandLibrary from './CommandLibrary.vue'
 import TerminalPrefs from './TerminalPrefs.vue'
 import BackupRestore from './BackupRestore.vue'
+import SystemUpgrade from './SystemUpgrade.vue'
 import OsLogo from '../../components/common/OsLogo.vue'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
@@ -219,7 +220,11 @@ onMounted(() => {
 </script>
 
 <template>
-  <NSpace vertical :size="16">
+  <div class="settings-view">
+    <div class="settings-toolbar">
+      <h2 class="page-title">系统设置</h2>
+    </div>
+    <NSpace vertical :size="16">
     <!-- System Status -->
     <NCard title="系统状态" :bordered="false">
       <NDescriptions :column="3" label-placement="left" bordered v-if="healthData">
@@ -324,6 +329,9 @@ onMounted(() => {
     <!-- Control-plane backup / restore (admin only) -->
     <BackupRestore />
 
+    <!-- Version & System / Agent Upgrade Center -->
+    <SystemUpgrade />
+
     <!-- One-line Install -->
     <NCard :bordered="false">
       <template #header>
@@ -425,9 +433,27 @@ onMounted(() => {
       </NSpace>
     </NCard>
   </NSpace>
+  </div>
 </template>
 
 <style scoped lang="scss">
+.settings-view {
+  height: 100%;
+  overflow-y: auto;
+  box-sizing: border-box;
+}
+
+.settings-toolbar {
+  margin-bottom: 16px;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
 .muted { color: var(--text-secondary); font-size: 13px; }
 code { font-size: 12px; }
 

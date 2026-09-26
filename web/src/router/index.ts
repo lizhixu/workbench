@@ -38,7 +38,7 @@ const routes: RouteRecordRaw[] = [
 	      { path: 'docker/:id', name: 'docker', component: () => import('../views/docker/Docker.vue'), meta: { viewName: 'Docker' } },
       { path: 'groups', name: 'groups', component: () => import('../views/groups/GroupList.vue'), meta: { viewName: 'GroupList' } },
       { path: 'users', name: 'users', component: () => import('../views/users/UserList.vue'), meta: { viewName: 'UserList' } },
-      { path: 'settings', name: 'settings', component: () => import('../views/settings/Settings.vue'), meta: { viewName: 'Settings' } },
+      { path: 'settings', name: 'settings', component: () => import('../views/settings/SettingsLayout.vue'), meta: { viewName: 'Settings' } },
       { path: 'ai/chat', name: 'ai-chat', component: () => import('../views/ai/AiChat.vue'), meta: { viewName: 'AiChat' } },
       { path: 'ai/report', name: 'ai-report', component: () => import('../views/ai/OpsReport.vue'), meta: { viewName: 'OpsReport' } },
     ],

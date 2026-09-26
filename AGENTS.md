@@ -149,6 +149,15 @@
 >（`settings.json`，system/user 双作用域、点分键、注册表校验），前端经 `stores/settings`
 > 统一读写；`appearance.theme_mode` 已从浏览器 localStorage 迁到服务端（localStorage 仅作首屏缓存）。
 > 秘密类配置（AI Key / Git Token）不进统一设置，保留专用存储。
+> 实现备注（2026-09-26，设置中心 Phase 1）：`/settings` 改为左右布局——`SettingsLayout.vue`
+>（左侧分组导航 + 搜索框，右侧内容区；`views/settings/sections.ts` 为分区注册表：
+> key/label/icon/component/keywords/group）。813 行旧 `Settings.vue` 已删除，内联区块抽取为
+> `SystemStatus.vue`、`AiConfig.vue`、`GitProviders.vue`、`InstallDeploy.vue`（样式随组件走）。
+> 分区切换走 `?s=` 查询参数（与主机详情 `?tab=` 同模式：深链优先、非法值回退 general、
+> 选中后把完整路径回写工作区页签），路由保持单条 `settings`（组件名仍为 `Settings`，
+> `meta.viewName` 不变），避免嵌套路由导致 AppShell 的 KeepAlive 按 key 反复重建布局。
+> 分区组件用内层 `<KeepAlive>` 缓存，切分区不丢已填表单；搜索按 label+keywords 过滤，
+> 回车跳首个匹配。AGENTS.md 3.12 中「设置搜索/拆分/导航」条目至此落地。
 > 实现备注（2026-09-26，设置中心 Phase 3）：补齐 3.12 剩余可配置项——
 > `navigation.default_host_tab`（主机默认页签，URL `?tab=` 深链优先于首选项；选项与
 > HostDetail 的 subNavItems 同源）、`appearance.show_tips`（功能提示语开关：前端给说明性

@@ -56,7 +56,7 @@ func (m *Manager) scanBaseline(req *agentpb.ScanRequest) []Finding {
 			"/etc/passwd 权限为 "+passwdPerms+"，建议为 644。",
 			"chmod 644 /etc/passwd")
 
-	addIf(&findings, shadowPerms != "640" && shadowPerms != "000" && shadowPerms != "" && shadowPerms != "640",
+	addIf(&findings, shadowPerms != "640" && shadowPerms != "000" && shadowPerms != "",
 		"fileperm", "high", "/etc/shadow 权限异常",
 			"/etc/shadow 权限为 "+shadowPerms+"，应为 640 或 000。",
 			"chmod 640 /etc/shadow")

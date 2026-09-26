@@ -14,13 +14,27 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-const (
-	remoteHost = "186.241.120.46:22"
-	remoteUser = "root"
-	remotePass = "npolJTQQ6327"
-)
+// Deployment target is configured via environment variables — never commit
+// credentials to the repo.
+//
+//	WATCHMAN_DEPLOY_HOST  e.g. "186.241.120.46:22"
+//	WATCHMAN_DEPLOY_USER  e.g. "root"
+//	WATCHMAN_DEPLOY_PASS  the SSH password / key passphrase
+func deployTarget() (host, user, pass string, err error) {
+	host = os.Getenv("WATCHMAN_DEPLOY_HOST")
+	user = os.Getenv("WATCHMAN_DEPLOY_USER")
+	pass = os.Getenv("WATCHMAN_DEPLOY_PASS")
+	if host == "" || user == "" || pass == "" {
+		return "", "", "", fmt.Errorf("set WATCHMAN_DEPLOY_HOST, WATCHMAN_DEPLOY_USER and WATCHMAN_DEPLOY_PASS env vars")
+	}
+	return host, user, pass, nil
+}
 
 func getSSHClient() (*ssh.Client, error) {
+	remoteHost, remoteUser, remotePass, err := deployTarget()
+	if err != nil {
+		return nil, err
+	}
 	config := &ssh.ClientConfig{
 		User: remoteUser,
 		Auth: []ssh.AuthMethod{
@@ -353,8 +367,9 @@ func main() {
 		}
 		fmt.Println("\n==========================================")
 		fmt.Println("🎉 Watchman deployed successfully!")
-		fmt.Println("Web Access: http://186.241.120.46/")
-		fmt.Println("Default Login: admin / admin")
+		if h, _, _ := strings.Cut(os.Getenv("WATCHMAN_DEPLOY_HOST"), ":"); h != "" {
+			fmt.Printf("Web Access: http://%s/\n", h)
+		}
 		fmt.Println("==========================================")
 
 	case "exec":

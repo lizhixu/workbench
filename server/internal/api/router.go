@@ -138,6 +138,9 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// Agent upgrade.
 	authed.POST("/hosts/:id/upgrade", auth.RequireRole(auth.RoleAdmin), h.upgradeAgent)
 
+	// Reverse TCP tunnels (dynamic networking).
+	h.registerTunnelRoutes(authed)
+
 	// User management (admin-only for mutating routes).
 	if authStore != nil {
 		auth.NewHandlers(authStore).Register(authed.Group(""))
@@ -890,9 +893,10 @@ func (h *handlers) upgradeAgent(c *gin.Context) {
 	hub.Send(&agentpb.ServerMessage{
 		Payload: &agentpb.ServerMessage_Upgrade{
 			Upgrade: &agentpb.UpgradeRequest{
-				Version: body.Version,
-				Url:     binaryURL,
-				Sha256:  body.Sha256,
+				Version:   body.Version,
+				Url:       binaryURL,
+				Sha256:    body.Sha256,
+				Signature: signUpgrade(body.Version, body.Sha256),
 			},
 		},
 	})

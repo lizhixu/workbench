@@ -47,7 +47,8 @@ func NewManager(log *slog.Logger) *Manager {
 		log = slog.Default()
 	}
 	dir := filepath.Join(os.TempDir(), "watchman-records")
-	_ = os.MkdirAll(dir, 0755)
+	// 0700: recordings may contain sensitive terminal output (passwords etc.).
+	_ = os.MkdirAll(dir, 0o700)
 	return &Manager{
 		sessions:  make(map[string]*session),
 		log:       log,

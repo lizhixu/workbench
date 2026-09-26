@@ -7,6 +7,8 @@
 package upgrade
 
 import (
+	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -31,6 +33,9 @@ type Manager struct {
 	log    *slog.Logger
 	sender Sender
 	busy   bool
+	// pubKey pins the Ed25519 public key allowed to sign upgrades.
+	// Nil means "sha256 only" (not recommended for production).
+	pubKey ed25519.PublicKey
 }
 
 // NewManager creates an upgrade manager.
@@ -39,6 +44,24 @@ func NewManager(log *slog.Logger) *Manager {
 		log = slog.Default()
 	}
 	return &Manager{log: log}
+}
+
+// SetPublicKeyHEX pins an Ed25519 public key (hex-encoded, 32 bytes) for
+// upgrade signature verification. Empty string disables pinning.
+func (m *Manager) SetPublicKeyHEX(hexKey string) error {
+	if hexKey == "" {
+		m.pubKey = nil
+		return nil
+	}
+	raw, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return fmt.Errorf("decode upgrade public key: %w", err)
+	}
+	if len(raw) != ed25519.PublicKeySize {
+		return fmt.Errorf("upgrade public key must be %d bytes, got %d", ed25519.PublicKeySize, len(raw))
+	}
+	m.pubKey = ed25519.PublicKey(raw)
+	return nil
 }
 
 // SetSender wires the live connection.
@@ -70,19 +93,37 @@ func (m *Manager) doUpgrade(req *agentpb.UpgradeRequest) {
 	}
 	m.progress("downloading", 1, "")
 
-	// 2. Verify sha256
-	if req.GetSha256() != "" {
-		m.progress("verifying", 0, "")
-		actual, err := fileSha256(tmpPath)
-		if err != nil {
-			m.progress("error", 0, "hash: "+err.Error())
+	// 2. Verify sha256 (required: refuse to install an unverified binary).
+	if req.GetSha256() == "" {
+		m.progress("error", 0, "upgrade rejected: server did not provide a sha256 checksum")
+		return
+	}
+	m.progress("verifying", 0, "")
+	actual, err := fileSha256(tmpPath)
+	if err != nil {
+		m.progress("error", 0, "hash: "+err.Error())
+		return
+	}
+	if !hmac.Equal([]byte(actual), []byte(req.GetSha256())) {
+		m.progress("error", 0, fmt.Sprintf("sha256 mismatch: expected %s got %s", req.GetSha256(), actual))
+		return
+	}
+	m.progress("verifying", 1, "")
+
+	// 3. Verify Ed25519 signature when the agent is configured with a
+	//    pinned upgrade public key. The signed payload is
+	//    "<version>\n<sha256>".
+	if m.pubKey != nil {
+		if len(req.GetSignature()) == 0 {
+			m.progress("error", 0, "upgrade rejected: missing signature (agent pins an upgrade public key)")
 			return
 		}
-		if actual != req.GetSha256() {
-			m.progress("error", 0, fmt.Sprintf("sha256 mismatch: expected %s got %s", req.GetSha256(), actual))
+		payload := []byte(req.GetVersion() + "\n" + req.GetSha256())
+		if !ed25519.Verify(m.pubKey, payload, req.GetSignature()) {
+			m.progress("error", 0, "upgrade rejected: invalid signature")
 			return
 		}
-		m.progress("verifying", 1, "")
+		m.log.Info("upgrade signature verified", "version", req.GetVersion())
 	}
 
 	// 3. Replace self

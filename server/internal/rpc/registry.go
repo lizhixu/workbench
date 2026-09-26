@@ -50,15 +50,16 @@ type Registry struct {
 	tokens  map[string]string        // auth_token -> agent_id (persisted; mirror of Agent.AuthToken for fast lookup)
 	hubs    map[string]*Hub          // by agent_id (only when connected; runtime-only)
 	enroll  map[string]*enrollTicket // enroll_token -> ticket (in-memory MVP)
+	tunnel  *Coordinator             // reverse TCP tunnels (nil = disabled)
 	dataDir string
 	log     *slog.Logger
 }
 
 type enrollTicket struct {
-	agentIDHint string
-	created     time.Time
-	expires     time.Time
-	used        bool
+	AgentIDHint string    `json:"agent_id_hint,omitempty"`
+	Created     time.Time `json:"created"`
+	Expires     time.Time `json:"expires"`
+	Used        bool      `json:"used"`
 }
 
 // Agent is the server-side view of a managed host.
@@ -92,6 +93,7 @@ type Hub struct {
 	lastSeen   time.Time
 	sendCh     chan *agentpb.ServerMessage
 	stream     agentpb.AgentService_ConnectServer
+	tunnel     *Coordinator // reverse TCP tunnels (nil = disabled)
 	mu         sync.Mutex
 	termHandlers map[string]func(*agentpb.TerminalOutput)
 	// Generic response handlers keyed by op_id / exec_id / session_id.
@@ -120,6 +122,11 @@ func NewRegistry(dataDir string, log *slog.Logger) *Registry {
 			log.Warn("load persisted agents", "err", err)
 		} else {
 			log.Info("loaded persisted agents", "count", len(r.agents))
+		}
+		if err := r.loadEnroll(); err != nil {
+			log.Warn("load persisted enroll tokens", "err", err)
+		} else {
+			log.Info("loaded persisted enroll tokens", "count", len(r.enroll))
 		}
 	}
 	return r
@@ -221,11 +228,63 @@ func (r *Registry) IssueEnrollToken() string {
 	tok := randomToken(24)
 	r.mu.Lock()
 	r.enroll[tok] = &enrollTicket{
-		created: time.Now(),
-		expires: time.Now().Add(24 * time.Hour),
+		Created: time.Now(),
+		Expires: time.Now().Add(24 * time.Hour),
 	}
+	_ = r.persistEnrollLocked()
 	r.mu.Unlock()
 	return tok
+}
+
+// enrollFile is the path to the persisted enroll-ticket file.
+func (r *Registry) enrollFile() string {
+	if r.dataDir == "" {
+		return ""
+	}
+	return filepath.Join(r.dataDir, "enroll.json")
+}
+
+// persistEnrollLocked writes enroll tickets to disk (0600: tokens are
+// secrets). Caller must hold r.mu.
+func (r *Registry) persistEnrollLocked() error {
+	path := r.enrollFile()
+	if path == "" {
+		return nil
+	}
+	data, err := json.MarshalIndent(r.enroll, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+// loadEnroll reads persisted enroll tickets, dropping expired ones.
+func (r *Registry) loadEnroll() error {
+	path := r.enrollFile()
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var raw map[string]*enrollTicket
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	for tok, t := range raw {
+		if t == nil || t.Used || now.After(t.Expires) {
+			continue
+		}
+		r.enroll[tok] = t
+	}
+	return nil
 }
 
 func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, authToken string) (*Hub, *agentpb.RegisterResponse, error) {
@@ -257,6 +316,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 		_ = r.persistAgentsLocked() // persist updated hostname/os/etc.
 
 		hub := newHub(agentID, heartbeatSec)
+		hub.tunnel = r.tunnel
 		r.hubs[agentID] = hub
 		return hub, &agentpb.RegisterResponse{
 			Ok:                  true,
@@ -270,15 +330,17 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 	if ticket == nil {
 		return nil, nil, errors.New("invalid enroll token")
 	}
-	if ticket.used {
+	if ticket.Used {
 		return nil, nil, errors.New("enroll token already used")
 	}
-	if time.Now().After(ticket.expires) {
+	if time.Now().After(ticket.Expires) {
 		delete(r.enroll, req.GetEnrollToken())
+		_ = r.persistEnrollLocked()
 		return nil, nil, errors.New("enroll token expired")
 	}
-	ticket.used = true
+	ticket.Used = true
 	delete(r.enroll, req.GetEnrollToken())
+	_ = r.persistEnrollLocked()
 
 	agentID := req.GetAgentId()
 	if agentID == "" {
@@ -299,6 +361,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 	_ = r.persistAgentsLocked() // safe: caller holds r.mu
 
 	hub := newHub(agentID, heartbeatSec)
+	hub.tunnel = r.tunnel
 	r.hubs[agentID] = hub
 	r.log.Info("agent registered", "agent_id", agentID, "hostname", req.GetHostname())
 	return hub, &agentpb.RegisterResponse{
@@ -546,6 +609,16 @@ func (h *Hub) handleAgentMessage(msg *agentpb.AgentMessage) error {
 		return nil
 	case *agentpb.AgentMessage_UpgradeProgress:
 		h.dispatchResp("upgrade", msg)
+		return nil
+	case *agentpb.AgentMessage_TunnelData:
+		if h.tunnel != nil {
+			h.tunnel.handleData(p.TunnelData)
+		}
+		return nil
+	case *agentpb.AgentMessage_TunnelClose:
+		if h.tunnel != nil {
+			h.tunnel.handleClose(p.TunnelClose)
+		}
 		return nil
 	default:
 		return nil

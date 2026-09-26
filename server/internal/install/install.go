@@ -83,8 +83,12 @@ func (h *Handler) installScript(c *gin.Context) {
 	serverURL := c.DefaultQuery("server", fmt.Sprintf("%s://%s", scheme, c.Request.Host))
 
 	if token == "" {
-		// If no token provided, generate one on the fly.
-		token = h.reg.IssueEnrollToken()
+		// Do NOT mint a token silently here: an unauthenticated caller
+		// could otherwise generate arbitrary enroll tokens. Tokens must
+		// come from an authenticated console session via
+		// POST /api/v1/hosts/enroll (or be passed explicitly).
+		c.String(http.StatusBadRequest, "missing token: generate one from the console (POST /api/v1/hosts/enroll) and retry with ?token=<token>")
+		return
 	}
 
 	var script string

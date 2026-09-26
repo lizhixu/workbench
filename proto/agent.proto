@@ -31,6 +31,8 @@ message AgentMessage {
     DockerEvent docker = 8; // (P2)
     ScanProgress scan_progress = 9; // (P3)
     UpgradeProgress upgrade_progress = 10; // (P3)
+    TunnelData tunnel_data = 11; // reverse TCP tunnel payload (agent -> server)
+    TunnelClose tunnel_close = 12; // reverse TCP tunnel teardown (agent -> server)
     Ack ack = 99;
   }
 }
@@ -51,6 +53,9 @@ message ServerMessage {
     DockerOp docker_op = 11; // (P2)
     ScanRequest scan = 12; // (P3)
     UpgradeRequest upgrade = 13; // (P3)
+    TunnelOpen tunnel_open = 14; // ask agent to open a TCP tunnel leg
+    TunnelData tunnel_data = 15; // reverse TCP tunnel payload (server -> agent)
+    TunnelClose tunnel_close = 16;
   }
 }
 
@@ -257,6 +262,9 @@ message UpgradeRequest {
   string version = 1;
   string url = 2;
   string sha256 = 3;
+  // Ed25519 signature over "<version>\n<sha256>", verified by the agent
+  // when it pins an upgrade public key.
+  bytes signature = 4;
 }
 
 message UpgradeProgress {
@@ -271,4 +279,28 @@ message Ack {
   bool ok = 1;
   string error = 2;
   string ref = 3; // optional correlation id
+}
+// ---- Reverse TCP tunnel (dynamic networking) ---------------------------
+// A tunnel carries one TCP connection from the control server to a target
+// reachable from the agent's network, multiplexed over the existing
+// agent<->server bidi stream. Flow:
+//   server -> agent: TunnelOpen{tunnel_id, target_host, target_port}
+//   both ways:      TunnelData{tunnel_id, data}  (stream of bytes)
+//   either way:     TunnelClose{tunnel_id}
+// The agent dials target_host:target_port on its local network and proxies
+// bytes between that socket and the stream.
+
+message TunnelOpen {
+  string tunnel_id = 1;
+  string target_host = 2;
+  uint32 target_port = 3;
+}
+
+message TunnelData {
+  string tunnel_id = 1;
+  bytes data = 2;
+}
+
+message TunnelClose {
+  string tunnel_id = 1;
 }

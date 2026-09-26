@@ -27,8 +27,10 @@ type Recorder struct {
 }
 
 // New creates a Recorder writing to path. Header is written immediately.
+// The file is created with 0600 permissions: recordings may contain
+// passwords or other sensitive terminal output.
 func New(path string, cols, rows int) (*Recorder, error) {
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("create cast file: %w", err)
 	}

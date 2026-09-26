@@ -12,6 +12,10 @@ type Config struct {
 	ServerAddr  string `json:"server_addr"`  // e.g. "localhost:9090"
 	EnrollToken string `json:"enroll_token"` // one-time, only for first registration
 	TLS         bool   `json:"tls"`          // use TLS to dial server
+	// TLSServerName overrides the TLS server name check (for IP-based servers).
+	TLSServerName string `json:"tls_server_name,omitempty"`
+	// UpgradePubKey is the hex Ed25519 public key that must sign upgrades.
+	UpgradePubKey string `json:"upgrade_pubkey,omitempty"`
 	// StateFile is where the persistent agent identity (agent_id + auth_token)
 	// is kept so the agent survives restarts.
 	StateFile string `json:"-"`

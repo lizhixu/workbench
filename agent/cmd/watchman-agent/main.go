@@ -18,6 +18,7 @@ import (
 	"watchman/agent/internal/scan"
 	"watchman/agent/internal/shell"
 	"watchman/agent/internal/sysinfo"
+	"watchman/agent/internal/tunnel"
 	"watchman/agent/internal/upgrade"
 )
 
@@ -25,6 +26,9 @@ func main() {
 	server := flag.String("server", "localhost:9090", "control server address (host:port)")
 	enroll := flag.String("enroll", "", "one-time enroll token (first registration only)")
 	state := flag.String("state", config.DefaultStatePath(), "path to agent state file")
+	useTLS := flag.Bool("tls", false, "use TLS to dial the control server")
+	tlsName := flag.String("tls-server-name", "", "override TLS server name check")
+	upPubKey := flag.String("upgrade-pubkey", "", "hex Ed25519 public key to verify self-upgrades")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -38,6 +42,15 @@ func main() {
 	cfg.ServerAddr = *server
 	cfg.EnrollToken = *enroll
 	cfg.StateFile = *state
+	if *useTLS {
+		cfg.TLS = true
+	}
+	if *tlsName != "" {
+		cfg.TLSServerName = *tlsName
+	}
+	if *upPubKey != "" {
+		cfg.UpgradePubKey = *upPubKey
+	}
 
 	log.Info("watchman-agent starting",
 		"server", cfg.ServerAddr,
@@ -57,8 +70,14 @@ func main() {
 	d.SetMetricsManager(metrics.NewManager(log))
 	d.SetSysInfoManager(sysinfo.NewManager(log))
 	d.SetDockerManager(docker.NewManager(log))
-	d.SetUpgradeManager(upgrade.NewManager(log))
+	upMgr := upgrade.NewManager(log)
+	if err := upMgr.SetPublicKeyHEX(cfg.UpgradePubKey); err != nil {
+		log.Error("invalid upgrade public key", "err", err)
+		os.Exit(1)
+	}
+	d.SetUpgradeManager(upMgr)
 	d.SetScanManager(scan.NewManager(log))
+	d.SetTunnelManager(tunnel.NewManager(log))
 
 	go d.Run(ctx)
 

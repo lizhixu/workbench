@@ -6,6 +6,7 @@ package conn
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"math"
@@ -23,10 +24,12 @@ import (
 	"watchman/agent/internal/scan"
 	"watchman/agent/internal/shell"
 	"watchman/agent/internal/sysinfo"
+	"watchman/agent/internal/tunnel"
 	"watchman/agent/internal/upgrade"
 	"watchman/proto/agentpb"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 )
@@ -43,6 +46,7 @@ type Dialer struct {
 	docker  *docker.Manager
 	upgrade *upgrade.Manager
 	scan    *scan.Manager
+	tunnel  *tunnel.Manager
 }
 
 // Hub is the agent-side view of an established stream.
@@ -84,6 +88,9 @@ func (d *Dialer) SetUpgradeManager(m *upgrade.Manager) { d.upgrade = m }
 // SetScanManager wires security scanning.
 func (d *Dialer) SetScanManager(m *scan.Manager) { d.scan = m }
 
+// SetTunnelManager wires reverse TCP tunnels.
+func (d *Dialer) SetTunnelManager(m *tunnel.Manager) { d.tunnel = m }
+
 // Run dials and maintains the connection forever (until ctx is cancelled).
 func (d *Dialer) Run(ctx context.Context) {
 	var attempt int
@@ -107,6 +114,18 @@ func (d *Dialer) Run(ctx context.Context) {
 	}
 }
 
+// transportCreds returns TLS credentials when cfg.TLS is set, and insecure
+// credentials otherwise. TLS uses the system root CAs; TLSServerName can
+// override the expected server name (useful for IP-based control servers).
+func (d *Dialer) transportCreds() credentials.TransportCredentials {
+	if !d.cfg.TLS {
+		d.log.Warn("dialing control server without TLS; traffic is unencrypted")
+		return insecure.NewCredentials()
+	}
+	tlsCfg := &tls.Config{ServerName: d.cfg.TLSServerName}
+	return credentials.NewTLS(tlsCfg)
+}
+
 func (d *Dialer) backoff(attempt int) time.Duration {
 	base := math.Pow(2, float64(attempt))
 	if base > 60 {
@@ -126,7 +145,7 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 		addr = net.JoinHostPort(addr, "9090")
 	}
 
-	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(d.transportCreds())}
 	cc, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", addr, err)
@@ -224,6 +243,9 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 	}
 	if d.scan != nil {
 		d.scan.SetSender(hub)
+	}
+	if d.tunnel != nil {
+		d.tunnel.SetSender(hub)
 	}
 
 	heartbeatSec := regResp.GetHeartbeatIntervalSec()
@@ -333,6 +355,26 @@ func (d *Dialer) handleServerMessage(msg *agentpb.ServerMessage) error {
 		d.scan.Handle(p.Scan)
 		return nil
 
+	// Reverse TCP tunnel.
+	case *agentpb.ServerMessage_TunnelOpen:
+		if d.tunnel == nil {
+			return fmt.Errorf("tunnel not available")
+		}
+		go d.tunnel.HandleOpen(p.TunnelOpen)
+		return nil
+	case *agentpb.ServerMessage_TunnelData:
+		if d.tunnel == nil {
+			return nil
+		}
+		d.tunnel.HandleData(p.TunnelData)
+		return nil
+	case *agentpb.ServerMessage_TunnelClose:
+		if d.tunnel == nil {
+			return nil
+		}
+		d.tunnel.HandleClose(p.TunnelClose)
+		return nil
+
 	default:
 		d.log.Debug("server message", "type", fmt.Sprintf("%T", msg.GetPayload()))
 		return nil
@@ -349,12 +391,15 @@ func (d *Dialer) heartbeatLoop(ctx context.Context, hub *Hub, interval time.Dura
 		case <-hub.done:
 			return
 		case <-t.C:
-			if err := hub.stream.Send(&agentpb.AgentMessage{
+			// Route through the send channel: sendPump is the only
+			// goroutine allowed to call stream.Send (gRPC streams are
+			// not safe for concurrent Send).
+			if !hub.Send(&agentpb.AgentMessage{
 				Payload: &agentpb.AgentMessage_Heartbeat{
 					Heartbeat: &agentpb.Heartbeat{Ts: time.Now().Unix()},
 				},
-			}); err != nil {
-				d.log.Debug("heartbeat send failed", "err", err)
+			}) {
+				d.log.Debug("heartbeat dropped, send channel full")
 				return
 			}
 		}
@@ -375,15 +420,26 @@ func (d *Dialer) sendPump(hub *Hub) {
 	}
 }
 
-// Send pushes a message to the server (thread-safe, best-effort).
+// Send pushes a message to the server (thread-safe). It blocks up to
+// sendTimeout waiting for channel capacity instead of silently dropping
+// the message; callers get false when the hub is gone or the timeout hits.
 func (h *Hub) Send(msg *agentpb.AgentMessage) bool {
+	select {
+	case <-h.done:
+		return false
+	default:
+	}
 	select {
 	case h.sendCh <- msg:
 		return true
-	default:
+	case <-h.done:
+		return false
+	case <-time.After(sendTimeout):
 		return false
 	}
 }
+
+const sendTimeout = 5 * time.Second
 
 func hostname() string {
 	h, err := os.Hostname()

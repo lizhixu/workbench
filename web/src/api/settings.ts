@@ -48,6 +48,8 @@ export type SettingsData = Record<string, unknown>
 export interface SettingsResponse {
   data: SettingsData
   schema: SettingSchemaEntry[]
+  /** Keys the user explicitly saved; everything else in data is a server default. */
+  stored_keys: string[]
 }
 
 // Defaults used before the first load resolves and when the server has no

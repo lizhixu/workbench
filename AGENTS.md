@@ -924,8 +924,8 @@ GET/PUT  /api/v1/hosts/:id/login-policy   # 禁止/口令/缺省
 GET    /api/v1/hosts/:id/login-history
 
 # 终端偏好（旧接口 GET/PUT /api/v1/me/term-prefs 已于 2026-09-26 被统一设置取代）
-GET    /api/v1/me/settings                 # 当前用户设置（data + schema），作用域 user
-PUT    /api/v1/me/settings                 # {data: {key: value}} 部分更新，原子校验
+GET    /api/v1/me/settings                 # 当前用户设置（data + schema + stored_keys），作用域 user
+PUT    /api/v1/me/settings                 # {data: {key: value}} 部分更新，原子校验；落盘失败不污染内存
 GET    /api/v1/settings                    # 全局设置（admin），作用域 system
 PUT    /api/v1/settings                    # {data: {key: value}} 部分更新（admin）
 # 键命名空间（点分）：appearance.theme_mode, appearance.show_tips,

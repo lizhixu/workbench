@@ -33,6 +33,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -334,18 +335,24 @@ func (s *Store) load() error {
 	return nil
 }
 
-// save persists the document via temp-file + rename so a crash cannot leave a
-// half-written settings.json behind.
+// save persists the live document via temp-file + rename so a crash cannot
+// leave a half-written settings.json behind.
 func (s *Store) save() error {
-	if s.dataDir == "" {
+	return writeDocument(s.dataDir, document{System: s.system, Users: s.users})
+}
+
+// writeDocument persists an arbitrary document the same way save does, so
+// SetMany can write its candidate maps to disk before swapping them into the
+// live in-memory state.
+func writeDocument(dataDir string, doc document) error {
+	if dataDir == "" {
 		return nil
 	}
-	doc := document{System: s.system, Users: s.users}
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(s.dataDir, "settings-*.json")
+	tmp, err := os.CreateTemp(dataDir, "settings-*.json")
 	if err != nil {
 		return fmt.Errorf("create temp settings file: %w", err)
 	}
@@ -363,7 +370,7 @@ func (s *Store) save() error {
 		os.Remove(tmpName)
 		return fmt.Errorf("chmod temp settings file: %w", err)
 	}
-	if err := os.Rename(tmpName, s.path()); err != nil {
+	if err := os.Rename(tmpName, filepath.Join(dataDir, "settings.json")); err != nil {
 		os.Remove(tmpName)
 		return fmt.Errorf("replace settings.json: %w", err)
 	}
@@ -478,8 +485,37 @@ func (s *Store) Effective(scope Scope, username string) map[string]any {
 	return out
 }
 
+// StoredKeys returns the keys explicitly saved for a scope (and username),
+// sorted. Unlike Effective it does not include defaults: the client uses it
+// to tell "the user chose this value" apart from "the server filled in a
+// default" — e.g. to decide whether a browser-local theme should be migrated
+// up on first login. Keys no longer in the registry are skipped.
+func (s *Store) StoredKeys(scope Scope, username string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := []string{}
+	collect := func(kv map[string]json.RawMessage) {
+		for k := range kv {
+			if def, ok := defByKey[k]; ok && def.Scope == scope {
+				keys = append(keys, k)
+			}
+		}
+	}
+	if scope == ScopeSystem {
+		collect(s.system)
+	} else {
+		collect(s.users[username])
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // SetMany validates every item first and then applies them atomically: if any
-// key is unknown or any value is invalid, nothing is written.
+// key is unknown or any value is invalid, nothing is written. The update is
+// also atomic against the in-memory state: candidate maps are built as copies
+// and persisted first, and only swapped into the live state after the write
+// succeeds, so a disk failure leaves the previous in-memory document — and
+// therefore every subsequent read — untouched.
 func (s *Store) SetMany(scope Scope, username string, items map[string]json.RawMessage) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -498,24 +534,39 @@ func (s *Store) SetMany(scope Scope, username string, items map[string]json.RawM
 		}
 		normed[key] = n
 	}
+	// Build the candidate document as copies: the live maps must not be
+	// mutated until the write has succeeded.
+	newSystem := make(map[string]json.RawMessage, len(s.system)+len(normed))
+	for k, v := range s.system {
+		newSystem[k] = v
+	}
+	newUsers := make(map[string]map[string]json.RawMessage, len(s.users)+1)
+	for u, kv := range s.users {
+		newUsers[u] = kv
+	}
 	switch scope {
 	case ScopeSystem:
 		for k, v := range normed {
-			s.system[k] = v
+			newSystem[k] = v
 		}
 	case ScopeUser:
-		kv := s.users[username]
-		if kv == nil {
-			kv = map[string]json.RawMessage{}
-			s.users[username] = kv
+		kv := make(map[string]json.RawMessage, len(s.users[username])+len(normed))
+		for k, v := range s.users[username] {
+			kv[k] = v
 		}
 		for k, v := range normed {
 			kv[k] = v
 		}
+		newUsers[username] = kv
 	default:
 		return fmt.Errorf("未知的作用域: %s", scope)
 	}
-	return s.save()
+	if err := writeDocument(s.dataDir, document{System: newSystem, Users: newUsers}); err != nil {
+		return err
+	}
+	s.system = newSystem
+	s.users = newUsers
+	return nil
 }
 
 // DeleteUser drops every user-scope setting of a username, so a recreated

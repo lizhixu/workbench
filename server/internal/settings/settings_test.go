@@ -2,9 +2,13 @@ package settings
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -244,5 +248,128 @@ func TestSchemaAndEffective(t *testing.T) {	s := newTestStore(t)
 	}
 	if len(s.Schema(ScopeSystem)) != 0 {
 		t.Fatal("system schema should be empty in Phase 2")
+	}
+}
+
+func TestSetManyPersistFailureKeepsMemory(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{
+		"appearance.theme_mode": raw(t, "light"),
+	}); err != nil {
+		t.Fatalf("SetMany: %v", err)
+	}
+	// Break persistence: point the store at a regular file instead of a
+	// directory, so the temp-file write fails (works even as root, where
+	// permission bits would not stop the write).
+	broken := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(broken, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.dataDir = broken
+	err = s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{
+		"appearance.theme_mode": raw(t, "dark"),
+		"terminal.font_size":    raw(t, 18),
+	})
+	if err == nil {
+		t.Fatal("expected persist error")
+	}
+	// In-memory state must be untouched by the failed write.
+	if got := s.Appearance("alice").ThemeMode; got != "light" {
+		t.Fatalf("memory changed on failed persist: theme_mode = %q, want light", got)
+	}
+	if got := s.Terminal("alice").FontSize; got != 14 {
+		t.Fatalf("memory changed on failed persist: font_size = %d, want 14", got)
+	}
+	if keys := s.StoredKeys(ScopeUser, "alice"); len(keys) != 1 || keys[0] != "appearance.theme_mode" {
+		t.Fatalf("stored keys changed on failed persist: %v", keys)
+	}
+	// The on-disk document still holds the first write only.
+	s2, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if got := s2.Appearance("alice").ThemeMode; got != "light" {
+		t.Fatalf("disk changed on failed persist: theme_mode = %q, want light", got)
+	}
+	// A retry after the directory is fixed succeeds and swaps the new state in.
+	s.dataDir = dir
+	if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{
+		"appearance.theme_mode": raw(t, "dark"),
+		"terminal.font_size":    raw(t, 18),
+	}); err != nil {
+		t.Fatalf("retry SetMany: %v", err)
+	}
+	if got := s.Appearance("alice").ThemeMode; got != "dark" {
+		t.Fatalf("retry theme_mode = %q, want dark", got)
+	}
+	if got := s.Terminal("alice").FontSize; got != 18 {
+		t.Fatalf("retry font_size = %d, want 18", got)
+	}
+}
+
+func TestStoredKeys(t *testing.T) {
+	s := newTestStore(t)
+	if keys := s.StoredKeys(ScopeUser, "alice"); len(keys) != 0 {
+		t.Fatalf("fresh store stored keys = %v, want empty", keys)
+	}
+	// Effective still reports defaults for keys nobody saved.
+	if got := s.Effective(ScopeUser, "alice")["appearance.theme_mode"]; got != "dark" {
+		t.Fatalf("effective theme_mode = %v, want dark default", got)
+	}
+	if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{
+		"terminal.font_size":    raw(t, 18),
+		"appearance.theme_mode": raw(t, "light"),
+	}); err != nil {
+		t.Fatalf("SetMany: %v", err)
+	}
+	keys := s.StoredKeys(ScopeUser, "alice")
+	if len(keys) != 2 || keys[0] != "appearance.theme_mode" || keys[1] != "terminal.font_size" {
+		t.Fatalf("stored keys = %v, want sorted [appearance.theme_mode terminal.font_size]", keys)
+	}
+	// Other users and scopes are isolated.
+	if keys := s.StoredKeys(ScopeUser, "bob"); len(keys) != 0 {
+		t.Fatalf("bob stored keys = %v, want empty", keys)
+	}
+	if keys := s.StoredKeys(ScopeSystem, ""); len(keys) != 0 {
+		t.Fatalf("system stored keys = %v, want empty", keys)
+	}
+}
+
+func TestGetUserExposesStoredKeys(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{
+		"appearance.theme_mode": raw(t, "light"),
+	}); err != nil {
+		t.Fatalf("SetMany: %v", err)
+	}
+	h := NewHandlers(s)
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("username", "alice")
+	h.getUser(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var body struct {
+		Data       map[string]any `json:"data"`
+		StoredKeys []string       `json:"stored_keys"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// The default-filled theme must not masquerade as an explicit choice.
+	if body.Data["terminal.theme"] == nil {
+		t.Fatal("data should include default-filled keys")
+	}
+	if len(body.StoredKeys) != 1 || body.StoredKeys[0] != "appearance.theme_mode" {
+		t.Fatalf("stored_keys = %v, want [appearance.theme_mode]", body.StoredKeys)
+	}
+	if body.Data["appearance.theme_mode"] != "light" {
+		t.Fatalf("data theme_mode = %v, want light", body.Data["appearance.theme_mode"])
 	}
 }

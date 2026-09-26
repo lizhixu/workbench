@@ -68,6 +68,11 @@ func (s *Store) Schema(scope Scope) []SchemaEntry {
 type settingsResponse struct {
 	Data   map[string]any `json:"data"`
 	Schema []SchemaEntry  `json:"schema"`
+	// StoredKeys lists the keys the user (or admin) explicitly saved.
+	// Everything else in Data is a server-side default. The client needs the
+	// distinction: e.g. the theme migration must not mistake the default
+	// "dark" for an explicit user choice.
+	StoredKeys []string `json:"stored_keys"`
 }
 
 type putBody struct {
@@ -77,8 +82,9 @@ type putBody struct {
 func (h *Handlers) getUser(c *gin.Context) {
 	username := c.GetString("username")
 	c.JSON(http.StatusOK, settingsResponse{
-		Data:   h.store.Effective(ScopeUser, username),
-		Schema: h.store.Schema(ScopeUser),
+		Data:       h.store.Effective(ScopeUser, username),
+		Schema:     h.store.Schema(ScopeUser),
+		StoredKeys: h.store.StoredKeys(ScopeUser, username),
 	})
 }
 
@@ -101,8 +107,9 @@ func (h *Handlers) putUser(c *gin.Context) {
 
 func (h *Handlers) getSystem(c *gin.Context) {
 	c.JSON(http.StatusOK, settingsResponse{
-		Data:   h.store.Effective(ScopeSystem, ""),
-		Schema: h.store.Schema(ScopeSystem),
+		Data:       h.store.Effective(ScopeSystem, ""),
+		Schema:     h.store.Schema(ScopeSystem),
+		StoredKeys: h.store.StoredKeys(ScopeSystem, ""),
 	})
 }
 

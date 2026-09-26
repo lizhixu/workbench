@@ -42,12 +42,20 @@ export const useSettingsStore = defineStore('settings', () => {
       .then(async (res) => {
         userData.value = res.data || {}
         schema.value = res.schema || []
-        const serverTheme = res.data?.[SETTING_KEYS.themeMode]
-        if (serverTheme === 'dark' || serverTheme === 'light') {
-          themeMode.value = serverTheme
+        // stored_keys tells an explicit choice apart from a server default:
+        // without it, the default "dark" would look like a saved value and
+        // a local "light" would never be migrated up.
+        const stored = new Set(res.stored_keys || [])
+        if (stored.has(SETTING_KEYS.themeMode)) {
+          // Server holds an explicit choice: it wins over the local cache.
+          const serverTheme = res.data?.[SETTING_KEYS.themeMode]
+          if (serverTheme === 'dark' || serverTheme === 'light') {
+            themeMode.value = serverTheme
+          }
         } else {
-          // Server has no theme yet: push the local choice up once so the
-          // user's existing preference is preserved server-side.
+          // No explicit server value yet: push the local choice up once so
+          // the user's existing preference is preserved server-side. After
+          // the push the key is stored, so this branch won't run again.
           const local = readLocalTheme()
           if (local) {
             try {

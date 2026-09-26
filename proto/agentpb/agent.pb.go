@@ -298,6 +298,7 @@ type ServerMessage struct {
 	//	*ServerMessage_DockerOp
 	//	*ServerMessage_Scan
 	//	*ServerMessage_Upgrade
+	//	*ServerMessage_Maintenance
 	//	*ServerMessage_TunnelOpen
 	//	*ServerMessage_TunnelData
 	//	*ServerMessage_TunnelClose
@@ -460,6 +461,15 @@ func (x *ServerMessage) GetUpgrade() *UpgradeRequest {
 	return nil
 }
 
+func (x *ServerMessage) GetMaintenance() *MaintenanceNotice {
+	if x != nil {
+		if x, ok := x.Payload.(*ServerMessage_Maintenance); ok {
+			return x.Maintenance
+		}
+	}
+	return nil
+}
+
 func (x *ServerMessage) GetTunnelOpen() *TunnelOpen {
 	if x != nil {
 		if x, ok := x.Payload.(*ServerMessage_TunnelOpen); ok {
@@ -543,16 +553,20 @@ type ServerMessage_Upgrade struct {
 	Upgrade *UpgradeRequest `protobuf:"bytes,13,opt,name=upgrade,proto3,oneof"` // (P3)
 }
 
+type ServerMessage_Maintenance struct {
+	Maintenance *MaintenanceNotice `protobuf:"bytes,14,opt,name=maintenance,proto3,oneof"` // server restarting / maintenance announcement
+}
+
 type ServerMessage_TunnelOpen struct {
-	TunnelOpen *TunnelOpen `protobuf:"bytes,14,opt,name=tunnel_open,json=tunnelOpen,proto3,oneof"` // ask agent to open a TCP tunnel leg
+	TunnelOpen *TunnelOpen `protobuf:"bytes,17,opt,name=tunnel_open,json=tunnelOpen,proto3,oneof"` // ask agent to open a TCP tunnel leg
 }
 
 type ServerMessage_TunnelData struct {
-	TunnelData *TunnelData `protobuf:"bytes,15,opt,name=tunnel_data,json=tunnelData,proto3,oneof"` // reverse TCP tunnel payload (server -> agent)
+	TunnelData *TunnelData `protobuf:"bytes,18,opt,name=tunnel_data,json=tunnelData,proto3,oneof"` // reverse TCP tunnel payload (server -> agent)
 }
 
 type ServerMessage_TunnelClose struct {
-	TunnelClose *TunnelClose `protobuf:"bytes,16,opt,name=tunnel_close,json=tunnelClose,proto3,oneof"`
+	TunnelClose *TunnelClose `protobuf:"bytes,19,opt,name=tunnel_close,json=tunnelClose,proto3,oneof"`
 }
 
 func (*ServerMessage_Register) isServerMessage_Payload() {}
@@ -581,6 +595,8 @@ func (*ServerMessage_Scan) isServerMessage_Payload() {}
 
 func (*ServerMessage_Upgrade) isServerMessage_Payload() {}
 
+func (*ServerMessage_Maintenance) isServerMessage_Payload() {}
+
 func (*ServerMessage_TunnelOpen) isServerMessage_Payload() {}
 
 func (*ServerMessage_TunnelData) isServerMessage_Payload() {}
@@ -595,20 +611,23 @@ type RegisterRequest struct {
 	EnrollToken string `protobuf:"bytes,1,opt,name=enroll_token,json=enrollToken,proto3" json:"enroll_token,omitempty"`
 	// agent_id is the persistent local identifier of the agent. On first
 	// registration the agent generates one; the server may override it.
-	AgentId       string `protobuf:"bytes,2,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
-	Hostname      string `protobuf:"bytes,3,opt,name=hostname,proto3" json:"hostname,omitempty"`
-	Os            string `protobuf:"bytes,4,opt,name=os,proto3" json:"os,omitempty"`     // linux / windows / darwin
-	Arch          string `protobuf:"bytes,5,opt,name=arch,proto3" json:"arch,omitempty"` // amd64 / arm64
-	Distro        string `protobuf:"bytes,6,opt,name=distro,proto3" json:"distro,omitempty"`
-	AgentVersion  string `protobuf:"bytes,7,opt,name=agent_version,json=agentVersion,proto3" json:"agent_version,omitempty"`
-	Uptime        int64  `protobuf:"varint,8,opt,name=uptime,proto3" json:"uptime,omitempty"`                           // real OS uptime in seconds (since boot), sent at registration so the UI doesn't wait for the first metrics cycle
-	CpuCores      int32  `protobuf:"varint,9,opt,name=cpu_cores,json=cpuCores,proto3" json:"cpu_cores,omitempty"`       // logical CPU cores count (e.g. 16, 4)
-	MemTotal      int64  `protobuf:"varint,10,opt,name=mem_total,json=memTotal,proto3" json:"mem_total,omitempty"`      // total memory in bytes
-	InternalIp    string `protobuf:"bytes,11,opt,name=internal_ip,json=internalIp,proto3" json:"internal_ip,omitempty"` // local private IP (e.g. 172.20.69.191)
-	PublicIp      string `protobuf:"bytes,12,opt,name=public_ip,json=publicIp,proto3" json:"public_ip,omitempty"`       // external public IP (e.g. 183.159.65.120)
-	Location      string `protobuf:"bytes,13,opt,name=location,proto3" json:"location,omitempty"`                       // geo location (e.g. 浙江省-杭州市)
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	AgentId      string `protobuf:"bytes,2,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
+	Hostname     string `protobuf:"bytes,3,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	Os           string `protobuf:"bytes,4,opt,name=os,proto3" json:"os,omitempty"`     // linux / windows / darwin
+	Arch         string `protobuf:"bytes,5,opt,name=arch,proto3" json:"arch,omitempty"` // amd64 / arm64
+	Distro       string `protobuf:"bytes,6,opt,name=distro,proto3" json:"distro,omitempty"`
+	AgentVersion string `protobuf:"bytes,7,opt,name=agent_version,json=agentVersion,proto3" json:"agent_version,omitempty"`
+	Uptime       int64  `protobuf:"varint,8,opt,name=uptime,proto3" json:"uptime,omitempty"`                           // real OS uptime in seconds (since boot), sent at registration so the UI doesn't wait for the first metrics cycle
+	CpuCores     int32  `protobuf:"varint,9,opt,name=cpu_cores,json=cpuCores,proto3" json:"cpu_cores,omitempty"`       // logical CPU cores count (e.g. 16, 4)
+	MemTotal     int64  `protobuf:"varint,10,opt,name=mem_total,json=memTotal,proto3" json:"mem_total,omitempty"`      // total memory in bytes
+	InternalIp   string `protobuf:"bytes,11,opt,name=internal_ip,json=internalIp,proto3" json:"internal_ip,omitempty"` // local private IP (e.g. 172.20.69.191)
+	PublicIp     string `protobuf:"bytes,12,opt,name=public_ip,json=publicIp,proto3" json:"public_ip,omitempty"`       // external public IP (e.g. 183.159.65.120)
+	Location     string `protobuf:"bytes,13,opt,name=location,proto3" json:"location,omitempty"`                       // geo location (e.g. 浙江省-杭州市)
+	// reconnect_reason indicates why the agent is connecting/reconnecting:
+	// "upgrade" (post agent self-upgrade), "maintenance" (post server restart), or empty.
+	ReconnectReason string `protobuf:"bytes,14,opt,name=reconnect_reason,json=reconnectReason,proto3" json:"reconnect_reason,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RegisterRequest) Reset() {
@@ -728,6 +747,13 @@ func (x *RegisterRequest) GetPublicIp() string {
 func (x *RegisterRequest) GetLocation() string {
 	if x != nil {
 		return x.Location
+	}
+	return ""
+}
+
+func (x *RegisterRequest) GetReconnectReason() string {
+	if x != nil {
+		return x.ReconnectReason
 	}
 	return ""
 }
@@ -1213,15 +1239,18 @@ type FileOp struct {
 	OpId  string                 `protobuf:"bytes,1,opt,name=op_id,json=opId,proto3" json:"op_id,omitempty"`
 	// op is one of: read, write, stat, list, mkdir, move, remove, copy,
 	// upload, download, resume.
-	Op            string `protobuf:"bytes,2,opt,name=op,proto3" json:"op,omitempty"`
-	Path          string `protobuf:"bytes,3,opt,name=path,proto3" json:"path,omitempty"`
-	Offset        int64  `protobuf:"varint,4,opt,name=offset,proto3" json:"offset,omitempty"`
-	Length        int64  `protobuf:"varint,5,opt,name=length,proto3" json:"length,omitempty"`
-	TotalSize     int64  `protobuf:"varint,6,opt,name=total_size,json=totalSize,proto3" json:"total_size,omitempty"`
-	ChunkSeq      uint32 `protobuf:"varint,7,opt,name=chunk_seq,json=chunkSeq,proto3" json:"chunk_seq,omitempty"`
-	Data          []byte `protobuf:"bytes,8,opt,name=data,proto3" json:"data,omitempty"`
-	Overwrite     bool   `protobuf:"varint,9,opt,name=overwrite,proto3" json:"overwrite,omitempty"`
-	DestPath      string `protobuf:"bytes,10,opt,name=dest_path,json=destPath,proto3" json:"dest_path,omitempty"` // for move / copy
+	Op        string `protobuf:"bytes,2,opt,name=op,proto3" json:"op,omitempty"`
+	Path      string `protobuf:"bytes,3,opt,name=path,proto3" json:"path,omitempty"`
+	Offset    int64  `protobuf:"varint,4,opt,name=offset,proto3" json:"offset,omitempty"`
+	Length    int64  `protobuf:"varint,5,opt,name=length,proto3" json:"length,omitempty"`
+	TotalSize int64  `protobuf:"varint,6,opt,name=total_size,json=totalSize,proto3" json:"total_size,omitempty"`
+	ChunkSeq  uint32 `protobuf:"varint,7,opt,name=chunk_seq,json=chunkSeq,proto3" json:"chunk_seq,omitempty"`
+	Data      []byte `protobuf:"bytes,8,opt,name=data,proto3" json:"data,omitempty"`
+	Overwrite bool   `protobuf:"varint,9,opt,name=overwrite,proto3" json:"overwrite,omitempty"`
+	DestPath  string `protobuf:"bytes,10,opt,name=dest_path,json=destPath,proto3" json:"dest_path,omitempty"` // for move / copy
+	// sha256 is the hex digest the finished write must match. Sent with the
+	// initial write op; empty means the agent skips integrity verification.
+	Sha256        string `protobuf:"bytes,11,opt,name=sha256,proto3" json:"sha256,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1322,6 +1351,13 @@ func (x *FileOp) GetOverwrite() bool {
 func (x *FileOp) GetDestPath() string {
 	if x != nil {
 		return x.DestPath
+	}
+	return ""
+}
+
+func (x *FileOp) GetSha256() string {
+	if x != nil {
+		return x.Sha256
 	}
 	return ""
 }
@@ -1571,21 +1607,33 @@ func (x *ExecResult) GetError() string {
 }
 
 type MetricsSample struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	AgentId       string                 `protobuf:"bytes,1,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
-	Ts            int64                  `protobuf:"varint,2,opt,name=ts,proto3" json:"ts,omitempty"`                                  // unix seconds
-	CpuUsage      float64                `protobuf:"fixed64,3,opt,name=cpu_usage,json=cpuUsage,proto3" json:"cpu_usage,omitempty"`     // percent 0..100
-	MemUsage      float64                `protobuf:"fixed64,4,opt,name=mem_usage,json=memUsage,proto3" json:"mem_usage,omitempty"`     // percent 0..100
-	MemTotal      int64                  `protobuf:"varint,5,opt,name=mem_total,json=memTotal,proto3" json:"mem_total,omitempty"`      // bytes
-	MemUsed       int64                  `protobuf:"varint,6,opt,name=mem_used,json=memUsed,proto3" json:"mem_used,omitempty"`         // bytes
-	NetRx         float64                `protobuf:"fixed64,7,opt,name=net_rx,json=netRx,proto3" json:"net_rx,omitempty"`              // bytes/s
-	NetTx         float64                `protobuf:"fixed64,8,opt,name=net_tx,json=netTx,proto3" json:"net_tx,omitempty"`              // bytes/s
-	DiskRead      float64                `protobuf:"fixed64,9,opt,name=disk_read,json=diskRead,proto3" json:"disk_read,omitempty"`     // bytes/s
-	DiskWrite     float64                `protobuf:"fixed64,10,opt,name=disk_write,json=diskWrite,proto3" json:"disk_write,omitempty"` // bytes/s
-	Mounts        []*Mount               `protobuf:"bytes,11,rep,name=mounts,proto3" json:"mounts,omitempty"`
-	Uptime        int64                  `protobuf:"varint,12,opt,name=uptime,proto3" json:"uptime,omitempty"` // host uptime in seconds (real OS boot-derived)
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	AgentId   string                 `protobuf:"bytes,1,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
+	Ts        int64                  `protobuf:"varint,2,opt,name=ts,proto3" json:"ts,omitempty"`                                  // unix seconds
+	CpuUsage  float64                `protobuf:"fixed64,3,opt,name=cpu_usage,json=cpuUsage,proto3" json:"cpu_usage,omitempty"`     // percent 0..100
+	MemUsage  float64                `protobuf:"fixed64,4,opt,name=mem_usage,json=memUsage,proto3" json:"mem_usage,omitempty"`     // percent 0..100
+	MemTotal  int64                  `protobuf:"varint,5,opt,name=mem_total,json=memTotal,proto3" json:"mem_total,omitempty"`      // bytes
+	MemUsed   int64                  `protobuf:"varint,6,opt,name=mem_used,json=memUsed,proto3" json:"mem_used,omitempty"`         // bytes
+	NetRx     float64                `protobuf:"fixed64,7,opt,name=net_rx,json=netRx,proto3" json:"net_rx,omitempty"`              // bytes/s
+	NetTx     float64                `protobuf:"fixed64,8,opt,name=net_tx,json=netTx,proto3" json:"net_tx,omitempty"`              // bytes/s
+	DiskRead  float64                `protobuf:"fixed64,9,opt,name=disk_read,json=diskRead,proto3" json:"disk_read,omitempty"`     // bytes/s
+	DiskWrite float64                `protobuf:"fixed64,10,opt,name=disk_write,json=diskWrite,proto3" json:"disk_write,omitempty"` // bytes/s
+	Mounts    []*Mount               `protobuf:"bytes,11,rep,name=mounts,proto3" json:"mounts,omitempty"`
+	Uptime    int64                  `protobuf:"varint,12,opt,name=uptime,proto3" json:"uptime,omitempty"` // host uptime in seconds (real OS boot-derived)
+	// Extended metrics.
+	Load1          float64 `protobuf:"fixed64,13,opt,name=load1,proto3" json:"load1,omitempty"` // 1/5/15-minute load averages (Linux; 0 elsewhere)
+	Load5          float64 `protobuf:"fixed64,14,opt,name=load5,proto3" json:"load5,omitempty"`
+	Load15         float64 `protobuf:"fixed64,15,opt,name=load15,proto3" json:"load15,omitempty"`
+	SwapTotal      int64   `protobuf:"varint,16,opt,name=swap_total,json=swapTotal,proto3" json:"swap_total,omitempty"`                // bytes
+	SwapUsed       int64   `protobuf:"varint,17,opt,name=swap_used,json=swapUsed,proto3" json:"swap_used,omitempty"`                   // bytes
+	TcpEstablished int32   `protobuf:"varint,18,opt,name=tcp_established,json=tcpEstablished,proto3" json:"tcp_established,omitempty"` // ESTABLISHED TCP connections
+	UdpCount       int32   `protobuf:"varint,19,opt,name=udp_count,json=udpCount,proto3" json:"udp_count,omitempty"`                   // UDP sockets
+	ProcessCount   int32   `protobuf:"varint,20,opt,name=process_count,json=processCount,proto3" json:"process_count,omitempty"`       // total processes
+	CpuModel       string  `protobuf:"bytes,21,opt,name=cpu_model,json=cpuModel,proto3" json:"cpu_model,omitempty"`                    // CPU model name (cached, static)
+	MonthRx        int64   `protobuf:"varint,22,opt,name=month_rx,json=monthRx,proto3" json:"month_rx,omitempty"`                      // bytes received this billing cycle
+	MonthTx        int64   `protobuf:"varint,23,opt,name=month_tx,json=monthTx,proto3" json:"month_tx,omitempty"`                      // bytes transmitted this billing cycle
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *MetricsSample) Reset() {
@@ -1702,6 +1750,83 @@ func (x *MetricsSample) GetUptime() int64 {
 	return 0
 }
 
+func (x *MetricsSample) GetLoad1() float64 {
+	if x != nil {
+		return x.Load1
+	}
+	return 0
+}
+
+func (x *MetricsSample) GetLoad5() float64 {
+	if x != nil {
+		return x.Load5
+	}
+	return 0
+}
+
+func (x *MetricsSample) GetLoad15() float64 {
+	if x != nil {
+		return x.Load15
+	}
+	return 0
+}
+
+func (x *MetricsSample) GetSwapTotal() int64 {
+	if x != nil {
+		return x.SwapTotal
+	}
+	return 0
+}
+
+func (x *MetricsSample) GetSwapUsed() int64 {
+	if x != nil {
+		return x.SwapUsed
+	}
+	return 0
+}
+
+func (x *MetricsSample) GetTcpEstablished() int32 {
+	if x != nil {
+		return x.TcpEstablished
+	}
+	return 0
+}
+
+func (x *MetricsSample) GetUdpCount() int32 {
+	if x != nil {
+		return x.UdpCount
+	}
+	return 0
+}
+
+func (x *MetricsSample) GetProcessCount() int32 {
+	if x != nil {
+		return x.ProcessCount
+	}
+	return 0
+}
+
+func (x *MetricsSample) GetCpuModel() string {
+	if x != nil {
+		return x.CpuModel
+	}
+	return ""
+}
+
+func (x *MetricsSample) GetMonthRx() int64 {
+	if x != nil {
+		return x.MonthRx
+	}
+	return 0
+}
+
+func (x *MetricsSample) GetMonthTx() int64 {
+	if x != nil {
+		return x.MonthTx
+	}
+	return 0
+}
+
 type Mount struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
@@ -1763,8 +1888,12 @@ func (x *Mount) GetUsed() int64 {
 }
 
 type SysInfoQuery struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Kind          string                 `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"` // process / port / user / login
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Kind  string                 `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"` // process / port / user / login / osinfo / kill
+	// pid targets a single process; only meaningful for kind="kill".
+	Pid int32 `protobuf:"varint,2,opt,name=pid,proto3" json:"pid,omitempty"`
+	// force selects SIGKILL over SIGTERM (taskkill /F on Windows).
+	Force         bool `protobuf:"varint,3,opt,name=force,proto3" json:"force,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1804,6 +1933,20 @@ func (x *SysInfoQuery) GetKind() string {
 		return x.Kind
 	}
 	return ""
+}
+
+func (x *SysInfoQuery) GetPid() int32 {
+	if x != nil {
+		return x.Pid
+	}
+	return 0
+}
+
+func (x *SysInfoQuery) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
 }
 
 // MetricsQuery asks the agent for current (or a single historical) metrics.
@@ -1915,11 +2058,15 @@ func (x *SysInfoSnapshot) GetJsonPayload() []byte {
 type DockerOp struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	OpId  string                 `protobuf:"bytes,1,opt,name=op_id,json=opId,proto3" json:"op_id,omitempty"`
-	// op is one of: ps, images, start, stop, restart, rm, logs, exec, inspect,
-	// remove_image, prune_images.
-	Op            string `protobuf:"bytes,2,opt,name=op,proto3" json:"op,omitempty"`
-	Container     string `protobuf:"bytes,3,opt,name=container,proto3" json:"container,omitempty"`
-	Image         string `protobuf:"bytes,4,opt,name=image,proto3" json:"image,omitempty"`
+	// op is one of: ps, images, start, stop, restart, rm, logs, inspect,
+	// remove_image, prune_images, pull, run, get_mirrors, set_mirrors.
+	Op        string `protobuf:"bytes,2,opt,name=op,proto3" json:"op,omitempty"`
+	Container string `protobuf:"bytes,3,opt,name=container,proto3" json:"container,omitempty"`
+	Image     string `protobuf:"bytes,4,opt,name=image,proto3" json:"image,omitempty"`
+	// args_json carries op-specific options:
+	// - For op "run": {"name":"...","ports":[...],"volumes":[...],"env":[...],"restart_policy":"...","command":[...]}
+	// - For op "set_mirrors": {"mirrors":["https://...","https://..."]}
+	// all fields optional; empty dynamic rows are skipped.
 	ArgsJson      []byte `protobuf:"bytes,5,opt,name=args_json,json=argsJson,proto3" json:"args_json,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2324,18 +2471,75 @@ func (x *UpgradeProgress) GetError() string {
 	return ""
 }
 
+type MaintenanceNotice struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// reason explains the maintenance: "server_restart", "agent_upgrade", "host_maintenance".
+	Reason string `protobuf:"bytes,1,opt,name=reason,proto3" json:"reason,omitempty"`
+	// expected_duration_sec is how long the server/agent anticipates being offline (e.g. 120s).
+	ExpectedDurationSec int32 `protobuf:"varint,2,opt,name=expected_duration_sec,json=expectedDurationSec,proto3" json:"expected_duration_sec,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *MaintenanceNotice) Reset() {
+	*x = MaintenanceNotice{}
+	mi := &file_agent_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MaintenanceNotice) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MaintenanceNotice) ProtoMessage() {}
+
+func (x *MaintenanceNotice) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MaintenanceNotice.ProtoReflect.Descriptor instead.
+func (*MaintenanceNotice) Descriptor() ([]byte, []int) {
+	return file_agent_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *MaintenanceNotice) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *MaintenanceNotice) GetExpectedDurationSec() int32 {
+	if x != nil {
+		return x.ExpectedDurationSec
+	}
+	return 0
+}
+
 type Ack struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ok            bool                   `protobuf:"varint,1,opt,name=ok,proto3" json:"ok,omitempty"`
-	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
-	Ref           string                 `protobuf:"bytes,3,opt,name=ref,proto3" json:"ref,omitempty"` // optional correlation id
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Ok    bool                   `protobuf:"varint,1,opt,name=ok,proto3" json:"ok,omitempty"`
+	Error string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	Ref   string                 `protobuf:"bytes,3,opt,name=ref,proto3" json:"ref,omitempty"` // optional correlation id
+	// sha256 is the hex digest the agent actually computed, set on file write
+	// acks so the caller can confirm the bytes landed intact.
+	Sha256        string `protobuf:"bytes,4,opt,name=sha256,proto3" json:"sha256,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Ack) Reset() {
 	*x = Ack{}
-	mi := &file_agent_proto_msgTypes[26]
+	mi := &file_agent_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2347,7 +2551,7 @@ func (x *Ack) String() string {
 func (*Ack) ProtoMessage() {}
 
 func (x *Ack) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[26]
+	mi := &file_agent_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2360,7 +2564,7 @@ func (x *Ack) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ack.ProtoReflect.Descriptor instead.
 func (*Ack) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{26}
+	return file_agent_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *Ack) GetOk() bool {
@@ -2384,6 +2588,13 @@ func (x *Ack) GetRef() string {
 	return ""
 }
 
+func (x *Ack) GetSha256() string {
+	if x != nil {
+		return x.Sha256
+	}
+	return ""
+}
+
 type TunnelOpen struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TunnelId      string                 `protobuf:"bytes,1,opt,name=tunnel_id,json=tunnelId,proto3" json:"tunnel_id,omitempty"`
@@ -2395,7 +2606,7 @@ type TunnelOpen struct {
 
 func (x *TunnelOpen) Reset() {
 	*x = TunnelOpen{}
-	mi := &file_agent_proto_msgTypes[27]
+	mi := &file_agent_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2407,7 +2618,7 @@ func (x *TunnelOpen) String() string {
 func (*TunnelOpen) ProtoMessage() {}
 
 func (x *TunnelOpen) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[27]
+	mi := &file_agent_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2420,7 +2631,7 @@ func (x *TunnelOpen) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TunnelOpen.ProtoReflect.Descriptor instead.
 func (*TunnelOpen) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{27}
+	return file_agent_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *TunnelOpen) GetTunnelId() string {
@@ -2454,7 +2665,7 @@ type TunnelData struct {
 
 func (x *TunnelData) Reset() {
 	*x = TunnelData{}
-	mi := &file_agent_proto_msgTypes[28]
+	mi := &file_agent_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2466,7 +2677,7 @@ func (x *TunnelData) String() string {
 func (*TunnelData) ProtoMessage() {}
 
 func (x *TunnelData) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[28]
+	mi := &file_agent_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2479,7 +2690,7 @@ func (x *TunnelData) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TunnelData.ProtoReflect.Descriptor instead.
 func (*TunnelData) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{28}
+	return file_agent_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *TunnelData) GetTunnelId() string {
@@ -2505,7 +2716,7 @@ type TunnelClose struct {
 
 func (x *TunnelClose) Reset() {
 	*x = TunnelClose{}
-	mi := &file_agent_proto_msgTypes[29]
+	mi := &file_agent_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2517,7 +2728,7 @@ func (x *TunnelClose) String() string {
 func (*TunnelClose) ProtoMessage() {}
 
 func (x *TunnelClose) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[29]
+	mi := &file_agent_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2530,7 +2741,7 @@ func (x *TunnelClose) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TunnelClose.ProtoReflect.Descriptor instead.
 func (*TunnelClose) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{29}
+	return file_agent_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *TunnelClose) GetTunnelId() string {
@@ -2563,7 +2774,7 @@ const file_agent_proto_rawDesc = "" +
 	"tunnelData\x12@\n" +
 	"\ftunnel_close\x18\f \x01(\v2\x1b.watchman.agent.TunnelCloseH\x00R\vtunnelClose\x12'\n" +
 	"\x03ack\x18c \x01(\v2\x13.watchman.agent.AckH\x00R\x03ackB\t\n" +
-	"\apayload\"\xda\a\n" +
+	"\apayload\"\xa1\b\n" +
 	"\rServerMessage\x12>\n" +
 	"\bregister\x18\x01 \x01(\v2 .watchman.agent.RegisterResponseH\x00R\bregister\x12<\n" +
 	"\theartbeat\x18\x02 \x01(\v2\x1c.watchman.agent.HeartbeatAckH\x00R\theartbeat\x12;\n" +
@@ -2580,13 +2791,14 @@ const file_agent_proto_rawDesc = "" +
 	" \x01(\v2\x1c.watchman.agent.MetricsQueryH\x00R\bmetricsQ\x127\n" +
 	"\tdocker_op\x18\v \x01(\v2\x18.watchman.agent.DockerOpH\x00R\bdockerOp\x121\n" +
 	"\x04scan\x18\f \x01(\v2\x1b.watchman.agent.ScanRequestH\x00R\x04scan\x12:\n" +
-	"\aupgrade\x18\r \x01(\v2\x1e.watchman.agent.UpgradeRequestH\x00R\aupgrade\x12=\n" +
-	"\vtunnel_open\x18\x0e \x01(\v2\x1a.watchman.agent.TunnelOpenH\x00R\n" +
+	"\aupgrade\x18\r \x01(\v2\x1e.watchman.agent.UpgradeRequestH\x00R\aupgrade\x12E\n" +
+	"\vmaintenance\x18\x0e \x01(\v2!.watchman.agent.MaintenanceNoticeH\x00R\vmaintenance\x12=\n" +
+	"\vtunnel_open\x18\x11 \x01(\v2\x1a.watchman.agent.TunnelOpenH\x00R\n" +
 	"tunnelOpen\x12=\n" +
-	"\vtunnel_data\x18\x0f \x01(\v2\x1a.watchman.agent.TunnelDataH\x00R\n" +
+	"\vtunnel_data\x18\x12 \x01(\v2\x1a.watchman.agent.TunnelDataH\x00R\n" +
 	"tunnelData\x12@\n" +
-	"\ftunnel_close\x18\x10 \x01(\v2\x1b.watchman.agent.TunnelCloseH\x00R\vtunnelCloseB\t\n" +
-	"\apayload\"\xf8\x02\n" +
+	"\ftunnel_close\x18\x13 \x01(\v2\x1b.watchman.agent.TunnelCloseH\x00R\vtunnelCloseB\t\n" +
+	"\apayload\"\xa3\x03\n" +
 	"\x0fRegisterRequest\x12!\n" +
 	"\fenroll_token\x18\x01 \x01(\tR\venrollToken\x12\x19\n" +
 	"\bagent_id\x18\x02 \x01(\tR\aagentId\x12\x1a\n" +
@@ -2602,7 +2814,8 @@ const file_agent_proto_rawDesc = "" +
 	"\vinternal_ip\x18\v \x01(\tR\n" +
 	"internalIp\x12\x1b\n" +
 	"\tpublic_ip\x18\f \x01(\tR\bpublicIp\x12\x1a\n" +
-	"\blocation\x18\r \x01(\tR\blocation\"\xd2\x01\n" +
+	"\blocation\x18\r \x01(\tR\blocation\x12)\n" +
+	"\x10reconnect_reason\x18\x0e \x01(\tR\x0freconnectReason\"\xd2\x01\n" +
 	"\x10RegisterResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12\x19\n" +
@@ -2640,7 +2853,7 @@ const file_agent_proto_rawDesc = "" +
 	"\x04rows\x18\x03 \x01(\rR\x04rows\".\n" +
 	"\rTerminalClose\x12\x1d\n" +
 	"\n" +
-	"session_id\x18\x01 \x01(\tR\tsessionId\"\xfc\x01\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\"\x94\x02\n" +
 	"\x06FileOp\x12\x13\n" +
 	"\x05op_id\x18\x01 \x01(\tR\x04opId\x12\x0e\n" +
 	"\x02op\x18\x02 \x01(\tR\x02op\x12\x12\n" +
@@ -2653,7 +2866,8 @@ const file_agent_proto_rawDesc = "" +
 	"\x04data\x18\b \x01(\fR\x04data\x12\x1c\n" +
 	"\toverwrite\x18\t \x01(\bR\toverwrite\x12\x1b\n" +
 	"\tdest_path\x18\n" +
-	" \x01(\tR\bdestPath\"\x93\x01\n" +
+	" \x01(\tR\bdestPath\x12\x16\n" +
+	"\x06sha256\x18\v \x01(\tR\x06sha256\"\x93\x01\n" +
 	"\tFileChunk\x12\x13\n" +
 	"\x05op_id\x18\x01 \x01(\tR\x04opId\x12\x1b\n" +
 	"\tchunk_seq\x18\x02 \x01(\rR\bchunkSeq\x12\x12\n" +
@@ -2676,7 +2890,7 @@ const file_agent_proto_rawDesc = "" +
 	"\x06stderr\x18\x04 \x01(\fR\x06stderr\x12\x1f\n" +
 	"\vduration_ms\x18\x05 \x01(\x03R\n" +
 	"durationMs\x12\x14\n" +
-	"\x05error\x18\x06 \x01(\tR\x05error\"\xdd\x02\n" +
+	"\x05error\x18\x06 \x01(\tR\x05error\"\x9b\x05\n" +
 	"\rMetricsSample\x12\x19\n" +
 	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12\x0e\n" +
 	"\x02ts\x18\x02 \x01(\x03R\x02ts\x12\x1b\n" +
@@ -2691,13 +2905,27 @@ const file_agent_proto_rawDesc = "" +
 	"disk_write\x18\n" +
 	" \x01(\x01R\tdiskWrite\x12-\n" +
 	"\x06mounts\x18\v \x03(\v2\x15.watchman.agent.MountR\x06mounts\x12\x16\n" +
-	"\x06uptime\x18\f \x01(\x03R\x06uptime\"E\n" +
+	"\x06uptime\x18\f \x01(\x03R\x06uptime\x12\x14\n" +
+	"\x05load1\x18\r \x01(\x01R\x05load1\x12\x14\n" +
+	"\x05load5\x18\x0e \x01(\x01R\x05load5\x12\x16\n" +
+	"\x06load15\x18\x0f \x01(\x01R\x06load15\x12\x1d\n" +
+	"\n" +
+	"swap_total\x18\x10 \x01(\x03R\tswapTotal\x12\x1b\n" +
+	"\tswap_used\x18\x11 \x01(\x03R\bswapUsed\x12'\n" +
+	"\x0ftcp_established\x18\x12 \x01(\x05R\x0etcpEstablished\x12\x1b\n" +
+	"\tudp_count\x18\x13 \x01(\x05R\budpCount\x12#\n" +
+	"\rprocess_count\x18\x14 \x01(\x05R\fprocessCount\x12\x1b\n" +
+	"\tcpu_model\x18\x15 \x01(\tR\bcpuModel\x12\x19\n" +
+	"\bmonth_rx\x18\x16 \x01(\x03R\amonthRx\x12\x19\n" +
+	"\bmonth_tx\x18\x17 \x01(\x03R\amonthTx\"E\n" +
 	"\x05Mount\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x14\n" +
 	"\x05total\x18\x02 \x01(\x03R\x05total\x12\x12\n" +
-	"\x04used\x18\x03 \x01(\x03R\x04used\"\"\n" +
+	"\x04used\x18\x03 \x01(\x03R\x04used\"J\n" +
 	"\fSysInfoQuery\x12\x12\n" +
-	"\x04kind\x18\x01 \x01(\tR\x04kind\"E\n" +
+	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x10\n" +
+	"\x03pid\x18\x02 \x01(\x05R\x03pid\x12\x14\n" +
+	"\x05force\x18\x03 \x01(\bR\x05force\"E\n" +
 	"\fMetricsQuery\x12\x12\n" +
 	"\x04live\x18\x01 \x01(\bR\x04live\x12!\n" +
 	"\finterval_sec\x18\x02 \x01(\x05R\vintervalSec\"H\n" +
@@ -2734,11 +2962,15 @@ const file_agent_proto_rawDesc = "" +
 	"\x0fUpgradeProgress\x12\x14\n" +
 	"\x05stage\x18\x01 \x01(\tR\x05stage\x12\x1a\n" +
 	"\bprogress\x18\x02 \x01(\x01R\bprogress\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\tR\x05error\"=\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\"_\n" +
+	"\x11MaintenanceNotice\x12\x16\n" +
+	"\x06reason\x18\x01 \x01(\tR\x06reason\x122\n" +
+	"\x15expected_duration_sec\x18\x02 \x01(\x05R\x13expectedDurationSec\"U\n" +
 	"\x03Ack\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12\x10\n" +
-	"\x03ref\x18\x03 \x01(\tR\x03ref\"k\n" +
+	"\x03ref\x18\x03 \x01(\tR\x03ref\x12\x16\n" +
+	"\x06sha256\x18\x04 \x01(\tR\x06sha256\"k\n" +
 	"\n" +
 	"TunnelOpen\x12\x1b\n" +
 	"\ttunnel_id\x18\x01 \x01(\tR\btunnelId\x12\x1f\n" +
@@ -2767,38 +2999,39 @@ func file_agent_proto_rawDescGZIP() []byte {
 	return file_agent_proto_rawDescData
 }
 
-var file_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
+var file_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
 var file_agent_proto_goTypes = []any{
-	(*AgentMessage)(nil),     // 0: watchman.agent.AgentMessage
-	(*ServerMessage)(nil),    // 1: watchman.agent.ServerMessage
-	(*RegisterRequest)(nil),  // 2: watchman.agent.RegisterRequest
-	(*RegisterResponse)(nil), // 3: watchman.agent.RegisterResponse
-	(*Heartbeat)(nil),        // 4: watchman.agent.Heartbeat
-	(*HeartbeatAck)(nil),     // 5: watchman.agent.HeartbeatAck
-	(*TerminalOpen)(nil),     // 6: watchman.agent.TerminalOpen
-	(*TerminalOutput)(nil),   // 7: watchman.agent.TerminalOutput
-	(*TerminalInput)(nil),    // 8: watchman.agent.TerminalInput
-	(*TerminalResize)(nil),   // 9: watchman.agent.TerminalResize
-	(*TerminalClose)(nil),    // 10: watchman.agent.TerminalClose
-	(*FileOp)(nil),           // 11: watchman.agent.FileOp
-	(*FileChunk)(nil),        // 12: watchman.agent.FileChunk
-	(*ExecRequest)(nil),      // 13: watchman.agent.ExecRequest
-	(*ExecResult)(nil),       // 14: watchman.agent.ExecResult
-	(*MetricsSample)(nil),    // 15: watchman.agent.MetricsSample
-	(*Mount)(nil),            // 16: watchman.agent.Mount
-	(*SysInfoQuery)(nil),     // 17: watchman.agent.SysInfoQuery
-	(*MetricsQuery)(nil),     // 18: watchman.agent.MetricsQuery
-	(*SysInfoSnapshot)(nil),  // 19: watchman.agent.SysInfoSnapshot
-	(*DockerOp)(nil),         // 20: watchman.agent.DockerOp
-	(*DockerEvent)(nil),      // 21: watchman.agent.DockerEvent
-	(*ScanRequest)(nil),      // 22: watchman.agent.ScanRequest
-	(*ScanProgress)(nil),     // 23: watchman.agent.ScanProgress
-	(*UpgradeRequest)(nil),   // 24: watchman.agent.UpgradeRequest
-	(*UpgradeProgress)(nil),  // 25: watchman.agent.UpgradeProgress
-	(*Ack)(nil),              // 26: watchman.agent.Ack
-	(*TunnelOpen)(nil),       // 27: watchman.agent.TunnelOpen
-	(*TunnelData)(nil),       // 28: watchman.agent.TunnelData
-	(*TunnelClose)(nil),      // 29: watchman.agent.TunnelClose
+	(*AgentMessage)(nil),      // 0: watchman.agent.AgentMessage
+	(*ServerMessage)(nil),     // 1: watchman.agent.ServerMessage
+	(*RegisterRequest)(nil),   // 2: watchman.agent.RegisterRequest
+	(*RegisterResponse)(nil),  // 3: watchman.agent.RegisterResponse
+	(*Heartbeat)(nil),         // 4: watchman.agent.Heartbeat
+	(*HeartbeatAck)(nil),      // 5: watchman.agent.HeartbeatAck
+	(*TerminalOpen)(nil),      // 6: watchman.agent.TerminalOpen
+	(*TerminalOutput)(nil),    // 7: watchman.agent.TerminalOutput
+	(*TerminalInput)(nil),     // 8: watchman.agent.TerminalInput
+	(*TerminalResize)(nil),    // 9: watchman.agent.TerminalResize
+	(*TerminalClose)(nil),     // 10: watchman.agent.TerminalClose
+	(*FileOp)(nil),            // 11: watchman.agent.FileOp
+	(*FileChunk)(nil),         // 12: watchman.agent.FileChunk
+	(*ExecRequest)(nil),       // 13: watchman.agent.ExecRequest
+	(*ExecResult)(nil),        // 14: watchman.agent.ExecResult
+	(*MetricsSample)(nil),     // 15: watchman.agent.MetricsSample
+	(*Mount)(nil),             // 16: watchman.agent.Mount
+	(*SysInfoQuery)(nil),      // 17: watchman.agent.SysInfoQuery
+	(*MetricsQuery)(nil),      // 18: watchman.agent.MetricsQuery
+	(*SysInfoSnapshot)(nil),   // 19: watchman.agent.SysInfoSnapshot
+	(*DockerOp)(nil),          // 20: watchman.agent.DockerOp
+	(*DockerEvent)(nil),       // 21: watchman.agent.DockerEvent
+	(*ScanRequest)(nil),       // 22: watchman.agent.ScanRequest
+	(*ScanProgress)(nil),      // 23: watchman.agent.ScanProgress
+	(*UpgradeRequest)(nil),    // 24: watchman.agent.UpgradeRequest
+	(*UpgradeProgress)(nil),   // 25: watchman.agent.UpgradeProgress
+	(*MaintenanceNotice)(nil), // 26: watchman.agent.MaintenanceNotice
+	(*Ack)(nil),               // 27: watchman.agent.Ack
+	(*TunnelOpen)(nil),        // 28: watchman.agent.TunnelOpen
+	(*TunnelData)(nil),        // 29: watchman.agent.TunnelData
+	(*TunnelClose)(nil),       // 30: watchman.agent.TunnelClose
 }
 var file_agent_proto_depIdxs = []int32{
 	2,  // 0: watchman.agent.AgentMessage.register:type_name -> watchman.agent.RegisterRequest
@@ -2811,9 +3044,9 @@ var file_agent_proto_depIdxs = []int32{
 	21, // 7: watchman.agent.AgentMessage.docker:type_name -> watchman.agent.DockerEvent
 	23, // 8: watchman.agent.AgentMessage.scan_progress:type_name -> watchman.agent.ScanProgress
 	25, // 9: watchman.agent.AgentMessage.upgrade_progress:type_name -> watchman.agent.UpgradeProgress
-	28, // 10: watchman.agent.AgentMessage.tunnel_data:type_name -> watchman.agent.TunnelData
-	29, // 11: watchman.agent.AgentMessage.tunnel_close:type_name -> watchman.agent.TunnelClose
-	26, // 12: watchman.agent.AgentMessage.ack:type_name -> watchman.agent.Ack
+	29, // 10: watchman.agent.AgentMessage.tunnel_data:type_name -> watchman.agent.TunnelData
+	30, // 11: watchman.agent.AgentMessage.tunnel_close:type_name -> watchman.agent.TunnelClose
+	27, // 12: watchman.agent.AgentMessage.ack:type_name -> watchman.agent.Ack
 	3,  // 13: watchman.agent.ServerMessage.register:type_name -> watchman.agent.RegisterResponse
 	5,  // 14: watchman.agent.ServerMessage.heartbeat:type_name -> watchman.agent.HeartbeatAck
 	6,  // 15: watchman.agent.ServerMessage.term_open:type_name -> watchman.agent.TerminalOpen
@@ -2827,17 +3060,18 @@ var file_agent_proto_depIdxs = []int32{
 	20, // 23: watchman.agent.ServerMessage.docker_op:type_name -> watchman.agent.DockerOp
 	22, // 24: watchman.agent.ServerMessage.scan:type_name -> watchman.agent.ScanRequest
 	24, // 25: watchman.agent.ServerMessage.upgrade:type_name -> watchman.agent.UpgradeRequest
-	27, // 26: watchman.agent.ServerMessage.tunnel_open:type_name -> watchman.agent.TunnelOpen
-	28, // 27: watchman.agent.ServerMessage.tunnel_data:type_name -> watchman.agent.TunnelData
-	29, // 28: watchman.agent.ServerMessage.tunnel_close:type_name -> watchman.agent.TunnelClose
-	16, // 29: watchman.agent.MetricsSample.mounts:type_name -> watchman.agent.Mount
-	0,  // 30: watchman.agent.AgentService.Connect:input_type -> watchman.agent.AgentMessage
-	1,  // 31: watchman.agent.AgentService.Connect:output_type -> watchman.agent.ServerMessage
-	31, // [31:32] is the sub-list for method output_type
-	30, // [30:31] is the sub-list for method input_type
-	30, // [30:30] is the sub-list for extension type_name
-	30, // [30:30] is the sub-list for extension extendee
-	0,  // [0:30] is the sub-list for field type_name
+	26, // 26: watchman.agent.ServerMessage.maintenance:type_name -> watchman.agent.MaintenanceNotice
+	28, // 27: watchman.agent.ServerMessage.tunnel_open:type_name -> watchman.agent.TunnelOpen
+	29, // 28: watchman.agent.ServerMessage.tunnel_data:type_name -> watchman.agent.TunnelData
+	30, // 29: watchman.agent.ServerMessage.tunnel_close:type_name -> watchman.agent.TunnelClose
+	16, // 30: watchman.agent.MetricsSample.mounts:type_name -> watchman.agent.Mount
+	0,  // 31: watchman.agent.AgentService.Connect:input_type -> watchman.agent.AgentMessage
+	1,  // 32: watchman.agent.AgentService.Connect:output_type -> watchman.agent.ServerMessage
+	32, // [32:33] is the sub-list for method output_type
+	31, // [31:32] is the sub-list for method input_type
+	31, // [31:31] is the sub-list for extension type_name
+	31, // [31:31] is the sub-list for extension extendee
+	0,  // [0:31] is the sub-list for field type_name
 }
 
 func init() { file_agent_proto_init() }
@@ -2874,6 +3108,7 @@ func file_agent_proto_init() {
 		(*ServerMessage_DockerOp)(nil),
 		(*ServerMessage_Scan)(nil),
 		(*ServerMessage_Upgrade)(nil),
+		(*ServerMessage_Maintenance)(nil),
 		(*ServerMessage_TunnelOpen)(nil),
 		(*ServerMessage_TunnelData)(nil),
 		(*ServerMessage_TunnelClose)(nil),
@@ -2884,7 +3119,7 @@ func file_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_proto_rawDesc), len(file_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   30,
+			NumMessages:   31,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

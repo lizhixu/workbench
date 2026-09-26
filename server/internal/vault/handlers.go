@@ -55,13 +55,19 @@ func (h *Handlers) create(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"data": created})
 }
 
+// get returns a credential's metadata. The stored secret is deliberately not
+// included: AGENTS.md B.8.4 requires the API to answer with has_secret only, so
+// a leaked console token cannot be turned into the host's real password. The
+// plaintext stays available in-process (Store.Get) for terminal login.
 func (h *Handlers) get(c *gin.Context) {
 	cred, ok := h.store.Get(c.Param("id"))
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": cred})
+	masked := *cred
+	masked.Secret = ""
+	c.JSON(http.StatusOK, gin.H{"data": masked, "has_secret": cred.Secret != ""})
 }
 
 func (h *Handlers) update(c *gin.Context) {

@@ -3,30 +3,53 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
+	"watchman/internal/version"
 	"watchman/proto/agentpb"
 	"watchman/server/internal/ai"
 	"watchman/server/internal/alert"
 	"watchman/server/internal/apps"
+	"watchman/server/internal/audit"
 	"watchman/server/internal/auth"
+	"watchman/server/internal/backup"
+	"watchman/server/internal/cert"
+	"watchman/server/internal/commands"
+	"watchman/server/internal/gitprovider"
+	"watchman/server/internal/groups"
 	"watchman/server/internal/metrics"
+	"watchman/server/internal/network"
 	"watchman/server/internal/policy"
+	"watchman/server/internal/prefs"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/session"
+	"watchman/server/internal/snapshots"
 	"watchman/server/internal/vault"
 	"watchman/server/internal/ws"
 
 	"github.com/gin-gonic/gin"
 )
+
+// CurrentAgentVersion is the latest release version of the Watchman Agent
+// binary built into or hosted by this control server. It comes from the linker
+// (see internal/version) so releasing a new agent only requires rebuilding with
+// -ldflags, never editing a hardcoded string.
+var CurrentAgentVersion = version.Get()
 
 // HostDTO is the public representation of a managed host.
 type HostDTO struct {
@@ -44,16 +67,38 @@ type HostDTO struct {
 	Uptime     int64    `json:"uptime"`
 	CPUCores   int32    `json:"cpu_cores"`
 	MemTotal   int64    `json:"mem_total"`
-	InternalIP string   `json:"internal_ip"`
-	PublicIP   string   `json:"public_ip"`
-	Location   string   `json:"location"`
+		InternalIP string   `json:"internal_ip"`
+		PublicIP   string   `json:"public_ip"`
+		Location   string   `json:"location"`
+		// Optional billing & traffic quota configurations
+		Price           float64 `json:"price,omitempty"`
+		Currency        string  `json:"currency,omitempty"`
+		BillingCycle    string  `json:"billing_cycle,omitempty"`
+		ExpiresAt       string  `json:"expires_at,omitempty"`
+		AutoRenewal     bool    `json:"auto_renewal,omitempty"`
+		TrafficLimitGB  float64 `json:"traffic_limit_gb,omitempty"`
+		TrafficCalcType string  `json:"traffic_calc_type,omitempty"`
+		TrafficResetDay int     `json:"traffic_reset_day,omitempty"`
+		RenewalURL      string  `json:"renewal_url,omitempty"`
+		Notes           string  `json:"notes,omitempty"`
+		// Extended live metrics (from the agent's latest sample).
+	CpuModel  string  `json:"cpu_model,omitempty"`
+	Load1     float64 `json:"load1"`
+	SwapUsage float64 `json:"swap_usage"`
+	MonthRx   int64   `json:"month_rx"`
+	MonthTx   int64   `json:"month_tx"`
 }
 
 // Router builds the gin engine with all routes mounted under /api/v1.
 // authStore may be nil for a degraded (token-less) mode used only in tests;
 // in production it is always provided. sessStore tracks terminal sessions
-// for audit (may be nil to disable auditing).
-func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store) *gin.Engine {
+// for audit (may be nil to disable auditing). auditStore records the unified
+// operational audit trail (may be nil to disable). commandStore backs the
+// saved-command library, groupStore backs host grouping + per-group user
+// authorization, prefsStore backs per-user terminal preferences and
+// backupStore backs control-plane backup/restore; all may be nil to disable
+// those features.
+func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, prefsStore *prefs.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine, gitProviderStore *gitprovider.Store, alertMon *alert.Monitor) *gin.Engine {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -62,17 +107,16 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	r.Use(gin.Recovery(), requestLogger(log))
 
 	v1 := r.Group("/api/v1")
-	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore}
+	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, prefs: prefsStore, alertMon: alertMon}
 
 	// ---- Public routes (no auth) ----
 	// Auth login.
 	if authStore != nil {
 		ah := auth.NewHandlers(authStore)
-		v1.POST("/auth/login", ah.Login)
+		v1.POST("/auth/login", h.loginWithAudit(ah.Login))
 	}
 
 	// Enroll (generates a one-time token; the install script uses it).
-	// Public by design (AGENTS.md B.4): one-click binding flow.
 	v1.POST("/hosts/enroll", h.enroll)
 
 	// Public share token info lookup for collaborative terminal guests
@@ -81,30 +125,37 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// ---- Authenticated routes ----
 	authed := v1.Group("", auth.Middleware(authStore))
 
+	// Role gates. A viewer is read-only by design (AGENTS.md 3.15/B.3), so any
+	// route that changes a host — shell, file write, exec, docker, scan — needs
+	// at least operator, and host lifecycle stays with admin.
+	hostWrite := authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator))
+	adminOnly := authed.Group("", auth.RequireRole(auth.RoleAdmin))
+
 	// Hosts.
 	authed.GET("/hosts", h.listHosts)
 	authed.GET("/hosts/:id", h.getHost)
-	authed.DELETE("/hosts/:id", h.deleteHost)
-	authed.PUT("/hosts/:id/group", h.setHostGroup)
-	authed.PUT("/hosts/:id/tags", h.setHostTags)
+	adminOnly.DELETE("/hosts/:id", h.deleteHost)
+		adminOnly.PUT("/hosts/:id/group", h.setHostGroup)
+		adminOnly.PUT("/hosts/:id/tags", h.setHostTags)
+		adminOnly.PUT("/hosts/:id/billing", h.setHostBilling)
 
-	// Terminal.
-	authed.POST("/hosts/:id/terminals", h.openTerminal)
-	authed.POST("/hosts/:id/terminals/:sid/share", h.shareTerminal)
+	// Terminal. An interactive shell is full write access to the host.
+	hostWrite.POST("/hosts/:id/terminals", h.openTerminal)
+	hostWrite.POST("/hosts/:id/terminals/:sid/share", h.shareTerminal)
 
-	// Files.
+	// Files: reads are open to every role, writes are not.
 	authed.GET("/hosts/:id/files", h.fileList)
 	authed.GET("/hosts/:id/files/stat", h.fileStat)
-	authed.POST("/hosts/:id/files/mkdir", h.fileMkdir)
-	authed.POST("/hosts/:id/files/move", h.fileMove)
-	authed.POST("/hosts/:id/files/copy", h.fileCopy)
-	authed.DELETE("/hosts/:id/files", h.fileRemove)
 	authed.GET("/hosts/:id/files/download", h.fileDownload)
-	authed.POST("/hosts/:id/files/upload", h.fileUpload)
+	hostWrite.POST("/hosts/:id/files/mkdir", h.fileMkdir)
+	hostWrite.POST("/hosts/:id/files/move", h.fileMove)
+	hostWrite.POST("/hosts/:id/files/copy", h.fileCopy)
+	hostWrite.DELETE("/hosts/:id/files", h.fileRemove)
+	hostWrite.POST("/hosts/:id/files/upload", h.fileUpload)
 
 	// Exec (push command).
-	authed.POST("/hosts/:id/exec", h.execCommand)
-	authed.POST("/hosts/batch-exec", h.batchExec)
+	hostWrite.POST("/hosts/:id/exec", h.execCommand)
+	hostWrite.POST("/hosts/batch-exec", h.batchExec)
 
 	// Metrics.
 	authed.GET("/hosts/:id/metrics", h.getMetrics)
@@ -112,39 +163,108 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 
 	// SysInfo.
 	authed.GET("/hosts/:id/sysinfo/:kind", h.getSysInfo)
+	hostWrite.POST("/hosts/:id/processes/:pid/kill", h.killProcess)
 
-	// Docker.
+	// Docker: inspection is read-only, container/image operations are not.
 	authed.GET("/hosts/:id/docker/ps", h.dockerPs)
 	authed.GET("/hosts/:id/docker/images", h.dockerImages)
 	authed.GET("/hosts/:id/docker/all", h.dockerAll)
-	authed.POST("/hosts/:id/docker/:op", h.dockerOp)
+	authed.GET("/hosts/:id/docker/mirrors", h.dockerGetMirrors)
+	hostWrite.PUT("/hosts/:id/docker/mirrors", h.dockerSetMirrors)
+	hostWrite.POST("/hosts/:id/docker/:op", h.dockerOp)
 
-	// App Store & templates.
-	apps.NewHandlers(reg).Register(authed)
+	// App Store & templates. Installing an app or Docker runs commands on the
+	// host, so those routes require a role that may change host state and are
+	// recorded in the audit trail.
+	apps.NewHandlers(reg).Register(authed,
+		authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator), h.auditMutation()))
+
+	// Git-linked applications (Dokploy-style lifecycle: link repo, auto
+	// deploy on push, rollback, build log). Mutations are audited; the
+	// webhook endpoint is public with its own per-app token.
+	if appStore != nil {
+		appWrite := authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator), h.auditMutation())
+			appHandlers := apps.NewAppHandlers(reg, appStore, appEngine)
+			if gitProviderStore != nil {
+				appHandlers.SetGitProvider(gitProviderStore)
+			}
+			if aiAssistant != nil {
+			appHandlers.SetAI(func(ctx context.Context, command, stdout, stderr string, exitCode int32) (any, error) {
+				return aiAssistant.AnalyzeExecResult(ctx, command, stdout, stderr, exitCode)
+			})
+		}
+		appHandlers.RegisterAppRoutes(
+			authed.Group(""),
+			appWrite,
+			v1)
+		// Reverse-proxy domain binding (cert + nginx vhost distribution),
+		// available when both the app store and the cert hub are wired.
+		if certHub != nil {
+			ph := apps.NewProxyHandler(reg, appStore, certHub)
+			ph.SetNetworkStore(networkStore)
+			ph.Register(appWrite)
+		}
+	}
+
+	// SSL certificate hub (ACME DNS-01 via dns-mng). Certificate material is
+	// sensitive, so mutations (config, issue, renew, delete) stay admin-only
+	// and audited; reads are open to every authenticated role.
+	if certHub != nil {
+		cert.NewHandlers(certHub).Register(
+			authed.Group(""),
+			adminOnly.Group("", h.auditMutation()),
+		)
+	}
+
+	// Host & container volume snapshots / database hot-backup (阶段 3).
+	// Mutations execute commands on the managed host, so they require
+	// hostWrite and are audited.
+	if snapshotStore != nil {
+		snapshots.NewHandlers(reg, snapshotStore, snapshotEngine).Register(
+			authed.Group(""),
+			hostWrite.Group("", h.auditMutation()),
+		)
+	}
+
+	// Git provider integration (GitHub account authorization & repo selector).
+	if gitProviderStore != nil {
+		gitprovider.NewHandlers(gitProviderStore).Register(
+			authed.Group(""),
+			hostWrite.Group("", h.auditMutation()),
+		)
+	}
 
 	// Security scanning.
 	if scanStore != nil {
-		scan.NewHandlers(reg, scanStore, log).Register(authed)
+		scan.NewHandlers(reg, scanStore, log).Register(authed, hostWrite)
 	}
 
-	// Sessions (audit / recordings).
+	// Sessions (audit / recordings). Removing a recording destroys audit
+	// evidence, so only an admin may do it.
 	authed.GET("/sessions", h.listSessions)
 	authed.GET("/sessions/:id", h.getSession)
 	authed.GET("/sessions/:id/recording", h.getRecording)
-	authed.DELETE("/sessions/:id", h.deleteSession)
+	adminOnly.DELETE("/sessions/:id", h.deleteSession)
 
 	// Health.
 	authed.GET("/system/health", h.health)
 
 	// Agent upgrade.
-	authed.POST("/hosts/:id/upgrade", auth.RequireRole(auth.RoleAdmin), h.upgradeAgent)
+	adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
 
-	// Reverse TCP tunnels (dynamic networking).
-	h.registerTunnelRoutes(authed)
+	// Control-server binary hot self-upgrade (upload file/base64 binary).
+	adminOnly.POST("/system/upgrade", h.systemUpgrade)
+	adminOnly.POST("/system/restart", h.systemRestart)
+	adminOnly.POST("/system/upgrade-agents", h.upgradeAgentsBatch)
 
-	// User management (admin-only for mutating routes).
+	// User management (admin-only for mutating routes). Deleting an account
+	// also drops its terminal preferences, so a recreated account starts fresh.
 	if authStore != nil {
-		auth.NewHandlers(authStore).Register(authed.Group(""))
+		uh := auth.NewHandlers(authStore)
+		if prefsStore != nil {
+			uh.OnUserDeleted(prefsStore.Delete)
+		}
+		uh.Register(authed.Group("", h.auditMutation()))
 	}
 
 	// Alerts (rules + events + webhook).
@@ -154,7 +274,7 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 
 	// Credential vault (admin-only).
 	if vaultStore != nil {
-		vault.NewHandlers(vaultStore).Register(authed.Group(""))
+		vault.NewHandlers(vaultStore).Register(authed.Group("", h.auditMutation()))
 	}
 
 	// AI diagnostics.
@@ -164,7 +284,50 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 
 	// High-risk command control (policy + audit).
 	if policyStore != nil {
-		policy.NewHandlers(policyStore).Register(authed.Group(""))
+		policy.NewHandlers(policyStore).Register(
+			authed.Group("", h.auditMutation()),
+			adminOnly.Group("", h.auditMutation()),
+		)
+	}
+
+	// Unified operational audit trail (admin-only).
+	if auditStore != nil {
+		audit.NewHandlers(auditStore).Register(authed.Group("", auth.RequireRole(auth.RoleAdmin)))
+	}
+
+	// Saved-command library (used by 推送命令 and the settings page).
+	if commandStore != nil {
+		commands.NewHandlers(commandStore).Register(authed.Group("", h.auditMutation()))
+	}
+
+	// Host groups + per-group user authorization (mutations are admin-only).
+	if groupStore != nil {
+		groups.NewHandlers(groupStore, reg).Register(
+			authed.Group(""),
+			authed.Group("", auth.RequireRole(auth.RoleAdmin), h.auditMutation()),
+		)
+	}
+
+	// Per-user terminal preferences (theme / default shell / font).
+	if prefsStore != nil {
+		prefs.NewHandlers(prefsStore).Register(authed)
+	}
+
+	// Control-plane backup / restore. An archive contains every credential,
+	// recording and audit entry the server holds, and a restore rewrites all of
+	// them, so these routes are admin-only and always audited.
+	if backupStore != nil {
+		backup.NewHandlers(backupStore).Register(
+			authed.Group("", auth.RequireRole(auth.RoleAdmin), h.auditMutation()),
+		)
+	}
+
+	// Overlay networking (Tailscale / Headscale).
+	if networkStore != nil {
+		network.NewHandlers(networkStore, reg, auditStore).Register(
+			authed.Group(""),
+			hostWrite.Group("", h.auditMutation()),
+		)
 	}
 
 	// WebSocket endpoint (token via query param, since browsers can't set
@@ -199,12 +362,82 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 }
 
 type handlers struct {
-	reg     *rpc.Registry
-	log     *slog.Logger
-	sess    *session.Store
-	auth    *auth.Store
-	metrics *metrics.Store
-	policy  *policy.Store
+	reg      *rpc.Registry
+	log      *slog.Logger
+	sess     *session.Store
+	auth     *auth.Store
+	metrics  *metrics.Store
+	policy   *policy.Store
+	audit    *audit.Store
+	groups   *groups.Store
+	prefs    *prefs.Store
+	alertMon *alert.Monitor
+}
+
+// canSeeHost reports whether the caller is allowed to reach the given host,
+// based on the host's group and the caller's group grants. Users without any
+// grant (and admins) are unrestricted, so grouping stays optional.
+func (h *handlers) canSeeHost(c *gin.Context, a *rpc.Agent) bool {
+	if h.groups == nil || a == nil {
+		return true
+	}
+	return h.groups.CanAccessGroup(auth.Username(c), auth.RoleOf(c) == auth.RoleAdmin, a.Group)
+}
+
+// recordAudit appends a unified audit entry, auto-filling the acting user and
+// request metadata. Safe to call when auditing is disabled (nil store).
+func (h *handlers) recordAudit(c *gin.Context, action, targetType, targetID, detail, risk, result string) {
+	if h.audit == nil {
+		return
+	}
+	ip, ua := audit.RequestInfo(c.Request)
+	h.audit.Record(audit.Entry{
+		Username:   auth.Username(c),
+		Action:     action,
+		TargetType: targetType,
+		TargetID:   targetID,
+		Detail:     detail,
+		IP:         ip,
+		UserAgent:  ua,
+		RiskLevel:  risk,
+		Result:     result,
+	})
+}
+
+// loginWithAudit wraps the login handler so successful and failed console
+// logins are recorded in the audit trail (login runs before auth middleware,
+// so the username is taken from the request body).
+func (h *handlers) loginWithAudit(login gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var username string
+		if raw, err := io.ReadAll(c.Request.Body); err == nil {
+			var body struct {
+				Username string `json:"username"`
+			}
+			_ = json.Unmarshal(raw, &body)
+			username = body.Username
+			// Restore the body for the real handler.
+			c.Request.Body = io.NopCloser(bytes.NewReader(raw))
+		}
+		login(c)
+		if h.audit == nil {
+			return
+		}
+		result := audit.ResultSuccess
+		if c.Writer.Status() != http.StatusOK {
+			result = audit.ResultFailed
+		}
+		ip, ua := audit.RequestInfo(c.Request)
+		h.audit.Record(audit.Entry{
+			Username:   username,
+			Action:     "login",
+			TargetType: "system",
+			IP:         ip,
+			UserAgent:  ua,
+			RiskLevel:  audit.RiskMedium,
+			Result:     result,
+		})
+	}
 }
 
 func (h *handlers) enroll(c *gin.Context) {
@@ -228,6 +461,9 @@ func (h *handlers) listHosts(c *gin.Context) {
 	agents := h.reg.ListAgents()
 	out := make([]HostDTO, 0, len(agents))
 	for _, a := range agents {
+		if !h.canSeeHost(c, a) {
+			continue
+		}
 		out = append(out, h.toDTO(a))
 	}
 	c.JSON(http.StatusOK, gin.H{"data": out, "total": len(out)})
@@ -239,6 +475,10 @@ func (h *handlers) getHost(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "host not found"})
 		return
 	}
+	if !h.canSeeHost(c, a) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权访问该主机所属分组"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": h.toDTO(a)})
 }
 
@@ -247,6 +487,7 @@ func (h *handlers) deleteHost(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	h.recordAudit(c, "host_unbind", "host", c.Param("id"), "解绑并移除主机", audit.RiskHigh, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -262,6 +503,7 @@ func (h *handlers) setHostGroup(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	h.recordAudit(c, "host_group", "host", c.Param("id"), "设置分组: "+body.Group, audit.RiskLow, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -277,6 +519,21 @@ func (h *handlers) setHostTags(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	h.recordAudit(c, "host_tags", "host", c.Param("id"), "更新标签", audit.RiskLow, audit.ResultSuccess)
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *handlers) setHostBilling(c *gin.Context) {
+	var body rpc.HostBillingConfig
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.reg.SetAgentBilling(c.Param("id"), body); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	h.recordAudit(c, "host_billing", "host", c.Param("id"), "更新主机财务与流量配置", audit.RiskLow, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -298,6 +555,13 @@ func (h *handlers) openTerminal(c *gin.Context) {
 	}
 	_ = c.ShouldBindJSON(&body)
 
+	// An unspecified shell falls back to the caller's saved default, so the
+	// preference applies even when the request comes from a client that does
+	// not read preferences (share links, older UI, API scripts).
+	if body.Shell == "" && h.prefs != nil {
+		body.Shell = h.prefs.Get(auth.Username(c)).DefaultShell
+	}
+
 	sid := randomToken(12)
 	ws.RegisterSession(sid, agentID, body.Shell)
 	// Record the session start for audit.
@@ -305,6 +569,13 @@ func (h *handlers) openTerminal(c *gin.Context) {
 		operator := auth.Username(c)
 		h.sess.Start(sid, agentID, a.Hostname, operator)
 	}
+	shell := body.Shell
+	if shell == "" {
+		shell = "default"
+	}
+	h.recordAudit(c, "terminal_open", "host", agentID,
+		fmt.Sprintf("打开终端会话 %s (shell=%s, 主机=%s)", sid, shell, a.Hostname),
+		audit.RiskMedium, audit.ResultSuccess)
 	// Build the WS URL with the caller's token so the browser can authenticate.
 	wsURL := "/api/v1/ws/terminal/" + sid
 	if tok := c.Query("ws_token"); tok != "" {
@@ -346,6 +617,10 @@ func (h *handlers) shareTerminal(c *gin.Context) {
 		return
 	}
 
+	h.recordAudit(c, "terminal_share", "session", sid,
+		fmt.Sprintf("分享终端会话 (模式=%s, 有效期=%d分钟, 主机=%s)", body.Mode, body.ExpireMinutes, agentID),
+		audit.RiskMedium, audit.ResultSuccess)
+
 	c.JSON(http.StatusOK, gin.H{
 		"share_token": share.Token,
 		"share_code":  share.Code,
@@ -380,10 +655,10 @@ func (h *handlers) getShareInfo(c *gin.Context) {
 
 func (h *handlers) execCommand(c *gin.Context) {
 	var body struct {
-		Command   string `json:"command"`
-		Shell     string `json:"shell"`
-		Timeout   int32  `json:"timeout_sec"`
-		IsScript  bool   `json:"is_script"`
+		Command  string `json:"command"`
+		Shell    string `json:"shell"`
+		Timeout  int32  `json:"timeout_sec"`
+		IsScript bool   `json:"is_script"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -391,8 +666,12 @@ func (h *handlers) execCommand(c *gin.Context) {
 	}
 
 	// High-risk command policy check.
+	risk := audit.RiskLow
 	if h.policy != nil {
 		res := h.policy.Check(body.Command)
+		if res.RiskLevel == policy.RiskHigh {
+			risk = audit.RiskHigh
+		}
 		username := auth.Username(c)
 		hostID := c.Param("id")
 		if !res.Allowed {
@@ -400,6 +679,9 @@ func (h *handlers) execCommand(c *gin.Context) {
 				Username: username, HostID: hostID, Command: body.Command, Shell: body.Shell,
 				RiskLevel: res.RiskLevel, Result: "blocked", Reason: res.Reason,
 			})
+			h.recordAudit(c, "exec", "host", hostID,
+				"命令被策略拦截: "+body.Command+" ("+res.Reason+")",
+				audit.RiskHigh, audit.ResultBlocked)
 			c.JSON(http.StatusForbidden, gin.H{"error": res.Reason, "risk_level": res.RiskLevel, "matched_pattern": res.MatchedPattern})
 			return
 		}
@@ -408,6 +690,9 @@ func (h *handlers) execCommand(c *gin.Context) {
 				Username: username, HostID: hostID, Command: body.Command, Shell: body.Shell,
 				RiskLevel: res.RiskLevel, Result: "denied", Reason: "未确认高危命令",
 			})
+			h.recordAudit(c, "exec", "host", hostID,
+				"高危命令等待二次确认: "+body.Command,
+				audit.RiskHigh, audit.ResultBlocked)
 			c.JSON(http.StatusConflict, gin.H{
 				"error":           res.Reason,
 				"risk_level":      res.RiskLevel,
@@ -456,12 +741,31 @@ func (h *handlers) execCommand(c *gin.Context) {
 	})
 
 	defer hub.SetRespHandler(execID, nil)
+	// Wait long enough for the requested command. A one-liner defaults to 60s,
+	// but an install script (Docker, etc.) can legitimately run for minutes, so
+	// honor the caller's timeout_sec plus round-trip headroom, capped so a stuck
+	// command can't pin a goroutine indefinitely.
+	waitFor := 120 * time.Second
+	if body.Timeout > 0 {
+		waitFor = time.Duration(body.Timeout+30) * time.Second
+	}
+	if waitFor > 900*time.Second {
+		waitFor = 900 * time.Second
+	}
 	select {
 	case res := <-resultCh:
 		if res == nil {
+			h.recordAudit(c, "exec", "host", c.Param("id"), "执行命令失败(agent断开): "+body.Command, risk, audit.ResultFailed)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent disconnected"})
 			return
 		}
+		result := audit.ResultSuccess
+		if res.GetExitCode() != 0 || res.GetError() != "" {
+			result = audit.ResultFailed
+		}
+		h.recordAudit(c, "exec", "host", c.Param("id"),
+			fmt.Sprintf("执行命令 (shell=%s, 退出码=%d): %s", body.Shell, res.GetExitCode(), body.Command),
+			risk, result)
 		c.JSON(http.StatusOK, gin.H{
 			"exec_id":     res.GetExecId(),
 			"exit_code":   res.GetExitCode(),
@@ -470,7 +774,8 @@ func (h *handlers) execCommand(c *gin.Context) {
 			"duration_ms": res.GetDurationMs(),
 			"error":       res.GetError(),
 		})
-	case <-time.After(120 * time.Second):
+	case <-time.After(waitFor):
+		h.recordAudit(c, "exec", "host", c.Param("id"), "执行命令超时: "+body.Command, risk, audit.ResultFailed)
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "exec timeout"})
 	}
 }
@@ -488,14 +793,21 @@ func (h *handlers) batchExec(c *gin.Context) {
 	}
 
 	// High-risk command policy check (batch).
+	batchRisk := audit.RiskLow
 	if h.policy != nil {
 		res := h.policy.Check(body.Command)
+		if res.RiskLevel == policy.RiskHigh {
+			batchRisk = audit.RiskHigh
+		}
 		username := auth.Username(c)
 		if !res.Allowed {
 			h.policy.RecordAudit(policy.AuditEntry{
 				Username: username, HostIDs: body.HostIDs, Command: body.Command, Shell: body.Shell,
 				RiskLevel: res.RiskLevel, Result: "blocked", Reason: res.Reason,
 			})
+			h.recordAudit(c, "batch_exec", "host", strings.Join(body.HostIDs, ","),
+				fmt.Sprintf("批量命令被策略拦截 (%d 台主机): %s", len(body.HostIDs), body.Command),
+				audit.RiskHigh, audit.ResultBlocked)
 			c.JSON(http.StatusForbidden, gin.H{"error": res.Reason, "risk_level": res.RiskLevel, "matched_pattern": res.MatchedPattern})
 			return
 		}
@@ -504,6 +816,9 @@ func (h *handlers) batchExec(c *gin.Context) {
 				Username: username, HostIDs: body.HostIDs, Command: body.Command, Shell: body.Shell,
 				RiskLevel: res.RiskLevel, Result: "denied", Reason: "未确认高危命令",
 			})
+			h.recordAudit(c, "batch_exec", "host", strings.Join(body.HostIDs, ","),
+				fmt.Sprintf("批量高危命令等待二次确认 (%d 台主机): %s", len(body.HostIDs), body.Command),
+				audit.RiskHigh, audit.ResultBlocked)
 			c.JSON(http.StatusConflict, gin.H{
 				"error":           res.Reason,
 				"risk_level":      res.RiskLevel,
@@ -575,6 +890,19 @@ func (h *handlers) batchExec(c *gin.Context) {
 			results = append(results, result{Error: "timeout"})
 		}
 	}
+	failed := 0
+	for _, r := range results {
+		if r.Error != "" || r.ExitCode != 0 {
+			failed++
+		}
+	}
+	resultLabel := audit.ResultSuccess
+	if failed > 0 {
+		resultLabel = audit.ResultFailed
+	}
+	h.recordAudit(c, "batch_exec", "host", strings.Join(body.HostIDs, ","),
+		fmt.Sprintf("批量推送命令到 %d 台主机 (%d 台异常): %s", len(body.HostIDs), failed, body.Command),
+		batchRisk, resultLabel)
 	c.JSON(http.StatusOK, gin.H{"results": results})
 }
 
@@ -605,19 +933,19 @@ func (h *handlers) getMetrics(c *gin.Context) {
 		},
 	})
 	select {
-		case m := <-resultCh:
-			if m == nil {
-				if lm != nil {
-					c.JSON(http.StatusOK, metricsToJSON(lm))
-					return
-				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no metrics"})
+	case m := <-resultCh:
+		if m == nil {
+			if lm != nil {
+				c.JSON(http.StatusOK, metricsToJSON(lm))
 				return
 			}
-			if h.metrics != nil {
-				h.metrics.AddSample(c.Param("id"), m)
-			}
-			c.JSON(http.StatusOK, metricsToJSON(m))
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no metrics"})
+			return
+		}
+		if h.metrics != nil {
+			h.metrics.AddSample(c.Param("id"), m)
+		}
+		c.JSON(http.StatusOK, metricsToJSON(m))
 	case <-time.After(3 * time.Second):
 		hub.SetRespHandler("metrics-live", nil)
 		if lm != nil {
@@ -638,16 +966,27 @@ func metricsToJSON(m *agentpb.MetricsSample) gin.H {
 		})
 	}
 	return gin.H{
-		"ts":         m.GetTs(),
-		"cpu_usage":  m.GetCpuUsage(),
-		"mem_usage":  m.GetMemUsage(),
-		"mem_total":  m.GetMemTotal(),
-		"mem_used":   m.GetMemUsed(),
-		"net_rx":     m.GetNetRx(),
-		"net_tx":     m.GetNetTx(),
-		"disk_read":  m.GetDiskRead(),
-		"disk_write": m.GetDiskWrite(),
-		"mounts":     mounts,
+		"ts":              m.GetTs(),
+		"cpu_usage":       m.GetCpuUsage(),
+		"mem_usage":       m.GetMemUsage(),
+		"mem_total":       m.GetMemTotal(),
+		"mem_used":        m.GetMemUsed(),
+		"net_rx":          m.GetNetRx(),
+		"net_tx":          m.GetNetTx(),
+		"disk_read":       m.GetDiskRead(),
+		"disk_write":      m.GetDiskWrite(),
+		"mounts":          mounts,
+		"load1":           m.GetLoad1(),
+		"load5":           m.GetLoad5(),
+		"load15":          m.GetLoad15(),
+		"swap_total":      m.GetSwapTotal(),
+		"swap_used":       m.GetSwapUsed(),
+		"tcp_established": m.GetTcpEstablished(),
+		"udp_count":       m.GetUdpCount(),
+		"process_count":   m.GetProcessCount(),
+		"cpu_model":       m.GetCpuModel(),
+		"month_rx":        m.GetMonthRx(),
+		"month_tx":        m.GetMonthTx(),
 	}
 }
 
@@ -702,7 +1041,86 @@ func (h *handlers) getSysInfo(c *gin.Context) {
 		return
 	}
 	kind := c.Param("kind")
-	ref := "sysinfo:" + kind
+	if kind == "kill" {
+		// Killing is a mutation and has its own audited route; refuse to reach it
+		// through the read-only sysinfo path.
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请使用 POST /hosts/:id/processes/:pid/kill"})
+		return
+	}
+	h.sysInfoQuery(c, hub, &agentpb.SysInfoQuery{Kind: kind})
+}
+
+// killProcess terminates a single process on the target host. Admin/operator
+// only, group-scoped, and audited as a high-risk action.
+func (h *handlers) killProcess(c *gin.Context) {
+	a := h.reg.GetAgent(c.Param("id"))
+	if a == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "host not found"})
+		return
+	}
+	if !h.canSeeHost(c, a) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权访问该主机所属分组"})
+		return
+	}
+	pid, err := strconv.Atoi(c.Param("pid"))
+	if err != nil || pid <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "非法 PID"})
+		return
+	}
+	hub := h.reg.Hub(c.Param("id"))
+	if hub == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline"})
+		return
+	}
+
+	var body struct {
+		Force bool   `json:"force"`
+		Name  string `json:"name"`
+	}
+	_ = c.ShouldBindJSON(&body)
+
+	signal := "SIGTERM"
+	if body.Force {
+		signal = "SIGKILL"
+	}
+	detail := fmt.Sprintf("结束进程 PID=%d (%s)", pid, signal)
+	if body.Name != "" {
+		detail = fmt.Sprintf("结束进程 %s PID=%d (%s)", body.Name, pid, signal)
+	}
+
+	status, payload := h.sysInfoCall(hub, &agentpb.SysInfoQuery{
+		Kind:  "kill",
+		Pid:   int32(pid),
+		Force: body.Force,
+	})
+	result := audit.ResultSuccess
+	if status != http.StatusOK {
+		result = audit.ResultFailed
+	}
+	h.recordAudit(c, "process_kill", "host", c.Param("id"), detail, audit.RiskHigh, result)
+	if status != http.StatusOK {
+		c.JSON(status, gin.H{"error": string(payload)})
+		return
+	}
+	c.Data(http.StatusOK, "application/json", payload)
+}
+
+// sysInfoQuery issues a SysInfoQuery and writes the agent's raw JSON payload to
+// the response.
+func (h *handlers) sysInfoQuery(c *gin.Context, hub *rpc.Hub, q *agentpb.SysInfoQuery) {
+	status, payload := h.sysInfoCall(hub, q)
+	if status != http.StatusOK {
+		c.JSON(status, gin.H{"error": string(payload)})
+		return
+	}
+	// Return the raw JSON payload from the agent.
+	c.Data(http.StatusOK, "application/json", payload)
+}
+
+// sysInfoCall performs one request/response round trip over the agent hub. On
+// success it returns (200, jsonPayload); on failure (status, errorText).
+func (h *handlers) sysInfoCall(hub *rpc.Hub, q *agentpb.SysInfoQuery) (int, []byte) {
+	ref := "sysinfo:" + q.GetKind()
 	resultCh := make(chan []byte, 1)
 	hub.SetRespHandler(ref, func(msg *agentpb.AgentMessage) {
 		hub.SetRespHandler(ref, nil)
@@ -717,53 +1135,72 @@ func (h *handlers) getSysInfo(c *gin.Context) {
 			resultCh <- nil
 		}
 	})
-	hub.Send(&agentpb.ServerMessage{
-		Payload: &agentpb.ServerMessage_SysinfoQ{
-			SysinfoQ: &agentpb.SysInfoQuery{Kind: kind},
-		},
-	})
 	defer hub.SetRespHandler(ref, nil)
+
+	hub.Send(&agentpb.ServerMessage{
+		Payload: &agentpb.ServerMessage_SysinfoQ{SysinfoQ: q},
+	})
+
 	select {
 	case data := <-resultCh:
 		if data == nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no response"})
-			return
+			return http.StatusServiceUnavailable, []byte("no response")
 		}
-		// Return the raw JSON payload from the agent.
-		c.Data(http.StatusOK, "application/json", data)
+		// The agent reports failures as {"error":"..."} through the same channel.
+		var probe struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(data, &probe) == nil && probe.Error != "" {
+			return http.StatusInternalServerError, []byte(probe.Error)
+		}
+		return http.StatusOK, data
 	case <-time.After(10 * time.Second):
-		hub.SetRespHandler(ref, nil)
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "sysinfo timeout"})
+		return http.StatusGatewayTimeout, []byte("sysinfo timeout")
 	}
 }
 
 // ---- Docker ----------------------------------------------------------
 
 func (h *handlers) dockerPs(c *gin.Context) {
-	h.dockerCall(c, "ps", "")
+	h.dockerCall(c, "ps", "", "", nil)
 }
 
 func (h *handlers) dockerImages(c *gin.Context) {
-	h.dockerCall(c, "images", "")
+	h.dockerCall(c, "images", "", "", nil)
 }
 
 // dockerAll fetches containers + images in a single round trip to the agent
 // (op "ps_images"), collapsing two HTTP calls into one for the dashboard.
 func (h *handlers) dockerAll(c *gin.Context) {
-	h.dockerCall(c, "ps_images", "")
+	h.dockerCall(c, "ps_images", "", "", nil)
 }
 
 func (h *handlers) dockerOp(c *gin.Context) {
 	op := c.Param("op")
 	var body struct {
-		Container string `json:"container"`
-		Image     string `json:"image"`
+		Container string          `json:"container"`
+		Image     string          `json:"image"`
+		Args      json.RawMessage `json:"args_json"` // run op options (name/ports/volumes/env/...)
 	}
 	_ = c.ShouldBindJSON(&body)
-	h.dockerCall(c, op, body.Container, body.Image)
+	// Mutating docker operations are audited; read-only ones (ps/images) are not.
+	switch op {
+	case "start", "stop", "restart", "rm", "pull", "rmi", "prune", "remove_image", "run":
+		target := body.Container
+		if target == "" {
+			target = body.Image
+		}
+		risk := audit.RiskLow
+		if op == "rm" || op == "rmi" || op == "remove_image" || op == "prune" {
+			risk = audit.RiskHigh
+		}
+		h.recordAudit(c, "docker_op", "host", c.Param("id"),
+			fmt.Sprintf("Docker 操作 %s %s", op, target), risk, audit.ResultSuccess)
+	}
+	h.dockerCall(c, op, body.Container, body.Image, body.Args)
 }
 
-func (h *handlers) dockerCall(c *gin.Context, op, container string, image ...string) {
+func (h *handlers) dockerCall(c *gin.Context, op, container, image string, argsJSON []byte) {
 	hub := h.reg.Hub(c.Param("id"))
 	if hub == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline"})
@@ -779,17 +1216,14 @@ func (h *handlers) dockerCall(c *gin.Context, op, container string, image ...str
 		}
 		resultCh <- msg.GetDocker()
 	})
-	img := ""
-	if len(image) > 0 {
-		img = image[0]
-	}
 	hub.Send(&agentpb.ServerMessage{
 		Payload: &agentpb.ServerMessage_DockerOp{
 			DockerOp: &agentpb.DockerOp{
 				OpId:      opID,
 				Op:        op,
 				Container: container,
-				Image:     img,
+				Image:     image,
+				ArgsJson:  argsJSON,
 			},
 		},
 	})
@@ -809,6 +1243,19 @@ func (h *handlers) dockerCall(c *gin.Context, op, container string, image ...str
 		// not a single JSON document, so try line-by-line parsing as a
 		// fallback before returning the raw text.
 		payload := ev.GetPayloadJson()
+		// ps/images are lists. `docker --format {{json .}}` prints one object per
+		// line, so a single container is a valid standalone JSON object while two
+		// or more are NDJSON. Parsing the document first would hand the browser
+		// an object in the one-container case and render an empty table, so list
+		// ops are always normalised to an array.
+		if op == "ps" || op == "images" {
+			rows := parseNDJSON(payload)
+			if rows == nil {
+				rows = []any{}
+			}
+			c.JSON(http.StatusOK, gin.H{"ok": true, "data": rows})
+			return
+		}
 		var parsed any
 		if json.Unmarshal(payload, &parsed) == nil {
 			c.JSON(http.StatusOK, gin.H{"ok": true, "data": parsed})
@@ -822,11 +1269,12 @@ func (h *handlers) dockerCall(c *gin.Context, op, container string, image ...str
 	}
 }
 
-// dockerOpTimeout returns the HTTP-side wait budget for a docker op. Pulls
-// can take minutes, so match the agent's longer budget instead of forcing a
-// 504 at 30s while the agent keeps working.
+// dockerOpTimeout returns the HTTP-side wait budget for a docker op. Pulls can
+// take minutes, and `docker run` pulls a missing image before creating the
+// container, so both match the agent's longer budget instead of forcing a 504
+// at 30s while the agent keeps working.
 func dockerOpTimeout(op string) time.Duration {
-	if op == "pull" {
+	if op == "pull" || op == "run" {
 		return 5 * time.Minute
 	}
 	return 30 * time.Second
@@ -854,12 +1302,221 @@ func parseNDJSON(raw []byte) []any {
 	return rows
 }
 
+// dockerGetMirrors reads the Docker daemon registry-mirrors configuration from the agent.
+func (h *handlers) dockerGetMirrors(c *gin.Context) {
+	hostID := c.Param("id")
+	hub := h.reg.Hub(hostID)
+	if hub == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline"})
+		return
+	}
+
+	cmd := `if [ -f /etc/docker/daemon.json ]; then cat /etc/docker/daemon.json; else echo "{}"; fi`
+	shell := "sh"
+	agent := h.reg.GetAgent(hostID)
+	if agent != nil && strings.Contains(strings.ToLower(agent.OS), "windows") {
+		cmd = `$p = "$env:ProgramData\Docker\config\daemon.json"; if (Test-Path $p) { Get-Content $p -Raw } else { "{}" }`
+		shell = "powershell"
+	}
+
+	execID := randomToken(8)
+	resultCh := make(chan *agentpb.ExecResult, 1)
+	hub.SetRespHandler(execID, func(msg *agentpb.AgentMessage) {
+		hub.SetRespHandler(execID, nil)
+		if msg != nil {
+			resultCh <- msg.GetExecResult()
+		} else {
+			resultCh <- nil
+		}
+	})
+
+	hub.Send(&agentpb.ServerMessage{
+		Payload: &agentpb.ServerMessage_Exec{
+			Exec: &agentpb.ExecRequest{
+				ExecId:     execID,
+				Shell:      shell,
+				Command:    cmd,
+				IsScript:   false,
+				TimeoutSec: 15,
+			},
+		},
+	})
+	defer hub.SetRespHandler(execID, nil)
+
+	select {
+	case res := <-resultCh:
+		if res == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent disconnected"})
+			return
+		}
+		if res.GetExitCode() != 0 {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read daemon.json: " + string(res.GetStderr())})
+			return
+		}
+		var daemonCfg struct {
+			RegistryMirrors []string `json:"registry-mirrors"`
+		}
+		out := bytes.TrimSpace(res.GetStdout())
+		if len(out) > 0 {
+			_ = json.Unmarshal(out, &daemonCfg)
+		}
+		if daemonCfg.RegistryMirrors == nil {
+			daemonCfg.RegistryMirrors = []string{}
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true, "mirrors": daemonCfg.RegistryMirrors})
+	case <-time.After(20 * time.Second):
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "timeout reading mirrors from host"})
+	}
+}
+
+// dockerSetMirrors updates the Docker daemon registry-mirrors configuration on the agent and reloads Docker.
+func (h *handlers) dockerSetMirrors(c *gin.Context) {
+	hostID := c.Param("id")
+	hub := h.reg.Hub(hostID)
+	if hub == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline"})
+		return
+	}
+
+	var body struct {
+		Mirrors []string `json:"mirrors"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	cleanMirrors := make([]string, 0, len(body.Mirrors))
+	for _, m := range body.Mirrors {
+		m = strings.TrimSpace(m)
+		if m != "" {
+			cleanMirrors = append(cleanMirrors, m)
+		}
+	}
+
+	mirrorsJSON, _ := json.Marshal(cleanMirrors)
+	agent := h.reg.GetAgent(hostID)
+	isWindows := agent != nil && strings.Contains(strings.ToLower(agent.OS), "windows")
+
+	var cmd, shell string
+	if isWindows {
+		shell = "powershell"
+		cmd = fmt.Sprintf(`$cfgPath = "$env:ProgramData\Docker\config\daemon.json"
+$dir = Split-Path $cfgPath
+if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+$cfg = @{}
+if (Test-Path $cfgPath) {
+    try { $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json -AsHashtable } catch { $cfg = @{} }
+}
+$m = '%s' | ConvertFrom-Json
+$cfg["registry-mirrors"] = $m
+$cfg | ConvertTo-Json -Depth 10 | Set-Content $cfgPath -Encoding UTF8
+Restart-Service docker -ErrorAction SilentlyContinue
+`, string(mirrorsJSON))
+	} else {
+		shell = "sh"
+		cmd = fmt.Sprintf(`set -e
+mkdir -p /etc/docker
+CFG="/etc/docker/daemon.json"
+if [ ! -f "$CFG" ]; then
+    echo "{}" > "$CFG"
+fi
+python3 -c '
+import json, sys
+cfg_path = "/etc/docker/daemon.json"
+mirrors = json.loads(sys.argv[1])
+try:
+    with open(cfg_path, "r") as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data["registry-mirrors"] = mirrors
+with open(cfg_path, "w") as f:
+    json.dump(data, f, indent=2)
+' '%s' 2>/dev/null || perl -MJSON::PP -e '
+my $path = "/etc/docker/daemon.json";
+my $mirrors = decode_json($ARGV[0]);
+my $data = {};
+if (open my $fh, "<", $path) {
+    local $/;
+    eval { $data = decode_json(<$fh>); };
+    close $fh;
+}
+$data->{"registry-mirrors"} = $mirrors;
+open my $out, ">", $path;
+print $out encode_json($data);
+close $out;
+' '%s' 2>/dev/null || {
+    echo "{\"registry-mirrors\": %s}" > "$CFG"
+}
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl reload docker || systemctl restart docker || true
+elif command -v service >/dev/null 2>&1; then
+    service docker reload || service docker restart || true
+fi
+`, string(mirrorsJSON), string(mirrorsJSON), string(mirrorsJSON))
+	}
+
+	execID := randomToken(8)
+	resultCh := make(chan *agentpb.ExecResult, 1)
+	hub.SetRespHandler(execID, func(msg *agentpb.AgentMessage) {
+		hub.SetRespHandler(execID, nil)
+		if msg != nil {
+			resultCh <- msg.GetExecResult()
+		} else {
+			resultCh <- nil
+		}
+	})
+
+	hub.Send(&agentpb.ServerMessage{
+		Payload: &agentpb.ServerMessage_Exec{
+			Exec: &agentpb.ExecRequest{
+				ExecId:     execID,
+				Shell:      shell,
+				Command:    cmd,
+				IsScript:   true,
+				TimeoutSec: 30,
+			},
+		},
+	})
+	defer hub.SetRespHandler(execID, nil)
+
+	select {
+	case res := <-resultCh:
+		if res == nil {
+			h.recordAudit(c, "docker_mirrors", "host", hostID, "更新镜像加速失败(agent断开)", audit.RiskLow, audit.ResultFailed)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent disconnected"})
+			return
+		}
+		if res.GetExitCode() != 0 {
+			errStr := res.GetError()
+			if errStr == "" {
+				errStr = string(res.GetStderr())
+			}
+			h.recordAudit(c, "docker_mirrors", "host", hostID, fmt.Sprintf("更新镜像加速失败: %s", errStr), audit.RiskLow, audit.ResultFailed)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update daemon.json: " + errStr})
+			return
+		}
+		h.recordAudit(c, "docker_mirrors", "host", hostID, fmt.Sprintf("配置 Docker 镜像加速: %v", cleanMirrors), audit.RiskLow, audit.ResultSuccess)
+		c.JSON(http.StatusOK, gin.H{"ok": true, "mirrors": cleanMirrors})
+	case <-time.After(35 * time.Second):
+		h.recordAudit(c, "docker_mirrors", "host", hostID, "更新镜像加速超时", audit.RiskLow, audit.ResultFailed)
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "timeout updating mirrors on host"})
+	}
+}
+
 // ---- Agent Upgrade ---------------------------------------------------
 
 func (h *handlers) upgradeAgent(c *gin.Context) {
-	hub := h.reg.Hub(c.Param("id"))
+	agentID := c.Param("id")
+	hub := h.reg.Hub(agentID)
 	if hub == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline"})
+		return
+	}
+	a := h.reg.GetAgent(agentID)
+	if a == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "host not found"})
 		return
 	}
 
@@ -868,15 +1525,27 @@ func (h *handlers) upgradeAgent(c *gin.Context) {
 		Sha256  string `json:"sha256"`
 	}
 	_ = c.ShouldBindJSON(&body)
+	if body.Version == "" {
+		body.Version = CurrentAgentVersion
+	}
 
 	// Build the binary download URL from the server's own address.
 	scheme := "http"
-	if c.Request.TLS != nil {
+	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
 		scheme = "https"
 	}
 	host := c.Request.Host
+
+	osName := strings.ToLower(a.OS)
+	if osName == "" {
+		osName = "linux"
+	}
+	archName := strings.ToLower(a.Arch)
+	if archName == "" {
+		archName = "amd64"
+	}
 	binaryURL := fmt.Sprintf("%s://%s/api/v1/agent/binary?os=%s&arch=%s",
-		scheme, host, "linux", "amd64") // agent OS; for MVP we assume linux agents
+		scheme, host, osName, archName)
 
 	// Collect upgrade progress messages.
 	progressCh := make(chan *agentpb.UpgradeProgress, 16)
@@ -891,13 +1560,17 @@ func (h *handlers) upgradeAgent(c *gin.Context) {
 	})
 	defer hub.SetRespHandler("upgrade", nil)
 
+	// Suppress offline and reconnect alerts for this host during the upgrade window
+	if h.alertMon != nil {
+		h.alertMon.SetHostMaintenance(agentID, 180*time.Second, "agent_upgrade")
+	}
+
 	hub.Send(&agentpb.ServerMessage{
 		Payload: &agentpb.ServerMessage_Upgrade{
 			Upgrade: &agentpb.UpgradeRequest{
-				Version:   body.Version,
-				Url:       binaryURL,
-				Sha256:    body.Sha256,
-				Signature: signUpgrade(body.Version, body.Sha256),
+				Version: body.Version,
+				Url:     binaryURL,
+				Sha256:  body.Sha256,
 			},
 		},
 	})
@@ -916,8 +1589,8 @@ loop:
 			lastProgress = p
 			if p.GetError() != "" {
 				c.JSON(http.StatusInternalServerError, gin.H{
-					"error":  p.GetError(),
-					"stage":  p.GetStage(),
+					"error": p.GetError(),
+					"stage": p.GetStage(),
 				})
 				return
 			}
@@ -930,11 +1603,81 @@ loop:
 		}
 	}
 
+	h.recordAudit(c, "agent_upgrade", "host", c.Param("id"),
+		fmt.Sprintf("升级 Agent 到 %s", body.Version), audit.RiskMedium, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{
 		"ok":      true,
 		"version": body.Version,
 		"message": "upgrade complete, agent restarting",
 	})
+}
+
+// ---- Audit helper for user/policy/vault mutations ---------------------
+
+// auditMutation wraps admin mutation route groups and records successful
+// writes to the unified audit trail. GETs and failed requests are skipped;
+// the action name is derived from the HTTP method + route pattern.
+func (h *handlers) auditMutation() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Next()
+		if h.audit == nil || c.Request.Method == http.MethodGet || c.Writer.Status() >= 400 {
+			return
+		}
+		action, ok := deriveMutationAction(c.Request.Method, c.FullPath())
+		if !ok {
+			return
+		}
+		risk := audit.RiskMedium
+		switch action {
+		case "user_delete", "policy_update", "docker_install",
+			"system_restore", "system_backup_delete":
+			risk = audit.RiskHigh
+		}
+		// Host-scoped routes carry :id; user routes carry :username; the rest
+		// (backups, groups, commands) name their target with :name or :id.
+		targetType, targetID := "system", c.Param("username")
+		if id := c.Param("id"); id != "" {
+			targetType, targetID = "host", id
+		}
+		if targetID == "" {
+			targetID = c.Param("name")
+		}
+		h.recordAudit(c, action, targetType, targetID,
+			c.Request.Method+" "+c.FullPath(), risk, audit.ResultSuccess)
+	}
+}
+
+// deriveMutationAction maps an HTTP method + gin route pattern to a concrete
+// audit action name.
+func deriveMutationAction(method, pattern string) (string, bool) {
+	type rule struct{ method, pattern, action string }
+	rules := []rule{
+		{http.MethodPost, "/api/v1/users", "user_create"},
+		{http.MethodPut, "/api/v1/users/:username/password", "user_password"},
+		{http.MethodPut, "/api/v1/users/:username/role", "user_role"},
+		{http.MethodPost, "/api/v1/users/:username/reset-password", "user_reset_password"},
+		{http.MethodDelete, "/api/v1/users/:username", "user_delete"},
+		{http.MethodPut, "/api/v1/policy/command", "policy_update"},
+		{http.MethodPost, "/api/v1/hosts/:id/apps/install", "app_install"},
+		{http.MethodDelete, "/api/v1/hosts/:id/apps/:name", "app_uninstall"},
+		{http.MethodPost, "/api/v1/hosts/:id/docker/install-script", "docker_install"},
+		// Control-plane backup / restore: a restore rewrites the whole dataset,
+		// so it is recorded as a high-risk action.
+		{http.MethodPost, "/api/v1/system/backup", "system_backup"},
+		{http.MethodDelete, "/api/v1/system/backups/:name", "system_backup_delete"},
+		{http.MethodPost, "/api/v1/system/backups/:name/restore", "system_restore"},
+		{http.MethodPost, "/api/v1/system/restore", "system_restore"},
+	}
+	for _, r := range rules {
+		if method == r.method && pattern == r.pattern {
+			return r.action, true
+		}
+	}
+	// Vault credential mutations share one pattern family.
+	if strings.HasPrefix(pattern, "/api/v1/vault") {
+		return "vault_op", true
+	}
+	return "", false
 }
 
 // ---- Sessions / Audit ------------------------------------------------
@@ -945,7 +1688,26 @@ func (h *handlers) listSessions(c *gin.Context) {
 		return
 	}
 	list := h.sess.List()
-	c.JSON(http.StatusOK, gin.H{"data": list, "total": len(list)})
+	total := len(list)
+	// Optional paging. Without page_size the full list is returned, so existing
+	// callers keep working; total always reports the unpaged count so the client
+	// can render a page count.
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	pageSize, _ := strconv.Atoi(c.Query("page_size"))
+	if pageSize > 0 {
+		if offset < 0 {
+			offset = 0
+		}
+		if offset > total {
+			offset = total
+		}
+		end := offset + pageSize
+		if end > total {
+			end = total
+		}
+		list = list[offset:end]
+	}
+	c.JSON(http.StatusOK, gin.H{"data": list, "total": total})
 }
 
 func (h *handlers) getSession(c *gin.Context) {
@@ -979,8 +1741,11 @@ func (h *handlers) getRecording(c *gin.Context) {
 
 	// Serve cached recording if available.
 	if path := h.sess.RecordingPath(sid); path != "" {
-		c.File(path)
-		return
+		if raw, err := os.ReadFile(path); err == nil && len(raw) > 0 {
+			normalized := normalizeCastRecording(raw, sess.Duration)
+			c.Data(http.StatusOK, "application/json", normalized)
+			return
+		}
 	}
 
 	// Fetch from agent: the agent records to <recordDir>/<sid>.cast. We request
@@ -1062,7 +1827,70 @@ loop:
 
 	// Cache it.
 	_ = h.sess.SaveRecording(sid, allData)
-	c.Data(http.StatusOK, "application/json", allData)
+	normalized := normalizeCastRecording(allData, sess.Duration)
+	c.Data(http.StatusOK, "application/json", normalized)
+}
+
+// normalizeCastRecording inspects an asciicast v2 file, ensures the header contains
+// the session duration, and appends a closing event timestamp if missing, so the
+// replay player's scrubber accurately covers the entire session lifetime rather
+// than stopping after the last keyboard activity.
+func normalizeCastRecording(raw []byte, durationSec int64) []byte {
+	if len(raw) == 0 {
+		return raw
+	}
+	lines := bytes.Split(raw, []byte("\n"))
+	if len(lines) == 0 {
+		return raw
+	}
+
+	// Parse header
+	var header map[string]any
+	if err := json.Unmarshal(lines[0], &header); err != nil {
+		return raw
+	}
+
+	if durationSec > 0 {
+		header["duration"] = float64(durationSec)
+		if hb, err := json.Marshal(header); err == nil {
+			lines[0] = hb
+		}
+	}
+
+	// Find the timestamp of the last event
+	var lastEventTime float64
+	for i := len(lines) - 1; i >= 1; i-- {
+		line := bytes.TrimSpace(lines[i])
+		if len(line) == 0 {
+			continue
+		}
+		var evt []any
+		if err := json.Unmarshal(line, &evt); err == nil && len(evt) >= 2 {
+			if t, ok := evt[0].(float64); ok {
+				lastEventTime = t
+				break
+			}
+		}
+	}
+
+	// If the recorded events cut off earlier than the session duration, append
+	// an EOF close frame so the player timeline reaches the full duration.
+	if durationSec > 0 && float64(durationSec) > lastEventTime {
+		closeEvt := []any{float64(durationSec), "o", ""}
+		if cb, err := json.Marshal(closeEvt); err == nil {
+			// Find trailing non-empty line
+			var filtered [][]byte
+			for _, l := range lines {
+				if len(bytes.TrimSpace(l)) > 0 {
+					filtered = append(filtered, l)
+				}
+			}
+			filtered = append(filtered, cb)
+			return append(bytes.Join(filtered, []byte("\n")), '\n')
+		}
+	}
+
+	return raw
 }
 
 func (h *handlers) deleteSession(c *gin.Context) {
@@ -1082,9 +1910,13 @@ func (h *handlers) deleteSession(c *gin.Context) {
 
 func (h *handlers) health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"ok":      true,
-		"agents":  len(h.reg.ListAgents()),
-		"version": "0.1.0-dev",
+		"ok":                   true,
+		"agents":               len(h.reg.ListAgents()),
+		"version":              version.Get(),
+		"agent_latest_version": CurrentAgentVersion,
+		"os":                   runtime.GOOS,
+		"arch":                 runtime.GOARCH,
+		"online_agents":        h.reg.CountOnline(),
 	})
 }
 
@@ -1110,11 +1942,21 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 		Uptime:     a.Uptime,
 		CPUCores:   a.CPUCores,
 		MemTotal:   a.MemTotal,
-		InternalIP: a.InternalIP,
-		PublicIP:   a.PublicIP,
-		Location:   a.Location,
-	}
-	// Surface the real OS uptime and latest metrics
+			InternalIP:      a.InternalIP,
+			PublicIP:        a.PublicIP,
+			Location:        a.Location,
+			Price:           a.Price,
+			Currency:        a.Currency,
+			BillingCycle:    a.BillingCycle,
+			ExpiresAt:       a.ExpiresAt,
+			AutoRenewal:     a.AutoRenewal,
+			TrafficLimitGB:  a.TrafficLimitGB,
+			TrafficCalcType: a.TrafficCalcType,
+			TrafficResetDay: a.TrafficResetDay,
+			RenewalURL:      a.RenewalURL,
+			Notes:           a.Notes,
+		}
+		// Surface the real OS uptime and latest metrics
 	if hub := h.reg.Hub(a.ID); hub != nil {
 		if m := hub.LastMetrics(); m != nil {
 			if m.GetUptime() > 0 {
@@ -1122,6 +1964,13 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 			}
 			if m.GetMemTotal() > 0 {
 				dto.MemTotal = m.GetMemTotal()
+			}
+			dto.CpuModel = m.GetCpuModel()
+			dto.Load1 = m.GetLoad1()
+			dto.MonthRx = m.GetMonthRx()
+			dto.MonthTx = m.GetMonthTx()
+			if m.GetSwapTotal() > 0 {
+				dto.SwapUsage = float64(m.GetSwapUsed()) / float64(m.GetSwapTotal()) * 100
 			}
 		}
 	}
@@ -1173,3 +2022,223 @@ func randomToken(n int) string {
 
 // avoid unused import
 var _ = fmt.Sprintf
+
+// UpgradePayload defines the JSON body for uploading a new server binary.
+type UpgradePayload struct {
+	Data string `json:"data"` // Base64 encoded binary
+}
+
+// systemUpgrade accepts either a multipart/form-data upload or a base64-encoded binary,
+// replaces the running watchman-server binary atomically, announces maintenance to all agents,
+// and instructs the operator or system to restart the process.
+func (h *handlers) systemUpgrade(c *gin.Context) {
+	self, err := os.Executable()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	target, err := filepath.EvalSymlinks(self)
+	if err != nil {
+		target = self
+	}
+
+	dir := filepath.Dir(target)
+	tmp := filepath.Join(dir, fmt.Sprintf("watchman-server.upgrade.%d", time.Now().UnixNano()))
+
+	var fileSize int64
+	contentType := c.GetHeader("Content-Type")
+
+	if strings.Contains(contentType, "multipart/form-data") {
+		fileHeader, err := c.FormFile("file")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请选择上传的文件: " + err.Error()})
+			return
+		}
+		fileSize = fileHeader.Size
+		src, err := fileHeader.Open()
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "打开上传文件失败: " + err.Error()})
+			return
+		}
+		defer src.Close()
+
+		dst, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("创建临时文件失败: %v", err)})
+			return
+		}
+		defer dst.Close()
+
+		if _, err := io.Copy(dst, src); err != nil {
+			os.Remove(tmp)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("写入文件失败: %v", err)})
+			return
+		}
+	} else {
+		// Fallback: JSON base64
+		var body UpgradePayload
+		if err := c.ShouldBindJSON(&body); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的上传参数"})
+			return
+		}
+		raw, err := base64.StdEncoding.DecodeString(body.Data)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid base64 data"})
+			return
+		}
+		fileSize = int64(len(raw))
+		if err := os.WriteFile(tmp, raw, 0755); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("写入临时文件失败: %v", err)})
+			return
+		}
+	}
+
+	// Safety backup of existing binary
+	bakPath := filepath.Join(dir, fmt.Sprintf("watchman-server.bak.%d", time.Now().Unix()))
+	_ = os.Rename(target, bakPath)
+
+	// Atomic rename to replace the running binary
+	if err := os.Rename(tmp, target); err != nil {
+		// Rollback if possible
+		_ = os.Rename(bakPath, target)
+		os.Remove(tmp)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("原子替换二进制失败: %v", err)})
+		return
+	}
+	_ = os.Chmod(target, 0755)
+
+	// Broadcast maintenance notice to all agents beforehand
+	h.reg.BroadcastMaintenance("server_upgrade", 180)
+
+	h.recordAudit(c, "update", "system", "server_binary",
+		fmt.Sprintf("上传新版本控制端二进制并原子替换 (大小: %d 字节)", fileSize),
+		audit.RiskHigh, audit.ResultSuccess)
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":       true,
+		"message":  "控制端二进制已成功替换并备份旧版！系统已向全网 Agent 下发维护预告，请点击平滑重启生效。",
+		"path":     target,
+		"size":     fileSize,
+		"bak_path": bakPath,
+	})
+}
+
+// systemRestart initiates graceful server restart under systemd / supervisor.
+func (h *handlers) systemRestart(c *gin.Context) {
+	h.reg.BroadcastMaintenance("server_restart", 120)
+	h.recordAudit(c, "restart", "system", "watchman-server",
+		"触发控制端平滑重启流程 (maintenance handshake)",
+		audit.RiskHigh, audit.ResultSuccess)
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      true,
+		"message": "已广播停机维护预告，正在触发控制端平滑重载...",
+	})
+
+	go func() {
+		time.Sleep(1 * time.Second)
+		p, err := os.FindProcess(os.Getpid())
+		if err == nil {
+			_ = p.Signal(os.Interrupt)
+		}
+	}()
+}
+
+// upgradeAgentsBatch pushes an upgrade to several hosts at once. Every target
+// gets a maintenance window first so the restart does not page anyone.
+func (h *handlers) upgradeAgentsBatch(c *gin.Context) {
+	var body struct {
+		HostIDs []string `json:"host_ids"` // optional; empty = all outdated online hosts
+		Force   bool     `json:"force"`    // re-push even to hosts already on the current version
+	}
+	_ = c.ShouldBindJSON(&body)
+
+	allAgents := h.reg.ListAgents()
+	var targets []*rpc.Agent
+
+	if len(body.HostIDs) > 0 {
+		targetMap := make(map[string]bool)
+		for _, id := range body.HostIDs {
+			targetMap[id] = true
+		}
+		for _, a := range allAgents {
+			if targetMap[a.ID] && a.Status == "online" {
+				targets = append(targets, a)
+			}
+		}
+	} else {
+		for _, a := range allAgents {
+			// Force is needed for dev builds, where every binary reports the
+			// same version and nothing would ever look outdated.
+			if a.Status != "online" {
+				continue
+			}
+			if body.Force || a.Version != CurrentAgentVersion {
+				targets = append(targets, a)
+			}
+		}
+	}
+
+	if len(targets) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"ok":      true,
+			"message": "没有需要升级的在线 Agent 主机",
+			"count":   0,
+		})
+		return
+	}
+
+	scheme := "http"
+	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
+		scheme = "https"
+	}
+	// TODO(server.public_url): the download URL is derived from the request's
+	// Host header, which a client controls. Once the documented
+	// server.public_url setting exists it must take precedence here, otherwise
+	// a crafted Host header can point agents at an attacker-supplied binary.
+	hostHeader := c.Request.Host
+
+	dispatched := make([]string, 0, len(targets))
+	for _, a := range targets {
+		hub := h.reg.Hub(a.ID)
+		if hub == nil {
+			continue
+		}
+
+		// Suppress offline/online alert noise during the upgrade
+		if h.alertMon != nil {
+			h.alertMon.SetHostMaintenance(a.ID, 180*time.Second, "agent_upgrade")
+		}
+
+		osName := strings.ToLower(a.OS)
+		if osName == "" {
+			osName = "linux"
+		}
+		archName := strings.ToLower(a.Arch)
+		if archName == "" {
+			archName = "amd64"
+		}
+		binaryURL := fmt.Sprintf("%s://%s/api/v1/agent/binary?os=%s&arch=%s", scheme, hostHeader, osName, archName)
+
+		hub.Send(&agentpb.ServerMessage{
+			Payload: &agentpb.ServerMessage_Upgrade{
+				Upgrade: &agentpb.UpgradeRequest{
+					Version: CurrentAgentVersion,
+					Url:     binaryURL,
+				},
+			},
+		})
+		dispatched = append(dispatched, a.Hostname)
+	}
+
+	h.recordAudit(c, "batch_upgrade", "system", "agents",
+		fmt.Sprintf("批量升级 %d 台在线 Agent 到最新版本 %s", len(dispatched), CurrentAgentVersion),
+		audit.RiskMedium, audit.ResultSuccess)
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      true,
+		"message": fmt.Sprintf("已成功向 %d 台主机下发升级任务，已自动开启 3 分钟维护静默期", len(dispatched)),
+		"count":   len(dispatched),
+		"hosts":   dispatched,
+	})
+}

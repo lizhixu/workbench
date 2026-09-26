@@ -1,6 +1,6 @@
 import { http, unwrap } from './http'
 
-export type RuleType = 'offline' | 'cpu_high' | 'mem_high' | 'disk_high' | 'anomaly'
+export type RuleType = 'offline' | 'online' | 'cpu_high' | 'mem_high' | 'disk_high' | 'anomaly'
 export type Severity = 'info' | 'warning' | 'critical'
 
 export interface AlertRule {
@@ -65,10 +65,32 @@ export function ackAllEvents() {
   return unwrap<{ ok: boolean }>(http.post('/alerts/events/ack-all'))
 }
 
+export function deleteEvent(id: string) {
+  return unwrap<{ ok: boolean }>(http.delete(`/alerts/events/${id}`))
+}
+
+export function clearEvents(resolvedOnly = false) {
+  return unwrap<{ ok: boolean }>(http.delete('/alerts/events', { params: { resolved_only: resolvedOnly } }))
+}
+
 export function getWebhook() {
   return unwrap<{ data: WebhookConfig }>(http.get('/alerts/webhook')).then((r) => r.data)
 }
 
 export function setWebhook(config: WebhookConfig) {
   return unwrap<{ ok: boolean }>(http.put('/alerts/webhook', config))
+}
+
+export interface WebhookTestResult {
+  ok: boolean
+  platform: 'dingtalk' | 'wecom' | 'feishu' | 'generic'
+  status_code: number
+  duration_ms: number
+  message?: string
+  error?: string
+  response?: string
+}
+
+export function testWebhook(config?: Partial<WebhookConfig>) {
+  return unwrap<WebhookTestResult>(http.post('/alerts/webhook/test', config || {}))
 }

@@ -203,11 +203,23 @@ func compileAll(patterns []string) []*regexp.Regexp {
 	return out
 }
 
-// GetPolicy returns a copy of the current policy.
+// GetPolicy returns a copy of the current policy. Pattern lists are always
+// non-nil: a nil slice marshals to JSON `null`, and clients that iterate or
+// read `.length` on it break.
 func (s *Store) GetPolicy() Policy {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.policy
+	p := s.policy
+	if p.Blacklist == nil {
+		p.Blacklist = []string{}
+	}
+	if p.Whitelist == nil {
+		p.Whitelist = []string{}
+	}
+	if p.HighRiskPatterns == nil {
+		p.HighRiskPatterns = []string{}
+	}
+	return p
 }
 
 // SetPolicy updates the policy, recompiles patterns, and persists.
@@ -250,6 +262,15 @@ func (s *Store) Check(command string) *CheckResult {
 	}
 
 	return &CheckResult{Allowed: true, RiskLevel: RiskLow, Reason: "ok"}
+}
+
+// CheckRisk is a flattened adapter over Check for consumers (the AI planner)
+// that only need the risk classification, without importing the CheckResult
+// type. It returns the risk level string, whether the command is blocked
+// outright, whether it needs confirmation, and the matched pattern.
+func (s *Store) CheckRisk(command string) (riskLevel string, blocked bool, needsConfirm bool, matchedPattern string) {
+	res := s.Check(command)
+	return string(res.RiskLevel), !res.Allowed, res.NeedsConfirm, res.MatchedPattern
 }
 
 // RecordAudit appends an audit entry and persists.

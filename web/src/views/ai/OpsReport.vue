@@ -1,23 +1,21 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import {
-  NSpace,
   NButton,
   NIcon,
   NSelect,
   NSpin,
   NEmpty,
-  NCard,
   NTag,
   NProgress,
   useMessage,
 } from 'naive-ui'
 import {
-  DocumentTextOutline,
   RefreshOutline,
   SparklesOutline,
   TimeOutline,
   AlertCircleOutline,
+  CopyOutline,
 } from '@vicons/ionicons5'
 import {
   generateOpsReport,
@@ -27,6 +25,10 @@ import {
 import { listHosts } from '../../api/hosts'
 import type { Host } from '../../api/types'
 import { useWorkspaceStore } from '../../stores/workspace'
+import { copyToClipboard } from '../../utils/clipboard'
+
+// KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
+defineOptions({ name: 'OpsReport' })
 
 const message = useMessage()
 const workspace = useWorkspaceStore()
@@ -112,6 +114,26 @@ function formatTime(t: string): string {
   }
 }
 
+async function copyReportText() {
+  if (!currentReport.value) return
+  const r = currentReport.value
+  const text = [
+    `【AI 运维健康报告】`,
+    `健康评分: ${r.health_score.toFixed(0)} / 100 (${healthStatus(r.health_score)})`,
+    `报告周期: ${r.period} | 主机数: ${r.host_reports.length}`,
+    `生成时间: ${formatTime(r.generated_at)}`,
+    `\n摘要:\n${r.summary}`,
+    r.suggestions?.length ? `\n改进建议:\n${r.suggestions.map((s, i) => `${i + 1}. ${s}`).join('\n')}` : '',
+  ].filter(Boolean).join('\n')
+
+  const ok = await copyToClipboard(text)
+  if (ok) {
+    message.success('已复制运维报告内容到剪贴板')
+  } else {
+    message.error('复制失败，请手动选中复制')
+  }
+}
+
 onMounted(() => {
   workspace.openTab({
     key: '/ai/report',
@@ -129,9 +151,7 @@ onMounted(() => {
     <!-- Header -->
     <div class="report-header">
       <div class="header-left">
-        <NIcon size="20" color="#6366f1"><DocumentTextOutline /></NIcon>
-        <span class="page-title">AI 运维报告</span>
-        <span class="page-desc">自动聚合主机健康度、告警与资源趋势，AI 撰写摘要与建议</span>
+        <h2 class="page-title">AI 运维报告</h2>
       </div>
       <div class="header-right">
         <NSelect
@@ -210,12 +230,22 @@ onMounted(() => {
             </div>
             <div class="score-info">
               <div class="info-row">
-                <NTag size="small" :type="currentReport.health_score >= 80 ? 'success' : currentReport.health_score >= 60 ? 'warning' : 'error'" bordered="false">
+                <NTag size="small" :type="currentReport.health_score >= 80 ? 'success' : currentReport.health_score >= 60 ? 'warning' : 'error'" :bordered="false">
                   {{ healthStatus(currentReport.health_score) }}
                 </NTag>
                 <span class="info-meta">报告周期: {{ currentReport.period }}</span>
                 <span class="info-meta">主机数: {{ currentReport.host_reports.length }}</span>
                 <span class="info-meta">生成时间: {{ formatTime(currentReport.generated_at) }}</span>
+                <NButton
+                  size="tiny"
+                  secondary
+                  type="primary"
+                  style="margin-left: auto"
+                  @click="copyReportText"
+                >
+                  <template #icon><NIcon :component="CopyOutline" /></template>
+                  复制报告
+                </NButton>
               </div>
               <div class="summary-text">{{ currentReport.summary }}</div>
             </div>
@@ -236,7 +266,7 @@ onMounted(() => {
                     v-if="hr.alerts > 0"
                     size="tiny"
                     type="error"
-                    bordered="false"
+                    :bordered="false"
                   >
                     <template #icon><NIcon><AlertCircleOutline /></NIcon></template>
                     {{ hr.alerts }}
@@ -280,7 +310,6 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   height: 100%;
-  padding: 16px;
   box-sizing: border-box;
   gap: 14px;
 
@@ -296,14 +325,10 @@ onMounted(() => {
       gap: 8px;
 
       .page-title {
+        margin: 0;
         font-size: 18px;
         font-weight: 700;
         color: var(--text-primary);
-      }
-
-      .page-desc {
-        font-size: 12px;
-        color: var(--text-secondary);
       }
     }
 
@@ -558,6 +583,57 @@ onMounted(() => {
         font-size: 13px;
         line-height: 1.6;
         color: var(--text-primary);
+      }
+    }
+  }
+}
+
+/* ===================== 移动端适配 ===================== */
+@media (max-width: 768px) {
+  .ops-report-view {
+    gap: 10px;
+
+    .report-header {
+      flex-wrap: wrap;
+      gap: 8px;
+
+      .header-right {
+        width: 100%;
+        flex-wrap: wrap;
+
+        :deep(.n-select) {
+          flex: 1;
+          min-width: 120px;
+        }
+      }
+    }
+
+    /* 侧栏历史报告列表 → 顶部横向滚动条 */
+    .report-body {
+      flex-direction: column;
+    }
+
+    .report-sidebar {
+      width: 100%;
+      max-height: 150px;
+      display: flex;
+      flex-direction: row;
+      align-items: flex-start;
+      gap: 8px;
+      overflow-x: auto;
+      overflow-y: hidden;
+
+      .sidebar-title {
+        flex-shrink: 0;
+        margin-bottom: 0;
+        margin-right: 4px;
+        align-self: center;
+      }
+
+      .report-list-item {
+        min-width: 140px;
+        flex-shrink: 0;
+        margin-bottom: 0;
       }
     }
   }

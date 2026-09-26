@@ -25,6 +25,7 @@ export interface EnrollResponse {
   enroll_token: string
   expires_in: number
   install: string
+  install_win?: string
 }
 
 export interface Host {
@@ -45,6 +46,36 @@ export interface Host {
   internal_ip?: string
   public_ip?: string
   location?: string
+  // Extended live metrics from the agent's latest sample.
+  cpu_model?: string
+  load1?: number
+  swap_usage?: number
+  month_rx?: number
+  month_tx?: number
+  // Optional billing & traffic quota configurations
+  price?: number
+  currency?: string
+  billing_cycle?: string
+  expires_at?: string
+  auto_renewal?: boolean
+  traffic_limit_gb?: number
+  traffic_calc_type?: 'both' | 'out' | 'in' | string
+  traffic_reset_day?: number
+  renewal_url?: string
+  notes?: string
+}
+
+export interface HostBillingConfig {
+  price?: number
+  currency?: string
+  billing_cycle?: string
+  expires_at?: string
+  auto_renewal?: boolean
+  traffic_limit_gb?: number
+  traffic_calc_type?: 'both' | 'out' | 'in' | string
+  traffic_reset_day?: number
+  renewal_url?: string
+  notes?: string
 }
 
 export interface ListResponse<T> {
@@ -55,7 +86,11 @@ export interface ListResponse<T> {
 export interface HealthResponse {
   ok: boolean
   agents: number
+  online_agents?: number
   version: string
+  agent_latest_version?: string
+  os?: string
+  arch?: string
 }
 
 // ---- Terminal ----
@@ -110,6 +145,18 @@ export interface Metrics {
   disk_read: number
   disk_write: number
   mounts: Mount[]
+  // Extended metrics (zero/absent on older agents).
+  load1?: number
+  load5?: number
+  load15?: number
+  swap_total?: number
+  swap_used?: number
+  tcp_established?: number
+  udp_count?: number
+  process_count?: number
+  cpu_model?: string
+  month_rx?: number
+  month_tx?: number
 }
 
 // ---- Docker ----

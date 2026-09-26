@@ -51,6 +51,43 @@ export function analyzeExec(command: string, stdout: string, stderr: string, exi
   ).then((r) => r.data)
 }
 
+// ---- Multi-step task planning (Terminal AI Copilot) ----
+
+export interface TaskPlanStep {
+  index: number
+  title: string
+  description: string
+  command: string
+  risk_level: 'low' | 'medium' | 'high'
+  needs_confirm: boolean
+  probe?: boolean
+  continue_on_error?: boolean
+  matched_pattern?: string
+}
+
+export interface TaskPlan {
+  title: string
+  goal: string
+  os: string
+  distro: string
+  arch: string
+  shell: string
+  summary: string
+  risk_level: 'low' | 'medium' | 'high'
+  steps: TaskPlanStep[]
+  source: 'blueprint' | 'llm'
+  model?: string
+}
+
+// planTask asks the server to break an operational intent (e.g. "安装 docker")
+// into an ordered, host-tailored multi-step plan. The server prefers built-in
+// offline blueprints and falls back to the configured LLM.
+export function planTask(prompt: string, hostId?: string) {
+  return unwrap<{ data: TaskPlan }>(
+    http.post('/ai/plan', { prompt, host_id: hostId }, { timeout: 120000 }),
+  ).then((r) => r.data)
+}
+
 // ---- Ops report & natural language Q&A (P3) ----
 
 export interface ChatMessage {

@@ -52,7 +52,8 @@ web/
     │   ├── exec.ts           # /exec/tasks, /commands (常用命令库)
     │   ├── monitor.ts        # /hosts/:id/metrics, /alerts, /alert-rules
     │   ├── sysinfo.ts        # /hosts/:id/processes, /ports, /users, /logins
-    │   ├── docker.ts         # /hosts/:id/apps, /docker/containers, /docker/images (P2)
+    │   ├── docker.ts         # /hosts/:id/docker/*, /docker/install-script (P2)
+    │   ├── apps.ts           # /apps CRUD/部署/回滚/历史, /apps/catalog, /apps/:id/proxy (P2)
     │   ├── security.ts       # /security/scans, /vulnerabilities (P3)
     │   ├── cloud.ts          # /cloud/accounts, /cloud/assets (P2)
     │   ├── network.ts        # /networks/join, /networks/topology (P2)
@@ -99,10 +100,13 @@ web/
     │   │   ├── Sysinfo.vue             # 进程清单 / 网络端口 / 系统账号 / 登录历史
     │   │   ├── Terminal.vue            # 多标签终端 + 远程协助 Modal
     │   │   ├── Files.vue               # 文件导航面包屑 + 虚拟树 + 上传/编辑
-    │   │   ├── Docker.vue              # (P2) Docker 容器与镜像管理
+    │   │   ├── Docker.vue              # (P2) Docker 容器与镜像管理（观测运维；部署走应用中心）
     │   │   ├── Vulnerabilities.vue     # (P3) 服务器漏洞与安全基线
-    │   │   ├── Apps.vue                # (P2) 应用市场一键部署
     │   │   └── CloudAssets.vue         # (P2) 云资产与云账号绑定
+    │   ├── apps/
+    │   │   ├── AppList.vue            # (P2) 应用中心列表
+    │   │   ├── AppCreate.vue          # (P2) 统一创建入口（模板/单镜像/Compose/Git）
+    │   │   └── AppDetail.vue          # (P2) 应用详情（部署历史/域名反代/拓扑）
     │   ├── exec/ExecPush.vue           # 批量命令推送与常用命令库
     │   ├── sessions/SessionList.vue    # 会话审计列表 + asciinema 回放
     │   ├── alerts/
@@ -132,10 +136,12 @@ web/
   ├ /hosts/:id/sysinfo                  Sysinfo.vue（系统状态与进程清单）
   ├ /hosts/:id/terminal                 Terminal.vue（在线终端与远程协助）
   ├ /hosts/:id/files                    Files.vue（文件管理）
-  ├ /hosts/:id/docker                   (P2) Docker.vue
-  ├ /hosts/:id/apps                     (P2) Apps.vue
+  ├ /hosts/:id/docker                   (P2) Docker.vue（容器/镜像观测运维）
   ├ /hosts/:id/vulnerabilities          (P3) Vulnerabilities.vue
   └ /hosts/:id/cloud                    (P2) CloudAssets.vue
+/apps                                   AppList.vue（应用中心列表）
+  ├ /apps/create                        AppCreate.vue（统一创建：模板/单镜像/Compose/Git）
+  └ /apps/:id                           AppDetail.vue（应用详情与域名反代）
 /exec                                   ExecPush.vue（批量推送命令）
 /sessions                               SessionList.vue（会话历史与回放）
 /alerts                                 AlertList.vue（告警列表）
@@ -308,18 +314,27 @@ web/
 
 ### 6.6 Docker 管理 `(P2)` `/hosts/:id/docker` (与 Agent.md 3.4 对齐，参截图 `7efe160649be740f6818f79b0511c9ca.png`)
 
+> Docker 面板定位为运行时观测与运维，不再承担应用部署入口——所有新建服务统一走 6.7 应用中心（`/apps/create`）。
+
 #### 功能点
 - **容器管理**：子 Tab `容器`。展示 Checkbox、`状态` (Green Pill `运行中 4月9天` / Red Pill `已停止`)、`名称` (容器名 + ID 如 `plex 2a0a02d23c1`)、`镜像` (`linuxserver/plex:...`)、`资源使用` (`CPU 0.2%, 内存 165.7 MB`)、`暴露端口`、`创建时间`。支持启动、停止、重启、查看日志、一键进入容器终端及批量操作。
-- **镜像管理**：子 Tab `镜像`。列表展示镜像 ID、Tag、大小、创建时间；支持单个删除、批量清理无用镜像 (Prune)。
+- **纳管状态列**：识别容器 `watchman.app=<appID>` 标签——应用中心部署的容器显示「应用中心纳管」并可跳转应用详情；标签对应应用已删除显示警告；外部/临时容器如实标注。
+- **部署新应用**：容器页签工具栏的「部署新应用」按钮跳转 `/apps/create?host_id=<当前主机>`（预选目标主机），由应用中心完成创建部署。
+- **镜像管理**：子 Tab `镜像`。列表展示镜像 ID、Tag、大小、创建时间；支持单个删除、批量清理无用镜像 (Prune)、拉取镜像（输入 `repo:tag`）；工具栏提供「镜像加速」入口，支持查看与修改 `daemon.json` 中的 `registry-mirrors`，内置常用国内加速源快捷添加，保存后平滑重载 Docker 守护进程。
 - **一键安装 Docker**：如主机未装 Docker，控制端检测后提供「一键安装 Docker」按钮。
 
 ---
 
-### 6.7 应用市场 `(P2)` `/hosts/:id/apps` (与 Agent.md 3.7 对齐)
+### 6.7 应用中心 `(P2)` `/apps` (与 Agent.md 3.7 对齐)
+
+> 原主机级「应用市场」Tab（`/hosts/:id/apps`）已废弃删除，全部部署能力收敛到全局应用中心。
 
 #### 功能点
-- **一键部署**：提供 Nginx、Redis、MySQL、雷池 WAF 社区版等应用卡片。点击安装后基于 `params_schema` 动态渲染参数表单，提交后在目标主机以 Docker 容器化拉起。
-- **应用管理**：展示已安装应用列表，提供启停、重启、日志查看、卸载及修改配置。
+- **统一创建入口** (`/apps/create`)：四种部署来源卡片——应用模板（Nginx/Redis/MySQL/雷池 WAF 等，`GET /apps/catalog` 声明式目录，动态渲染参数表单）、单镜像（输入 `repo:tag`）、Compose 编排（在线 YAML）、Git 仓库（GitHub 授权选择或手动 URL，支持 Webhook 自动部署）。
+- **端口绑定范围**：每条端口映射可选「公网开放」（绑定 0.0.0.0）或「仅异地组网」（只绑定主机 Tailscale IP，公网不可达），联动展示所选主机的组网 IP。
+- **创建时绑定域名**：填写域名与反代模式（节点本地 / 统一网关），提交依次执行 创建应用 → 自动签发证书（默认 ACME 账户）→ 下发 Nginx 反代并热加载；绑定失败不回滚应用。
+- **应用管理**：应用列表/详情支持部署、回滚、启停、查看构建日志、部署历史、AI 排障诊断；健康检查探活失败自动保留旧版本（`-next`/`-prev` 滚动替换）。
+- **流量拓扑展示**：详情页「域名与反代」页签可视化 `公网用户 → 网关节点 (Nginx/SSL) → Tailscale 内网 → 应用容器`，网关模式下应用主机无需公网 IP。
 
 ---
 
@@ -450,3 +465,40 @@ web/
 ### 8.2 代码质量与编译零错误防线 (与 Agent.md 第 7 节对齐)
 - **严格类型校验**：Vue Template 与 TS 脚本严格无类型错误，避免使用废弃 Emoji 表情或断句字符。
 - **构建验证**：任何前端改动须通过 `vue-tsc --noEmit` 与 `vite build` 验证，确保编译零 Error / 零 Warning。
+
+---
+
+## 9. 前端页面布局与组件开发规范
+
+### 9.1 组件选用准则：优先使用 Naive UI 原生组件，非必要不封装
+- **核心原则**：所有视图与交互设计中，**一律优先使用 Naive UI 原生组件库**（`NCard`, `NDataTable`, `NTabs`, `NTabPane`, `NButton`, `NSpace`, `NTag`, `NModal`, `NAlert`, `NInput`, `NSelect`, `NRadioGroup` 等），**非必要绝不二次封装**或手写自定义 `div` 模拟组件结构。
+- **杜绝低效套壳**：严禁无意义地对 Naive UI 原生控件包一层壳作为私有组件；业务组件仅在跨多页面复用高度特化业务逻辑时方可封装（如终端 `TerminalPane`、资源曲线 `MetricsPane` 等）。
+- **统一主题感知**：原生组件深度绑定 Naive UI 的运行时暗色/亮色主题与 CSS 变量（如 `--bg-card`, `--border-color`, `--text-primary` 等），杜绝因私自定义类脱离主题变量而导致的色彩断层或样式漂移。
+
+### 9.2 页面标题规范：外层单文字标题体系
+- **标准语法**：凡具备独立页面标题的视图，统一在主视口外层顶栏左侧使用单文字 `<h2 class="page-title">标题名</h2>`，右侧配合 `NSpace` 承载页面级全局操作按钮组（如刷新、新增等）。
+- **四项杜绝规范**：
+  1. **杜绝中英文混排**：禁止出现 `(Tailscale / Headscale)` 等冗长括号英文，统一使用简炼中文（如 `异地组网`）。
+  2. **杜绝图标混排**：标题文字前禁止附加各类修饰性 `NIcon`，保持极简统一的纯文本层级。
+  3. **杜绝标题下方副标题说明**：取消标题下方的 `page-desc` 说明段落，界面交互以直观功能为主，必要说明使用 `NAlert` 或字段 Tooltip 呈现。
+  4. **杜绝文字塞在卡片内部**：严禁将整页主标题写在 `<NCard title="推送命令">` 或内层卡片中；主标题必须外提至视口顶部，卡片内仅保留表单/表格内容。
+
+### 9.3 多页签与表格布局规范：Tab 与表格卡片分层架构
+- **标准参考**：以「消息与告警中心（`AlertList.vue`）」为标准布局规范模板（快照备份 `SnapshotList.vue`、证书中心 `CertList.vue` 均已完成对齐）。
+- **分层拓扑架构**：
+  1. **顶层容器**：`.page-flex-column` 纵向 flex 撑满视口，`overflow: hidden`。
+  2. **页面顶栏**：`.page-header`（左侧单文字标题，右侧操作按钮组）。
+  3. **全局 Tab 栏**：使用独立的 `.tabs-container` 包裹 `<NTabs type="line">`，**严禁将 Tab 塞进表格内部或放在卡片容器内**。
+  4. **页签内容区**：各个 `NTabPane` 内部由 `.tab-pane-content` 承载，若有指引则上方放 `NAlert`，下方紧跟 `<NCard :bordered="false" class="table-flex-fill">`。
+  5. **表格自适应撑满**：表格统一设置 `flex-height` 和 `:bordered="false"`，结合 `.table-flex-fill` 与全局 flex 穿透样式，让表头与分页条牢牢钉在视口两端，仅数据区纵向滚动。
+
+### 9.4 表格容器视觉规范：统一背景色与消除多余外边框
+- **背景色绝对统一**：表格与主容器卡片一律统一使用系统标准卡片背景变量 `var(--bg-card)`（暗色 `#131b2e`，亮色 `#ffffff`），严禁使用任意无主题感知的 `rgba(128, 128, 128, 0.06)` 等伪背景。
+- **消除多余外边框**：表格卡片容器严禁添加外层实线边框（如禁止出现 `border: 1px solid var(--border-color);` 与外层生硬的 `padding`），消除突兀内缩矩形框，保持平整、沉浸的云控制台视觉风格。
+
+### 9.5 顶部 Workspace 多页签拖拽排序交互规范
+- **原生零依赖**：利用 HTML5 Drag and Drop 原生机制（`draggable="true"`, `@dragstart`, `@dragover`, `@drop`, `@dragend`），无需额外三方库。
+- **动态位移感知**：计算鼠标距离当前目标 item 左边缘的距离，按 `< width/2` 动态判断放置到当前 item 的左侧 (`left`) 或右侧 (`right`)。
+- **清晰指示线**：通过 `.drop-left::before` 与 `.drop-right::after` 伪元素在间隙处绘制品牌色垂直指示线，源节点半透明展示；关闭按钮加 `@mousedown.stop` 防止误触拖拽。
+- **Store 顺序持久响应**：在 Pinia `workspace` store 中执行 `moveTab`，通过 `splice` 自动修正索引偏移，确保顶部工作区与组件激活状态平滑响应。
+

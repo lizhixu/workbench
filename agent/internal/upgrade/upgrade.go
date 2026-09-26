@@ -36,7 +36,8 @@ type Manager struct {
 	busy   bool
 	// pubKey pins the Ed25519 public key allowed to sign upgrades.
 	// Nil means "sha256 only" (not recommended for production).
-	pubKey ed25519.PublicKey
+	pubKey    ed25519.PublicKey
+	onSuccess func() // callback before exit/restart, e.g. record state
 }
 
 // NewManager creates an upgrade manager.
@@ -63,6 +64,11 @@ func (m *Manager) SetPublicKeyHEX(hexKey string) error {
 	}
 	m.pubKey = ed25519.PublicKey(raw)
 	return nil
+}
+
+// SetOnSuccess registers a callback executed just before restart.
+func (m *Manager) SetOnSuccess(fn func()) {
+	m.onSuccess = fn
 }
 
 // SetSender wires the live connection.
@@ -143,6 +149,10 @@ func (m *Manager) doUpgrade(req *agentpb.UpgradeRequest) {
 	m.log.Info("upgrade complete, restarting", "version", req.GetVersion())
 	m.progress("restarting", 1, "")
 
+	if m.onSuccess != nil {
+		m.onSuccess()
+	}
+
 	// Trigger restart in a separate goroutine so the progress message can flush.
 	go func() {
 		time.Sleep(1 * time.Second)
@@ -186,25 +196,41 @@ func (m *Manager) replaceSelf(newBin string) error {
 	if err != nil {
 		return err
 	}
-	// On Windows, we can't overwrite a running exe directly; rename self first.
+	selfDir := filepath.Dir(self)
+	staging := filepath.Join(selfDir, fmt.Sprintf(".%s.new-%d", filepath.Base(self), time.Now().UnixNano()))
+
+	// 1. Copy new binary to staging file in the same directory (ensures same filesystem).
+	if err := copyFile(newBin, staging); err != nil {
+		_ = os.Remove(staging)
+		return fmt.Errorf("stage new binary: %w", err)
+	}
+	_ = os.Chmod(staging, 0o755)
+
+	// 2. On Windows, a running executable cannot be unlinked or overwritten in place;
+	// rename the running executable first, then replace.
 	if runtime.GOOS == "windows" {
 		old := self + ".old"
 		_ = os.Remove(old)
 		if err := os.Rename(self, old); err != nil {
-			return fmt.Errorf("rename old: %w", err)
+			_ = os.Remove(staging)
+			return fmt.Errorf("rename running binary: %w", err)
 		}
-		if err := copyFile(newBin, self); err != nil {
-			// Try to restore.
+		if err := os.Rename(staging, self); err != nil {
+			// Try rollback.
 			_ = os.Rename(old, self)
-			return fmt.Errorf("copy new: %w", err)
+			_ = os.Remove(staging)
+			return fmt.Errorf("replace binary: %w", err)
 		}
 		_ = os.Remove(old)
 	} else {
-		if err := copyFile(newBin, self); err != nil {
-			return fmt.Errorf("copy: %w", err)
+		// On Linux/Unix, unlink or atomic rename over a running text-busy executable
+		// is fully supported by the kernel, while in-place truncation open() triggers ETXTBSY.
+		if err := os.Rename(staging, self); err != nil {
+			_ = os.Remove(staging)
+			return fmt.Errorf("atomic rename replace: %w", err)
 		}
-		_ = os.Chmod(self, 0o755)
 	}
+
 	_ = os.Remove(newBin)
 	return nil
 }

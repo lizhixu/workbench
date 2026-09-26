@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, computed, h } from 'vue'
 import {
-  NCard, NButton, NSpace, NTable, NTag, NModal, NForm, NFormItem,
+  NCard, NButton, NSpace, NTag, NModal, NForm, NFormItem, NDataTable,
   NInput, NSelect, NPopconfirm, useMessage, NIcon, NEmpty,
+  type DataTableColumns,
 } from 'naive-ui'
 import {
   AddCircleOutline, RefreshOutline, KeyOutline, TrashOutline,
@@ -10,6 +11,10 @@ import {
 import type { Role, UserRecord } from '../../api/types'
 import { listUsers, createUser, updateUserRole, deleteUser, resetPassword } from '../../api/users'
 import { useAuthStore } from '../../stores/auth'
+import { useTablePagination } from '../../composables/useTablePagination'
+
+// KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
+defineOptions({ name: 'UserList' })
 
 const message = useMessage()
 const auth = useAuthStore()
@@ -22,6 +27,9 @@ const showReset = ref(false)
 const form = ref({ username: '', password: '', role: 'operator' as Role })
 const resetTarget = ref('')
 const newPassword = ref('')
+
+const userCount = computed(() => users.value.length)
+const { pagination, resetPage } = useTablePagination({ pageSize: 20, rowCount: userCount })
 
 const roleOptions = [
   { label: '管理员 (admin)', value: 'admin' },
@@ -41,11 +49,77 @@ function roleLabel(role: Role) {
   return '只读'
 }
 
+const isAdmin = () => auth.role === 'admin'
+
+const columns = computed<DataTableColumns<UserRecord>>(() => [
+  {
+    title: '用户名',
+    key: 'username',
+    minWidth: 180,
+    render: (u) =>
+      h(NSpace, { size: 6, align: 'center', wrapItem: false }, {
+        default: () => [
+          h('span', { class: 'username-text' }, u.username),
+          u.username === auth.user?.username
+            ? h(NTag, { size: 'tiny', type: 'info', round: true }, { default: () => '我' })
+            : null,
+        ],
+      }),
+  },
+  {
+    title: '角色',
+    key: 'role',
+    width: 190,
+    render: (u) =>
+      isAdmin() && u.username !== auth.user?.username
+        ? h(NSelect, {
+            value: u.role,
+            options: roleOptions,
+            size: 'small',
+            style: 'width: 160px',
+            'onUpdate:value': (v: Role) => doRoleChange(u, v),
+          })
+        : h(NTag, { type: roleTagType(u.role), size: 'small', round: true }, { default: () => roleLabel(u.role) }),
+  },
+  {
+    title: '创建时间',
+    key: 'created_at',
+    width: 180,
+    render: (u) => h('span', { class: 'muted' }, u.created_at?.slice(0, 19).replace('T', ' ') || '-'),
+  },
+  {
+    title: '操作',
+    key: 'actions',
+    width: 200,
+    render: (u) =>
+      h(NSpace, { size: 4, wrapItem: false }, {
+        default: () => [
+          isAdmin()
+            ? h(NButton, { size: 'small', quaternary: true, onClick: () => openReset(u.username) }, {
+                icon: () => h(NIcon, { component: KeyOutline }),
+                default: () => '重置密码',
+              })
+            : null,
+          isAdmin() && u.username !== auth.user?.username
+            ? h(NPopconfirm, { onPositiveClick: () => doDelete(u.username) }, {
+                trigger: () => h(NButton, { size: 'small', quaternary: true, type: 'error' }, {
+                  icon: () => h(NIcon, { component: TrashOutline }),
+                  default: () => '删除',
+                }),
+                default: () => `确认删除用户 ${u.username}？`,
+              })
+            : null,
+        ],
+      }),
+  },
+])
+
 async function refresh() {
   loading.value = true
   try {
     const res = await listUsers()
     users.value = res.data || []
+    resetPage()
   } catch (e: any) {
     message.error(e.message)
   } finally {
@@ -109,8 +183,6 @@ async function doDelete(username: string) {
   }
 }
 
-const isAdmin = () => auth.role === 'admin'
-
 onMounted(() => {
   if (isAdmin()) refresh()
   else message.warning('需要管理员权限')
@@ -118,10 +190,11 @@ onMounted(() => {
 </script>
 
 <template>
-  <NSpace vertical :size="16">
-    <NSpace align="center" justify="space-between">
+  <div class="user-view page-flex-column">
+    <div class="user-toolbar">
       <h2 class="page-title">用户管理</h2>
-      <NSpace>
+      <NSpace align="center" :size="12">
+        <span class="muted">共 {{ userCount }} 个用户</span>
         <NButton @click="refresh" :loading="loading">
           <template #icon><NIcon :component="RefreshOutline" /></template>
           刷新
@@ -131,62 +204,26 @@ onMounted(() => {
           新增用户
         </NButton>
       </NSpace>
-    </NSpace>
+    </div>
 
-    <NCard>
-      <NEmpty v-if="users.length === 0 && !loading" description="暂无用户" />
-      <NTable v-else :single-line="false">
-        <thead>
-          <tr>
-            <th>用户名</th>
-            <th>角色</th>
-            <th>创建时间</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="u in users" :key="u.id">
-            <td class="username-cell">
-              {{ u.username }}
-              <NTag v-if="u.username === auth.user?.username" size="tiny" type="info" round>我</NTag>
-            </td>
-            <td>
-              <NSelect
-                v-if="isAdmin() && u.username !== auth.user?.username"
-                :value="u.role"
-                :options="roleOptions"
-                size="small"
-                style="width: 160px"
-                @update:value="(v: Role) => doRoleChange(u, v)"
-              />
-              <NTag v-else :type="roleTagType(u.role)" size="small" round>{{ roleLabel(u.role) }}</NTag>
-            </td>
-            <td class="muted">{{ u.created_at?.slice(0, 19).replace('T', ' ') }}</td>
-            <td>
-              <NSpace :size="4">
-                <NButton size="small" quaternary @click="openReset(u.username)" v-if="isAdmin()">
-                  <template #icon><NIcon :component="KeyOutline" /></template>
-                  重置密码
-                </NButton>
-                <NPopconfirm
-                  v-if="isAdmin() && u.username !== auth.user?.username"
-                  @positive-click="doDelete(u.username)"
-                >
-                  <template #trigger>
-                    <NButton size="small" quaternary type="error">
-                      <template #icon><NIcon :component="TrashOutline" /></template>
-                      删除
-                    </NButton>
-                  </template>
-                  确认删除用户 {{ u.username }}？
-                </NPopconfirm>
-              </NSpace>
-            </td>
-          </tr>
-        </tbody>
-      </NTable>
+    <NCard class="table-flex-fill">
+      <NDataTable
+        flex-height
+        :columns="columns"
+        :data="users"
+        :pagination="pagination"
+        :loading="loading"
+        :bordered="false"
+        size="small"
+        :row-key="(u: UserRecord) => u.id"
+        :scroll-x="760"
+      >
+        <template #empty>
+          <NEmpty description="暂无用户" />
+        </template>
+      </NDataTable>
     </NCard>
-  </NSpace>
+  </div>
 
   <!-- Create user modal -->
   <NModal v-model:show="showCreate" preset="card" title="新增用户" style="width: 460px">
@@ -223,18 +260,32 @@ onMounted(() => {
 </template>
 
 <style scoped lang="scss">
+.user-view {
+  gap: 16px;
+  overflow: hidden;
+}
+.user-toolbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
 .page-title {
   margin: 0;
   font-size: 18px;
 }
-.username-cell {
+:deep(.username-text) {
   font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 6px;
 }
-.muted {
-  color: #9ca3af;
+.muted,
+:deep(.muted) {
+  color: var(--text-secondary);
   font-size: 13px;
+}
+:deep(.n-data-table__pagination) {
+  padding: 12px 16px;
+  margin: 0 !important;
+  border-top: 1px solid var(--border-color);
+  box-sizing: border-box;
 }
 </style>

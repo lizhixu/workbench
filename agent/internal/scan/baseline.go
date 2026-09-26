@@ -42,8 +42,8 @@ func (m *Manager) scanBaseline(req *agentpb.ScanRequest) []Finding {
 
 	addIf(&findings, !strings.Contains(ufwStatus, "active") && firewalldStatus == "" && (iptablesRules == "0" || iptablesRules == "" || iptablesRules == "3"),
 		"firewall", "high", "防火墙未启用",
-			"系统未检测到活跃的防火墙（ufw/firewalld/iptables 均未配置规则），所有端口对外开放。",
-			"启用 ufw: ufw default deny incoming && ufw enable; 或启用 firewalld: systemctl start firewalld")
+		"系统未检测到活跃的防火墙（ufw/firewalld/iptables 均未配置规则），所有端口对外开放。",
+		"启用 ufw: ufw default deny incoming && ufw enable; 或启用 firewalld: systemctl start firewalld")
 
 	m.sendProgress(req.GetScanId(), 0.4, false, nil, "")
 
@@ -53,13 +53,13 @@ func (m *Manager) scanBaseline(req *agentpb.ScanRequest) []Finding {
 
 	addIf(&findings, passwdPerms != "644" && passwdPerms != "",
 		"fileperm", "medium", "/etc/passwd 权限异常",
-			"/etc/passwd 权限为 "+passwdPerms+"，建议为 644。",
-			"chmod 644 /etc/passwd")
+		"/etc/passwd 权限为 "+passwdPerms+"，建议为 644。",
+		"chmod 644 /etc/passwd")
 
-	addIf(&findings, shadowPerms != "640" && shadowPerms != "000" && shadowPerms != "",
+	addIf(&findings, shadowPerms != "640" && shadowPerms != "000" && shadowPerms != "600" && shadowPerms != "",
 		"fileperm", "high", "/etc/shadow 权限异常",
-			"/etc/shadow 权限为 "+shadowPerms+"，应为 640 或 000。",
-			"chmod 640 /etc/shadow")
+		"/etc/shadow 权限为 "+shadowPerms+"，应为 640 或 000。",
+		"chmod 640 /etc/shadow")
 
 	m.sendProgress(req.GetScanId(), 0.55, false, nil, "")
 

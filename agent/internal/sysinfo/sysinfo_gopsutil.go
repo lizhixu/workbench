@@ -2,11 +2,47 @@ package sysinfo
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
 
 	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shirou/gopsutil/v3/net"
 	"github.com/shirou/gopsutil/v3/process"
 )
+
+// killProcessGopsutil terminates a single process. force selects SIGKILL
+// (TerminateProcess on Windows) over SIGTERM. The agent's own process and PID 1
+// are refused outright so a mis-click cannot take down the agent or init.
+func killProcessGopsutil(pid int32, force bool) ([]byte, error) {
+	if pid <= 0 {
+		return nil, fmt.Errorf("非法 PID: %d", pid)
+	}
+	if pid == 1 {
+		return nil, fmt.Errorf("拒绝结束 PID 1 (init/系统进程)")
+	}
+	if int(pid) == os.Getpid() {
+		return nil, fmt.Errorf("拒绝结束 Agent 自身进程 (PID %d)", pid)
+	}
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		return nil, fmt.Errorf("进程 %d 不存在: %w", pid, err)
+	}
+	name, _ := p.Name()
+	if force {
+		err = p.Kill()
+	} else {
+		err = p.Terminate()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("结束进程 %d (%s) 失败: %w", pid, name, err)
+	}
+	return json.Marshal(map[string]any{
+		"ok":    true,
+		"pid":   pid,
+		"name":  name,
+		"force": force,
+	})
+}
 
 func processListGopsutil() ([]byte, error) {
 	procs, err := process.Processes()

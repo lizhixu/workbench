@@ -3,12 +3,14 @@ import { onMounted, ref, computed, h } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NButton,
-  NSpace,
   NInput,
   NModal,
   NCode,
   NSpin,
   NDropdown,
+  NSelect,
+  NSpace,
+  NTag,
   useMessage,
   useDialog,
   NIcon,
@@ -27,17 +29,34 @@ import {
   PulseOutline,
   SparklesOutline,
   DocumentTextOutline,
+  ShieldCheckmarkOutline,
+  CopyOutline,
+  CheckmarkCircleOutline,
+  LayersOutline,
+  ArrowUpCircleOutline,
+  GitNetworkOutline,
+  CardOutline,
+  LinkOutline,
 } from '@vicons/ionicons5'
 import OsLogo from '../../components/common/OsLogo.vue'
+import HostBillingModal from '../../components/host/HostBillingModal.vue'
 import { useHostsStore } from '../../stores/hosts'
 import { useWorkspaceStore } from '../../stores/workspace'
-import { enroll, deleteHost } from '../../api/hosts'
+import { useAuthStore } from '../../stores/auth'
+import { enroll, deleteHost, setHostGroup, upgradeAgent } from '../../api/hosts'
+import { listNetworkNodes } from '../../api/network'
+import { listGroups, type HostGroup } from '../../api/groups'
 import { copyToClipboard } from '../../utils/clipboard'
 import type { Host } from '../../api/types'
+import type { NetworkNode } from '../../api/network'
+
+// KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
+defineOptions({ name: 'HostList' })
 
 const router = useRouter()
 const store = useHostsStore()
 const workspace = useWorkspaceStore()
+const auth = useAuthStore()
 const message = useMessage()
 const dialog = useDialog()
 
@@ -45,11 +64,49 @@ const search = ref('')
 const showEnroll = ref(false)
 const enrollToken = ref('')
 const enrollCmd = ref('')
+const enrollWinCmd = ref('')
 const enrolling = ref(false)
+const showBillingModal = ref(false)
+const selectedBillingHost = ref<Host | null>(null)
+
+// Host grouping: filter bar + per-host assignment modal.
+const groups = ref<HostGroup[]>([])
+const groupFilter = ref<string>('')
+const showGroupModal = ref(false)
+const groupTarget = ref<Host | null>(null)
+const groupChoice = ref<string>('')
+const networkNodesMap = ref<Record<string, NetworkNode>>({})
+
+async function loadNetworkNodes() {
+  try {
+    const list = await listNetworkNodes()
+    const map: Record<string, NetworkNode> = {}
+    for (const node of list) {
+      map[node.host_id] = node
+    }
+    networkNodesMap.value = map
+  } catch {
+    networkNodesMap.value = {}
+  }
+}
+
+const groupFilterOptions = computed(() => [
+  { label: '全部分组', value: '' },
+  { label: '未分组', value: '__none__' },
+  ...groups.value.map((g) => ({ label: `${g.name} (${g.host_count})`, value: g.name })),
+])
+
+const groupAssignOptions = computed(() => [
+  { label: '（不属于任何分组）', value: '' },
+  ...groups.value.map((g) => ({ label: g.name, value: g.name })),
+])
 
 const filteredHosts = computed(() => {
   const q = search.value.trim().toLowerCase()
+  const gf = groupFilter.value
   return store.hosts.filter((h) => {
+    if (gf === '__none__' && h.group) return false
+    if (gf && gf !== '__none__' && h.group !== gf) return false
     if (!q) return true
     return (
       h.hostname.toLowerCase().includes(q) ||
@@ -58,10 +115,39 @@ const filteredHosts = computed(() => {
       (h.distro || '').toLowerCase().includes(q) ||
       (h.internal_ip || '').toLowerCase().includes(q) ||
       (h.public_ip || '').toLowerCase().includes(q) ||
-      (h.group || '').toLowerCase().includes(q)
+      (h.group || '').toLowerCase().includes(q) ||
+      (h.notes || '').toLowerCase().includes(q)
     )
   })
 })
+
+async function loadGroups() {
+  try {
+    groups.value = await listGroups()
+  } catch {
+    // Grouping is optional; a failure here must not block the host list.
+  }
+}
+
+function openGroupModal(host: Host) {
+  groupTarget.value = host
+  groupChoice.value = host.group || ''
+  showGroupModal.value = true
+}
+
+async function submitGroup() {
+  const host = groupTarget.value
+  if (!host) return
+  try {
+    await setHostGroup(host.id, groupChoice.value)
+    message.success(groupChoice.value ? `已将 ${host.hostname} 移入 ${groupChoice.value}` : `已将 ${host.hostname} 移出分组`)
+    showGroupModal.value = false
+    await Promise.all([store.fetchList(), loadGroups()])
+  } catch (e: any) {
+    message.error(e.message || '设置分组失败')
+  }
+}
+
 
 function formatArch(arch?: string): string {
   const a = (arch || '').toLowerCase()
@@ -114,8 +200,70 @@ function goDetail(host: Host, tab = 'metrics') {
   router.push({ path: `/hosts/${host.id}`, query: { tab } })
 }
 
-function goExec() {
-  router.push('/exec')
+function hasPrice(h: Host): boolean {
+  return h.price !== undefined && h.price !== null && !isNaN(Number(h.price))
+}
+
+function hasBilling(h: Host): boolean {
+  return (
+    hasPrice(h) ||
+    (h.traffic_limit_gb !== undefined && h.traffic_limit_gb !== null && Number(h.traffic_limit_gb) > 0) ||
+    !!h.expires_at ||
+    (!!h.notes && h.notes.trim() !== '')
+  )
+}
+
+function formatPrice(h: Host): string {
+  if (!hasPrice(h)) return '-'
+  const curMap: Record<string, string> = { CNY: '¥', USD: '$', EUR: '€', HKD: 'HK$', JPY: '¥', GBP: '£', USDT: 'USDT ' }
+  const cur = curMap[h.currency || 'CNY'] || `${h.currency || ''} `
+  const p = `${cur}${h.price}`
+  const c = h.billing_cycle ? ` / ${h.billing_cycle}` : ''
+  return `${p}${c}`.trim()
+}
+
+function formatHostTraffic(h: Host): string {
+  if (!h.traffic_limit_gb) return '-'
+  let used = (h.month_rx || 0) + (h.month_tx || 0)
+  if (h.traffic_calc_type === 'out') used = h.month_tx || 0
+  else if (h.traffic_calc_type === 'in') used = h.month_rx || 0
+  const usedGB = used / (1024 * 1024 * 1024)
+  const pct = Math.round((usedGB / h.traffic_limit_gb) * 100)
+  return `${usedGB.toFixed(1)}G/${h.traffic_limit_gb}G (${pct}%)`
+}
+
+function getTrafficTooltip(h: Host): string {
+  if (!h.traffic_limit_gb) return ''
+  const rxGB = ((h.month_rx || 0) / (1024 * 1024 * 1024)).toFixed(2)
+  const txGB = ((h.month_tx || 0) / (1024 * 1024 * 1024)).toFixed(2)
+  return `本月入向: ${rxGB} GB | 本月出向: ${txGB} GB | 重置日: 每月 ${h.traffic_reset_day || 1} 号`
+}
+
+function getExpiryClass(exp?: string): string {
+  if (!exp) return ''
+  const days = (new Date(exp).getTime() - Date.now()) / (1000 * 3600 * 24)
+  if (days < 0) return 'text-error'
+  if (days <= 30) return 'text-warning'
+  return ''
+}
+
+function getExpiryDaysText(exp?: string): string {
+  if (!exp) return ''
+  const diffDays = Math.ceil((new Date(exp).getTime() - Date.now()) / (1000 * 3600 * 24))
+  if (diffDays < 0) return `已逾期 ${Math.abs(diffDays)} 天`
+  if (diffDays === 0) return '今天到期'
+  return `剩 ${diffDays} 天`
+}
+
+function goExec(host?: Host) {
+  const query = host && typeof host === 'object' && host.id ? `?host_id=${host.id}` : ''
+  workspace.openTab({
+    key: '/batch-exec',
+    title: '推送命令',
+    path: `/batch-exec${query}`,
+    closable: true,
+  })
+  router.push(`/batch-exec${query}`)
 }
 
 function goAiChat() {
@@ -138,9 +286,30 @@ function goAiReport() {
   router.push('/ai/report')
 }
 
+const isAdmin = computed(() => auth.role === 'admin')
+
+function goAudit() {
+  workspace.openTab({
+    key: '/audit',
+    title: '操作审计',
+    path: '/audit',
+    closable: true,
+  })
+  router.push('/audit')
+}
+
 function handleMenuSelect(key: string, host: Host) {
   if (key === 'detail') {
     goDetail(host, 'metrics')
+  } else if (key === 'network') {
+    workspace.openTab({
+      key: '/network',
+      title: '异地组网',
+      path: '/network',
+      closable: true,
+      viewName: 'NetworkList',
+    })
+    router.push('/network')
   } else if (key === 'terminal') {
     goDetail(host, 'terminal')
   } else if (key === 'files') {
@@ -148,7 +317,33 @@ function handleMenuSelect(key: string, host: Host) {
   } else if (key === 'docker') {
     goDetail(host, 'docker')
   } else if (key === 'exec') {
-    router.push('/exec')
+    goExec(host)
+  } else if (key === 'billing') {
+    selectedBillingHost.value = host
+    showBillingModal.value = true
+  } else if (key === 'group') {
+    openGroupModal(host)
+  } else if (key === 'upgrade') {
+    if (host.status !== 'online') {
+      message.warning('主机已离线，无法下发在线升级指令')
+      return
+    }
+    dialog.info({
+      title: '升级 Agent 确认',
+      content: `确定将主机 "${host.hostname}" 的 Agent 升级至控制端最新版本吗？\n升级过程中 Agent 将下载最新对应平台二进制，校验并平滑重启服务。`,
+      positiveText: '开始升级',
+      negativeText: '取消',
+      onPositiveClick: async () => {
+        message.loading('正在下发升级指令并等待 Agent 替换重启…', { duration: 6000 })
+        try {
+          const res = await upgradeAgent(host.id)
+          message.success(res.message || 'Agent 升级成功，正在重启自愈连线！')
+          setTimeout(() => store.fetchList(), 4000)
+        } catch (e: any) {
+          message.error(e.message || 'Agent 升级失败')
+        }
+      },
+    })
   } else if (key === 'unbind') {
     dialog.warning({
       title: '解绑主机确认',
@@ -175,6 +370,11 @@ const menuOptions = [
     icon: () => h(NIcon, null, { default: () => h(PulseOutline) }),
   },
   {
+    label: '异地组网 (Tailscale)',
+    key: 'network',
+    icon: () => h(NIcon, { color: '#10b981' }, { default: () => h(GitNetworkOutline) }),
+  },
+  {
     label: '在线终端',
     key: 'terminal',
     icon: () => h(NIcon, null, { default: () => h(TerminalOutline) }),
@@ -195,8 +395,23 @@ const menuOptions = [
     icon: () => h(NIcon, null, { default: () => h(PaperPlaneOutline) }),
   },
   {
+    label: '财务与规格',
+    key: 'billing',
+    icon: () => h(NIcon, { color: '#6366f1' }, { default: () => h(CardOutline) }),
+  },
+  {
     type: 'divider',
     key: 'd1',
+  },
+  {
+    label: '设置分组',
+    key: 'group',
+    icon: () => h(NIcon, null, { default: () => h(LayersOutline) }),
+  },
+  {
+    label: '升级 Agent',
+    key: 'upgrade',
+    icon: () => h(NIcon, { color: '#6366f1' }, { default: () => h(ArrowUpCircleOutline) }),
   },
   {
     label: '解绑主机',
@@ -205,9 +420,16 @@ const menuOptions = [
   },
 ]
 
+const copied = ref(false)
+const copiedWin = ref(false)
+let copyTimer: any = null
+let copyWinTimer: any = null
+
 async function openEnroll() {
   showEnroll.value = true
   enrolling.value = true
+  copied.value = false
+  copiedWin.value = false
   try {
     const res = await enroll()
     enrollToken.value = res.enroll_token
@@ -215,6 +437,7 @@ async function openEnroll() {
     const host = window.location.hostname || 'localhost'
     const port = window.location.port ? `:${window.location.port}` : ''
     enrollCmd.value = res.install || `curl -kfsSL '${proto}//${host}${port}/install?token=${res.enroll_token}' | sudo bash`
+    enrollWinCmd.value = res.install_win || `irm '${proto}//${host}${port}/install?os_type=windows^&token=${res.enroll_token}' | iex`
   } catch (e: any) {
     message.error(e.message || '获取安装脚本失败')
   } finally {
@@ -223,21 +446,54 @@ async function openEnroll() {
 }
 
 async function copyCmd() {
+  if (!enrollCmd.value) return
   const ok = await copyToClipboard(enrollCmd.value)
   if (ok) {
-    message.success('已复制安装脚本命令到剪贴板')
+    copied.value = true
+    if (copyTimer) clearTimeout(copyTimer)
+    copyTimer = setTimeout(() => {
+      copied.value = false
+    }, 2500)
+    message.success('已复制 Linux 安装命令到剪贴板')
   } else {
     message.error('复制失败，请手动选中文本复制')
   }
 }
 
+async function copyWinCmd() {
+  if (!enrollWinCmd.value) return
+  const ok = await copyToClipboard(enrollWinCmd.value)
+  if (ok) {
+    copiedWin.value = true
+    if (copyWinTimer) clearTimeout(copyWinTimer)
+    copyWinTimer = setTimeout(() => {
+      copiedWin.value = false
+    }, 2500)
+    message.success('已复制 Windows 安装命令到剪贴板')
+  } else {
+    message.error('复制失败，请手动选中文本复制')
+  }
+}
+
+async function copyIp(ip?: string) {
+  if (!ip || ip === '-') return
+  const ok = await copyToClipboard(ip)
+  if (ok) {
+    message.success(`已复制 IP 地址 (${ip}) 到剪贴板`)
+  } else {
+    message.error('复制失败，请手动选中复制')
+  }
+}
+
 async function refresh() {
-  await store.fetchList()
+  await Promise.all([store.fetchList(), loadGroups(), loadNetworkNodes()])
 }
 
 onMounted(() => {
   workspace.setActiveKey('/hosts')
   store.fetchList().catch((e) => message.error(e.message))
+  loadGroups()
+  loadNetworkNodes()
 })
 </script>
 
@@ -258,6 +514,12 @@ onMounted(() => {
               <NIcon :component="SearchOutline" />
             </template>
           </NInput>
+          <NSelect
+            v-model:value="groupFilter"
+            :options="groupFilterOptions"
+            size="small"
+            style="width: 170px"
+          />
           <span class="total-count-text">共 {{ store.hosts.length }} 台主机</span>
         </div>
 
@@ -269,7 +531,7 @@ onMounted(() => {
             绑定主机
           </NButton>
 
-          <NButton secondary type="primary" size="small" @click="goExec">
+          <NButton secondary type="primary" size="small" @click="() => goExec()">
             <template #icon>
               <NIcon :component="PaperPlaneOutline" />
             </template>
@@ -288,6 +550,13 @@ onMounted(() => {
               <NIcon :component="DocumentTextOutline" />
             </template>
             运维报告
+          </NButton>
+
+          <NButton v-if="isAdmin" secondary size="small" @click="goAudit">
+            <template #icon>
+              <NIcon :component="ShieldCheckmarkOutline" />
+            </template>
+            操作审计
           </NButton>
 
           <NButton quaternary size="small" @click="refresh" :loading="store.loading">
@@ -323,6 +592,7 @@ onMounted(() => {
             <div class="col-host-info">
               <div class="host-name-row">
                 <span class="host-name">{{ host.hostname }}</span>
+                <NTag v-if="host.group" size="tiny" :bordered="false" type="info">{{ host.group }}</NTag>
               </div>
               <div class="host-distro">
                 {{ host.distro || host.os || 'Linux' }}
@@ -351,13 +621,32 @@ onMounted(() => {
               </div>
             </div>
 
-            <!-- 5. 内网与外网 IP + 地理位置 -->
+            <!-- 5. 内网与外网 IP + 组网 IP + 地理位置 -->
             <div class="col-ips">
-              <div class="ip-line">
+              <div
+                v-if="networkNodesMap[host.id]?.online && networkNodesMap[host.id]?.ip"
+                class="ip-line is-copyable text-emerald-wrap"
+                :title="`点击复制异地组网虚拟 IP (${networkNodesMap[host.id].ip})`"
+                @click.stop="copyIp(networkNodesMap[host.id].ip)"
+              >
+                <span class="ip-label ip-label-net">网</span>
+                <span class="ip-value ip-value-net">{{ networkNodesMap[host.id].ip }}</span>
+              </div>
+              <div
+                class="ip-line"
+                :class="{ 'is-copyable': host.internal_ip && host.internal_ip !== '-' }"
+                :title="host.internal_ip && host.internal_ip !== '-' ? '点击复制内网 IP' : ''"
+                @click.stop="copyIp(host.internal_ip)"
+              >
                 <span class="ip-label">内</span>
                 <span class="ip-value">{{ host.internal_ip || '-' }}</span>
               </div>
-              <div class="ip-line">
+              <div
+                class="ip-line"
+                :class="{ 'is-copyable': host.public_ip && host.public_ip !== '-' }"
+                :title="host.public_ip && host.public_ip !== '-' ? '点击复制外网 IP' : ''"
+                @click.stop="copyIp(host.public_ip)"
+              >
                 <span class="ip-label">外</span>
                 <span class="ip-value">
                   {{ host.public_ip || '-' }}
@@ -366,7 +655,42 @@ onMounted(() => {
               </div>
             </div>
 
-            <!-- 6. 右侧更多操作按钮 -->
+            <!-- 6. 财务与规格概要（配置什么展示什么，未配置不展示） -->
+            <div v-if="hasBilling(host)" class="col-billing">
+              <div v-if="hasPrice(host)" class="billing-line">
+                <span class="billing-label">资费</span>
+                <span class="billing-value" :title="formatPrice(host)">{{ formatPrice(host) }}</span>
+              </div>
+              <div v-if="host.traffic_limit_gb" class="billing-line" :title="getTrafficTooltip(host)">
+                <span class="billing-label">流量</span>
+                <span class="billing-value">{{ formatHostTraffic(host) }}</span>
+              </div>
+              <div v-if="host.expires_at" class="billing-line">
+                <span class="billing-label">到期</span>
+                <div class="expiry-group" :class="getExpiryClass(host.expires_at)" :title="`${host.expires_at} (${getExpiryDaysText(host.expires_at)})`">
+                  <span class="expiry-date">{{ host.expires_at }}</span>
+                  <span class="expiry-badge">{{ getExpiryDaysText(host.expires_at) }}</span>
+                  <span v-if="host.auto_renewal" class="auto-renew-badge">自续</span>
+                  <a
+                    v-if="host.renewal_url"
+                    :href="host.renewal_url"
+                    target="_blank"
+                    class="renewal-link-icon"
+                    title="点击跳转服务商控制台续费"
+                    @click.stop
+                  >
+                    <NIcon :component="LinkOutline" size="12" />
+                  </a>
+                </div>
+              </div>
+              <!-- 备注行：配了就展示，没配隐藏 -->
+              <div v-if="host.notes && host.notes.trim()" class="billing-line" :title="`备注: ${host.notes}`">
+                <span class="billing-label">备注</span>
+                <span class="billing-value muted-notes">{{ host.notes }}</span>
+              </div>
+            </div>
+
+            <!-- 7. 右侧更多操作按钮 -->
             <div class="col-actions" @click.stop>
               <NDropdown
                 trigger="click"
@@ -400,12 +724,69 @@ onMounted(() => {
           <div class="code-container">
             <NCode :code="enrollCmd" language="bash" word-wrap />
           </div>
-          <NSpace justify="end" style="margin-top: 14px">
-            <NButton type="primary" @click="copyCmd">复制命令</NButton>
+          <NSpace justify="end" style="margin-top: 10px">
+            <NButton
+              :type="copied ? 'success' : 'primary'"
+              @click="copyCmd"
+            >
+              <template #icon>
+                <NIcon :component="copied ? CheckmarkCircleOutline : CopyOutline" />
+              </template>
+              {{ copied ? '已复制命令' : '复制命令' }}
+            </NButton>
+          </NSpace>
+
+          <p class="guide-text" style="margin-top: 6px">
+            在目标 Windows 主机以管理员身份运行 PowerShell，执行以下安装指令：
+          </p>
+          <div class="code-container">
+            <NCode :code="enrollWinCmd" language="powershell" word-wrap />
+          </div>
+          <NSpace justify="end" style="margin-top: 10px">
+            <NButton
+              :type="copiedWin ? 'success' : 'primary'"
+              @click="copyWinCmd"
+            >
+              <template #icon>
+                <NIcon :component="copiedWin ? CheckmarkCircleOutline : CopyOutline" />
+              </template>
+              {{ copiedWin ? '已复制命令' : '复制命令' }}
+            </NButton>
           </NSpace>
         </div>
       </template>
     </NModal>
+
+    <!-- 设置主机分组 Modal -->
+    <NModal
+      v-model:show="showGroupModal"
+      preset="card"
+      title="设置主机分组"
+      style="width: 440px"
+    >
+      <NSpace vertical :size="12">
+        <p class="guide-text">
+          将主机 <code>{{ groupTarget?.hostname }}</code> 归入分组，用于按分组给用户授权访问。
+        </p>
+        <NSelect v-model:value="groupChoice" :options="groupAssignOptions" />
+        <p v-if="!groups.length" class="guide-text">
+          暂无可用分组，请先在「分组权限」页面创建分组。
+        </p>
+      </NSpace>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showGroupModal = false">取消</NButton>
+          <NButton type="primary" @click="submitGroup">保存</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- 财务与规格编辑弹窗 -->
+    <HostBillingModal
+      v-model:show="showBillingModal"
+      :host="selectedBillingHost"
+      @saved="refresh"
+    />
   </div>
 </template>
 
@@ -413,7 +794,6 @@ onMounted(() => {
 .baichuan-host-list-view {
   display: flex;
   height: 100%;
-  padding: 16px;
   box-sizing: border-box;
 
   .main-table-area {
@@ -425,7 +805,7 @@ onMounted(() => {
     background-color: var(--bg-card);
     border: 1px solid var(--border-color);
     border-radius: 8px;
-    padding: 16px 20px;
+    padding: var(--card-padding);
     box-shadow: var(--shadow-sm);
 
     .toolbar-bar {
@@ -497,6 +877,7 @@ onMounted(() => {
             .host-name-row {
               display: flex;
               align-items: center;
+              gap: 6px;
 
               .host-name {
                 font-weight: 600;
@@ -568,7 +949,7 @@ onMounted(() => {
 
           // 5. 内网与外网 IP
           .col-ips {
-            flex: 1;
+            flex: 0 0 250px;
             min-width: 0;
             display: flex;
             flex-direction: column;
@@ -579,6 +960,45 @@ onMounted(() => {
             .ip-line {
               display: flex;
               align-items: center;
+              // 收缩为内容实际宽度，避免 hover 高亮铺满整个富余列宽
+              width: fit-content;
+              max-width: 100%;
+
+              &.is-copyable {
+                cursor: pointer;
+                transition: color 0.15s ease, background-color 0.15s ease;
+                border-radius: 4px;
+                padding: 1px 4px;
+                margin-left: -4px;
+
+                &:hover {
+                  color: #6366f1;
+                  background-color: rgba(99, 102, 241, 0.08);
+
+                  .ip-value {
+                    color: #6366f1;
+                  }
+                }
+              }
+
+              &.text-emerald-wrap {
+                .ip-label-net {
+                  color: #10b981;
+                  font-weight: 600;
+                }
+                .ip-value-net {
+                  color: #10b981;
+                  font-weight: 600;
+                  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+                }
+                &:hover {
+                  color: #059669;
+                  background-color: rgba(16, 185, 129, 0.08);
+                  .ip-value-net {
+                    color: #059669;
+                  }
+                }
+              }
 
               .ip-label {
                 color: var(--text-tertiary, #8c8c8c);
@@ -602,9 +1022,118 @@ onMounted(() => {
             }
           }
 
-          // 6. 更多操作按钮
+          // 6. 财务与规格概要
+          .col-billing {
+            flex: 0 0 240px;
+            margin-left: 28px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            font-size: 13px;
+            padding-right: 12px;
+            min-width: 0;
+
+            .billing-line {
+              display: flex;
+              align-items: center;
+              gap: 4px;
+              min-width: 0;
+
+              .billing-label {
+                color: var(--text-tertiary, #8c8c8c);
+                width: 32px;
+                flex-shrink: 0;
+                font-size: 12px;
+              }
+
+              .billing-value {
+                color: var(--text-primary);
+                font-weight: 500;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+
+                &.muted-notes {
+                  color: var(--text-secondary);
+                  font-weight: 400;
+                  font-size: 12px;
+                }
+              }
+
+              .expiry-group {
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                min-width: 0;
+                overflow: hidden;
+                white-space: nowrap;
+
+                .expiry-date {
+                  font-weight: 500;
+                  color: var(--text-primary);
+                }
+
+                .expiry-badge {
+                  font-size: 10px;
+                  padding: 1px 4px;
+                  border-radius: 3px;
+                  background: rgba(148, 163, 184, 0.14);
+                  color: var(--text-secondary);
+                  flex-shrink: 0;
+                  line-height: 1.2;
+                }
+
+                .auto-renew-badge {
+                  font-size: 10px;
+                  padding: 1px 4px;
+                  border-radius: 3px;
+                  background: rgba(16, 185, 129, 0.12);
+                  color: #10b981;
+                  font-weight: 600;
+                  flex-shrink: 0;
+                  line-height: 1.2;
+                }
+
+                .renewal-link-icon {
+                  display: inline-flex;
+                  align-items: center;
+                  justify-content: center;
+                  color: var(--primary-color, #6366f1);
+                  padding: 2px;
+                  border-radius: 3px;
+                  flex-shrink: 0;
+                  transition: background-color 0.15s ease;
+
+                  &:hover {
+                    background: rgba(99, 102, 241, 0.12);
+                  }
+                }
+
+                &.text-error {
+                  .expiry-date,
+                  .expiry-badge {
+                    color: #ef4444;
+                    background: rgba(239, 68, 68, 0.14);
+                    font-weight: 600;
+                  }
+                }
+
+                &.text-warning {
+                  .expiry-date,
+                  .expiry-badge {
+                    color: #f59e0b;
+                    background: rgba(245, 158, 11, 0.14);
+                    font-weight: 600;
+                  }
+                }
+              }
+            }
+          }
+
+          // 7. 更多操作按钮
           .col-actions {
             flex: 0 0 44px;
+            margin-left: auto;
             display: flex;
             align-items: center;
             justify-content: flex-end;
@@ -642,6 +1171,166 @@ onMounted(() => {
       border: 1px solid var(--border-color);
       padding: 12px;
       border-radius: 6px;
+    }
+  }
+}
+
+/* ===================== 移动端适配 ===================== */
+@media (max-width: 768px) {
+  .baichuan-host-list-view {
+    .main-table-area {
+      gap: 8px;
+
+      /* 工具栏换行：搜索框占满首行，按钮组换到第二行 */
+      .toolbar-bar {
+        flex-wrap: wrap;
+        gap: 8px;
+
+        .toolbar-left {
+          flex: 1 1 100%;
+          min-width: 0;
+
+          .n-input {
+            width: 100% !important;
+            flex: 1;
+          }
+
+          .total-count-text {
+            font-size: 12px;
+            flex-shrink: 0;
+          }
+        }
+
+        .toolbar-right {
+          flex: 1 1 100%;
+          justify-content: flex-end;
+          gap: 8px;
+          flex-wrap: wrap;
+
+          .n-button {
+            padding: 0 10px;
+          }
+        }
+      }
+
+      .host-list-container {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+
+        .host-row-item {
+          /* 桌面端单行 6 列 → 移动端独立卡片布局 */
+          flex-wrap: wrap;
+          padding: 12px 14px;
+          row-gap: 8px;
+          background: var(--bg-card);
+          border: 1px solid var(--border-color);
+          border-radius: 8px;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+          transition: all 0.15s ease;
+
+          &:hover {
+            border-color: var(--primary-color, #6366f1);
+          }
+
+          /* 重排：第一行 logo + 主机名 + 更多按钮；第二行 pill/规格；第三行 IP */
+          .col-os-logo {
+            order: 1;
+            flex: 0 0 44px;
+          }
+
+          .col-host-info {
+            order: 2;
+            flex: 1 1 auto;
+            min-width: 0;
+            padding-right: 4px;
+
+            .host-name {
+              font-size: 14px;
+              white-space: nowrap;
+              overflow: hidden;
+              text-overflow: ellipsis;
+            }
+
+            .host-distro {
+              font-size: 11px;
+              white-space: nowrap;
+              overflow: hidden;
+              text-overflow: ellipsis;
+            }
+          }
+
+          .col-actions {
+            order: 3;
+            flex: 0 0 32px;
+          }
+
+          /* 运行时间 pill：第二行开头 */
+          .col-status {
+            order: 4;
+            flex: 0 0 auto;
+            padding-right: 6px;
+
+            .uptime-pill {
+              padding: 2px 8px;
+              font-size: 11px;
+              white-space: nowrap;
+            }
+          }
+
+          /* 规格与 IP：第二行并排 */
+          .col-specs {
+            order: 5;
+            flex: 1 1 auto;
+            min-width: 0;
+            font-size: 12px;
+
+            .spec-line .spec-label {
+              width: 32px;
+            }
+          }
+
+          .col-ips {
+            order: 6;
+            flex: 1 1 100%;
+            font-size: 11px;
+            padding-top: 4px;
+            border-top: 1px dashed var(--border-dashed, rgba(0, 0, 0, 0.06));
+            display: flex;
+            flex-direction: row;
+            justify-content: space-between;
+            gap: 6px;
+
+            .ip-line {
+              flex: 1;
+              min-width: 0;
+            }
+
+            .ip-value {
+              white-space: nowrap;
+              overflow: hidden;
+              text-overflow: ellipsis;
+            }
+          }
+
+          .col-billing {
+            order: 7;
+            flex: 1 1 100%;
+            font-size: 11px;
+            padding-top: 4px;
+            border-top: 1px dashed var(--border-dashed, rgba(0, 0, 0, 0.06));
+            display: flex;
+            flex-direction: row;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+
+            .billing-line {
+              margin-right: 6px;
+            }
+          }
+        }
+      }
     }
   }
 }

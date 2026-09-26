@@ -8,21 +8,33 @@ import {
   NDescriptionsItem,
   NTag,
   useMessage,
-  NTabs,
-  NTabPane,
   NInput,
   NSwitch,
   NFormItem,
   NSelect,
   NAlert,
   NIcon,
+  NAvatar,
+  NModal,
 } from 'naive-ui'
-import { CheckmarkCircleOutline, SparklesOutline } from '@vicons/ionicons5'
+import { CheckmarkCircleOutline, SparklesOutline, LogoGithub } from '@vicons/ionicons5'
 import { health, enroll } from '../../api/hosts'
 import { getAIConfig, setAIConfig, testAIConfig, type AIConfig } from '../../api/ai'
+import {
+  getGitProviders, connectGitHubToken, disconnectGitHub,
+  listGitHubRepos, type GitProvidersStatus,
+} from '../../api/git'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useWorkspaceStore } from '../../stores/workspace'
 import CommandPolicy from './CommandPolicy.vue'
+import CommandLibrary from './CommandLibrary.vue'
+import TerminalPrefs from './TerminalPrefs.vue'
+import BackupRestore from './BackupRestore.vue'
+import SystemUpgrade from './SystemUpgrade.vue'
+import OsLogo from '../../components/common/OsLogo.vue'
+
+// KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
+defineOptions({ name: 'Settings' })
 
 const message = useMessage()
 const workspace = useWorkspaceStore()
@@ -200,6 +212,70 @@ async function copyCmd() {
   }
 }
 
+// ---------------- Git Providers (对齐 Dokploy: Connect your Git provider) ----------------
+const gitStatus = ref<GitProvidersStatus | null>(null)
+const loadingGit = ref(false)
+const showGitAuthModal = ref(false)
+const gitTokenInput = ref('')
+const connectingGit = ref(false)
+const disconnectingGit = ref(false)
+const refreshingGit = ref(false)
+
+async function loadGitStatus() {
+  loadingGit.value = true
+  try {
+    gitStatus.value = await getGitProviders()
+  } catch (e: any) {
+    // silently fail
+  } finally {
+    loadingGit.value = false
+  }
+}
+
+async function submitGitToken() {
+  if (!gitTokenInput.value.trim()) {
+    message.warning('请输入 GitHub Personal Access Token')
+    return
+  }
+  connectingGit.value = true
+  try {
+    const acc = await connectGitHubToken(gitTokenInput.value.trim())
+    message.success(`成功连接 GitHub 账号: ${acc.login}`)
+    showGitAuthModal.value = false
+    gitTokenInput.value = ''
+    await loadGitStatus()
+  } catch (e: any) {
+    message.error(e.message || '连接失败')
+  } finally {
+    connectingGit.value = false
+  }
+}
+
+async function doDisconnectGit() {
+  disconnectingGit.value = true
+  try {
+    await disconnectGitHub()
+    message.success('已断开 GitHub 连接')
+    await loadGitStatus()
+  } catch (e: any) {
+    message.error(e.message || '断开失败')
+  } finally {
+    disconnectingGit.value = false
+  }
+}
+
+async function refreshGitRepos() {
+  refreshingGit.value = true
+  try {
+    const repos = await listGitHubRepos()
+    message.success(`GitHub 授权有效，已成功获取 ${repos.length} 个可用仓库`)
+  } catch (e: any) {
+    message.error(e.message || '同步失败')
+  } finally {
+    refreshingGit.value = false
+  }
+}
+
 onMounted(() => {
   workspace.openTab({
     key: '/settings',
@@ -210,11 +286,16 @@ onMounted(() => {
   loadHealth()
   genToken()
   loadAIConfig()
+  loadGitStatus()
 })
 </script>
 
 <template>
-  <NSpace vertical :size="16">
+  <div class="settings-view">
+    <div class="settings-toolbar">
+      <h2 class="page-title">系统设置</h2>
+    </div>
+    <NSpace vertical :size="16">
     <!-- System Status -->
     <NCard title="系统状态" :bordered="false">
       <NDescriptions :column="3" label-placement="left" bordered v-if="healthData">
@@ -307,8 +388,122 @@ onMounted(() => {
       </NSpace>
     </NCard>
 
+    <!-- Git Providers 代码源集成 (对齐 Dokploy: Connect your Git provider for authentication) -->
+    <NCard title="代码源集成 (Git Providers)" :bordered="false" size="small">
+      <template #header-extra>
+        <span class="muted" style="font-size: 13px">Connect your Git provider for authentication.</span>
+      </template>
+
+      <NSpace vertical :size="14">
+        <p class="muted">
+          连接您的 Git 账号后，发布应用可直接读取私有与公开代码仓库。启用自动部署后，系统将自动通过 API 为仓库配置 Webhook，实现代码提交即自动构建与更新，无需手动去仓库配置 Webhook。
+        </p>
+
+        <div class="git-provider-row">
+          <NSpace align="center" justify="space-between" style="width: 100%">
+            <NSpace align="center" :size="12">
+              <NAvatar
+                v-if="gitStatus?.github?.connected && gitStatus.github.account?.avatar_url"
+                :src="gitStatus.github.account.avatar_url"
+                round
+                :size="36"
+              />
+              <NIcon v-else size="32" :component="LogoGithub" />
+              <div>
+                <NSpace align="center" :size="8">
+                  <span style="font-size: 15px; font-weight: 600">GitHub</span>
+                  <NTag v-if="gitStatus?.github?.connected" type="success" size="small" round>已连接</NTag>
+                  <NTag v-else type="default" size="small" round>未连接</NTag>
+                </NSpace>
+                <div class="muted" style="font-size: 12px; margin-top: 2px">
+                  {{ gitStatus?.github?.connected
+                      ? `已授权账号：${gitStatus.github.account?.name || gitStatus.github.account?.login} (@${gitStatus.github.account?.login})`
+                      : '通过 Personal Access Token 连接您的 GitHub 账号' }}
+                </div>
+              </div>
+            </NSpace>
+
+            <NSpace align="center">
+              <template v-if="gitStatus?.github?.connected">
+                <NButton size="small" secondary :loading="refreshingGit" @click="refreshGitRepos">
+                  测试同步仓库
+                </NButton>
+                <NButton size="small" quaternary type="error" :loading="disconnectingGit" @click="doDisconnectGit">
+                  断开连接
+                </NButton>
+              </template>
+              <template v-else>
+                <NButton type="primary" size="small" @click="showGitAuthModal = true">
+                  连接 GitHub
+                </NButton>
+              </template>
+            </NSpace>
+          </NSpace>
+        </div>
+      </NSpace>
+    </NCard>
+
+    <!-- 连接 GitHub 弹窗 -->
+    <NModal
+      v-model:show="showGitAuthModal"
+      preset="card"
+      title="连接 GitHub 账号 (Connect GitHub)"
+      style="width: 620px; max-width: 94vw"
+    >
+      <NSpace vertical size="medium">
+        <NAlert type="info" :show-icon="true">
+          <div style="font-weight: 600; margin-bottom: 6px">Token 权限配置说明（满足以下任一方式即可）：</div>
+          <div style="font-size: 13px; line-height: 1.6">
+            <div>
+              <b>1. 细粒度 Token（Fine-grained，官方推荐）</b>：
+              <ul style="margin: 2px 0 6px 18px; padding: 0">
+                <li><b>Repository access</b>：选择目标仓库或 <i>All repositories</i></li>
+                <li><b>Permissions -> Contents</b>：设置为 <b>Read-only</b>（用于读取代码与 Compose 编排）</li>
+                <li><b>Permissions -> Webhooks</b>：设置为 <b>Read and write</b>（用于系统自动创建 push Webhook）</li>
+              </ul>
+            </div>
+            <div>
+              <b>2. 传统 Token（Tokens classic）</b>：
+              <ul style="margin: 2px 0 0 18px; padding: 0">
+                <li>私有仓库勾选 <b>repo</b>（公开仓库仅需 <b>public_repo</b>）</li>
+                <li>勾选 <b>admin:repo_hook</b>（用于系统自动配置 Push Webhook）</li>
+              </ul>
+            </div>
+          </div>
+        </NAlert>
+
+        <NFormItem label="GitHub Personal Access Token" required>
+          <NInput
+            v-model:value="gitTokenInput"
+            type="password"
+            show-password-on="click"
+            placeholder="github_pat_xxx 或 ghp_xxx"
+          />
+        </NFormItem>
+
+        <NSpace justify="end">
+          <NButton @click="showGitAuthModal = false">取消</NButton>
+          <NButton type="primary" :loading="connectingGit" @click="submitGitToken">
+            验证并连接
+          </NButton>
+        </NSpace>
+      </NSpace>
+    </NModal>
+
+    <!-- Saved-command library -->
+    <CommandLibrary />
+
+    <!-- Per-user terminal preferences (theme / shell / font) -->
+    <TerminalPrefs />
+
     <!-- High-risk command control (P3) -->
     <CommandPolicy />
+
+    <!-- Control-plane backup / restore (admin only) -->
+    <BackupRestore />
+
+    <!-- Version & System / Agent Upgrade Center -->
+    <SystemUpgrade />
 
     <!-- One-line Install -->
     <NCard :bordered="false">
@@ -316,13 +511,31 @@ onMounted(() => {
         <span style="font-size: 16px; font-weight: 700">一键安装 Agent</span>
       </template>
       <template #header-extra>
-        <NSpace align="center">
-          <span class="muted">目标系统:</span>
-          <NTabs v-model:value="osType" type="segment" size="small">
-            <NTabPane name="linux" tab="Linux" />
-            <NTabPane name="windows" tab="Windows" />
-          </NTabs>
-        </NSpace>
+        <div class="os-selector-wrap">
+          <span class="selector-label">目标系统:</span>
+          <div class="os-segment-group">
+            <button
+              type="button"
+              class="os-segment-btn"
+              :class="{ active: osType === 'linux' }"
+              @click="osType = 'linux'"
+            >
+              <OsLogo os="linux" :show-badge="false" :size="16" class="btn-logo" />
+              <span class="btn-text">Linux</span>
+              <span class="btn-sub">x86 / arm</span>
+            </button>
+            <button
+              type="button"
+              class="os-segment-btn"
+              :class="{ active: osType === 'windows' }"
+              @click="osType = 'windows'"
+            >
+              <OsLogo os="windows" :show-badge="false" :size="14" class="btn-logo win-logo" />
+              <span class="btn-text">Windows</span>
+              <span class="btn-sub">x64</span>
+            </button>
+          </div>
+        </div>
       </template>
 
       <NSpace vertical :size="16">
@@ -393,11 +606,110 @@ onMounted(() => {
       </NSpace>
     </NCard>
   </NSpace>
+  </div>
 </template>
 
 <style scoped lang="scss">
+.settings-view {
+  height: 100%;
+  overflow-y: auto;
+  box-sizing: border-box;
+}
+
+.settings-toolbar {
+  margin-bottom: 16px;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
 .muted { color: var(--text-secondary); font-size: 13px; }
 code { font-size: 12px; }
+
+.os-selector-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+
+  .selector-label {
+    font-size: 13px;
+    color: var(--text-secondary);
+    font-weight: 500;
+  }
+
+  .os-segment-group {
+    display: inline-flex;
+    align-items: center;
+    background-color: var(--code-box-bg, rgba(0, 0, 0, 0.2));
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 3px;
+    gap: 4px;
+
+    .os-segment-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text-secondary);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      user-select: none;
+      outline: none;
+
+      .btn-logo {
+        transition: transform 0.2s ease;
+      }
+
+      .btn-text {
+        font-weight: 600;
+      }
+
+      .btn-sub {
+        font-size: 10.5px;
+        color: var(--text-tertiary, #9ca3af);
+        padding: 0 4px;
+        border-radius: 3px;
+        background-color: rgba(255, 255, 255, 0.06);
+        line-height: 1.4;
+      }
+
+      &:hover:not(.active) {
+        color: var(--text-primary);
+        background-color: rgba(255, 255, 255, 0.05);
+      }
+
+      &.active {
+        background-color: var(--bg-card);
+        color: #6366f1;
+        border-color: rgba(99, 102, 241, 0.35);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.24);
+
+        .btn-logo {
+          transform: scale(1.1);
+        }
+
+        .win-logo {
+          color: #0078d6;
+        }
+
+        .btn-sub {
+          color: #6366f1;
+          background-color: rgba(99, 102, 241, 0.12);
+        }
+      }
+    }
+  }
+}
 
 .token-box {
   display: flex;
@@ -487,4 +799,11 @@ code { font-size: 12px; }
   font-size: 13px;
 }
 .dl-link:hover { text-decoration: underline; }
+
+.git-provider-row {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 14px 16px;
+  background: var(--bg-card-subtle);
+}
 </style>

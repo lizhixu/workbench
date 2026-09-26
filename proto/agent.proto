@@ -53,9 +53,10 @@ message ServerMessage {
     DockerOp docker_op = 11; // (P2)
     ScanRequest scan = 12; // (P3)
     UpgradeRequest upgrade = 13; // (P3)
-    TunnelOpen tunnel_open = 14; // ask agent to open a TCP tunnel leg
-    TunnelData tunnel_data = 15; // reverse TCP tunnel payload (server -> agent)
-    TunnelClose tunnel_close = 16;
+    MaintenanceNotice maintenance = 14; // server restarting / maintenance announcement
+    TunnelOpen tunnel_open = 17; // ask agent to open a TCP tunnel leg
+    TunnelData tunnel_data = 18; // reverse TCP tunnel payload (server -> agent)
+    TunnelClose tunnel_close = 19;
   }
 }
 
@@ -80,6 +81,9 @@ message RegisterRequest {
   string internal_ip = 11; // local private IP (e.g. 172.20.69.191)
   string public_ip = 12; // external public IP (e.g. 183.159.65.120)
   string location = 13; // geo location (e.g. 浙江省-杭州市)
+  // reconnect_reason indicates why the agent is connecting/reconnecting:
+  // "upgrade" (post agent self-upgrade), "maintenance" (post server restart), or empty.
+  string reconnect_reason = 14;
 }
 
 message RegisterResponse {
@@ -150,6 +154,9 @@ message FileOp {
   bytes data = 8;
   bool overwrite = 9;
   string dest_path = 10; // for move / copy
+  // sha256 is the hex digest the finished write must match. Sent with the
+  // initial write op; empty means the agent skips integrity verification.
+  string sha256 = 11;
 }
 
 message FileChunk {
@@ -195,6 +202,18 @@ message MetricsSample {
   double disk_write = 10; // bytes/s
   repeated Mount mounts = 11;
   int64 uptime = 12; // host uptime in seconds (real OS boot-derived)
+  // Extended metrics.
+  double load1 = 13; // 1/5/15-minute load averages (Linux; 0 elsewhere)
+  double load5 = 14;
+  double load15 = 15;
+  int64 swap_total = 16; // bytes
+  int64 swap_used = 17;  // bytes
+  int32 tcp_established = 18; // ESTABLISHED TCP connections
+  int32 udp_count = 19;      // UDP sockets
+  int32 process_count = 20;  // total processes
+  string cpu_model = 21;     // CPU model name (cached, static)
+  int64 month_rx = 22; // bytes received this billing cycle
+  int64 month_tx = 23; // bytes transmitted this billing cycle
 }
 
 message Mount {
@@ -206,7 +225,11 @@ message Mount {
 // ---- System info -----------------------------------------------------
 
 message SysInfoQuery {
-  string kind = 1; // process / port / user / login
+  string kind = 1; // process / port / user / login / osinfo / kill
+  // pid targets a single process; only meaningful for kind="kill".
+  int32 pid = 2;
+  // force selects SIGKILL over SIGTERM (taskkill /F on Windows).
+  bool force = 3;
 }
 
 // MetricsQuery asks the agent for current (or a single historical) metrics.
@@ -225,11 +248,15 @@ message SysInfoSnapshot {
 
 message DockerOp {
   string op_id = 1;
-  // op is one of: ps, images, start, stop, restart, rm, logs, exec, inspect,
-  // remove_image, prune_images.
+  // op is one of: ps, images, start, stop, restart, rm, logs, inspect,
+  // remove_image, prune_images, pull, run, get_mirrors, set_mirrors.
   string op = 2;
   string container = 3;
   string image = 4;
+  // args_json carries op-specific options:
+  // - For op "run": {"name":"...","ports":[...],"volumes":[...],"env":[...],"restart_policy":"...","command":[...]}
+  // - For op "set_mirrors": {"mirrors":["https://...","https://..."]}
+  // all fields optional; empty dynamic rows are skipped.
   bytes args_json = 5;
 }
 
@@ -273,12 +300,24 @@ message UpgradeProgress {
   string error = 3;
 }
 
+// ---- Maintenance handshake ------------------------------------------
+
+message MaintenanceNotice {
+  // reason explains the maintenance: "server_restart", "agent_upgrade", "host_maintenance".
+  string reason = 1;
+  // expected_duration_sec is how long the server/agent anticipates being offline (e.g. 120s).
+  int32 expected_duration_sec = 2;
+}
+
 // ---- Generic ack -----------------------------------------------------
 
 message Ack {
   bool ok = 1;
   string error = 2;
   string ref = 3; // optional correlation id
+  // sha256 is the hex digest the agent actually computed, set on file write
+  // acks so the caller can confirm the bytes landed intact.
+  string sha256 = 4;
 }
 // ---- Reverse TCP tunnel (dynamic networking) ---------------------------
 // A tunnel carries one TCP connection from the control server to a target

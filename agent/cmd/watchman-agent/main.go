@@ -29,6 +29,7 @@ func main() {
 	useTLS := flag.Bool("tls", false, "use TLS to dial the control server")
 	tlsName := flag.String("tls-server-name", "", "override TLS server name check")
 	upPubKey := flag.String("upgrade-pubkey", "", "hex Ed25519 public key to verify self-upgrades")
+	trafficResetDay := flag.Int("traffic-reset-day", 1, "billing cycle reset day-of-month (1-28) for monthly traffic stats")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -67,7 +68,9 @@ func main() {
 	d.SetShellManager(shell.NewManager(log))
 	d.SetFileManager(files.NewManager(log))
 	d.SetExecManager(exec.NewManager(log))
-	d.SetMetricsManager(metrics.NewManager(log))
+	mm := metrics.NewManager(log)
+	mm.SetStateFile(*state, *trafficResetDay)
+	d.SetMetricsManager(mm)
 	d.SetSysInfoManager(sysinfo.NewManager(log))
 	d.SetDockerManager(docker.NewManager(log))
 	upMgr := upgrade.NewManager(log)
@@ -75,6 +78,13 @@ func main() {
 		log.Error("invalid upgrade public key", "err", err)
 		os.Exit(1)
 	}
+	upMgr.SetOnSuccess(func() {
+		// Record the planned restart before exiting so the control plane can
+		// suppress the reconnect alert (AGENTS.md 8.6.3).
+		if err := cfg.SetReconnectReason("upgrade"); err != nil {
+			log.Warn("save state with upgrade reason", "err", err)
+		}
+	})
 	d.SetUpgradeManager(upMgr)
 	d.SetScanManager(scan.NewManager(log))
 	d.SetTunnelManager(tunnel.NewManager(log))

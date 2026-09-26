@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -35,6 +36,17 @@ type persistedAgent struct {
 	InternalIP string    `json:"internal_ip"`
 	PublicIP   string    `json:"public_ip"`
 	Location   string    `json:"location"`
+	// Optional billing & traffic quota configurations
+	Price           float64 `json:"price,omitempty"`
+	Currency        string  `json:"currency,omitempty"`
+	BillingCycle    string  `json:"billing_cycle,omitempty"`
+	ExpiresAt       string  `json:"expires_at,omitempty"`
+	AutoRenewal     bool    `json:"auto_renewal,omitempty"`
+	TrafficLimitGB  float64 `json:"traffic_limit_gb,omitempty"`
+	TrafficCalcType string  `json:"traffic_calc_type,omitempty"`
+	TrafficResetDay int     `json:"traffic_reset_day,omitempty"`
+	RenewalURL      string  `json:"renewal_url,omitempty"`
+	Notes           string  `json:"notes,omitempty"`
 	// AuthToken is the long-lived token issued at registration; kept here
 	// (NOT in r.tokens) so a server restart doesn't invalidate it.
 	AuthToken string `json:"auth_token"`
@@ -81,6 +93,19 @@ type Agent struct {
 	InternalIP string
 	PublicIP   string
 	Location   string
+	// Optional billing & traffic quota configurations
+	Price           float64
+	Currency        string
+	BillingCycle    string
+	ExpiresAt       string
+	AutoRenewal     bool
+	TrafficLimitGB  float64
+	TrafficCalcType string
+	TrafficResetDay int
+	RenewalURL      string
+	Notes           string
+	// ReconnectReason is the reason sent by the agent on its most recent registration.
+	ReconnectReason string
 	// AuthToken is the long-lived token; persisted with the agent so the
 	// server can validate reconnects after a restart.
 	AuthToken string
@@ -88,18 +113,24 @@ type Agent struct {
 
 // Hub is the live connection state for a connected agent.
 type Hub struct {
-	AgentID    string
-	heartbeat  int32
-	lastSeen   time.Time
-	sendCh     chan *agentpb.ServerMessage
-	stream     agentpb.AgentService_ConnectServer
-	tunnel     *Coordinator // reverse TCP tunnels (nil = disabled)
-	mu         sync.RWMutex
+	AgentID   string
+	heartbeat int32
+	lastSeen  time.Time
+	sendCh    chan *agentpb.ServerMessage
+	// closed is set under mu before sendCh is closed, so Send can fail fast
+	// once the hub is unbound: writing to a closed channel panics, and Send
+	// races with unbind otherwise.
+	closed       bool
+	stream       agentpb.AgentService_ConnectServer
+	tunnel       *Coordinator // reverse TCP tunnels (nil = disabled)
+	mu           sync.RWMutex
 	termHandlers map[string]func(*agentpb.TerminalOutput)
 	// Generic response handlers keyed by op_id / exec_id / session_id.
 	respHandlers map[string]func(*agentpb.AgentMessage)
 	// Latest metrics sample (for REST polling).
 	lastMetrics *agentpb.MetricsSample
+	// Back-reference to registry so metrics can update the persisted Agent.
+	registry *Registry
 }
 
 // NewRegistry creates a registry, loading any persisted agents from
@@ -162,23 +193,33 @@ func (r *Registry) loadAgents() error {
 	defer r.mu.Unlock()
 	for id, p := range raw {
 		a := &Agent{
-			ID:         id,
-			Hostname:   p.Hostname,
-			OS:         p.OS,
-			Arch:       p.Arch,
-			Distro:     p.Distro,
-			Version:    p.Version,
-			Status:     "offline",
-			Registered: p.Registered,
-			Group:      p.Group,
-			Tags:       p.Tags,
-			Uptime:     p.Uptime,
-			CPUCores:   p.CPUCores,
-			MemTotal:   p.MemTotal,
-			InternalIP: p.InternalIP,
-			PublicIP:   p.PublicIP,
-			Location:   p.Location,
-			AuthToken:  p.AuthToken,
+			ID:              id,
+			Hostname:        p.Hostname,
+			OS:              p.OS,
+			Arch:            p.Arch,
+			Distro:          p.Distro,
+			Version:         p.Version,
+			Status:          "offline",
+			Registered:      p.Registered,
+			Group:           p.Group,
+			Tags:            p.Tags,
+			Uptime:          p.Uptime,
+			CPUCores:        p.CPUCores,
+			MemTotal:        p.MemTotal,
+			InternalIP:      p.InternalIP,
+			PublicIP:        p.PublicIP,
+			Location:        p.Location,
+			Price:           p.Price,
+			Currency:        p.Currency,
+			BillingCycle:    p.BillingCycle,
+			ExpiresAt:       p.ExpiresAt,
+			AutoRenewal:     p.AutoRenewal,
+			TrafficLimitGB:  p.TrafficLimitGB,
+			TrafficCalcType: p.TrafficCalcType,
+			TrafficResetDay: p.TrafficResetDay,
+			RenewalURL:      p.RenewalURL,
+			Notes:           p.Notes,
+			AuthToken:       p.AuthToken,
 		}
 		if a.Tags == nil {
 			a.Tags = []string{}
@@ -200,21 +241,31 @@ func (r *Registry) persistAgentsLocked() error {
 	raw := make(map[string]persistedAgent, len(r.agents))
 	for id, a := range r.agents {
 		raw[id] = persistedAgent{
-			Hostname:   a.Hostname,
-			OS:         a.OS,
-			Arch:       a.Arch,
-			Distro:     a.Distro,
-			Version:    a.Version,
-			Registered: a.Registered,
-			Group:      a.Group,
-			Tags:       a.Tags,
-			Uptime:     a.Uptime,
-			CPUCores:   a.CPUCores,
-			MemTotal:   a.MemTotal,
-			InternalIP: a.InternalIP,
-			PublicIP:   a.PublicIP,
-			Location:   a.Location,
-			AuthToken:  a.AuthToken,
+			Hostname:        a.Hostname,
+			OS:              a.OS,
+			Arch:            a.Arch,
+			Distro:          a.Distro,
+			Version:         a.Version,
+			Registered:      a.Registered,
+			Group:           a.Group,
+			Tags:            a.Tags,
+			Uptime:          a.Uptime,
+			CPUCores:        a.CPUCores,
+			MemTotal:        a.MemTotal,
+			InternalIP:      a.InternalIP,
+			PublicIP:        a.PublicIP,
+			Location:        a.Location,
+			Price:           a.Price,
+			Currency:        a.Currency,
+			BillingCycle:    a.BillingCycle,
+			ExpiresAt:       a.ExpiresAt,
+			AutoRenewal:     a.AutoRenewal,
+			TrafficLimitGB:  a.TrafficLimitGB,
+			TrafficCalcType: a.TrafficCalcType,
+			TrafficResetDay: a.TrafficResetDay,
+			RenewalURL:      a.RenewalURL,
+			Notes:           a.Notes,
+			AuthToken:       a.AuthToken,
 		}
 	}
 	data, err := json.MarshalIndent(raw, "", "  ")
@@ -315,7 +366,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 		a.LastSeen = time.Now()
 		_ = r.persistAgentsLocked() // persist updated hostname/os/etc.
 
-		hub := newHub(agentID, heartbeatSec)
+		hub := newHub(agentID, heartbeatSec, r)
 		hub.tunnel = r.tunnel
 		// The agent reconnected: drop tunnels bound to the old stream's hub.
 		if r.tunnel != nil {
@@ -323,10 +374,10 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 		}
 		r.hubs[agentID] = hub
 		return hub, &agentpb.RegisterResponse{
-			Ok:                  true,
-			AgentId:             agentID,
+			Ok:                   true,
+			AgentId:              agentID,
 			HeartbeatIntervalSec: heartbeatSec,
-			SessionKeepSec:      sessionKeep,
+			SessionKeepSec:       sessionKeep,
 		}, nil
 	}
 
@@ -364,7 +415,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 	r.tokens[authTokenNew] = agentID
 	_ = r.persistAgentsLocked() // safe: caller holds r.mu
 
-	hub := newHub(agentID, heartbeatSec)
+	hub := newHub(agentID, heartbeatSec, r)
 	hub.tunnel = r.tunnel
 	// Fresh enroll for a known agent id: drop stale tunnels as above.
 	if r.tunnel != nil {
@@ -373,11 +424,11 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 	r.hubs[agentID] = hub
 	r.log.Info("agent registered", "agent_id", agentID, "hostname", req.GetHostname())
 	return hub, &agentpb.RegisterResponse{
-		Ok:                  true,
-		AgentId:             agentID,
-		AuthToken:           authTokenNew,
+		Ok:                   true,
+		AgentId:              agentID,
+		AuthToken:            authTokenNew,
 		HeartbeatIntervalSec: heartbeatSec,
-		SessionKeepSec:      sessionKeep,
+		SessionKeepSec:       sessionKeep,
 	}, nil
 }
 
@@ -415,6 +466,7 @@ func applyReg(a *Agent, req *agentpb.RegisterRequest) {
 	if v := req.GetLocation(); v != "" {
 		a.Location = v
 	}
+	a.ReconnectReason = req.GetReconnectReason()
 }
 
 func (r *Registry) ListAgents() []*Agent {
@@ -425,6 +477,16 @@ func (r *Registry) ListAgents() []*Agent {
 		cp := *a
 		out = append(out, &cp)
 	}
+	// Map iteration order is randomized in Go, so return a stable order or the
+	// host list reshuffles on every refresh. Registration time keeps a host in
+	// the same slot across calls; ID is a deterministic tiebreaker for agents
+	// registered in the same instant (or with a zero timestamp).
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Registered.Equal(out[j].Registered) {
+			return out[i].Registered.Before(out[j].Registered)
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out
 }
 
@@ -470,6 +532,168 @@ func (r *Registry) SetAgentTags(id string, tags []string) error {
 	return nil
 }
 
+// ClearReconnectReason clears the one-shot reconnect reason for an agent after
+// it has been consumed by the alert engine, ensuring subsequent checks behave normally.
+func (r *Registry) ClearReconnectReason(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if a, ok := r.agents[id]; ok {
+		a.ReconnectReason = ""
+	}
+}
+
+// HostBillingConfig carries optional user-managed finance, traffic quota and note configs for a host.
+type HostBillingConfig struct {
+	Price           float64 `json:"price"`
+	Currency        string  `json:"currency"`
+	BillingCycle    string  `json:"billing_cycle"`
+	ExpiresAt       string  `json:"expires_at"`
+	AutoRenewal     bool    `json:"auto_renewal"`
+	TrafficLimitGB  float64 `json:"traffic_limit_gb"`
+	TrafficCalcType string  `json:"traffic_calc_type"`
+	TrafficResetDay int     `json:"traffic_reset_day"`
+	RenewalURL      string  `json:"renewal_url"`
+	Notes           string  `json:"notes"`
+}
+
+// SetAgentBilling updates optional billing, traffic limits and notes for a host.
+func (r *Registry) SetAgentBilling(id string, b HostBillingConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.agents[id]
+	if !ok {
+		return fmt.Errorf("agent not found")
+	}
+	a.Price = b.Price
+	a.Currency = b.Currency
+	a.BillingCycle = b.BillingCycle
+	a.ExpiresAt = b.ExpiresAt
+	a.AutoRenewal = b.AutoRenewal
+	a.TrafficLimitGB = b.TrafficLimitGB
+	if b.TrafficCalcType == "" {
+		a.TrafficCalcType = "both"
+	} else {
+		a.TrafficCalcType = b.TrafficCalcType
+	}
+	if b.TrafficResetDay <= 0 {
+		a.TrafficResetDay = 1
+	} else if b.TrafficResetDay > 31 {
+		a.TrafficResetDay = 31
+	} else {
+		a.TrafficResetDay = b.TrafficResetDay
+	}
+	a.RenewalURL = b.RenewalURL
+	a.Notes = b.Notes
+	_ = r.persistAgentsLocked()
+	return nil
+}
+
+// RenameGroup rewrites every agent whose group is oldName to newName and
+// returns how many records changed. Passing an empty newName clears the group
+// (used when a group is deleted) so hosts are never left pointing at a group
+// that no longer exists.
+func (r *Registry) RenameGroup(oldName, newName string) int {
+	if oldName == "" {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, a := range r.agents {
+		if a.Group == oldName {
+			a.Group = newName
+			n++
+		}
+	}
+	if n > 0 {
+		_ = r.persistAgentsLocked()
+	}
+	return n
+}
+
+// broadcastTimeout bounds a maintenance broadcast so a shutdown is never
+// blocked by a slow or wedged agent connection.
+const broadcastTimeout = 3 * time.Second
+
+// BroadcastMaintenance sends a maintenance notice to all currently connected agents.
+// Called prior to graceful server shutdown or restart so agents persist a
+// "maintenance" reconnect reason and the alert engine stays quiet (see AGENTS.md 8.6).
+//
+// The hub list is snapshotted under the read lock but frames are sent outside
+// it: Hub.Send may block up to 5s per agent when the outbound channel is full,
+// and holding r.mu across that would stall ListAgents/Hub — and therefore every
+// HTTP request that resolves a host — for the whole broadcast.
+func (r *Registry) BroadcastMaintenance(reason string, durationSec int) {
+	r.mu.RLock()
+	hubs := make([]*Hub, 0, len(r.hubs))
+	for _, hub := range r.hubs {
+		if hub != nil {
+			hubs = append(hubs, hub)
+		}
+	}
+	r.mu.RUnlock()
+
+	if len(hubs) == 0 {
+		return
+	}
+	r.log.Info("broadcasting maintenance notice", "reason", reason, "agents", len(hubs))
+
+	done := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(len(hubs))
+		for _, hub := range hubs {
+			go func(h *Hub) {
+				defer wg.Done()
+				// Build a fresh message per hub; protobuf messages must not be
+				// shared across goroutines that may lazily populate caches.
+				h.Send(&agentpb.ServerMessage{
+					Payload: &agentpb.ServerMessage_Maintenance{
+						Maintenance: &agentpb.MaintenanceNotice{
+							Reason:              reason,
+							ExpectedDurationSec: int32(durationSec),
+						},
+					},
+				})
+			}(hub)
+		}
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(broadcastTimeout):
+		r.log.Warn("maintenance broadcast timed out", "reason", reason, "agents", len(hubs))
+	}
+}
+
+// CountOnline returns how many agents are currently connected.
+func (r *Registry) CountOnline() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, a := range r.agents {
+		if a.Status == "online" {
+			n++
+		}
+	}
+	return n
+}
+
+// CountByGroup returns how many agents are in the given group name.
+func (r *Registry) CountByGroup(name string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, a := range r.agents {
+		if a.Group == name {
+			n++
+		}
+	}
+	return n
+}
+
 // DeleteAgent removes an agent from the registry.
 func (r *Registry) DeleteAgent(id string) error {
 	r.mu.Lock()
@@ -491,20 +715,54 @@ func (r *Registry) DeleteAgent(id string) error {
 
 func (r *Registry) ReapStale() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	now := time.Now()
+	// Snapshot the stale IDs under r.mu, then read hub.lastSeen under hub.mu:
+	// lastSeen is also written by handleAgentMessage under hub.mu, and an
+	// unsynchronized read here is a data race (torn time.Time on 32-bit).
+	type staleHub struct {
+		id        string
+		heartbeat int32
+	}
+	var stale []staleHub
 	for id, hub := range r.hubs {
-		if now.Sub(hub.lastSeen) > time.Duration(hub.heartbeat)*heartbeatGraceFactor*time.Second {
-			delete(r.hubs, id)
-			if a, ok := r.agents[id]; ok {
-				a.Status = "offline"
-			}
-			r.log.Info("agent reaped (stale)", "agent_id", id)
+		hub.mu.Lock()
+		idle := now.Sub(hub.lastSeen)
+		hb := hub.heartbeat
+		hub.mu.Unlock()
+		if idle > time.Duration(hb)*heartbeatGraceFactor*time.Second {
+			stale = append(stale, staleHub{id: id, heartbeat: hb})
 		}
 	}
+	for _, s := range stale {
+		delete(r.hubs, s.id)
+		if a, ok := r.agents[s.id]; ok {
+			a.Status = "offline"
+		}
+		r.log.Info("agent reaped (stale)", "agent_id", s.id)
+	}
+	r.mu.Unlock()
 }
 
-func newHub(agentID string, heartbeatSec int32) *Hub {
+// updateAgentMetrics writes the latest uptime and hardware info from a
+// metrics sample back into the persisted Agent struct so the host list
+// API always returns fresh values even without a live hub lookup.
+func (r *Registry) updateAgentMetrics(agentID string, m *agentpb.MetricsSample) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.agents[agentID]
+	if !ok {
+		return
+	}
+	if m.GetUptime() > 0 {
+		a.Uptime = m.GetUptime()
+	}
+	if m.GetMemTotal() > 0 {
+		a.MemTotal = m.GetMemTotal()
+	}
+	a.LastSeen = time.Now()
+}
+
+func newHub(agentID string, heartbeatSec int32, reg *Registry) *Hub {
 	return &Hub{
 		AgentID:      agentID,
 		heartbeat:    heartbeatSec,
@@ -512,6 +770,7 @@ func newHub(agentID string, heartbeatSec int32) *Hub {
 		sendCh:       make(chan *agentpb.ServerMessage, 128),
 		termHandlers: make(map[string]func(*agentpb.TerminalOutput)),
 		respHandlers: make(map[string]func(*agentpb.AgentMessage)),
+		registry:     reg,
 	}
 }
 
@@ -525,18 +784,27 @@ func (h *Hub) bind(stream agentpb.AgentService_ConnectServer) {
 func (h *Hub) unbind() {
 	h.mu.Lock()
 	h.stream = nil
+	h.closed = true
 	close(h.sendCh)
-	// Clean up all response handlers.
+	// Snapshot all handlers and clear the maps BEFORE invoking callbacks: the
+	// handlers (e.g. metrics-poll in metrics.Store) re-enter SetRespHandler to
+	// deregister themselves, which would self-deadlock on this non-reentrant
+	// mutex if we called them while still holding it. That deadlock pinned
+	// hub.mu forever and froze every reader (LastMetrics, alert monitor).
+	handlers := make(map[string]func(*agentpb.AgentMessage), len(h.respHandlers))
 	for id, fn := range h.respHandlers {
-		if fn != nil {
-			fn(nil) // signal disconnection
-		}
+		handlers[id] = fn
 		delete(h.respHandlers, id)
 	}
 	for id := range h.termHandlers {
 		delete(h.termHandlers, id)
 	}
 	h.mu.Unlock()
+	for _, fn := range handlers {
+		if fn != nil {
+			fn(nil) // signal disconnection
+		}
+	}
 }
 
 func (h *Hub) sendPump(stream agentpb.AgentService_ConnectServer) {
@@ -550,12 +818,14 @@ func (h *Hub) sendPump(stream agentpb.AgentService_ConnectServer) {
 func (h *Hub) Send(msg *agentpb.ServerMessage) bool {
 	// Hold a read lock across the channel send so unbind() — which closes
 	// sendCh under the write lock — can never run concurrently with a send.
-	// This rules out the "send on closed channel" panic. It blocks up to 5
-	// seconds waiting for sendCh capacity instead of silently dropping the
-	// message; callers get false when the hub is gone or the timeout hits.
+	// This rules out the "send on closed channel" panic that a check-then-
+	// send without the lock would still have (unbind could close sendCh in
+	// the window between the check and the send). It blocks up to 5 seconds
+	// waiting for sendCh capacity instead of silently dropping the message;
+	// callers get false when the hub is gone or the timeout hits.
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	if h.stream == nil {
+	if h.stream == nil || h.closed {
 		slog.Default().Warn("hub.Send: stream is nil", "agent_id", h.AgentID)
 		return false
 	}
@@ -601,14 +871,16 @@ func (h *Hub) handleAgentMessage(msg *agentpb.AgentMessage) error {
 	case *agentpb.AgentMessage_ExecResult:
 		h.dispatchResp(p.ExecResult.GetExecId(), msg)
 		return nil
-		case *agentpb.AgentMessage_Metrics:
-			h.mu.Lock()
-			h.lastMetrics = p.Metrics
-			h.mu.Unlock()
-			// Dispatch to any live metrics handler (registered under "metrics-live") or poll handler ("metrics-poll").
-			h.dispatchResp("metrics-live", msg)
-			h.dispatchResp("metrics-poll", msg)
-			return nil
+	case *agentpb.AgentMessage_Metrics:
+		h.mu.Lock()
+		h.lastMetrics = p.Metrics
+		h.mu.Unlock()
+		if h.registry != nil && p.Metrics.GetUptime() > 0 {
+			h.registry.updateAgentMetrics(h.AgentID, p.Metrics)
+		}
+		h.dispatchResp("metrics-live", msg)
+		h.dispatchResp("metrics-poll", msg)
+		return nil
 	case *agentpb.AgentMessage_Sysinfo:
 		// SysInfo responses are keyed by kind in the query; we use the kind as ref.
 		h.dispatchResp("sysinfo:"+p.Sysinfo.GetKind(), msg)
@@ -691,4 +963,30 @@ func randomToken(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// MockConnectForTest marks the hub as connected for unit tests without a real gRPC stream.
+func (h *Hub) MockConnectForTest() {
+	h.mu.Lock()
+	h.stream = &mockConnectServer{}
+	h.mu.Unlock()
+}
+
+type mockConnectServer struct {
+	agentpb.AgentService_ConnectServer
+}
+
+// RecvForTest reads the next message sent to the agent's outbound channel.
+func (h *Hub) RecvForTest(timeout time.Duration) (*agentpb.ServerMessage, bool) {
+	select {
+	case msg := <-h.sendCh:
+		return msg, true
+	case <-time.After(timeout):
+		return nil, false
+	}
+}
+
+// DispatchRespForTest dispatches a mock agent response to registered handlers.
+func (h *Hub) DispatchRespForTest(ref string, msg *agentpb.AgentMessage) {
+	h.dispatchResp(ref, msg)
 }

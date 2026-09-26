@@ -1,5 +1,5 @@
 import { http, unwrap } from './http'
-import type { EnrollResponse, HealthResponse, Host, ListResponse, SessionRecord } from './types'
+import type { EnrollResponse, HealthResponse, Host, HostBillingConfig, ListResponse, SessionRecord } from './types'
 
 export function listHosts() {
   return unwrap<ListResponse<Host>>(http.get('/hosts'))
@@ -27,6 +27,10 @@ export function setHostGroup(id: string, group: string) {
 
 export function setHostTags(id: string, tags: string[]) {
   return unwrap<{ ok: boolean }>(http.put(`/hosts/${id}/tags`, { tags }))
+}
+
+export function updateHostBilling(id: string, billing: HostBillingConfig) {
+  return unwrap<{ ok: boolean }>(http.put(`/hosts/${id}/billing`, billing))
 }
 
 // ---- Terminal ----
@@ -108,14 +112,43 @@ export async function fileUpload(hostId: string, path: string, file: File) {
   return resp.data
 }
 
+// fileReadText fetches a file as UTF-8 text for the preview/edit panel. Large
+// files are rejected client-side by the caller after a fileStat size check.
+export async function fileReadText(hostId: string, path: string) {
+  const resp = await http.get(`/hosts/${hostId}/files/download`, {
+    params: { path },
+    responseType: 'text',
+    transformResponse: [(d) => d],
+    timeout: 60000,
+  })
+  return typeof resp.data === 'string' ? resp.data : String(resp.data ?? '')
+}
+
+// fileWriteText saves edited text back to the host, reusing the chunked upload
+// endpoint so no separate write path is needed.
+export async function fileWriteText(hostId: string, path: string, content: string) {
+  const resp = await http.post(
+    `/hosts/${hostId}/files/upload?path=${encodeURIComponent(path)}`,
+    new Blob([content], { type: 'application/octet-stream' }),
+    { headers: { 'Content-Type': 'application/octet-stream' }, timeout: 60000 },
+  )
+  return resp.data
+}
+
 // ---- Exec ----
 export function execCommand(hostId: string, command: string, shell = '', timeoutSec = 60, isScript = false, confirmRisk = false) {
+  // The default axios timeout (15s) is far shorter than a long-running command
+  // (a Docker install pulls packages for minutes). Align the HTTP timeout with
+  // the requested server-side exec timeout, plus headroom for round-trip, so
+  // the browser doesn't abort a command the agent is still running.
+  const httpTimeout = Math.max(timeoutSec + 30, 60) * 1000
+  const headers = confirmRisk ? { 'X-Confirm-Risk': 'true' } : undefined
   return unwrap<any>(http.post(`/hosts/${hostId}/exec`, {
     command,
     shell,
     timeout_sec: timeoutSec,
     is_script: isScript,
-  }, confirmRisk ? { headers: { 'X-Confirm-Risk': 'true' } } : {}))
+  }, { timeout: httpTimeout, headers }))
 }
 
 export function batchExec(hostIds: string[], command: string, shell = '', timeoutSec = 60, confirmRisk = false) {
@@ -142,6 +175,17 @@ export interface MetricPoint {
   net_tx: number
   disk_read: number
   disk_write: number
+  // Extended metrics (zero/absent on older records).
+  load1?: number
+  load5?: number
+  load15?: number
+  swap_total?: number
+  swap_used?: number
+  tcp_established?: number
+  udp_count?: number
+  process_count?: number
+  month_rx?: number
+  month_tx?: number
 }
 
 export interface MetricsHistoryResponse {
@@ -217,13 +261,40 @@ export function uninstallApp(hostId: string, appName: string) {
   return unwrap<any>(http.delete(`/hosts/${hostId}/apps/${appName}`))
 }
 
-export function getDockerInstallScript(hostId: string) {
-  return unwrap<{ script: string; command: string }>(http.get(`/hosts/${hostId}/apps/install-docker-script`))
+export interface DockerInstallResult {
+  ok: boolean
+  exit_code: number
+  stdout: string
+  stderr: string
+}
+
+// installDocker runs the server-side one-click Docker install script on the
+// host. The script is defined on the server, not sent by the client, so the
+// command that actually runs cannot be tampered with from the browser.
+export function installDocker(hostId: string) {
+  return unwrap<DockerInstallResult>(
+    http.post(`/hosts/${hostId}/docker/install-script`, {}, { timeout: 330000 }),
+  )
 }
 
 // ---- SysInfo ----
 export function getSysInfo(hostId: string, kind: string) {
   return unwrap<any>(http.get(`/hosts/${hostId}/sysinfo/${kind}`))
+}
+
+export interface KillProcessResult {
+  ok: boolean
+  pid: number
+  name: string
+  force: boolean
+}
+
+// killProcess terminates one process on the host. force selects SIGKILL over
+// SIGTERM; name is sent for the audit trail only.
+export function killProcess(hostId: string, pid: number, force = false, name = '') {
+  return unwrap<KillProcessResult>(
+    http.post(`/hosts/${hostId}/processes/${pid}/kill`, { force, name }),
+  )
 }
 
 // ---- Docker ----
@@ -246,9 +317,19 @@ export function dockerOp(hostId: string, op: string, container = '', image = '')
   return unwrap<any>(http.post(`/hosts/${hostId}/docker/${op}`, { container, image }))
 }
 
+export function dockerGetMirrors(hostId: string) {
+  return unwrap<{ ok: boolean; mirrors: string[] }>(http.get(`/hosts/${hostId}/docker/mirrors`))
+}
+
+export function dockerSetMirrors(hostId: string, mirrors: string[]) {
+  return unwrap<{ ok: boolean; mirrors: string[] }>(
+    http.put(`/hosts/${hostId}/docker/mirrors`, { mirrors }, { timeout: 45000 }),
+  )
+}
+
 // ---- Sessions ----
-export function listSessions() {
-  return unwrap<ListResponse<SessionRecord>>(http.get('/sessions'))
+export function listSessions(params?: { offset?: number; page_size?: number }) {
+  return unwrap<ListResponse<SessionRecord>>(http.get('/sessions', { params }))
 }
 
 export function getSession(id: string) {
@@ -263,4 +344,19 @@ export function sessionRecordingUrl(id: string): string {
   const baseURL = (http.defaults.baseURL || '/api/v1').replace(/\/$/, '')
   const token = localStorage.getItem('watchman_token') || ''
   return `${baseURL}/sessions/${id}/recording?token=${encodeURIComponent(token)}`
+}
+
+export interface UpgradeAgentResult {
+  ok: boolean
+  version: string
+  message: string
+}
+
+// upgradeAgent triggers in-place self-upgrade on a target managed host.
+// The agent downloads the latest binary for its platform from the server,
+// verifies sha256, replaces itself, and reboots seamlessly.
+export function upgradeAgent(hostId: string, version = '', sha256 = '') {
+  return unwrap<UpgradeAgentResult>(
+    http.post(`/hosts/${hostId}/upgrade`, { version, sha256 }, { timeout: 130000 }),
+  )
 }

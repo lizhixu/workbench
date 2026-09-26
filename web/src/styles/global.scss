@@ -47,6 +47,15 @@ html.dark {
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4);
 }
 
+/* 布局度量：与主题无关，两套配色共用。
+   --page-padding 由 AppShell 统一施加在内容区，页面组件不要再自行设置外层内边距，
+   否则会重新出现各页面留白不一致的问题。
+   --card-padding 为页面内主卡片/面板的内边距，与页面留白取同一档位。 */
+:root {
+  --page-padding: 16px;
+  --card-padding: 16px;
+}
+
 html,
 body,
 #app {
@@ -66,6 +75,8 @@ body,
 
 * {
   box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-dashed) transparent;
 }
 
 code, .mono-font {
@@ -108,7 +119,7 @@ code, .mono-font {
   }
 }
 
-/* 自定义极简滚动条 */
+/* 全局极简现代滚动条 */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -118,8 +129,163 @@ code, .mono-font {
 }
 ::-webkit-scrollbar-thumb {
   background: var(--border-dashed);
-  border-radius: 3px;
+  border-radius: 999px;
+  transition: background-color 0.2s ease;
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
 }
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* 统一可滚动区域行为与平滑滚动 */
+.scroll-container,
+.sub-view-pane,
+.host-list-container,
+.file-table-container,
+.chat-list,
+.audit-table-wrap,
+.log-output-box {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+/* ===================== 大数据表格页面布局 =====================
+   见 AGENTS.md 8.2：承载不定长列表的表格填满视口，表头与分页固定，
+   只有数据区滚动。三个类配合 NDataTable 的 flex-height 使用。 */
+
+/* 页面根容器：撑满可用高度的纵向 flex 容器 */
+.page-flex-column {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  box-sizing: border-box;
+}
+
+/* 表格容器：吃掉剩余高度。min-height:0 是必需的——flex 子项默认
+   min-height:auto，不写则容器不会收缩，滚动条会跑到页面外层。 */
+.table-flex-fill {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+
+  /* 包了 NCard 时，卡片内容区也要具备同样的 flex 能力。
+     naive-ui 的类名是 n-card-content（单连字符），不是 n-card__content。
+     注意：无 header 的卡片，naive-ui 会额外给 .n-card-content:first-child 加
+     padding-top: var(--n-padding-bottom)，且其运行时注入的样式排在 global.scss
+     之后，同优先级下会覆盖这里的 padding: 0，导致表头上方多出一条空白。
+     因此这里必须用 !important 压制，:first-child 也要显式清零。 */
+  :deep(.n-card-content),
+  .n-card-content {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding: 0 !important;
+
+    &:first-child {
+      padding-top: 0 !important;
+    }
+  }
+
+  /* 表格自身占满容器，由 flex-height 计算内部滚动区 */
+  :deep(.n-data-table),
+  .n-data-table {
+    flex: 1;
+    min-height: 0;
+
+    /* 内置分页条统一样式与对称间距，防止顶到卡片底边或下拉遮挡 */
+    .n-data-table__pagination {
+      padding: 12px 16px;
+      margin: 0;
+      border-top: 1px solid var(--border-color);
+      box-sizing: border-box;
+    }
+  }
+}
+
+/* 分页条：钉在表格下方，不参与滚动。
+   固定条高 + 上下对称内边距，让分页在条内垂直居中；只给 padding-top 会让分页
+   紧贴卡片底边，视觉上像被裁掉，「每页条数」下拉也会顶到边缘。 */
+.table-pagination-bar {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border-color);
+}
+
+/* ===================== 移动端适配 ===================== */
+@media (max-width: 768px) {
+  :root {
+    --page-padding: 10px;
+    --card-padding: 10px;
+  }
+
+  html,
+  body {
+    font-size: 13px;
+  }
+
+  /* 所有卡片式 Modal / Drawer 在窄屏下自适应宽度（覆盖内联 width） */
+  .n-modal,
+  .n-card.n-modal {
+    width: 92vw !important;
+    max-width: 92vw;
+    margin: 0 4vw;
+  }
+
+  .n-drawer {
+    width: 100vw !important;
+    max-width: 100vw;
+  }
+
+  /* 下拉菜单不要超出屏幕 */
+  .n-dropdown-menu,
+  .n-dropdown-option {
+    max-width: 86vw;
+  }
+
+  /* 数据表格容器允许横向滚动 */
+  .n-data-table {
+    overflow-x: auto;
+  }
+
+  /* 通用工具栏在窄屏下换行（跨视图复用的类名） */
+  .toolbar-bar,
+  .toolbar-left,
+  .toolbar-right,
+  .table-card-header,
+  .catalog-toolbar,
+  .sysinfo-header,
+  .report-header {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  /* 长 token / 命令 / 日志文本换行，避免撑破容器 */
+  code,
+  pre,
+  .cmd-text,
+  .token-value,
+  .log-output {
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+
+  /* 触控设备：去掉 hover 粘滞 */
+  @media (hover: none) {
+    .n-button:focus-visible {
+      outline: none;
+    }
+  }
+}
+

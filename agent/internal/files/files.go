@@ -30,21 +30,33 @@ type Sender interface {
 }
 
 // Manager handles file operations.
+//
+// The two mutexes must stay separate: mu guards the chunked-write sessions and
+// is held across a whole write step, while sendMu only guards the sender field.
+// Folding them into one lock deadlocks, because a write step acks its own
+// result and sync.Mutex is not reentrant.
 type Manager struct {
-	mu       sync.Mutex
-	sender   Sender
-	log      *slog.Logger
-	writers  map[string]*writeSession // op_id -> session for chunked writes
+	mu      sync.Mutex
+	sendMu  sync.RWMutex
+	sender  Sender
+	log     *slog.Logger
+	writers map[string]*writeSession // op_id -> session for chunked writes
+	writeQ  chan *agentpb.FileOp     // ordered queue for chunked writes
 }
 
+// writeQueueDepth bounds how many write messages may wait on the disk. Each
+// chunk is at most 64KB, so this caps in-flight upload memory at a few MB and
+// applies backpressure to the stream instead of dropping chunks.
+const writeQueueDepth = 64
+
 type writeSession struct {
-	file       *os.File
-	path       string
-	nextSeq    uint32
-	total      int64
-	written    int64
-	sha        []byte // expected sha256 if provided
-	hasher     hash.Hash
+	file    *os.File
+	path    string
+	nextSeq uint32
+	total   int64
+	written int64
+	sha     string // expected sha256 hex digest, empty = skip verification
+	hasher  hash.Hash
 }
 
 // NewManager creates a file manager.
@@ -52,17 +64,35 @@ func NewManager(log *slog.Logger) *Manager {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Manager{
+	m := &Manager{
 		log:     log,
 		writers: make(map[string]*writeSession),
+		writeQ:  make(chan *agentpb.FileOp, writeQueueDepth),
+	}
+	go m.writeWorker()
+	return m
+}
+
+// writeWorker applies queued write messages in arrival order.
+func (m *Manager) writeWorker() {
+	for op := range m.writeQ {
+		m.Handle(op)
 	}
 }
 
 // SetSender wires the manager to the live connection hub.
 func (m *Manager) SetSender(s Sender) {
-	m.mu.Lock()
+	m.sendMu.Lock()
 	m.sender = s
-	m.mu.Unlock()
+	m.sendMu.Unlock()
+}
+
+// currentSender returns the live sender without touching mu, so it is safe to
+// call while a write step holds mu.
+func (m *Manager) currentSender() Sender {
+	m.sendMu.RLock()
+	defer m.sendMu.RUnlock()
+	return m.sender
 }
 
 // FileInfo is the JSON shape for file list / stat responses.
@@ -75,7 +105,9 @@ type FileInfo struct {
 	ModTime string `json:"mod_time"`
 }
 
-// Handle processes a FileOp message from the server.
+// Handle processes a FileOp message synchronously, in the caller's goroutine.
+// Chunked writes must reach it in arrival order; use HandleAsync from a
+// connection receive loop rather than calling this concurrently.
 func (m *Manager) Handle(op *agentpb.FileOp) {
 	switch op.GetOp() {
 	case "list":
@@ -100,6 +132,27 @@ func (m *Manager) Handle(op *agentpb.FileOp) {
 		m.handleWrite(op) // same as write
 	default:
 		m.ack(op.GetOpId(), false, fmt.Sprintf("unknown op: %s", op.GetOp()), "")
+	}
+}
+
+// HandleAsync dispatches an op off the connection's receive loop.
+//
+// An upload arrives as a session header followed by numbered chunks, each its
+// own stream message. Handling those on independent goroutines loses the
+// arrival order and the write fails with a missing session or a sequence
+// mismatch, so writes go through one ordered queue. Every other op is
+// self-contained and still runs concurrently.
+func (m *Manager) HandleAsync(op *agentpb.FileOp) {
+	switch op.GetOp() {
+	case "write", "upload":
+		select {
+		case m.writeQ <- op:
+		case <-time.After(10 * time.Second):
+			m.log.Warn("write queue saturated, op dropped", "op_id", op.GetOpId(), "path", op.GetPath())
+			m.ack(op.GetOpId(), false, "agent write queue saturated", "")
+		}
+	default:
+		go m.Handle(op)
 	}
 }
 
@@ -329,15 +382,32 @@ func (m *Manager) handleWrite(op *agentpb.FileOp) {
 			ws.written += int64(len(op.GetData()))
 		}
 		ws.nextSeq++
-		// Check if we've written everything (total_size known and reached).
-		if op.GetTotalSize() > 0 && ws.written >= op.GetTotalSize() {
-			// Verify sha256 if provided.
+		// Check if we've written everything. The completing frame carries
+		// total_size; fall back to the header's session total when a chunk
+		// omits it, so the write still acks and the session is cleaned up.
+		total := op.GetTotalSize()
+		if total == 0 {
+			total = ws.total
+		}
+		if total > 0 && ws.written >= total {
+			actual := ""
 			if ws.hasher != nil {
-				actual := hex.EncodeToString(ws.hasher.Sum(nil))
-				_ = actual
+				actual = hex.EncodeToString(ws.hasher.Sum(nil))
+			}
+			// A digest mismatch means the file on disk is not what the server
+			// sent, so remove the corrupt result instead of leaving it in place.
+			if ws.sha != "" && actual != ws.sha {
+				path := ws.path
+				m.cleanupWrite(op.GetOpId())
+				_ = os.Remove(path)
+				m.log.Warn("write sha256 mismatch, file discarded",
+					"path", path, "expected", ws.sha, "actual", actual)
+				m.ackSha(op.GetOpId(), false,
+					fmt.Sprintf("sha256 校验失败: 期望 %s, 实际 %s", ws.sha, actual), actual)
+				return
 			}
 			m.cleanupWrite(op.GetOpId())
-			m.ack(op.GetOpId(), true, "", "")
+			m.ackSha(op.GetOpId(), true, "", actual)
 		}
 		return
 	}
@@ -360,13 +430,14 @@ func (m *Manager) handleWrite(op *agentpb.FileOp) {
 		path:    targetPath,
 		nextSeq: 0,
 		total:   op.GetTotalSize(),
+		sha:     strings.ToLower(op.GetSha256()),
 		hasher:  sha256.New(),
 	}
 	m.writers[op.GetOpId()] = ws
 	// If total_size is 0, it's an empty file — done immediately.
 	if op.GetTotalSize() == 0 {
 		m.cleanupWrite(op.GetOpId())
-		m.ack(op.GetOpId(), true, "", "")
+		m.ackSha(op.GetOpId(), true, "", hex.EncodeToString(sha256.New().Sum(nil)))
 	}
 }
 
@@ -440,10 +511,7 @@ func (m *Manager) CloseAll() {
 }
 
 func (m *Manager) sendChunk(fc *agentpb.FileChunk) {
-	m.mu.Lock()
-	s := m.sender
-	m.mu.Unlock()
-	if s != nil {
+	if s := m.currentSender(); s != nil {
 		s.Send(&agentpb.AgentMessage{
 			Payload: &agentpb.AgentMessage_FileChunk{FileChunk: fc},
 		})
@@ -451,13 +519,22 @@ func (m *Manager) sendChunk(fc *agentpb.FileChunk) {
 }
 
 func (m *Manager) ack(opID string, ok bool, errMsg, ref string) {
-	m.mu.Lock()
-	s := m.sender
-	m.mu.Unlock()
-	if s != nil {
+	if s := m.currentSender(); s != nil {
 		s.Send(&agentpb.AgentMessage{
 			Payload: &agentpb.AgentMessage_Ack{
 				Ack: &agentpb.Ack{Ok: ok, Error: errMsg, Ref: opID},
+			},
+		})
+	}
+}
+
+// ackSha acknowledges a chunked write and reports the digest the agent actually
+// computed, so the server can log or compare it.
+func (m *Manager) ackSha(opID string, ok bool, errMsg, sha string) {
+	if s := m.currentSender(); s != nil {
+		s.Send(&agentpb.AgentMessage{
+			Payload: &agentpb.AgentMessage_Ack{
+				Ack: &agentpb.Ack{Ok: ok, Error: errMsg, Ref: opID, Sha256: sha},
 			},
 		})
 	}

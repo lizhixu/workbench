@@ -20,11 +20,12 @@ import (
 type RuleType string
 
 const (
-	RuleOffline    RuleType = "offline"     // agent goes offline
-	RuleCPUHigh    RuleType = "cpu_high"    // CPU usage > threshold % for duration
-	RuleMemHigh    RuleType = "mem_high"    // memory usage > threshold % for duration
-	RuleDiskHigh   RuleType = "disk_high"   // any mount usage > threshold %
-	RuleAnomaly    RuleType = "anomaly"     // AI/statistical anomaly: value deviates > threshold × σ from recent mean
+	RuleOffline  RuleType = "offline"   // agent goes offline
+	RuleOnline   RuleType = "online"    // agent comes online
+	RuleCPUHigh  RuleType = "cpu_high"  // CPU usage > threshold % for duration
+	RuleMemHigh  RuleType = "mem_high"  // memory usage > threshold % for duration
+	RuleDiskHigh RuleType = "disk_high" // any mount usage > threshold %
+	RuleAnomaly  RuleType = "anomaly"   // AI/statistical anomaly: value deviates > threshold × σ from recent mean
 )
 
 // Severity classifies alert events.
@@ -38,17 +39,17 @@ const (
 
 // Rule defines an alert condition.
 type Rule struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	Type       RuleType  `json:"type"`
-	Severity   Severity  `json:"severity"`
-	Threshold  float64   `json:"threshold"`  // e.g. 90 for 90%; for anomaly = σ multiplier (e.g. 3)
-	Duration   int       `json:"duration"`   // seconds the condition must hold (0 = immediate)
-	Metric     string    `json:"metric,omitempty"`  // for anomaly: cpu / mem / net_rx / net_tx / disk_read / disk_write
-	HostFilter  string   `json:"host_filter"` // empty = all hosts; otherwise hostname substring
-	GroupFilter string   `json:"group_filter"` // empty = all groups
-	Enabled    bool      `json:"enabled"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Type        RuleType  `json:"type"`
+	Severity    Severity  `json:"severity"`
+	Threshold   float64   `json:"threshold"`        // e.g. 90 for 90%; for anomaly = σ multiplier (e.g. 3)
+	Duration    int       `json:"duration"`         // seconds the condition must hold (0 = immediate)
+	Metric      string    `json:"metric,omitempty"` // for anomaly: cpu / mem / net_rx / net_tx / disk_read / disk_write
+	HostFilter  string    `json:"host_filter"`      // empty = all hosts; otherwise hostname substring
+	GroupFilter string    `json:"group_filter"`     // empty = all groups
+	Enabled     bool      `json:"enabled"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // Event is a fired alert.
@@ -75,13 +76,18 @@ type WebhookConfig struct {
 
 // Store persists rules, events, and webhook config.
 type Store struct {
-	mu        sync.RWMutex
-	rules     map[string]*Rule
-	events    []*Event
-	webhook   WebhookConfig
-	filePath  string
+	mu       sync.RWMutex
+	rules    map[string]*Rule
+	events   []*Event
+	webhook  WebhookConfig
+	filePath string
 	// Track which rules are currently firing per host (to avoid duplicate events).
 	firing map[string]bool // key = ruleID:hostID
+	// Track when each rule:host condition was first observed true, so rules with
+	// a Duration only fire once the condition has held that long. In-memory only:
+	// a restart deliberately restarts every sustain window rather than firing on
+	// a window it never actually observed.
+	pending map[string]time.Time // key = ruleID:hostID
 }
 
 // NewStore loads (or creates) the alert store.
@@ -93,17 +99,63 @@ func NewStore(dataDir string) (*Store, error) {
 		rules:    map[string]*Rule{},
 		filePath: filepath.Join(dataDir, "alerts.json"),
 		firing:   map[string]bool{},
+		pending:  map[string]time.Time{},
 	}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
+	// Seed the built-in "host online"/"host offline" rules (AGENTS.md 3.11:
+	// built-in monitor items). Idempotent: only inserts when no rule of that
+	// type exists, so users who delete or customise a default keep their change.
+	s.seedBuiltinRules()
 	return s, nil
 }
 
+// seedBuiltinRules installs the built-in online/offline notification rules the
+// first time the store is created, so out-of-the-box deployments get host
+// up/down alerts without manual setup. Existing rules of the same type are left
+// untouched.
+func (s *Store) seedBuiltinRules() {
+	seeds := []*Rule{
+		{
+			ID:       "builtin-online",
+			Name:     "主机上线通知",
+			Type:     RuleOnline,
+			Severity: SeverityInfo,
+			Enabled:  true,
+		},
+		{
+			ID:       "builtin-offline",
+			Name:     "主机离线告警",
+			Type:     RuleOffline,
+			Severity: SeverityCritical,
+			Enabled:  true,
+		},
+	}
+
+	existing := map[RuleType]bool{}
+	for _, r := range s.rules {
+		existing[r.Type] = true
+	}
+
+	changed := false
+	for _, seed := range seeds {
+		if existing[seed.Type] {
+			continue
+		}
+		seed.CreatedAt = time.Now()
+		s.rules[seed.ID] = seed
+		changed = true
+	}
+	if changed {
+		_ = s.persist()
+	}
+}
+
 type persisted struct {
-	Rules   []*Rule        `json:"rules"`
-	Events  []*Event       `json:"events"`
-	Webhook WebhookConfig  `json:"webhook"`
+	Rules   []*Rule       `json:"rules"`
+	Events  []*Event      `json:"events"`
+	Webhook WebhookConfig `json:"webhook"`
 }
 
 func (s *Store) load() error {
@@ -124,30 +176,100 @@ func (s *Store) load() error {
 	}
 	s.events = p.Events
 	s.webhook = p.Webhook
+	// Restore active alerts into s.firing so a server restart does not re-fire
+	// existing un-resolved alerts (CPU/mem/disk high, offline, etc.).
+	for _, e := range s.events {
+		if !e.Resolved && e.RuleID != "" && e.HostID != "" {
+			s.firing[e.RuleID+":"+e.HostID] = true
+		}
+	}
+	// Deduplicate redundant historical "builtin-online" events for the same host:
+	// Server restarts previously generated duplicate "host online" notifications
+	// on each boot. Keep only the most recent online notification per host.
+	s.dedupHistoricalOnlineEventsLocked()
 	s.mu.Unlock()
 	return nil
 }
 
-func (s *Store) persist() error {
-	s.mu.RLock()
-	p := persisted{
-		Rules:   make([]*Rule, 0, len(s.rules)),
-		Events:  s.events,
+// dedupHistoricalOnlineEventsLocked cleans up duplicate historical online events
+// generated by previous control server restarts. Caller must hold s.mu.
+func (s *Store) dedupHistoricalOnlineEventsLocked() {
+	seenOnlineHost := make(map[string]bool)
+	var filtered []*Event
+	// Events are stored chronological (oldest to newest). Iterate in reverse to
+	// retain the most recent online notification per host.
+	for i := len(s.events) - 1; i >= 0; i-- {
+		e := s.events[i]
+		if e.RuleID == "builtin-online" {
+			if seenOnlineHost[e.HostID] {
+				continue
+			}
+			seenOnlineHost[e.HostID] = true
+		}
+		filtered = append(filtered, e)
+	}
+	// Reverse back to chronological order.
+	for i, j := 0, len(filtered)-1; i < j; i, j = i+1, j-1 {
+		filtered[i], filtered[j] = filtered[j], filtered[i]
+	}
+	if len(filtered) != len(s.events) {
+		s.events = filtered
+		_ = s.persistLocked()
+	}
+}
+
+func (s *Store) snapshotForPersistLocked() persisted {
+	rules := make([]*Rule, 0, len(s.rules))
+	for _, r := range s.rules {
+		rules = append(rules, r)
+	}
+	events := make([]*Event, len(s.events))
+	copy(events, s.events)
+	if len(events) > 500 {
+		events = events[len(events)-500:]
+	}
+	return persisted{
+		Rules:   rules,
+		Events:  events,
 		Webhook: s.webhook,
 	}
-	for _, r := range s.rules {
-		p.Rules = append(p.Rules, r)
+}
+
+func atomicWriteFile(filePath string, data []byte) error {
+	dir := filepath.Dir(filePath)
+	tmp := filepath.Join(dir, fmt.Sprintf("%s.tmp.%d", filepath.Base(filePath), time.Now().UnixNano()))
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
 	}
-	s.mu.RUnlock()
-	// Cap events at 500 to prevent unbounded growth.
-	if len(p.Events) > 500 {
-		p.Events = p.Events[len(p.Events)-500:]
+	if err := os.Rename(tmp, filePath); err != nil {
+		_ = os.Remove(filePath)
+		if err2 := os.Rename(tmp, filePath); err2 != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
 	}
+	return nil
+}
+
+func (s *Store) persistLocked() error {
+	p := s.snapshotForPersistLocked()
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.filePath, data, 0o600)
+	return atomicWriteFile(s.filePath, data)
+}
+
+func (s *Store) persist() error {
+	s.mu.RLock()
+	p := s.snapshotForPersistLocked()
+	s.mu.RUnlock()
+
+	data, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(s.filePath, data)
 }
 
 // ---- Rules ----
@@ -251,6 +373,43 @@ func (s *Store) AckAllEvents() error {
 	return s.persist()
 }
 
+// DeleteEvent removes a specific event by ID.
+func (s *Store) DeleteEvent(id string) error {
+	s.mu.Lock()
+	idx := -1
+	for i, e := range s.events {
+		if e.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		s.mu.Unlock()
+		return fmt.Errorf("event not found")
+	}
+	s.events = append(s.events[:idx], s.events[idx+1:]...)
+	s.mu.Unlock()
+	return s.persist()
+}
+
+// ClearEvents removes all events or only resolved events.
+func (s *Store) ClearEvents(resolvedOnly bool) error {
+	s.mu.Lock()
+	if resolvedOnly {
+		unresolved := make([]*Event, 0, len(s.events))
+		for _, e := range s.events {
+			if !e.Resolved {
+				unresolved = append(unresolved, e)
+			}
+		}
+		s.events = unresolved
+	} else {
+		s.events = make([]*Event, 0)
+	}
+	s.mu.Unlock()
+	return s.persist()
+}
+
 // ---- Webhook ----
 
 func (s *Store) GetWebhook() WebhookConfig {
@@ -277,6 +436,29 @@ func (s *Store) isFiring(key string) bool {
 func (s *Store) setFiring(key string, v bool) {
 	s.mu.Lock()
 	s.firing[key] = v
+	s.mu.Unlock()
+}
+
+// markPending records the first time a rule's condition was seen true for a
+// host and reports how long it has held. The second return value is false when
+// this is the first observation, so callers can distinguish "just started" from
+// "has been true for 0s".
+func (s *Store) markPending(key string, now time.Time) (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	since, ok := s.pending[key]
+	if !ok {
+		s.pending[key] = now
+		return 0, false
+	}
+	return now.Sub(since), true
+}
+
+// clearPending forgets the sustain window for a rule:host pair, so the next
+// time the condition appears it starts counting from zero.
+func (s *Store) clearPending(key string) {
+	s.mu.Lock()
+	delete(s.pending, key)
 	s.mu.Unlock()
 }
 

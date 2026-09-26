@@ -49,6 +49,10 @@ func NewManager(log *slog.Logger) *Manager {
 	dir := filepath.Join(os.TempDir(), "watchman-records")
 	// 0700: recordings may contain sensitive terminal output (passwords etc.).
 	_ = os.MkdirAll(dir, 0o700)
+	// Tighten permissions on dirs created by older versions (0755).
+	if fi, err := os.Stat(dir); err == nil && fi.Mode().Perm() != 0o700 {
+		_ = os.Chmod(dir, 0o700)
+	}
 	return &Manager{
 		sessions:  make(map[string]*session),
 		log:       log,

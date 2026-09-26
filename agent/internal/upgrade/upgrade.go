@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"watchman/proto/agentpb"
@@ -94,6 +95,8 @@ func (m *Manager) doUpgrade(req *agentpb.UpgradeRequest) {
 	m.progress("downloading", 1, "")
 
 	// 2. Verify sha256 (required: refuse to install an unverified binary).
+	// The comparison is case/whitespace-insensitive; the signature below is
+	// still verified over the exact string the server signed.
 	if req.GetSha256() == "" {
 		m.progress("error", 0, "upgrade rejected: server did not provide a sha256 checksum")
 		return
@@ -104,7 +107,8 @@ func (m *Manager) doUpgrade(req *agentpb.UpgradeRequest) {
 		m.progress("error", 0, "hash: "+err.Error())
 		return
 	}
-	if !hmac.Equal([]byte(actual), []byte(req.GetSha256())) {
+	want := strings.ToLower(strings.TrimSpace(req.GetSha256()))
+	if !hmac.Equal([]byte(actual), []byte(want)) {
 		m.progress("error", 0, fmt.Sprintf("sha256 mismatch: expected %s got %s", req.GetSha256(), actual))
 		return
 	}

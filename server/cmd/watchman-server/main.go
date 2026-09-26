@@ -125,12 +125,17 @@ func main() {
 
 	// ---- gRPC (agents) ----
 	var grpcOpts []grpc.ServerOption
-	if *tlsCert != "" && *tlsKey != "" {
+	switch {
+	case *tlsCert != "" && *tlsKey != "":
 		creds, err := credentials.NewServerTLSFromFile(*tlsCert, *tlsKey)
 		must(log, "load TLS credentials", err)
 		grpcOpts = append(grpcOpts, grpc.Creds(creds))
 		log.Info("gRPC TLS enabled")
-	} else {
+	case *tlsCert != "" || *tlsKey != "":
+		// Half-configured TLS must not silently fall back to plaintext.
+		log.Error("-tls-cert and -tls-key must be set together")
+		os.Exit(1)
+	default:
 		log.Warn("gRPC running without TLS: agent traffic is unencrypted; use -tls-cert/-tls-key")
 	}
 	grpcServer := grpc.NewServer(grpcOpts...)

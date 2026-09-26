@@ -94,7 +94,7 @@ type Hub struct {
 	sendCh     chan *agentpb.ServerMessage
 	stream     agentpb.AgentService_ConnectServer
 	tunnel     *Coordinator // reverse TCP tunnels (nil = disabled)
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	termHandlers map[string]func(*agentpb.TerminalOutput)
 	// Generic response handlers keyed by op_id / exec_id / session_id.
 	respHandlers map[string]func(*agentpb.AgentMessage)
@@ -317,6 +317,10 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 
 		hub := newHub(agentID, heartbeatSec)
 		hub.tunnel = r.tunnel
+		// The agent reconnected: drop tunnels bound to the old stream's hub.
+		if r.tunnel != nil {
+			r.tunnel.CloseByAgent(agentID)
+		}
 		r.hubs[agentID] = hub
 		return hub, &agentpb.RegisterResponse{
 			Ok:                  true,
@@ -362,6 +366,10 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 
 	hub := newHub(agentID, heartbeatSec)
 	hub.tunnel = r.tunnel
+	// Fresh enroll for a known agent id: drop stale tunnels as above.
+	if r.tunnel != nil {
+		r.tunnel.CloseByAgent(agentID)
+	}
 	r.hubs[agentID] = hub
 	r.log.Info("agent registered", "agent_id", agentID, "hostname", req.GetHostname())
 	return hub, &agentpb.RegisterResponse{
@@ -540,13 +548,17 @@ func (h *Hub) sendPump(stream agentpb.AgentService_ConnectServer) {
 }
 
 func (h *Hub) Send(msg *agentpb.ServerMessage) bool {
-	h.mu.Lock()
+	// Hold a read lock across the channel send so unbind() — which closes
+	// sendCh under the write lock — can never run concurrently with a send.
+	// This rules out the "send on closed channel" panic. It blocks up to 5
+	// seconds waiting for sendCh capacity instead of silently dropping the
+	// message; callers get false when the hub is gone or the timeout hits.
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	if h.stream == nil {
-		h.mu.Unlock()
 		slog.Default().Warn("hub.Send: stream is nil", "agent_id", h.AgentID)
 		return false
 	}
-	h.mu.Unlock()
 	// Block up to 5 seconds waiting for sendCh capacity instead of silently
 	// dropping op messages (DockerOp, FileOp, Exec) — a drop causes the HTTP
 	// handler to wait the full 30s timeout with no response. Heartbeat and

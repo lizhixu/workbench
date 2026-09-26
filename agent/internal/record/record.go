@@ -34,6 +34,10 @@ func New(path string, cols, rows int) (*Recorder, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create cast file: %w", err)
 	}
+	// Tighten permissions on files created by older versions (0644).
+	if fi, err := f.Stat(); err == nil && fi.Mode().Perm() != 0o600 {
+		_ = f.Chmod(0o600)
+	}
 	w := bufio.NewWriter(f)
 	r := &Recorder{file: f, writer: w, start: time.Now()}
 

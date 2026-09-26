@@ -26,6 +26,9 @@ import (
 
 const (
 	tunnelIOBuf = 32 * 1024
+	// maxTunnelsPerAgent caps how many tunnels one agent may own.
+	// Each tunnel holds a loopback listener, so this bounds fd usage.
+	maxTunnelsPerAgent = 16
 )
 
 // Tunnel describes one reverse port-forward.
@@ -42,6 +45,7 @@ type Tunnel struct {
 type tunnelConn struct {
 	id     string
 	sock   net.Conn
+	hub    *Hub        // agent stream this leg runs on (for TunnelClose on teardown)
 	toSock chan []byte // agent -> server payloads
 	done   chan struct{}
 	once   sync.Once
@@ -104,6 +108,17 @@ func (c *Coordinator) Open(agentID, targetHost string, targetPort uint32) (*Tunn
 	hub := c.reg.Hub(agentID)
 	if hub == nil {
 		return nil, fmt.Errorf("agent %q offline", agentID)
+	}
+	c.mu.Lock()
+	n := 0
+	for _, st := range c.tunnels {
+		if st.AgentID == agentID {
+			n++
+		}
+	}
+	c.mu.Unlock()
+	if n >= maxTunnelsPerAgent {
+		return nil, fmt.Errorf("agent %q already has %d tunnels (max)", agentID, maxTunnelsPerAgent)
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -168,6 +183,23 @@ func (c *Coordinator) Close(id string) error {
 	return nil
 }
 
+// CloseByAgent shuts down every tunnel owned by agentID. Called when the
+// agent (re-)registers: legs are bound to the old stream's hub, so they
+// can never work again — drop them instead of leaking listeners.
+func (c *Coordinator) CloseByAgent(agentID string) {
+	c.mu.Lock()
+	ids := make([]string, 0)
+	for id, st := range c.tunnels {
+		if st.AgentID == agentID {
+			ids = append(ids, id)
+		}
+	}
+	c.mu.Unlock()
+	for _, id := range ids {
+		_ = c.Close(id)
+	}
+}
+
 // acceptLoop proxies each inbound TCP connection through a new tunnel leg.
 func (c *Coordinator) acceptLoop(st *tunnelState) {
 	for {
@@ -190,6 +222,7 @@ func (c *Coordinator) acceptLoop(st *tunnelState) {
 		st.conns[tc.id] = tc
 		c.legs[tc.id] = tc
 		hub := st.hub
+		tc.hub = hub
 		c.mu.Unlock()
 
 		ok := hub.Send(&agentpb.ServerMessage{Payload: &agentpb.ServerMessage_TunnelOpen{
@@ -292,6 +325,14 @@ func (c *Coordinator) closeLeg(tc *tunnelConn, reason string) {
 	tc.once.Do(func() {
 		close(tc.done)
 		_ = tc.sock.Close()
+		// Tell the agent the leg is gone so it tears down its side too
+		// (dialed socket + pump goroutines). Best-effort: the agent already
+		// drops unknown/closed legs on its own.
+		if tc.hub != nil {
+			tc.hub.Send(&agentpb.ServerMessage{Payload: &agentpb.ServerMessage_TunnelClose{
+				TunnelClose: &agentpb.TunnelClose{TunnelId: tc.id},
+			}})
+		}
 		c.log.Debug("tunnel leg closed", "tunnel_id", tc.id, "reason", reason)
 	})
 }

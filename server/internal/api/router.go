@@ -71,14 +71,16 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		v1.POST("/auth/login", ah.Login)
 	}
 
-	// Enroll (generates a one-time token; the install script uses it).
-	v1.POST("/hosts/enroll", h.enroll)
-
 	// Public share token info lookup for collaborative terminal guests
 	v1.GET("/terminals/share/:token", h.getShareInfo)
 
 	// ---- Authenticated routes ----
 	authed := v1.Group("", auth.Middleware(authStore))
+
+	// Enroll (generates a one-time token; the install script takes it via
+	// ?token=). Behind auth: an unauthenticated caller must not be able to
+	// mint enroll tokens.
+	authed.POST("/hosts/enroll", h.enroll)
 
 	// Hosts.
 	authed.GET("/hosts", h.listHosts)

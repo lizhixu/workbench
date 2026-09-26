@@ -22,7 +22,7 @@ import {
 } from '@vicons/ionicons5'
 import { useTermPrefsStore } from '../../stores/termPrefs'
 import { resolveTermTheme } from '../../utils/termThemes'
-import type { TermPrefs, TermShell } from '../../api/prefs'
+import type { TermPrefs, TermShell } from '../../api/settings'
 
 const message = useMessage()
 const termPrefs = useTermPrefsStore()
@@ -31,8 +31,8 @@ const form = ref<TermPrefs>({ ...termPrefs.prefs })
 const saving = ref(false)
 const loading = ref(false)
 
-// Mirrors the server-side bounds in prefs.go so an out-of-range value is
-// rejected in the form rather than by the API.
+// Mirrors the server-side bounds in server/internal/settings so an
+// out-of-range value is rejected in the form rather than by the API.
 const FONT_MIN = 10
 const FONT_MAX = 24
 const SCROLLBACK_MIN = 500

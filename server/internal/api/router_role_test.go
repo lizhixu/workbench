@@ -20,7 +20,7 @@ import (
 	"watchman/server/internal/metrics"
 	"watchman/server/internal/network"
 	"watchman/server/internal/policy"
-	"watchman/server/internal/prefs"
+	"watchman/server/internal/settings"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/session"
@@ -75,7 +75,7 @@ func newTestRouter(t *testing.T) (*gin.Engine, *auth.Store) {
 	must(err)
 	groupStore, err := groups.NewStore(dir, log)
 	must(err)
-	prefsStore, err := prefs.NewStore(dir, log)
+	settingsStore, err := settings.NewStore(dir, log)
 	must(err)
 	backupStore, err := backup.NewStore(dir, log)
 	must(err)
@@ -87,7 +87,7 @@ func newTestRouter(t *testing.T) (*gin.Engine, *auth.Store) {
 
 	r := Router(rpc.NewRegistry(dir, log), log, authStore, sessStore, alertStore, vaultStore,
 		nil, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore,
-		prefsStore, backupStore, networkStore, appStore, appEngine, nil, nil, nil, nil, nil)
+		settingsStore, backupStore, networkStore, appStore, appEngine, nil, nil, nil, nil, nil)
 	return r, authStore
 }
 

@@ -34,7 +34,7 @@ import (
 	"watchman/server/internal/metrics"
 	"watchman/server/internal/network"
 	"watchman/server/internal/policy"
-	"watchman/server/internal/prefs"
+	"watchman/server/internal/settings"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/session"
@@ -98,7 +98,7 @@ type HostDTO struct {
 // authorization, prefsStore backs per-user terminal preferences and
 // backupStore backs control-plane backup/restore; all may be nil to disable
 // those features.
-func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, prefsStore *prefs.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine, gitProviderStore *gitprovider.Store, alertMon *alert.Monitor) *gin.Engine {
+func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, settingsStore *settings.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine, gitProviderStore *gitprovider.Store, alertMon *alert.Monitor) *gin.Engine {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -107,7 +107,7 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	r.Use(gin.Recovery(), requestLogger(log))
 
 	v1 := r.Group("/api/v1")
-	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, prefs: prefsStore, alertMon: alertMon}
+	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, settings: settingsStore, alertMon: alertMon}
 
 	// ---- Public routes (no auth) ----
 	// Auth login.
@@ -261,8 +261,8 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// also drops its terminal preferences, so a recreated account starts fresh.
 	if authStore != nil {
 		uh := auth.NewHandlers(authStore)
-		if prefsStore != nil {
-			uh.OnUserDeleted(prefsStore.Delete)
+		if settingsStore != nil {
+			uh.OnUserDeleted(settingsStore.DeleteUser)
 		}
 		uh.Register(authed.Group("", h.auditMutation()))
 	}
@@ -308,9 +308,12 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		)
 	}
 
-	// Per-user terminal preferences (theme / default shell / font).
-	if prefsStore != nil {
-		prefs.NewHandlers(prefsStore).Register(authed)
+	// Unified settings (Phase 2): user scope under /me, system scope admin-only.
+	// Writes go through the audited groups so setting changes are logged.
+	if settingsStore != nil {
+		sh := settings.NewHandlers(settingsStore)
+		sh.RegisterUser(authed, authed.Group("", h.auditMutation()))
+		sh.RegisterSystem(adminOnly, adminOnly.Group("", h.auditMutation()))
 	}
 
 	// Control-plane backup / restore. An archive contains every credential,
@@ -370,7 +373,7 @@ type handlers struct {
 	policy   *policy.Store
 	audit    *audit.Store
 	groups   *groups.Store
-	prefs    *prefs.Store
+	settings *settings.Store
 	alertMon *alert.Monitor
 }
 
@@ -558,8 +561,8 @@ func (h *handlers) openTerminal(c *gin.Context) {
 	// An unspecified shell falls back to the caller's saved default, so the
 	// preference applies even when the request comes from a client that does
 	// not read preferences (share links, older UI, API scripts).
-	if body.Shell == "" && h.prefs != nil {
-		body.Shell = h.prefs.Get(auth.Username(c)).DefaultShell
+	if body.Shell == "" && h.settings != nil {
+		body.Shell = h.settings.Terminal(auth.Username(c)).DefaultShell
 	}
 
 	sid := randomToken(12)

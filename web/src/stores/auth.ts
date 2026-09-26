@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import type { User } from '../api/types'
 import { login as apiLogin, logout as apiLogout } from '../api/auth'
+import { useSettingsStore } from './settings'
 
 export const useAuthStore = defineStore('auth', () => {
   const user = ref<User | null>(loadUser())
@@ -16,6 +17,9 @@ export const useAuthStore = defineStore('auth', () => {
     user.value = res.user
     localStorage.setItem('watchman_token', res.token)
     localStorage.setItem('watchman_user', JSON.stringify(res.user))
+    // Fresh login without a page reload: pull server-side settings now so the
+    // UI theme follows the account immediately.
+    useSettingsStore().load()
   }
 
   function logout() {

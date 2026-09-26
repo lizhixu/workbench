@@ -145,6 +145,11 @@
 
 ### 3.12 系统设置
 
+> 实现备注（2026-09-26，设置中心 Phase 2）：所有设置项走统一存储 `server/internal/settings`
+>（`settings.json`，system/user 双作用域、点分键、注册表校验），前端经 `stores/settings`
+> 统一读写；`appearance.theme_mode` 已从浏览器 localStorage 迁到服务端（localStorage 仅作首屏缓存）。
+> 秘密类配置（AI Key / Git Token）不进统一设置，保留专用存储。
+
 - **通用设置**：
   - 首选页面（进入主机管理时默认展示的模块：资源负载/系统状态/Docker/在线终端/文件管理/应用市场）。
   - 开关加载页面时的功能提示语。
@@ -849,8 +854,8 @@ login_sessions(id, user_id, ip, user_agent, login_at, logout_at, status)
 host_login_history(id, host_id, username, src_ip, login_type,
                    login_at, status)                 # status: success/failed
 
-# 终端用户偏好（主题/默认 shell/字体等，落库以跨设备一致）
-term_prefs(user_id, theme, default_shell, font_family, font_size)
+# 统一设置（system/user 双作用域，点分键；旧 term_prefs 表已并入，落库以跨设备一致）
+settings(scope, key, value_json)          # 如 user/alice.terminal.theme, user/alice.appearance.theme_mode
 
 # 文件编辑版本/锁（防并发覆盖）
 file_locks(path, host_id, user_id, locked_at, expires_at)
@@ -902,8 +907,14 @@ GET/PUT  /api/v1/hosts/:id/login-policy   # 禁止/口令/缺省
 # 主机登录历史
 GET    /api/v1/hosts/:id/login-history
 
-# 终端偏好
-GET/PUT /api/v1/me/term-prefs             # 当前用户主题/默认 shell/字体
+# 终端偏好（旧接口 GET/PUT /api/v1/me/term-prefs 已于 2026-09-26 被统一设置取代）
+GET    /api/v1/me/settings                 # 当前用户设置（data + schema），作用域 user
+PUT    /api/v1/me/settings                 # {data: {key: value}} 部分更新，原子校验
+GET    /api/v1/settings                    # 全局设置（admin），作用域 system
+PUT    /api/v1/settings                    # {data: {key: value}} 部分更新（admin）
+# 键命名空间（点分）：appearance.theme_mode, terminal.theme, terminal.default_shell,
+# terminal.font_family, terminal.font_size, terminal.cursor_blink, terminal.scrollback
+# 秘密（AI key / Git token 等）不进统一设置，留在各自专用存储
 
 # 文件锁/版本（MVP 仅 etag；P2 起开放）
 POST   /api/v1/hosts/:id/files/lock

@@ -14,6 +14,10 @@ import { useSettingsStore } from './stores/settings'
 
 const settingsStore = useSettingsStore()
 
+// Pull server-side settings (incl. the UI theme migrated from localStorage).
+// Deduplicated inside the store, so calling it here and after login is safe.
+settingsStore.load()
+
 watchEffect(() => {
   const mode = settingsStore.themeMode
   document.documentElement.setAttribute('data-theme', mode)

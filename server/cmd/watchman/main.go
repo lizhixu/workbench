@@ -35,7 +35,7 @@ import (
 	"watchman/server/internal/metrics"
 	"watchman/server/internal/network"
 	"watchman/server/internal/policy"
-	"watchman/server/internal/prefs"
+	"watchman/server/internal/settings"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/session"
@@ -162,14 +162,14 @@ func main() {
 	}
 	log.Info("group store ready", "groups", len(groupStore.List()))
 
-	// Per-user terminal preferences (theme / shell / font), server-side so the
-	// terminal looks the same from any machine the user logs in from.
-	prefsStore, err := prefs.NewStore(*dataDir, log)
+	// Unified settings (Phase 2): terminal/appearance preferences live on the
+	// server so they follow the user across machines.
+	settingsStore, err := settings.NewStore(*dataDir, log)
 	if err != nil {
-		log.Error("term prefs store init", "err", err)
+		log.Error("settings store init", "err", err)
 		os.Exit(1)
 	}
-	log.Info("term prefs store ready")
+	log.Info("settings store ready")
 
 	// Control-plane backup/restore, so the whole dataset can be archived and
 	// moved to another machine (AGENTS.md 5.1 数据自主可控).
@@ -316,7 +316,7 @@ func main() {
 	}()
 
 	// HTTP server (REST + WS).
-	hr := api.Router(reg, log, authStore, sessStore, alertStore, vaultStore, aiAssistant, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore, prefsStore, backupStore, networkStore, appStore, appEngine, certHub, snapshotStore, snapshotEngine, gitProviderStore, alertMonitor)
+	hr := api.Router(reg, log, authStore, sessStore, alertStore, vaultStore, aiAssistant, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore, settingsStore, backupStore, networkStore, appStore, appEngine, certHub, snapshotStore, snapshotEngine, gitProviderStore, alertMonitor)
 	// Install endpoints (one-line agent install + binary download).
 	installHandler := install.NewHandler(reg, "bin")
 	installHandler.RegisterRoutes(hr)

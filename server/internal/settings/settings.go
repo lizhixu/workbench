@@ -79,6 +79,9 @@ type Definition struct {
 	// prefs behavior where an unset field fell back to its default instead
 	// of failing validation.
 	DefaultOnEmpty bool
+	// Validate runs after the generic kind checks for domain-specific rules.
+	// A nil Validate means no extra rule.
+	Validate func(v any) error
 }
 
 // Terminal color themes the web terminal can render. The server validates
@@ -139,6 +142,32 @@ var Definitions = []Definition{
 	{Key: "terminal.font_size", Scope: ScopeUser, Kind: KindInt, Title: "终端字号", Default: 14, Min: MinFontSize, Max: MaxFontSize, DefaultOnEmpty: true},
 	{Key: "terminal.cursor_blink", Scope: ScopeUser, Kind: KindBool, Title: "光标闪烁", Default: true},
 	{Key: "terminal.scrollback", Scope: ScopeUser, Kind: KindInt, Title: "回滚行数", Default: 2000, Min: MinScrollback, Max: MaxScrollback, DefaultOnEmpty: true},
+	// Phase 3: the settings AGENTS.md 3.12 requires but no UI had yet.
+	{Key: "navigation.default_host_tab", Scope: ScopeUser, Kind: KindEnum, Title: "主机默认页签", Default: "files",
+		Enum: []string{"files", "metrics", "sysinfo", "terminal", "docker", "vulnerabilities", "network"}},
+	{Key: "appearance.show_tips", Scope: ScopeUser, Kind: KindBool, Title: "显示功能提示语", Default: true},
+	{Key: "files.default_path", Scope: ScopeUser, Kind: KindString, Title: "文件管理默认路径", Default: "",
+		MaxLen: 500, Validate: validateAbsPath},
+}
+
+// validateAbsPath accepts an empty value (OS default applies) or an absolute
+// path: Unix-style or a Windows drive path.
+func validateAbsPath(v any) error {
+	s, _ := v.(string)
+	if s == "" {
+		return nil
+	}
+	if strings.HasPrefix(s, "/") {
+		return nil
+	}
+	if len(s) >= 3 && isASCIILetter(s[0]) && s[1] == ':' && (s[2] == '\\' || s[2] == '/') {
+		return nil
+	}
+	return errors.New("文件管理默认路径必须是绝对路径（/ 开头或盘符路径）")
+}
+
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
 // defByKey indexes Definitions for validation lookups.
@@ -212,6 +241,11 @@ func (d Definition) normalize(raw json.RawMessage) (json.RawMessage, error) {
 		}
 	default:
 		return nil, fmt.Errorf("%s: 未知的值类型", d.Key)
+	}
+	if d.Validate != nil {
+		if err := d.Validate(v); err != nil {
+			return nil, err
+		}
 	}
 	out, err := json.Marshal(v)
 	if err != nil {

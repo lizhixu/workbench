@@ -14,6 +14,8 @@ import {
 import { getHost } from '../../api/hosts'
 import type { Host } from '../../api/types'
 import { useWorkspaceStore } from '../../stores/workspace'
+import { useSettingsStore } from '../../stores/settings'
+import { SETTING_KEYS } from '../../api/settings'
 import HostHeaderBanner from '../../components/host/HostHeaderBanner.vue'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
@@ -33,11 +35,13 @@ const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const workspace = useWorkspaceStore()
+const settings = useSettingsStore()
 
 const host = ref<Host | null>(null)
 const loading = ref(true)
 
-const subNavItems = [
+// 主机页签的单一来源：通用设置里的「首选页面」下拉框也用这一份。
+export const subNavItems = [
   { key: 'files', label: '文件管理', icon: FolderOpenOutline },
   { key: 'metrics', label: '资源监控', icon: StatsChartOutline },
   { key: 'sysinfo', label: '系统状态', icon: ListOutline },
@@ -49,12 +53,27 @@ const subNavItems = [
 
 const validTabs = subNavItems.map((i) => i.key)
 
+// 无显式页签时的兜底：用户在通用设置里配的首选页签；非法值退回文件管理。
+function defaultTab(): string {
+  const pref = settings.getUserKey<string>(SETTING_KEYS.defaultHostTab, 'files')
+  return validTabs.includes(pref) ? pref : 'files'
+}
+
 function resolveTab(raw: unknown): string {
   const key = typeof raw === 'string' ? raw : ''
-  return validTabs.includes(key) ? key : 'files'
+  if (key) return validTabs.includes(key) ? key : 'files'
+  return defaultTab()
 }
 
 const activeSubTab = ref(resolveTab(route.query.tab))
+
+// 设置可能在挂载后才加载完（比如首屏直连主机详情）。只在用户没有显式
+// 选过页签（URL 或点击）时应用首选项，避免覆盖用户操作。
+settings.load().then(() => {
+  if (route.name !== 'host-detail' || route.query.tab) return
+  const pref = defaultTab()
+  if (pref !== activeSubTab.value) selectTab(pref)
+})
 
 // 子页签既要能深链、刷新后还原，也要在顶部页签之间来回切换时记得住。所以
 // 除了写 URL，还把带 query 的完整路径回写到工作区页签上——点页签回来时用的

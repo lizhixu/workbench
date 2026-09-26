@@ -28,6 +28,9 @@ watchEffect(() => {
     document.documentElement.classList.add('light')
     document.documentElement.classList.remove('dark')
   }
+  // Feature-tip paragraphs marked with .tip-hint are hidden when the user
+  // disables appearance.show_tips in General settings.
+  document.documentElement.classList.toggle('hide-tips', !settingsStore.showTips)
 })
 
 const currentTheme = computed(() => {

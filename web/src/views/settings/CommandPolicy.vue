@@ -198,7 +198,7 @@ onMounted(() => {
     </template>
 
     <NSpace vertical :size="16">
-      <p class="muted">
+      <p class="muted tip-hint">
         控制端在下发命令前按以下规则检查：黑名单命中即拦截，高危模式命中需二次确认，白名单命中可跳过确认。Agent 侧另有内置硬编码高危拦截作为最后防线。
       </p>
 

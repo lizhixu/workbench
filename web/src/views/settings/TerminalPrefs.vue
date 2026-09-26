@@ -126,7 +126,7 @@ onMounted(refresh)
 
     <NSpin :show="loading">
       <NSpace vertical :size="14">
-        <p class="muted">
+        <p class="muted tip-hint">
           偏好保存在控制端而非浏览器，从任意设备登录同一账号都会套用相同的终端外观。修改保存后对新开的终端会话生效，主题切换对当前会话立即生效。
         </p>
 

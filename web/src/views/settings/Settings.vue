@@ -28,6 +28,7 @@ import { copyToClipboard } from '../../utils/clipboard'
 import { useWorkspaceStore } from '../../stores/workspace'
 import CommandPolicy from './CommandPolicy.vue'
 import CommandLibrary from './CommandLibrary.vue'
+import GeneralPrefs from './GeneralPrefs.vue'
 import TerminalPrefs from './TerminalPrefs.vue'
 import BackupRestore from './BackupRestore.vue'
 import SystemUpgrade from './SystemUpgrade.vue'
@@ -316,7 +317,7 @@ onMounted(() => {
       </template>
 
       <NSpace vertical :size="14">
-        <p class="muted">
+        <p class="muted tip-hint">
           Watchman 支持集成各类大语言模型（DeepSeek、OpenAI、Ollama、vLLM 等）。启用后将在在线终端、命令执行排错、主机资源诊断中提供智能辅助。
         </p>
 
@@ -395,7 +396,7 @@ onMounted(() => {
       </template>
 
       <NSpace vertical :size="14">
-        <p class="muted">
+        <p class="muted tip-hint">
           连接您的 Git 账号后，发布应用可直接读取私有与公开代码仓库。启用自动部署后，系统将自动通过 API 为仓库配置 Webhook，实现代码提交即自动构建与更新，无需手动去仓库配置 Webhook。
         </p>
 
@@ -492,6 +493,9 @@ onMounted(() => {
 
     <!-- Saved-command library -->
     <CommandLibrary />
+
+    <!-- General per-user preferences (default host tab / tips / file path) -->
+    <GeneralPrefs />
 
     <!-- Per-user terminal preferences (theme / shell / font) -->
     <TerminalPrefs />

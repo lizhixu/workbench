@@ -263,7 +263,7 @@ onMounted(refresh)
     </template>
 
     <NSpace vertical :size="12">
-      <p class="muted">
+      <p class="muted tip-hint">
         命令库在「推送命令」页面可直接选取套用。内置命令与管理员发布的共享命令对所有人可见，个人命令仅本人可见；使用次数高的排在前面。
       </p>
 

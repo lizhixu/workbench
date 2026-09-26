@@ -149,6 +149,13 @@
 >（`settings.json`，system/user 双作用域、点分键、注册表校验），前端经 `stores/settings`
 > 统一读写；`appearance.theme_mode` 已从浏览器 localStorage 迁到服务端（localStorage 仅作首屏缓存）。
 > 秘密类配置（AI Key / Git Token）不进统一设置，保留专用存储。
+> 实现备注（2026-09-26，设置中心 Phase 3）：补齐 3.12 剩余可配置项——
+> `navigation.default_host_tab`（主机默认页签，URL `?tab=` 深链优先于首选项；选项与
+> HostDetail 的 subNavItems 同源）、`appearance.show_tips`（功能提示语开关：前端给说明性
+> `<p class="muted">` 加 `tip-hint` 类，`hide-tips` 根类由 App.vue 按设置切换隐藏；警告类
+> NAlert 不受影响）、`files.default_path`（文件管理默认路径，空=按 OS 默认；Linux `/root`、
+> Windows `C:\`，后端校验必须为绝对路径）。新组件 `views/settings/GeneralPrefs.vue`
+> 挂在 Settings.vue 的 CommandLibrary 之后。
 
 - **通用设置**：
   - 首选页面（进入主机管理时默认展示的模块：资源负载/系统状态/Docker/在线终端/文件管理/应用市场）。
@@ -912,8 +919,9 @@ GET    /api/v1/me/settings                 # 当前用户设置（data + schema�
 PUT    /api/v1/me/settings                 # {data: {key: value}} 部分更新，原子校验
 GET    /api/v1/settings                    # 全局设置（admin），作用域 system
 PUT    /api/v1/settings                    # {data: {key: value}} 部分更新（admin）
-# 键命名空间（点分）：appearance.theme_mode, terminal.theme, terminal.default_shell,
-# terminal.font_family, terminal.font_size, terminal.cursor_blink, terminal.scrollback
+# 键命名空间（点分）：appearance.theme_mode, appearance.show_tips,
+# terminal.theme, terminal.default_shell, terminal.font_family, terminal.font_size,
+# terminal.cursor_blink, terminal.scrollback, navigation.default_host_tab, files.default_path
 # 秘密（AI key / Git token 等）不进统一设置，留在各自专用存储
 
 # 文件锁/版本（MVP 仅 etag；P2 起开放）
@@ -1008,7 +1016,6 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
 - 页面内主卡片/面板的内边距统一取 `--card-padding`，与页面留白同一档位。
 
 ### 8.2 大数据表格：整页高度自适应 + 表头分页固定
-
 凡是承载**不定长数据列表**的表格（审计日志、进程清单、端口清单、系统账号、登录历史、会话记录、文件列表、容器/镜像列表、扫描结果、告警消息、用户、凭据、分组、命令拦截审计等），一律采用「整页填满视口 + 表头与分页固定 + 仅数据区滚动 + **必须分页**」的布局。不允许让整页跟着表格一起长高，把分页条推到首屏之外；也不允许不分页地一次渲染全量数据。
 
 实现要求：
@@ -1243,6 +1250,11 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
 3. **读谁的字段就持谁的锁**：`ReapStale` 遍历 hub 判定过期时，`lastSeen`/`heartbeat` 与 `handleAgentMessage` 的写侧并发，必须在 `hub.mu` 内读取（快照后解锁再处理），裸读是数据竞争。
 4. **回归测试钉住死锁**：`registry_test.go` 的 `TestUnbindWithReentrantHandlerNoDeadlock`（处理器先注销自身再返回，`unbind` 5 秒内必须完成）与 `TestUnbindThenRebindChannelFreshness`（旧 hub 关闭后新 hub 可正常收发）任一失败即并发语义回归，禁止删除或放宽。
 5. **诊断手段**：`kill -QUIT <pid>` 可让 Go runtime 把全量 goroutine 栈Dump 到 stderr（journald 可查），`[sync.Mutex.Lock, N minutes]` 即锁等待时长，是定位「接口活着但后台协程全冻结」类问题的首选；systemd 会自动拉起被 QUIT 杀掉的进程，生产可用。
+
+### 8.3 功能提示语的可开关约定
+
+- 各页面**说明性**的帮助段落（`<p class="muted">` 这类功能说明文字）在 `class` 上追加 `tip-hint`，受用户设置 `appearance.show_tips` 控制：App.vue 按设置给 `documentElement` 切换 `hide-tips` 类，全局样式隐藏 `.tip-hint`。
+- **警告/报错类 NAlert、数据展示用的 muted 文本不加** `tip-hint`，开关只隐藏说明文字，不隐藏业务信息。
 
 
 

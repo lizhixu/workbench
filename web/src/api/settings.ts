@@ -23,12 +23,15 @@ export interface TermPrefs {
 // Setting key names, mirroring server/internal/settings Definitions.
 export const SETTING_KEYS = {
   themeMode: 'appearance.theme_mode',
+  showTips: 'appearance.show_tips',
   termTheme: 'terminal.theme',
   termShell: 'terminal.default_shell',
   termFontFamily: 'terminal.font_family',
   termFontSize: 'terminal.font_size',
   termCursorBlink: 'terminal.cursor_blink',
   termScrollback: 'terminal.scrollback',
+  defaultHostTab: 'navigation.default_host_tab',
+  filesDefaultPath: 'files.default_path',
 } as const
 
 export interface SettingSchemaEntry {

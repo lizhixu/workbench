@@ -8,7 +8,7 @@
 // Migration runs once inside load(): if the server has no theme yet but
 // localStorage has one, the local choice is pushed up so nothing is lost.
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import {
   getMySettings,
   saveMySettings,
@@ -111,8 +111,13 @@ export const useSettingsStore = defineStore('settings', () => {
     setThemeMode(themeMode.value === 'dark' ? 'light' : 'dark')
   }
 
+  // Whether feature tip paragraphs are shown; drives the hide-tips class on
+  // documentElement (see App.vue). Defaults to true before load.
+  const showTips = computed(() => getUserKey<boolean>(SETTING_KEYS.showTips, true))
+
   return {
     themeMode,
+    showTips,
     userData,
     schema,
     loaded,

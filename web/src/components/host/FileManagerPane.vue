@@ -51,6 +51,8 @@ import {
 } from '../../api/hosts'
 import type { FileInfo } from '../../api/types'
 import { useAuthStore } from '../../stores/auth'
+import { useSettingsStore } from '../../stores/settings'
+import { SETTING_KEYS } from '../../api/settings'
 import { useTablePagination } from '../../composables/useTablePagination'
 
 const props = defineProps<{
@@ -61,6 +63,7 @@ const props = defineProps<{
 const message = useMessage()
 const dialog = useDialog()
 const auth = useAuthStore()
+const settingsStore = useSettingsStore()
 const loading = ref(false)
 const hostOs = ref(props.os || '')
 
@@ -600,6 +603,13 @@ watch(
 
 onMounted(async () => {
   await detectOS()
+  // 通用设置里配了文件默认路径就优先用；留空沿用按 OS 的旧默认值。
+  await settingsStore.load()
+  const custom = settingsStore.getUserKey<string>(SETTING_KEYS.filesDefaultPath, '').trim()
+  if (custom) {
+    currentPath.value = custom
+    pathInput.value = custom
+  }
   load()
 })
 </script>

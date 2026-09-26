@@ -290,7 +290,7 @@ onMounted(() => {
     />
 
     <NSpace v-else vertical :size="12">
-      <p class="muted">
+      <p class="muted tip-hint">
         备份会把整个数据目录（用户账号、主机注册信息、终端录像、监控历史、审计日志、设置）打包成一个
         tar.gz 归档，存放在服务端 <code>data/backups</code> 下，可下载后带到另一台机器恢复，实现跨机迁移。
         恢复采用覆盖写入：归档中有的文件会被写回，归档中没有的现有文件保持不动。

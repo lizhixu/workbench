@@ -289,3 +289,8 @@ code, .mono-font {
   }
 }
 
+/* 功能提示语开关（appearance.show_tips=false 时隐藏带 tip-hint 的说明文字） */
+.hide-tips .tip-hint {
+  display: none !important;
+}
+

@@ -193,8 +193,42 @@ func TestMigrateLegacy(t *testing.T) {
 	}
 }
 
-func TestSchemaAndEffective(t *testing.T) {
+func TestPhase3Keys(t *testing.T) {
 	s := newTestStore(t)
+	// Defaults.
+	if got := s.Get(ScopeUser, "nobody", "navigation.default_host_tab"); string(got) != `"files"` {
+		t.Fatalf("default_host_tab default = %s, want \"files\"", got)
+	}
+	if got := s.Get(ScopeUser, "nobody", "appearance.show_tips"); string(got) != `true` {
+		t.Fatalf("show_tips default = %s, want true", got)
+	}
+	// Valid values round-trip.
+	if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{
+		"navigation.default_host_tab": raw(t, "terminal"),
+		"appearance.show_tips":        raw(t, false),
+		"files.default_path":          raw(t, "/var/log"),
+	}); err != nil {
+		t.Fatalf("SetMany: %v", err)
+	}
+	// Invalid values rejected.
+	for key, val := range map[string]any{
+		"navigation.default_host_tab": "market", // removed tab
+		"appearance.show_tips":        "yes",
+		"files.default_path":          "relative/path",
+	} {
+		if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{key: raw(t, val)}); err == nil {
+			t.Errorf("key %s accepted invalid value %v", key, val)
+		}
+	}
+	// Windows drive paths accepted; empty means OS default.
+	for _, p := range []string{`C:\`, `D:/data`} {
+		if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{"files.default_path": raw(t, p)}); err != nil {
+			t.Errorf("files.default_path rejected %q: %v", p, err)
+		}
+	}
+}
+
+func TestSchemaAndEffective(t *testing.T) {	s := newTestStore(t)
 	schema := s.Schema(ScopeUser)
 	if len(schema) != len(Definitions) {
 		t.Fatalf("schema has %d entries, want %d", len(schema), len(Definitions))

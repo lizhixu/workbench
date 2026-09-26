@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"testing"
 	"time"
+
+	"watchman/proto/agentpb"
 )
 
 // TestListAgentsStableOrder verifies ListAgents returns a deterministic order.
@@ -58,4 +60,88 @@ func TestListAgentsTiebreakByID(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestUnbindWithReentrantHandlerNoDeadlock reproduces the production alert
+// freeze: unbind used to invoke resp handlers while holding hub.mu, and the
+// metrics-poll handler's first statement re-enters SetRespHandler to
+// deregister itself — a self-deadlock on the non-reentrant mutex that pinned
+// hub.mu forever, freezing the alert monitor (LastMetrics) and the metrics
+// collector. The test runs unbind while such a handler is registered; if the
+// deadlock regresses, the test times out rather than hanging forever.
+func TestUnbindWithReentrantHandlerNoDeadlock(t *testing.T) {
+	r := NewRegistry("", slog.Default())
+	hub := newHub("agent-1", 30, r)
+	hub.MockConnectForTest()
+
+	// Exactly like metrics.Store.StartAutoCollector's one-shot poll handler.
+	hub.SetRespHandler("metrics-poll", func(msg *agentpb.AgentMessage) {
+		hub.SetRespHandler("metrics-poll", nil) // re-enter while being invoked
+	})
+
+	done := make(chan struct{})
+	go func() {
+		hub.unbind()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("unbind deadlocked: resp handler re-entered hub.mu while held")
+	}
+
+	// The hub must remain fully usable after unbind.
+	hub.mu.Lock()
+	if len(hub.respHandlers) != 0 {
+		t.Fatalf("respHandlers not cleared: %d entries left", len(hub.respHandlers))
+	}
+	if !hub.closed {
+		t.Fatal("hub.closed flag not set by unbind")
+	}
+	hub.mu.Unlock()
+
+	// Send after close must return false instead of panicking on the closed
+	// channel (bind() may race a reconnect).
+	if hub.Send(&agentpb.ServerMessage{}) {
+		t.Fatal("Send on unbound hub should return false")
+	}
+}
+
+// TestUnbindThenRebindChannelFreshness verifies the reconnect path: after a
+// stale hub is unbound, a NEW hub replaces it in the registry (Register
+// creates a fresh hub per connection), so the closed sendCh of the old hub
+// never receives traffic. Simulates the sequence the flaky Singapore host
+// exercises every reconnect.
+func TestUnbindThenRebindChannelFreshness(t *testing.T) {
+	r := NewRegistry("", slog.Default())
+	hub := newHub("agent-1", 30, r)
+	hub.MockConnectForTest()
+
+	hub.SetRespHandler("metrics-poll", func(msg *agentpb.AgentMessage) {
+		hub.SetRespHandler("metrics-poll", nil)
+	})
+	hub.SetTermHandler("sess-1", func(out *agentpb.TerminalOutput) {})
+
+	hub.unbind()
+
+	// The closed channel is drained by unbind-time consumers; just assert the
+	// hub reports itself closed and refuses further sends.
+	hub.mu.Lock()
+	closed := hub.closed
+	hub.mu.Unlock()
+	if !closed {
+		t.Fatal("sendCh should be closed after unbind")
+	}
+
+	// A fresh hub (as created by Register on reconnect) must be unaffected.
+	hub2 := newHub("agent-1", 30, r)
+	hub2.MockConnectForTest()
+	if !hub2.Send(&agentpb.ServerMessage{}) {
+		t.Fatal("fresh hub should accept sends")
+	}
+	msg, ok := hub2.RecvForTest(time.Second)
+	if !ok || msg == nil {
+		t.Fatal("fresh hub did not deliver message")
+	}
+	hub2.unbind()
 }

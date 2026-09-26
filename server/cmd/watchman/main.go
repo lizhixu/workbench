@@ -44,6 +44,7 @@ import (
 	"watchman/server/internal/ws"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 func main() {
@@ -238,8 +239,18 @@ func main() {
 
 	grpcSrv := rpc.NewServer(reg, log)
 
-	// gRPC server (agent inbound).
-	gs := grpc.NewServer()
+	// gRPC server (agent inbound) with HTTP/2 transport keepalive to maintain
+	// NAT state across firewalls and detect dead connections within 30s.
+	gs := grpc.NewServer(
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    30 * time.Second,
+			Timeout: 10 * time.Second,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
 	agentpb.RegisterAgentServiceServer(gs, grpcSrv)
 	lis, err := net.Listen("tcp", *grpcAddr)
 	if err != nil {

@@ -20,12 +20,12 @@ import (
 type RuleType string
 
 const (
-	RuleOffline     RuleType = "offline"      // agent goes offline
-	RuleOnline      RuleType = "online"       // agent comes online
-	RuleCPUHigh     RuleType = "cpu_high"     // CPU usage > threshold % for duration
-	RuleMemHigh     RuleType = "mem_high"     // memory usage > threshold % for duration
-	RuleDiskHigh    RuleType = "disk_high"    // any mount usage > threshold %
-	RuleAnomaly     RuleType = "anomaly"      // AI/statistical anomaly: value deviates > threshold × σ from recent mean
+	RuleOffline  RuleType = "offline"   // agent goes offline
+	RuleOnline   RuleType = "online"    // agent comes online
+	RuleCPUHigh  RuleType = "cpu_high"  // CPU usage > threshold % for duration
+	RuleMemHigh  RuleType = "mem_high"  // memory usage > threshold % for duration
+	RuleDiskHigh RuleType = "disk_high" // any mount usage > threshold %
+	RuleAnomaly  RuleType = "anomaly"   // AI/statistical anomaly: value deviates > threshold × σ from recent mean
 )
 
 // Severity classifies alert events.
@@ -46,8 +46,8 @@ type Rule struct {
 	Threshold   float64   `json:"threshold"`        // e.g. 90 for 90%; for anomaly = σ multiplier (e.g. 3)
 	Duration    int       `json:"duration"`         // seconds the condition must hold (0 = immediate)
 	Metric      string    `json:"metric,omitempty"` // for anomaly: cpu / mem / net_rx / net_tx / disk_read / disk_write
-	HostFilter  string    `json:"host_filter"`        // empty = all hosts; otherwise hostname substring
-	GroupFilter string    `json:"group_filter"`       // empty = all groups
+	HostFilter  string    `json:"host_filter"`      // empty = all hosts; otherwise hostname substring
+	GroupFilter string    `json:"group_filter"`     // empty = all groups
 	Enabled     bool      `json:"enabled"`
 	CreatedAt   time.Time `json:"created_at"`
 }
@@ -218,45 +218,58 @@ func (s *Store) dedupHistoricalOnlineEventsLocked() {
 	}
 }
 
-func (s *Store) persistLocked() error {
-	p := persisted{
-		Rules:   make([]*Rule, 0, len(s.rules)),
-		Events:  s.events,
+func (s *Store) snapshotForPersistLocked() persisted {
+	rules := make([]*Rule, 0, len(s.rules))
+	for _, r := range s.rules {
+		rules = append(rules, r)
+	}
+	events := make([]*Event, len(s.events))
+	copy(events, s.events)
+	if len(events) > 500 {
+		events = events[len(events)-500:]
+	}
+	return persisted{
+		Rules:   rules,
+		Events:  events,
 		Webhook: s.webhook,
 	}
-	for _, r := range s.rules {
-		p.Rules = append(p.Rules, r)
+}
+
+func atomicWriteFile(filePath string, data []byte) error {
+	dir := filepath.Dir(filePath)
+	tmp := filepath.Join(dir, fmt.Sprintf("%s.tmp.%d", filepath.Base(filePath), time.Now().UnixNano()))
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
 	}
-	if len(p.Events) > 500 {
-		p.Events = p.Events[len(p.Events)-500:]
+	if err := os.Rename(tmp, filePath); err != nil {
+		_ = os.Remove(filePath)
+		if err2 := os.Rename(tmp, filePath); err2 != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
 	}
+	return nil
+}
+
+func (s *Store) persistLocked() error {
+	p := s.snapshotForPersistLocked()
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.filePath, data, 0o600)
+	return atomicWriteFile(s.filePath, data)
 }
 
 func (s *Store) persist() error {
 	s.mu.RLock()
-	p := persisted{
-		Rules:   make([]*Rule, 0, len(s.rules)),
-		Events:  s.events,
-		Webhook: s.webhook,
-	}
-	for _, r := range s.rules {
-		p.Rules = append(p.Rules, r)
-	}
+	p := s.snapshotForPersistLocked()
 	s.mu.RUnlock()
-	// Cap events at 500 to prevent unbounded growth.
-	if len(p.Events) > 500 {
-		p.Events = p.Events[len(p.Events)-500:]
-	}
+
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.filePath, data, 0o600)
+	return atomicWriteFile(s.filePath, data)
 }
 
 // ---- Rules ----

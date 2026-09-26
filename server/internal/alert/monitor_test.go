@@ -16,6 +16,14 @@ func (m *mockProvider) ListHosts() []HostInfo {
 	return m.hosts
 }
 
+func (m *mockProvider) ClearReconnectReason(hostID string) {
+	for i := range m.hosts {
+		if m.hosts[i].ID == hostID {
+			m.hosts[i].ReconnectReason = ""
+		}
+	}
+}
+
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	dir := t.TempDir()

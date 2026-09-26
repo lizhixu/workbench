@@ -1223,6 +1223,17 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
    - Pinia `workspace` store 提供 `moveTab(fromIndex, targetIndex, position)`，在数组切片 `splice` 移动时自动校准由于元素抽取导致的索引位移，实现无缝平滑重排；
    - 页签关闭按钮附加 `@mousedown.stop`，避免点击关闭图标时误触发父级拖拽。
 
+### 8.10 RPC Hub 生命周期与锁纪律（告警引擎冻结事故复盘）
+
+`server/internal/rpc/registry.go` 的 `Hub` 是所有 Agent 长连接的会话锚点，`unbind`/`Send`/`ReapStale` 的并发正确性直接决定告警引擎能否运转。曾因 `unbind` 在持有 `hub.mu` 时直接调用响应处理器回调，而处理器（metrics 自动采集）第一条语句就重入 `SetRespHandler` 注销自身——`sync.Mutex` 不可重入，`hub.mu` 被永久钉死，所有读者（`LastMetrics` → 告警 `Monitor.evaluate` → `ListHosts`）随之冻结，表现为「主机离线/上线没有任何通知」但 HTTP 接口照常响应。事故复盘出的铁律：
+
+1. **持锁期间严禁调用外部回调**：`unbind` 必须先在 `hub.mu` 内快照并清空 `respHandlers`/`termHandlers`，解锁后再逐个以 `fn(nil)` 通知断连；任何处理器都可能重入 `SetRespHandler` 注销自己，持锁调用即自死锁。回调用 `nil` 入参表达「连接已断」，处理器必须容忍 `msg == nil`。
+2. **关闭共享 channel 必须带 closed 守卫**：`sendCh` 由 `unbind` 关闭，`Send` 可能并发投递；先在锁内置 `closed = true` 再 `close(h.sendCh)`，`Send` 在锁内检查 `closed` 后再入队，否则「向已关闭 channel 发送」直接 panic。
+3. **读谁的字段就持谁的锁**：`ReapStale` 遍历 hub 判定过期时，`lastSeen`/`heartbeat` 与 `handleAgentMessage` 的写侧并发，必须在 `hub.mu` 内读取（快照后解锁再处理），裸读是数据竞争。
+4. **回归测试钉住死锁**：`registry_test.go` 的 `TestUnbindWithReentrantHandlerNoDeadlock`（处理器先注销自身再返回，`unbind` 5 秒内必须完成）与 `TestUnbindThenRebindChannelFreshness`（旧 hub 关闭后新 hub 可正常收发）任一失败即并发语义回归，禁止删除或放宽。
+5. **诊断手段**：`kill -QUIT <pid>` 可让 Go runtime 把全量 goroutine 栈Dump 到 stderr（journald 可查），`[sync.Mutex.Lock, N minutes]` 即锁等待时长，是定位「接口活着但后台协程全冻结」类问题的首选；systemd 会自动拉起被 QUIT 杀掉的进程，生产可用。
+
+
 
 
 

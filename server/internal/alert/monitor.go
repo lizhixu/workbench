@@ -32,6 +32,7 @@ type HostInfo struct {
 // implements this interface.
 type HostProvider interface {
 	ListHosts() []HostInfo
+	ClearReconnectReason(hostID string)
 }
 
 // Monitor periodically evaluates alert rules against the live host state.
@@ -42,6 +43,7 @@ type Monitor struct {
 	aiAssistant  *ai.Assistant
 	log          *slog.Logger
 	stop         chan struct{}
+	stopOnce     sync.Once
 
 	mu        sync.Mutex
 	startTime time.Time
@@ -148,10 +150,20 @@ func (m *Monitor) Start(ctx context.Context, interval time.Duration) {
 
 // Stop halts the monitor.
 func (m *Monitor) Stop() {
-	close(m.stop)
+	m.stopOnce.Do(func() {
+		close(m.stop)
+	})
 }
 
 func (m *Monitor) evaluate() {
+	defer func() {
+		if r := recover(); r != nil {
+			m.log.Error("alert monitor evaluate recovered from panic", "panic", r)
+		}
+	}()
+
+	m.log.Debug("alert monitor evaluate tick started")
+
 	// Alert storm suppression: if >20 events fired in the last 5 minutes,
 	// collapse them into a single summary event and downgrade the rest.
 	m.suppressStorm()
@@ -206,26 +218,28 @@ func (m *Monitor) evaluate() {
 		if (isBootstrapping || boundaryRun) && (rule.Type == RuleOnline || rule.Type == RuleOffline) {
 			continue
 		}
-			for _, host := range hosts {
-				if !matchesFilter(host, rule) {
-					continue
-				}
-				m.checkRule(rule, host)
+		for _, host := range hosts {
+			if !matchesFilter(host, rule) {
+				continue
 			}
+			m.checkRule(rule, host)
 		}
+	}
 
-		// 评估各主机的专属月流量配额超标（达到80%警告，达到100%严重）
-		for _, host := range hosts {
-			m.checkHostTraffic(host)
-			// 到期时间前 30 天发起一次续费提醒
-			m.checkHostExpiry(host)
-		}
+	// 评估各主机的专属月流量配额超标（达到80%警告，达到100%严重）
+	for _, host := range hosts {
+		m.checkHostTraffic(host)
+		// 到期时间前 30 天发起一次续费提醒
+		m.checkHostExpiry(host)
+	}
 
-		m.mu.Lock()
-		for _, host := range hosts {
+	m.mu.Lock()
+	for _, host := range hosts {
 		m.prevStatus[host.ID] = host.Status
 	}
 	m.mu.Unlock()
+
+	m.log.Debug("alert monitor evaluate tick finished", "rules", len(rules), "hosts", len(hosts))
 }
 
 // suppressStorm detects alert storms (>20 events in 5 min) and merges them
@@ -455,17 +469,18 @@ func (m *Monitor) checkRule(rule *Rule, host HostInfo) {
 				m.mu.Unlock()
 				m.store.setFiring(key, true)
 				m.log.Info("host reconnected with planned reason, suppressing online alert", "host_id", host.ID, "hostname", host.Hostname, "reason", host.ReconnectReason)
-				break
+				m.provider.ClearReconnectReason(host.ID)
+				return
 			}
 			if m.InMaintenance(host.ID) {
 				m.store.setFiring(key, true)
 				m.log.Debug("suppressing online alert during maintenance", "host_id", host.ID, "hostname", host.Hostname)
-				break
+				return
 			}
 			if booting && startupPending {
 				// The host was already known before this server boot and has
 				// merely reconnected during the grace window; never notify.
-				break
+				return
 			}
 
 			// Edge-triggered: fire ONLY if previously observed as offline,
@@ -748,17 +763,17 @@ func (a *registryAdapter) ListHosts() []HostInfo {
 	agents := a.reg.ListAgents()
 	out := make([]HostInfo, 0, len(agents))
 	for _, ag := range agents {
-			hi := HostInfo{
-				ID:              ag.ID,
-				Hostname:        ag.Hostname,
-				Group:           ag.Group,
-				Status:          ag.Status,
-				ReconnectReason: ag.ReconnectReason,
-				TrafficLimitGB:  ag.TrafficLimitGB,
-				TrafficCalcType: ag.TrafficCalcType,
-				TrafficResetDay: ag.TrafficResetDay,
-				ExpiresAt:       ag.ExpiresAt,
-			}
+		hi := HostInfo{
+			ID:              ag.ID,
+			Hostname:        ag.Hostname,
+			Group:           ag.Group,
+			Status:          ag.Status,
+			ReconnectReason: ag.ReconnectReason,
+			TrafficLimitGB:  ag.TrafficLimitGB,
+			TrafficCalcType: ag.TrafficCalcType,
+			TrafficResetDay: ag.TrafficResetDay,
+			ExpiresAt:       ag.ExpiresAt,
+		}
 		hub := a.reg.Hub(ag.ID)
 		if hub != nil {
 			hi.Metrics = hub.LastMetrics()
@@ -766,4 +781,10 @@ func (a *registryAdapter) ListHosts() []HostInfo {
 		out = append(out, hi)
 	}
 	return out
+}
+
+func (a *registryAdapter) ClearReconnectReason(hostID string) {
+	if a.reg != nil {
+		a.reg.ClearReconnectReason(hostID)
+	}
 }

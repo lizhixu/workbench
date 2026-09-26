@@ -30,6 +30,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -128,7 +129,16 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 		addr = net.JoinHostPort(addr, "9090")
 	}
 
-	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	kacp := keepalive.ClientParameters{
+		Time:                20 * time.Second, // Send keepalive ping every 20s if no activity
+		Timeout:             10 * time.Second, // Wait 10s for ping ack before tearing down connection
+		PermitWithoutStream: true,             // Send keepalive pings even without active streams
+	}
+
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(kacp),
+	}
 	cc, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", addr, err)

@@ -33,23 +33,23 @@ type persistedAgent struct {
 	Uptime     int64     `json:"uptime"`
 	CPUCores   int32     `json:"cpu_cores"`
 	MemTotal   int64     `json:"mem_total"`
-		InternalIP string    `json:"internal_ip"`
-		PublicIP   string    `json:"public_ip"`
-		Location   string    `json:"location"`
-		// Optional billing & traffic quota configurations
-		Price           float64 `json:"price,omitempty"`
-		Currency        string  `json:"currency,omitempty"`
-		BillingCycle    string  `json:"billing_cycle,omitempty"`
-		ExpiresAt       string  `json:"expires_at,omitempty"`
-		AutoRenewal     bool    `json:"auto_renewal,omitempty"`
-		TrafficLimitGB  float64 `json:"traffic_limit_gb,omitempty"`
-		TrafficCalcType string  `json:"traffic_calc_type,omitempty"`
-		TrafficResetDay int     `json:"traffic_reset_day,omitempty"`
-		RenewalURL      string  `json:"renewal_url,omitempty"`
-		Notes           string  `json:"notes,omitempty"`
-		// AuthToken is the long-lived token issued at registration; kept here
-		// (NOT in r.tokens) so a server restart doesn't invalidate it.
-		AuthToken string `json:"auth_token"`
+	InternalIP string    `json:"internal_ip"`
+	PublicIP   string    `json:"public_ip"`
+	Location   string    `json:"location"`
+	// Optional billing & traffic quota configurations
+	Price           float64 `json:"price,omitempty"`
+	Currency        string  `json:"currency,omitempty"`
+	BillingCycle    string  `json:"billing_cycle,omitempty"`
+	ExpiresAt       string  `json:"expires_at,omitempty"`
+	AutoRenewal     bool    `json:"auto_renewal,omitempty"`
+	TrafficLimitGB  float64 `json:"traffic_limit_gb,omitempty"`
+	TrafficCalcType string  `json:"traffic_calc_type,omitempty"`
+	TrafficResetDay int     `json:"traffic_reset_day,omitempty"`
+	RenewalURL      string  `json:"renewal_url,omitempty"`
+	Notes           string  `json:"notes,omitempty"`
+	// AuthToken is the long-lived token issued at registration; kept here
+	// (NOT in r.tokens) so a server restart doesn't invalidate it.
+	AuthToken string `json:"auth_token"`
 }
 
 // Registry holds all known agents (online and recently offline) and the live
@@ -89,22 +89,22 @@ type Agent struct {
 	Uptime     int64 // real OS uptime in seconds (since boot), from registration/metrics
 	CPUCores   int32
 	MemTotal   int64
-		InternalIP string
-		PublicIP   string
-		Location   string
-		// Optional billing & traffic quota configurations
-		Price           float64
-		Currency        string
-		BillingCycle    string
-		ExpiresAt       string
-		AutoRenewal     bool
-		TrafficLimitGB  float64
-		TrafficCalcType string
-		TrafficResetDay int
-		RenewalURL      string
-		Notes           string
-		// ReconnectReason is the reason sent by the agent on its most recent registration.
-		ReconnectReason string
+	InternalIP string
+	PublicIP   string
+	Location   string
+	// Optional billing & traffic quota configurations
+	Price           float64
+	Currency        string
+	BillingCycle    string
+	ExpiresAt       string
+	AutoRenewal     bool
+	TrafficLimitGB  float64
+	TrafficCalcType string
+	TrafficResetDay int
+	RenewalURL      string
+	Notes           string
+	// ReconnectReason is the reason sent by the agent on its most recent registration.
+	ReconnectReason string
 	// AuthToken is the long-lived token; persisted with the agent so the
 	// server can validate reconnects after a restart.
 	AuthToken string
@@ -112,10 +112,14 @@ type Agent struct {
 
 // Hub is the live connection state for a connected agent.
 type Hub struct {
-	AgentID      string
-	heartbeat    int32
-	lastSeen     time.Time
-	sendCh       chan *agentpb.ServerMessage
+	AgentID   string
+	heartbeat int32
+	lastSeen  time.Time
+	sendCh    chan *agentpb.ServerMessage
+	// closed is set under mu before sendCh is closed, so Send can prove the
+	// channel send is safe: writing to a closed channel panics, and Send races
+	// with unbind otherwise.
+	closed       bool
 	stream       agentpb.AgentService_ConnectServer
 	mu           sync.Mutex
 	termHandlers map[string]func(*agentpb.TerminalOutput)
@@ -182,34 +186,34 @@ func (r *Registry) loadAgents() error {
 	defer r.mu.Unlock()
 	for id, p := range raw {
 		a := &Agent{
-			ID:         id,
-			Hostname:   p.Hostname,
-			OS:         p.OS,
-			Arch:       p.Arch,
-			Distro:     p.Distro,
-			Version:    p.Version,
-			Status:     "offline",
-			Registered: p.Registered,
-			Group:      p.Group,
-			Tags:       p.Tags,
-			Uptime:     p.Uptime,
-			CPUCores:   p.CPUCores,
-			MemTotal:   p.MemTotal,
-				InternalIP:      p.InternalIP,
-				PublicIP:        p.PublicIP,
-				Location:        p.Location,
-				Price:           p.Price,
-				Currency:        p.Currency,
-				BillingCycle:    p.BillingCycle,
-				ExpiresAt:       p.ExpiresAt,
-				AutoRenewal:     p.AutoRenewal,
-				TrafficLimitGB:  p.TrafficLimitGB,
-				TrafficCalcType: p.TrafficCalcType,
-				TrafficResetDay: p.TrafficResetDay,
-				RenewalURL:      p.RenewalURL,
-				Notes:           p.Notes,
-				AuthToken:       p.AuthToken,
-			}
+			ID:              id,
+			Hostname:        p.Hostname,
+			OS:              p.OS,
+			Arch:            p.Arch,
+			Distro:          p.Distro,
+			Version:         p.Version,
+			Status:          "offline",
+			Registered:      p.Registered,
+			Group:           p.Group,
+			Tags:            p.Tags,
+			Uptime:          p.Uptime,
+			CPUCores:        p.CPUCores,
+			MemTotal:        p.MemTotal,
+			InternalIP:      p.InternalIP,
+			PublicIP:        p.PublicIP,
+			Location:        p.Location,
+			Price:           p.Price,
+			Currency:        p.Currency,
+			BillingCycle:    p.BillingCycle,
+			ExpiresAt:       p.ExpiresAt,
+			AutoRenewal:     p.AutoRenewal,
+			TrafficLimitGB:  p.TrafficLimitGB,
+			TrafficCalcType: p.TrafficCalcType,
+			TrafficResetDay: p.TrafficResetDay,
+			RenewalURL:      p.RenewalURL,
+			Notes:           p.Notes,
+			AuthToken:       p.AuthToken,
+		}
 		if a.Tags == nil {
 			a.Tags = []string{}
 		}
@@ -230,32 +234,32 @@ func (r *Registry) persistAgentsLocked() error {
 	raw := make(map[string]persistedAgent, len(r.agents))
 	for id, a := range r.agents {
 		raw[id] = persistedAgent{
-			Hostname:   a.Hostname,
-			OS:         a.OS,
-			Arch:       a.Arch,
-			Distro:     a.Distro,
-			Version:    a.Version,
-			Registered: a.Registered,
-			Group:      a.Group,
-			Tags:       a.Tags,
-			Uptime:     a.Uptime,
-			CPUCores:   a.CPUCores,
-			MemTotal:   a.MemTotal,
-				InternalIP:      a.InternalIP,
-				PublicIP:        a.PublicIP,
-				Location:        a.Location,
-				Price:           a.Price,
-				Currency:        a.Currency,
-				BillingCycle:    a.BillingCycle,
-				ExpiresAt:       a.ExpiresAt,
-				AutoRenewal:     a.AutoRenewal,
-				TrafficLimitGB:  a.TrafficLimitGB,
-				TrafficCalcType: a.TrafficCalcType,
-				TrafficResetDay: a.TrafficResetDay,
-				RenewalURL:      a.RenewalURL,
-				Notes:           a.Notes,
-				AuthToken:       a.AuthToken,
-			}
+			Hostname:        a.Hostname,
+			OS:              a.OS,
+			Arch:            a.Arch,
+			Distro:          a.Distro,
+			Version:         a.Version,
+			Registered:      a.Registered,
+			Group:           a.Group,
+			Tags:            a.Tags,
+			Uptime:          a.Uptime,
+			CPUCores:        a.CPUCores,
+			MemTotal:        a.MemTotal,
+			InternalIP:      a.InternalIP,
+			PublicIP:        a.PublicIP,
+			Location:        a.Location,
+			Price:           a.Price,
+			Currency:        a.Currency,
+			BillingCycle:    a.BillingCycle,
+			ExpiresAt:       a.ExpiresAt,
+			AutoRenewal:     a.AutoRenewal,
+			TrafficLimitGB:  a.TrafficLimitGB,
+			TrafficCalcType: a.TrafficCalcType,
+			TrafficResetDay: a.TrafficResetDay,
+			RenewalURL:      a.RenewalURL,
+			Notes:           a.Notes,
+			AuthToken:       a.AuthToken,
+		}
 	}
 	data, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
@@ -457,6 +461,16 @@ func (r *Registry) SetAgentTags(id string, tags []string) error {
 	return nil
 }
 
+// ClearReconnectReason clears the one-shot reconnect reason for an agent after
+// it has been consumed by the alert engine, ensuring subsequent checks behave normally.
+func (r *Registry) ClearReconnectReason(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if a, ok := r.agents[id]; ok {
+		a.ReconnectReason = ""
+	}
+}
+
 // HostBillingConfig carries optional user-managed finance, traffic quota and note configs for a host.
 type HostBillingConfig struct {
 	Price           float64 `json:"price"`
@@ -630,17 +644,32 @@ func (r *Registry) DeleteAgent(id string) error {
 
 func (r *Registry) ReapStale() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	now := time.Now()
+	// Snapshot the stale IDs under r.mu, then read hub.lastSeen under hub.mu:
+	// lastSeen is also written by handleAgentMessage under hub.mu, and an
+	// unsynchronized read here is a data race (torn time.Time on 32-bit).
+	type staleHub struct {
+		id        string
+		heartbeat int32
+	}
+	var stale []staleHub
 	for id, hub := range r.hubs {
-		if now.Sub(hub.lastSeen) > time.Duration(hub.heartbeat)*heartbeatGraceFactor*time.Second {
-			delete(r.hubs, id)
-			if a, ok := r.agents[id]; ok {
-				a.Status = "offline"
-			}
-			r.log.Info("agent reaped (stale)", "agent_id", id)
+		hub.mu.Lock()
+		idle := now.Sub(hub.lastSeen)
+		hb := hub.heartbeat
+		hub.mu.Unlock()
+		if idle > time.Duration(hb)*heartbeatGraceFactor*time.Second {
+			stale = append(stale, staleHub{id: id, heartbeat: hb})
 		}
 	}
+	for _, s := range stale {
+		delete(r.hubs, s.id)
+		if a, ok := r.agents[s.id]; ok {
+			a.Status = "offline"
+		}
+		r.log.Info("agent reaped (stale)", "agent_id", s.id)
+	}
+	r.mu.Unlock()
 }
 
 // updateAgentMetrics writes the latest uptime and hardware info from a
@@ -684,18 +713,27 @@ func (h *Hub) bind(stream agentpb.AgentService_ConnectServer) {
 func (h *Hub) unbind() {
 	h.mu.Lock()
 	h.stream = nil
+	h.closed = true
 	close(h.sendCh)
-	// Clean up all response handlers.
+	// Snapshot all handlers and clear the maps BEFORE invoking callbacks: the
+	// handlers (e.g. metrics-poll in metrics.Store) re-enter SetRespHandler to
+	// deregister themselves, which would self-deadlock on this non-reentrant
+	// mutex if we called them while still holding it. That deadlock pinned
+	// hub.mu forever and froze every reader (LastMetrics, alert monitor).
+	handlers := make(map[string]func(*agentpb.AgentMessage), len(h.respHandlers))
 	for id, fn := range h.respHandlers {
-		if fn != nil {
-			fn(nil) // signal disconnection
-		}
+		handlers[id] = fn
 		delete(h.respHandlers, id)
 	}
 	for id := range h.termHandlers {
 		delete(h.termHandlers, id)
 	}
 	h.mu.Unlock()
+	for _, fn := range handlers {
+		if fn != nil {
+			fn(nil) // signal disconnection
+		}
+	}
 }
 
 func (h *Hub) sendPump(stream agentpb.AgentService_ConnectServer) {
@@ -708,7 +746,7 @@ func (h *Hub) sendPump(stream agentpb.AgentService_ConnectServer) {
 
 func (h *Hub) Send(msg *agentpb.ServerMessage) bool {
 	h.mu.Lock()
-	if h.stream == nil {
+	if h.stream == nil || h.closed {
 		h.mu.Unlock()
 		slog.Default().Warn("hub.Send: stream is nil", "agent_id", h.AgentID)
 		return false

@@ -235,10 +235,10 @@ const eventColumns = computed<DataTableColumns<AlertEvent>>(() => [
   {
     title: '状态',
     key: 'resolved',
-    width: 72,
+    width: 80,
     render: (e) =>
-      h(NTag, { type: e.resolved ? 'default' : 'warning', size: 'small', round: true }, {
-        default: () => (e.resolved ? '已读' : '未读'),
+      h(NTag, { type: e.resolved ? 'default' : 'error', size: 'small', round: true }, {
+        default: () => (e.resolved ? '已恢复' : '告警中'),
       }),
   },
   {
@@ -249,7 +249,7 @@ const eventColumns = computed<DataTableColumns<AlertEvent>>(() => [
       h(NSpace, { size: 6, wrapItem: false }, {
         default: () => [
           !e.resolved
-            ? h(NButton, { size: 'tiny', type: 'success', secondary: true, onClick: () => doAckEvent(e.id) }, { default: () => '已读' })
+            ? h(NButton, { size: 'tiny', type: 'success', secondary: true, onClick: () => doAckEvent(e.id) }, { default: () => '解决' })
             : null,
           e.host_id
             ? h(NButton, { size: 'tiny', quaternary: true, type: 'primary', onClick: () => goHostDetail(e.host_id, e.hostname) }, { default: () => '查看' })
@@ -594,7 +594,7 @@ onMounted(() => {
             @click="doAckAllEvents"
           >
             <template #icon><NIcon :component="CheckmarkDoneOutline" /></template>
-            全部标记已读
+            全部标记解决
           </NButton>
           <NPopconfirm
             v-if="activeTab === 'messages' && notifStore.events.length > 0"
@@ -639,8 +639,8 @@ onMounted(() => {
               <div class="filter-left">
                 <NRadioGroup v-model:value="statusFilter" size="small">
                   <NRadioButton value="all">全部 ({{ notifStore.events.length }})</NRadioButton>
-                  <NRadioButton value="unread">未读 ({{ notifStore.unreadCount }})</NRadioButton>
-                  <NRadioButton value="resolved">已读/已恢复</NRadioButton>
+                  <NRadioButton value="unread">告警中 ({{ notifStore.unreadCount }})</NRadioButton>
+                  <NRadioButton value="resolved">已恢复</NRadioButton>
                 </NRadioGroup>
 
                 <NSelect

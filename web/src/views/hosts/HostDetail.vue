@@ -2,15 +2,6 @@
 import { defineAsyncComponent, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NSpin, NIcon, useMessage, NTooltip } from 'naive-ui'
-import {
-  StatsChartOutline,
-  ListOutline,
-  CubeOutline,
-  FolderOpenOutline,
-  ShieldCheckmarkOutline,
-  TerminalOutline,
-  GitNetworkOutline,
-} from '@vicons/ionicons5'
 import { getHost } from '../../api/hosts'
 import type { Host } from '../../api/types'
 import { useWorkspaceStore } from '../../stores/workspace'
@@ -40,28 +31,17 @@ const settings = useSettingsStore()
 const host = ref<Host | null>(null)
 const loading = ref(true)
 
-// 主机页签的单一来源：通用设置里的「首选页面」下拉框也用这一份。
-export const subNavItems = [
-  { key: 'files', label: '文件管理', icon: FolderOpenOutline },
-  { key: 'metrics', label: '资源监控', icon: StatsChartOutline },
-  { key: 'sysinfo', label: '系统状态', icon: ListOutline },
-  { key: 'terminal', label: '在线终端', icon: TerminalOutline },
-  { key: 'docker', label: 'Docker', icon: CubeOutline },
-  { key: 'vulnerabilities', label: '漏洞管理', icon: ShieldCheckmarkOutline },
-  { key: 'network', label: '异地组网', icon: GitNetworkOutline },
-]
-
-const validTabs = subNavItems.map((i) => i.key)
+import { subNavItems, validHostTabs } from './hostTabs'
 
 // 无显式页签时的兜底：用户在通用设置里配的首选页签；非法值退回文件管理。
 function defaultTab(): string {
   const pref = settings.getUserKey<string>(SETTING_KEYS.defaultHostTab, 'files')
-  return validTabs.includes(pref) ? pref : 'files'
+  return validHostTabs.includes(pref) ? pref : 'files'
 }
 
 function resolveTab(raw: unknown): string {
   const key = typeof raw === 'string' ? raw : ''
-  if (key) return validTabs.includes(key) ? key : 'files'
+  if (key) return validHostTabs.includes(key) ? key : 'files'
   return defaultTab()
 }
 

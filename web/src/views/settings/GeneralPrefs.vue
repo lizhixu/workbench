@@ -16,7 +16,7 @@ import { SettingsOutline } from '@vicons/ionicons5'
 import { useSettingsStore } from '../../stores/settings'
 import { SETTING_KEYS, type SettingsData } from '../../api/settings'
 // Single source of truth for host tabs: the same list HostDetail renders.
-import { subNavItems } from '../hosts/HostDetail.vue'
+import { subNavItems } from '../hosts/hostTabs'
 
 const message = useMessage()
 const settings = useSettingsStore()

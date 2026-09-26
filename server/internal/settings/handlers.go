@@ -81,10 +81,11 @@ type putBody struct {
 
 func (h *Handlers) getUser(c *gin.Context) {
 	username := c.GetString("username")
+	data, stored := h.store.Snapshot(ScopeUser, username)
 	c.JSON(http.StatusOK, settingsResponse{
-		Data:       h.store.Effective(ScopeUser, username),
+		Data:       data,
 		Schema:     h.store.Schema(ScopeUser),
-		StoredKeys: h.store.StoredKeys(ScopeUser, username),
+		StoredKeys: stored,
 	})
 }
 
@@ -106,10 +107,11 @@ func (h *Handlers) putUser(c *gin.Context) {
 }
 
 func (h *Handlers) getSystem(c *gin.Context) {
+	data, stored := h.store.Snapshot(ScopeSystem, "")
 	c.JSON(http.StatusOK, settingsResponse{
-		Data:       h.store.Effective(ScopeSystem, ""),
+		Data:       data,
 		Schema:     h.store.Schema(ScopeSystem),
-		StoredKeys: h.store.StoredKeys(ScopeSystem, ""),
+		StoredKeys: stored,
 	})
 }
 

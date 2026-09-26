@@ -26,6 +26,9 @@ export const useAuthStore = defineStore('auth', () => {
     apiLogout()
     token.value = ''
     user.value = null
+    // Drop the signed-out account's settings: the next login in this page
+    // must fetch fresh data instead of reusing the old account's theme.
+    useSettingsStore().reset()
   }
 
   function can(action: string): boolean {

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -43,8 +44,8 @@ func TestDefaultsForUnknownUser(t *testing.T) {
 func TestSetManyRoundtrip(t *testing.T) {
 	s := newTestStore(t)
 	err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{
-		"terminal.theme":     raw(t, "Dracula"),
-		"terminal.font_size": raw(t, 18),
+		"terminal.theme":        raw(t, "Dracula"),
+		"terminal.font_size":    raw(t, 18),
 		"appearance.theme_mode": raw(t, "light"),
 	})
 	if err != nil {
@@ -232,7 +233,8 @@ func TestPhase3Keys(t *testing.T) {
 	}
 }
 
-func TestSchemaAndEffective(t *testing.T) {	s := newTestStore(t)
+func TestSchemaAndEffective(t *testing.T) {
+	s := newTestStore(t)
 	schema := s.Schema(ScopeUser)
 	if len(schema) != len(Definitions) {
 		t.Fatalf("schema has %d entries, want %d", len(schema), len(Definitions))
@@ -372,4 +374,52 @@ func TestGetUserExposesStoredKeys(t *testing.T) {
 	if body.Data["appearance.theme_mode"] != "light" {
 		t.Fatalf("data theme_mode = %v, want light", body.Data["appearance.theme_mode"])
 	}
+}
+
+// TestSnapshotConsistentUnderConcurrency hammers SetMany from several
+// goroutines while taking snapshots: every snapshot must be internally
+// consistent — a key listed in stored_keys must carry its stored value in
+// data, never a default from another SetMany generation. This nails down the
+// reason Snapshot exists instead of calling Effective + StoredKeys separately.
+func TestSnapshotConsistentUnderConcurrency(t *testing.T) {
+	s := newTestStore(t)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				v := "dark"
+				if (i+w)%2 == 1 {
+					v = "light"
+				}
+				_ = s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{
+					"appearance.theme_mode": raw(t, v),
+				})
+			}
+		}(w)
+	}
+	for i := 0; i < 2000; i++ {
+		data, stored := s.Snapshot(ScopeUser, "alice")
+		listed := false
+		for _, k := range stored {
+			if k == "appearance.theme_mode" {
+				listed = true
+			}
+		}
+		if listed {
+			v, ok := data["appearance.theme_mode"].(string)
+			if !ok || (v != "dark" && v != "light") {
+				t.Fatalf("torn snapshot: stored_keys lists theme_mode but data has %v", data["appearance.theme_mode"])
+			}
+		}
+	}
+	close(stop)
+	wg.Wait()
 }

@@ -83,7 +83,11 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="settings-layout">
+  <div class="settings-view">
+    <div class="page-header">
+      <h2 class="page-title">系统设置</h2>
+    </div>
+    <div class="settings-layout">
     <!-- 左侧导航 -->
     <aside class="settings-nav">
       <NInput
@@ -128,14 +132,34 @@ onMounted(() => {
         <component :is="activeSection.component" :key="activeSection.key" />
       </KeepAlive>
     </main>
+    </div>
   </div>
 </template>
 
 <style scoped lang="scss">
+.settings-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.page-header {
+  flex-shrink: 0;
+  margin-bottom: 16px;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
 .settings-layout {
   display: flex;
   gap: 16px;
-  height: 100%;
+  flex: 1;
   min-height: 0;
 }
 

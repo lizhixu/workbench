@@ -96,7 +96,7 @@ export function getMySettings() {
 }
 
 export function saveMySettings(data: SettingsData) {
-  return unwrap<{ data: SettingsData }>(http.put('/me/settings', { data })).then((r) => r.data)
+  return unwrap<SettingsResponse>(http.put('/me/settings', { data }))
 }
 
 export function getSystemSettings() {
@@ -104,5 +104,5 @@ export function getSystemSettings() {
 }
 
 export function saveSystemSettings(data: SettingsData) {
-  return unwrap<{ data: SettingsData }>(http.put('/settings', { data })).then((r) => r.data)
+  return unwrap<SettingsResponse>(http.put('/settings', { data }))
 }

@@ -34,12 +34,17 @@ export const useSettingsStore = defineStore('settings', () => {
   const schema = ref<SettingSchemaEntry[]>([])
   const loaded = ref(false)
   let inflight: Promise<void> | null = null
+  // Bumped by reset(): lets an in-flight load detect that its account is
+  // gone and skip applying stale state.
+  let generation = 0
 
   function load(): Promise<void> {
     if (loaded.value) return Promise.resolve()
     if (inflight) return inflight
+    const gen = generation
     inflight = getMySettings()
       .then(async (res) => {
+        if (gen !== generation) return
         userData.value = res.data || {}
         schema.value = res.schema || []
         // stored_keys tells an explicit choice apart from a server default:
@@ -59,19 +64,22 @@ export const useSettingsStore = defineStore('settings', () => {
           const local = readLocalTheme()
           if (local) {
             try {
-              const data = await saveMySettings({ [SETTING_KEYS.themeMode]: local })
-              userData.value = data
+              const saved = await saveMySettings({ [SETTING_KEYS.themeMode]: local })
+              if (gen !== generation) return
+              userData.value = saved.data
             } catch {
               // Cosmetic only: keep the local value if the push fails.
             }
           }
         }
+        if (gen !== generation) return
         localStorage.setItem(LS_THEME_KEY, themeMode.value)
         loaded.value = true
       })
       .catch(() => {
         // Offline or logged out: keep the localStorage value; theme and
         // terminal still render with defaults.
+        if (gen !== generation) return
         loaded.value = true
       })
       .finally(() => {
@@ -85,6 +93,18 @@ export const useSettingsStore = defineStore('settings', () => {
     return load()
   }
 
+  // Called on logout: drop the previous account's settings so the next login
+  // in the same page (no reload) fetches fresh data instead of reusing the
+  // old account's theme and preferences.
+  function reset() {
+    generation++
+    inflight = null
+    userData.value = {}
+    schema.value = []
+    loaded.value = false
+    themeMode.value = readLocalTheme() || 'dark'
+  }
+
   /** Read one user-scope key with a fallback (for facades like termPrefs). */
   function getUserKey<T>(key: string, fallback: T): T {
     const v = userData.value[key]
@@ -94,13 +114,13 @@ export const useSettingsStore = defineStore('settings', () => {
   /** Partial update of user-scope keys; returns the full effective data. */
   async function saveUserKeys(data: SettingsData): Promise<SettingsData> {
     const saved = await saveMySettings(data)
-    userData.value = saved
-    const t = saved[SETTING_KEYS.themeMode]
+    userData.value = saved.data
+    const t = saved.data[SETTING_KEYS.themeMode]
     if (t === 'dark' || t === 'light') {
       themeMode.value = t
       localStorage.setItem(LS_THEME_KEY, t)
     }
-    return saved
+    return saved.data
   }
 
   function setThemeMode(mode: ThemeMode) {
@@ -131,6 +151,7 @@ export const useSettingsStore = defineStore('settings', () => {
     loaded,
     load,
     reload,
+    reset,
     getUserKey,
     saveUserKeys,
     setThemeMode,

@@ -468,10 +468,8 @@ func (s *Store) Get(scope Scope, username, key string) json.RawMessage {
 	return s.effective(scope, username, key)
 }
 
-// Effective returns every registered key of a scope with its effective value.
-func (s *Store) Effective(scope Scope, username string) map[string]any {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// effectiveAll is the lock-free core of Effective.
+func (s *Store) effectiveAll(scope Scope, username string) map[string]any {
 	out := make(map[string]any, len(Definitions))
 	for _, d := range Definitions {
 		if d.Scope != scope {
@@ -485,14 +483,15 @@ func (s *Store) Effective(scope Scope, username string) map[string]any {
 	return out
 }
 
-// StoredKeys returns the keys explicitly saved for a scope (and username),
-// sorted. Unlike Effective it does not include defaults: the client uses it
-// to tell "the user chose this value" apart from "the server filled in a
-// default" — e.g. to decide whether a browser-local theme should be migrated
-// up on first login. Keys no longer in the registry are skipped.
-func (s *Store) StoredKeys(scope Scope, username string) []string {
+// Effective returns every registered key of a scope with its effective value.
+func (s *Store) Effective(scope Scope, username string) map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.effectiveAll(scope, username)
+}
+
+// storedKeysAll is the lock-free core of StoredKeys.
+func (s *Store) storedKeysAll(scope Scope, username string) []string {
 	keys := []string{}
 	collect := func(kv map[string]json.RawMessage) {
 		for k := range kv {
@@ -508,6 +507,28 @@ func (s *Store) StoredKeys(scope Scope, username string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// Snapshot returns the effective data and the explicitly stored keys of one
+// scope in a single locked read, so the two can never describe different
+// SetMany generations. A torn read here would confuse the client's
+// stored-vs-default distinction: e.g. the theme migration could mistake a
+// default for an explicit choice, or the other way around.
+func (s *Store) Snapshot(scope Scope, username string) (map[string]any, []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.effectiveAll(scope, username), s.storedKeysAll(scope, username)
+}
+
+// StoredKeys returns the keys explicitly saved for a scope (and username),
+// sorted. Unlike Effective it does not include defaults: the client uses it
+// to tell "the user chose this value" apart from "the server filled in a
+// default" — e.g. to decide whether a browser-local theme should be migrated
+// up on first login. Keys no longer in the registry are skipped.
+func (s *Store) StoredKeys(scope Scope, username string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.storedKeysAll(scope, username)
 }
 
 // SetMany validates every item first and then applies them atomically: if any

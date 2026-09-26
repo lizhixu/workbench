@@ -1,11 +1,14 @@
 package gitprovider
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,6 +27,7 @@ type Store struct {
 	log     *slog.Logger
 	account *Account
 	oauth   *OAuthConfig
+	client  *Client
 }
 
 // NewStore loads or initializes the Git provider store.
@@ -32,8 +36,9 @@ func NewStore(dataDir string, log *slog.Logger) (*Store, error) {
 		log = slog.Default()
 	}
 	s := &Store{
-		dir: dataDir,
-		log: log,
+		dir:    dataDir,
+		log:    log,
+		client: NewClient(),
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -136,4 +141,62 @@ func (s *Store) SetOAuthConfig(cfg *OAuthConfig) error {
 	defer s.mu.Unlock()
 	s.oauth = cfg
 	return s.saveLocked()
+}
+
+// ParseGitHubRepo parses owner and repository name from various GitHub URL formats.
+func ParseGitHubRepo(rawURL string) (owner, repo string, ok bool) {
+	raw := strings.TrimSpace(rawURL)
+	if strings.HasPrefix(raw, "git@github.com:") {
+		path := strings.TrimPrefix(raw, "git@github.com:")
+		path = strings.TrimSuffix(path, ".git")
+		parts := strings.Split(path, "/")
+		if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+			return parts[0], parts[1], true
+		}
+		return "", "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", "", false
+	}
+	if !strings.Contains(strings.ToLower(u.Host), "github.com") {
+		return "", "", false
+	}
+	path := strings.Trim(u.Path, "/")
+	path = strings.TrimSuffix(path, ".git")
+	parts := strings.Split(path, "/")
+	if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+		return parts[0], parts[1], true
+	}
+	return "", "", false
+}
+
+// EnsureRepoWebhook checks if the Git repository belongs to GitHub and, if an authorized
+// GitHub account exists, registers the specified webhook URL.
+func (s *Store) EnsureRepoWebhook(ctx context.Context, repoURL, webhookURL string) (int64, error) {
+	owner, repo, ok := ParseGitHubRepo(repoURL)
+	if !ok {
+		return 0, fmt.Errorf("不是有效的 GitHub 仓库地址: %s", repoURL)
+	}
+	token, ok := s.GetToken()
+	if !ok || token == "" {
+		return 0, fmt.Errorf("尚未连接 GitHub 账号，无法自动注册 Webhook")
+	}
+	return s.client.EnsureRepoWebhook(ctx, token, owner, repo, webhookURL)
+}
+
+// DeleteRepoWebhook removes the webhook from GitHub if configured.
+func (s *Store) DeleteRepoWebhook(ctx context.Context, repoURL string, hookID int64) error {
+	if hookID <= 0 {
+		return nil
+	}
+	owner, repo, ok := ParseGitHubRepo(repoURL)
+	if !ok {
+		return nil
+	}
+	token, ok := s.GetToken()
+	if !ok || token == "" {
+		return nil
+	}
+	return s.client.DeleteRepoWebhook(ctx, token, owner, repo, hookID)
 }

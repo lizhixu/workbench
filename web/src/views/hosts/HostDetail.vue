@@ -9,7 +9,6 @@ import {
   FolderOpenOutline,
   ShieldCheckmarkOutline,
   TerminalOutline,
-  StorefrontOutline,
   GitNetworkOutline,
 } from '@vicons/ionicons5'
 import { getHost } from '../../api/hosts'
@@ -20,14 +19,13 @@ import HostHeaderBanner from '../../components/host/HostHeaderBanner.vue'
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'HostDetail' })
 
-// 七个面板按需加载：静态导入会把 echarts、xterm、Docker、应用市场、漏洞管理
-// 全部打进本路由的同一个 chunk（约 1MB），只想看进程列表也得先下完整包。
+// 七个面板按需加载：静态导入会把 echarts、xterm、Docker、漏洞管理全部打进
+// 本路由的同一个 chunk（约 1MB），只想看进程列表也得先下完整包。
 const FileManagerPane = defineAsyncComponent(() => import('../../components/host/FileManagerPane.vue'))
 const MetricsPane = defineAsyncComponent(() => import('../../components/host/MetricsPane.vue'))
 const SysInfoPane = defineAsyncComponent(() => import('../../components/host/SysInfoPane.vue'))
 const TerminalPane = defineAsyncComponent(() => import('../../components/host/TerminalPane.vue'))
 const DockerView = defineAsyncComponent(() => import('../docker/Docker.vue'))
-const AppStoreView = defineAsyncComponent(() => import('../apps/AppStore.vue'))
 const VulnerabilitiesView = defineAsyncComponent(() => import('./tabs/Vulnerabilities.vue'))
 const HostNetworkPane = defineAsyncComponent(() => import('../../components/host/HostNetworkPane.vue'))
 
@@ -45,7 +43,6 @@ const subNavItems = [
   { key: 'sysinfo', label: '系统状态', icon: ListOutline },
   { key: 'terminal', label: '在线终端', icon: TerminalOutline },
   { key: 'docker', label: 'Docker', icon: CubeOutline },
-  { key: 'apps', label: '应用市场', icon: StorefrontOutline },
   { key: 'vulnerabilities', label: '漏洞管理', icon: ShieldCheckmarkOutline },
   { key: 'network', label: '异地组网', icon: GitNetworkOutline },
 ]
@@ -176,11 +173,8 @@ onMounted(load)
                 <TerminalPane :host-id="host.id" :os="host.os" :distro="host.distro" />
               </div>
 
-              <!-- Docker 管理 (P2) -->
+              <!-- Docker 管理（观测与运维入口，应用部署统一走全局应用中心） -->
               <DockerView v-else-if="activeSubTab === 'docker'" />
-
-              <!-- 应用市场 (P2) -->
-              <AppStoreView v-else-if="activeSubTab === 'apps'" :host-id="host.id" />
 
               <!-- 漏洞管理 (P3) -->
               <VulnerabilitiesView v-else-if="activeSubTab === 'vulnerabilities'" :host-id="host.id" />

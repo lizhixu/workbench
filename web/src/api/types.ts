@@ -25,6 +25,7 @@ export interface EnrollResponse {
   enroll_token: string
   expires_in: number
   install: string
+  install_win?: string
 }
 
 export interface Host {

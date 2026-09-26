@@ -194,6 +194,7 @@ func main() {
 
 	reg := rpc.NewRegistry(*dataDir, log)
 	appEngine := apps.NewEngine(reg, appStore, vaultStore, log)
+	appEngine.SetNetworkStore(networkStore)
 
 	// Git provider integration (GitHub authorization & repo selector).
 	gitProviderStore, err := gitprovider.NewStore(*dataDir, log)

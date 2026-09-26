@@ -17,10 +17,17 @@ type AIDiagnoseFunc func(ctx context.Context, command, stdout, stderr string, ex
 
 // AppHandlers manages Git-linked application CRUD, deployments and rollback.
 type AppHandlers struct {
-	reg    *rpc.Registry
-	store  *Store
-	engine *Engine
-	ai     AIDiagnoseFunc
+	reg         *rpc.Registry
+	store       *Store
+	engine      *Engine
+	ai          AIDiagnoseFunc
+	gitProvider GitWebhookManager
+}
+
+// GitWebhookManager handles automatic lifecycle sync for Git provider webhooks.
+type GitWebhookManager interface {
+	EnsureRepoWebhook(ctx context.Context, repoURL, webhookURL string) (int64, error)
+	DeleteRepoWebhook(ctx context.Context, repoURL string, hookID int64) error
 }
 
 // NewAppHandlers creates the application management handlers.
@@ -31,6 +38,11 @@ func NewAppHandlers(reg *rpc.Registry, store *Store, engine *Engine) *AppHandler
 // SetAI injects the AI assistant for deployment failure diagnosis.
 func (h *AppHandlers) SetAI(fn AIDiagnoseFunc) {
 	h.ai = fn
+}
+
+// SetGitProvider injects the Git provider store for automatic Webhook lifecycle management.
+func (h *AppHandlers) SetGitProvider(gp GitWebhookManager) {
+	h.gitProvider = gp
 }
 
 // RegisterAppRoutes mounts the application lifecycle routes. Reads are open
@@ -54,6 +66,7 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	writeRG.POST("/apps/:id/stop", h.stopApp)
 	writeRG.POST("/apps/:id/start", h.startApp)
 	writeRG.POST("/apps/:id/restart", h.restartApp)
+	writeRG.POST("/apps/:id/webhook/sync", h.syncAppWebhook)
 
 	// Git provider webhooks: no JWT, token-in-path authentication.
 	public.POST("/apps/webhook/:token", h.webhook)
@@ -77,7 +90,7 @@ func (h *AppHandlers) getApp(c *gin.Context) {
 type createAppReq struct {
 	Name           string            `json:"name"`
 	HostID         string            `json:"host_id"`
-	SourceType     string            `json:"source_type"` // "git" | "raw_compose"
+	SourceType     string            `json:"source_type"` // "git" | "raw_compose" | "image" | "template"
 	RepoURL        string            `json:"repo_url"`
 	Branch         string            `json:"branch"`
 	AuthVaultID    string            `json:"auth_vault_id"`
@@ -87,6 +100,9 @@ type createAppReq struct {
 	BuildContext   string            `json:"build_context"`
 	BuildTimeout   int32             `json:"build_timeout_sec"`
 	ComposeContent string            `json:"compose_content"` // raw compose.yaml
+	Image          string            `json:"image"`           // pre-built image for source_type=image/template
+	TemplateID     string            `json:"template_id"`
+	TemplateParams map[string]string `json:"template_params"`
 	EnvVars        map[string]string `json:"env_vars"`
 	Ports          []PortMapping     `json:"ports"`
 	Volumes        []string          `json:"volumes"`
@@ -101,18 +117,36 @@ func (r *createAppReq) validate() error {
 	if r.HostID == "" {
 		return fmt.Errorf("必须选择目标主机")
 	}
-	if r.SourceType == "raw_compose" {
+
+	srcType := r.SourceType
+	if srcType == "" {
+		srcType = "git"
+	}
+
+	switch srcType {
+	case "raw_compose":
 		if strings.TrimSpace(r.ComposeContent) == "" {
 			return fmt.Errorf("Docker Compose 内容不能为空")
 		}
-		return nil
+	case "image":
+		if strings.TrimSpace(r.Image) == "" {
+			return fmt.Errorf("镜像地址不能为空")
+		}
+	case "template":
+		if strings.TrimSpace(r.TemplateID) == "" {
+			return fmt.Errorf("必须选择应用模板")
+		}
+	case "git":
+		if strings.TrimSpace(r.RepoURL) == "" {
+			return fmt.Errorf("Git 仓库地址不能为空")
+		}
+		if !strings.HasPrefix(r.RepoURL, "https://") && !strings.HasPrefix(r.RepoURL, "http://") {
+			return fmt.Errorf("仅支持 http(s) Git 仓库地址")
+		}
+	default:
+		return fmt.Errorf("不支持的部署来源类型: %s", srcType)
 	}
-	if strings.TrimSpace(r.RepoURL) == "" {
-		return fmt.Errorf("Git 仓库地址不能为空")
-	}
-	if !strings.HasPrefix(r.RepoURL, "https://") && !strings.HasPrefix(r.RepoURL, "http://") {
-		return fmt.Errorf("仅支持 http(s) Git 仓库地址")
-	}
+
 	for k, v := range r.EnvVars {
 		if k == "" || v == "" {
 			return fmt.Errorf("环境变量名与值都不能为空")
@@ -169,6 +203,9 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 		BuildContext:   firstNonEmpty(req.BuildContext, "."),
 		BuildTimeout:   req.BuildTimeout,
 		ComposeContent: req.ComposeContent,
+		Image:          strings.TrimSpace(req.Image),
+		TemplateID:     req.TemplateID,
+		TemplateParams: req.TemplateParams,
 		EnvVars:        req.EnvVars,
 		Ports:          req.Ports,
 		Volumes:        req.Volumes,
@@ -176,6 +213,22 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 		ContainerName:  firstNonEmpty(req.ContainerName, "watchman-app-"+strings.ReplaceAll(strings.TrimSpace(req.Name), " ", "-")),
 		CreatedAt:      time.Now(),
 	}
+
+	// If AutoDeploy is enabled for a GitHub repository and the Git Provider is connected,
+	// automatically register the push webhook on the repository via GitHub API.
+	if app.AutoDeploy && h.gitProvider != nil && strings.Contains(strings.ToLower(app.RepoURL), "github.com") {
+		webhookURL := h.buildWebhookURL(c, app.WebhookToken)
+		hookID, err := h.gitProvider.EnsureRepoWebhook(c.Request.Context(), app.RepoURL, webhookURL)
+		if err == nil {
+			app.WebhookAutoManaged = true
+			app.GitHubHookID = hookID
+			app.WebhookError = ""
+		} else {
+			app.WebhookAutoManaged = false
+			app.WebhookError = err.Error()
+		}
+	}
+
 	if err := h.store.PutApp(app); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -183,8 +236,25 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": app})
 }
 
+func (h *AppHandlers) buildWebhookURL(c *gin.Context, token string) string {
+	scheme := "http"
+	if c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https") {
+		scheme = "https"
+	}
+	host := c.Request.Host
+	if host == "" {
+		host = "127.0.0.1:18080"
+	}
+	return fmt.Sprintf("%s://%s/api/v1/apps/webhook/%s", scheme, host, token)
+}
+
 func (h *AppHandlers) updateApp(c *gin.Context) {
 	id := c.Param("id")
+	oldApp, ok := h.store.GetApp(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
+		return
+	}
 	var req createAppReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -227,6 +297,27 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 			a.BuildType = req.BuildType
 		}
 		a.HealthcheckURL = req.HealthcheckURL
+
+		// Sync webhook if auto_deploy state or repo changed
+		if h.gitProvider != nil && strings.Contains(strings.ToLower(a.RepoURL), "github.com") {
+			if a.AutoDeploy && (!oldApp.AutoDeploy || a.RepoURL != oldApp.RepoURL || a.GitHubHookID == 0) {
+				webhookURL := h.buildWebhookURL(c, a.WebhookToken)
+				hookID, err := h.gitProvider.EnsureRepoWebhook(c.Request.Context(), a.RepoURL, webhookURL)
+				if err == nil {
+					a.WebhookAutoManaged = true
+					a.GitHubHookID = hookID
+					a.WebhookError = ""
+				} else {
+					a.WebhookAutoManaged = false
+					a.WebhookError = err.Error()
+				}
+			} else if !a.AutoDeploy && oldApp.AutoDeploy && oldApp.GitHubHookID > 0 {
+				_ = h.gitProvider.DeleteRepoWebhook(c.Request.Context(), oldApp.RepoURL, oldApp.GitHubHookID)
+				a.WebhookAutoManaged = false
+				a.GitHubHookID = 0
+				a.WebhookError = ""
+			}
+		}
 		return nil
 	}); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
@@ -238,11 +329,52 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 
 func (h *AppHandlers) deleteApp(c *gin.Context) {
 	id := c.Param("id")
+	if app, ok := h.store.GetApp(id); ok {
+		if app.WebhookAutoManaged && app.GitHubHookID > 0 && h.gitProvider != nil {
+			_ = h.gitProvider.DeleteRepoWebhook(context.Background(), app.RepoURL, app.GitHubHookID)
+		}
+	}
 	if err := h.store.DeleteApp(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *AppHandlers) syncAppWebhook(c *gin.Context) {
+	id := c.Param("id")
+	app, ok := h.store.GetApp(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "应用不存在"})
+		return
+	}
+	if h.gitProvider == nil || !strings.Contains(strings.ToLower(app.RepoURL), "github.com") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "该应用不是 GitHub 仓库或未启用 Git Provider 集成"})
+		return
+	}
+	webhookURL := h.buildWebhookURL(c, app.WebhookToken)
+	hookID, err := h.gitProvider.EnsureRepoWebhook(c.Request.Context(), app.RepoURL, webhookURL)
+	if err != nil {
+		_ = h.store.UpdateApp(id, func(a *Application) error {
+			a.WebhookAutoManaged = false
+			a.WebhookError = err.Error()
+			return nil
+		})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "自动同步 GitHub Webhook 失败: " + err.Error()})
+		return
+	}
+	_ = h.store.UpdateApp(id, func(a *Application) error {
+		a.WebhookAutoManaged = true
+		a.GitHubHookID = hookID
+		a.WebhookError = ""
+		return nil
+	})
+	updated, _ := h.store.GetApp(id)
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      true,
+		"message": "已成功通过 GitHub API 为该仓库配置 Webhook",
+		"data":    updated,
+	})
 }
 
 func (h *AppHandlers) deployApp(c *gin.Context) {

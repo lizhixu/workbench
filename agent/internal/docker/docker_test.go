@@ -2,6 +2,8 @@ package docker
 
 import (
 	"errors"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 )
@@ -60,5 +62,38 @@ func TestPositiveDockerLookupIsCached(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("正向结果应只探测 1 次，实际 %d 次", calls)
+	}
+}
+
+// The run whitelists must reject payloads that would smuggle docker flags into
+// the argv (e.g. a container named "--privileged") while accepting the normal
+// values the console sends.
+func TestRunWhitelists(t *testing.T) {
+	cases := []struct {
+		name string
+		re   *regexp.Regexp
+		ok   string
+		bad  string
+	}{
+		{"name", runNameRe, "my-app_1.2", "--privileged"},
+		{"port", runPortRe, "8080:80", "8080:80 --privileged"},
+		{"volume", runVolumeRe, "/data:/data", "/etc:/etc -v /:/:ro"},
+		{"env", runEnvRe, "TZ=Asia/Shanghai", "=start"},
+		{"policy", runPolicyRe, "unless-stopped", "always --privileged"},
+		{"image", runImageRe, "nginx:alpine", "--pull=always"},
+	}
+	for _, c := range cases {
+		if !c.re.MatchString(c.ok) {
+			t.Errorf("%s 白名单应放行 %q", c.name, c.ok)
+		}
+		if c.re.MatchString(c.bad) {
+			t.Errorf("%s 白名单应拒绝 %q", c.name, c.bad)
+		}
+	}
+	// digest / registry forms are valid image references
+	for _, ref := range []string{"nginx", "redis:7.2-alpine", "registry.example.com:5000/app/web:1.0", "app@sha256:" + strings.Repeat("a", 64)} {
+		if !runImageRe.MatchString(ref) {
+			t.Errorf("镜像引用 %q 应放行", ref)
+		}
 	}
 }

@@ -4,11 +4,13 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"watchman/proto/agentpb"
+	"watchman/server/internal/network"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/vault"
 )
@@ -24,6 +26,7 @@ type Engine struct {
 	reg         *rpc.Registry
 	store       *Store
 	vault       *vault.Store
+	networkStore *network.Store
 	gitProvider gitTokenProvider
 	log         *slog.Logger
 
@@ -34,6 +37,11 @@ type Engine struct {
 // SetGitProvider injects a token provider (e.g. GitHub connection) for auto-cloning.
 func (e *Engine) SetGitProvider(gp gitTokenProvider) {
 	e.gitProvider = gp
+}
+
+// SetNetworkStore injects the overlay network store to resolve Tailscale mesh IPs.
+func (e *Engine) SetNetworkStore(ns *network.Store) {
+	e.networkStore = ns
 }
 
 // NewEngine creates the deployment engine. A nil log falls back to the
@@ -204,6 +212,26 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 		return
 	}
 
+	// Branch for single pre-built image deployment (app store / quick run):
+	if app.SourceType == "image" {
+		e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
+		logBuf.WriteString("$ deploy pre-built image\n")
+		e.deploySingleContainer(hub, app, dep, logBuf, app.Image)
+		return
+	}
+
+	// Branch for built-in template deployment:
+	if app.SourceType == "template" {
+		e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
+		logBuf.WriteString("$ deploy built-in template\n")
+		if err := ResolveTemplate(app); err != nil {
+			fail("解析应用模板失败: %v", err)
+			return
+		}
+		e.deploySingleContainer(hub, app, dep, logBuf, app.Image)
+		return
+	}
+
 	// Step 1: fetch or clone the linked repository, then check out the branch
 	// head — or the pinned commit for a rollback.
 	fetchURL := app.RepoURL
@@ -301,6 +329,17 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 	// Step 3: start the replacement container under a -next name, health
 	// probe, then swap. The old container keeps running the whole time so a
 	// failure leaves the previous version untouched (auto-rollback-by-design).
+	e.deploySingleContainer(hub, app, dep, logBuf, imageRef)
+}
+
+// deploySingleContainer handles the generic run-probe-swap pipeline for both
+// pre-built images (source_type=image/template) and built images (source_type=git).
+func (e *Engine) deploySingleContainer(hub *rpc.Hub, app *Application, dep *Deployment, logBuf *logBuffer, imageRef string) {
+	fail := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		e.fail(app, dep, logBuf, msg)
+	}
+
 	container := app.ContainerName
 	if container == "" {
 		container = "watchman-app-" + app.ID
@@ -309,8 +348,32 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 
 	envArgs := e.resolveEnvArgs(app, logBuf)
 	var runArgs []string
+
+	// Resolve mesh IP if any port requires internal network binding
+	meshIP := ""
+	needsMesh := false
 	for _, pm := range app.Ports {
-		runArgs = append(runArgs, "-p", fmt.Sprintf("%d:%d", pm.Host, pm.Container))
+		if pm.BindScope == "mesh" {
+			needsMesh = true
+			break
+		}
+	}
+	if needsMesh {
+		if e.networkStore == nil {
+			logBuf.WriteString("WARN: 需要绑定异地组网，但 NetworkStore 未初始化，回退为公网绑定\n")
+		} else if st, ok := e.networkStore.GetNodeStatus(app.HostID); ok && st.IP != "" {
+			meshIP = st.IP
+		} else {
+			logBuf.WriteString("WARN: 无法获取主机异地组网 IP，回退为公网绑定\n")
+		}
+	}
+
+	for _, pm := range app.Ports {
+		if pm.BindScope == "mesh" && meshIP != "" {
+			runArgs = append(runArgs, "-p", fmt.Sprintf("%s:%d:%d", meshIP, pm.Host, pm.Container))
+		} else {
+			runArgs = append(runArgs, "-p", fmt.Sprintf("%d:%d", pm.Host, pm.Container))
+		}
 	}
 	for _, v := range app.Volumes {
 		runArgs = append(runArgs, "-v", v)
@@ -319,7 +382,7 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 	runCmd := fmt.Sprintf("docker rm -f %s 2>/dev/null; docker run -d --name %s --restart unless-stopped %s %s %s",
 		container, nextName, strings.Join(envArgs, " "), strings.Join(runArgs, " "), imageRef)
 	logBuf.WriteString("$ start replacement container\n")
-	res, err = execOnAgent(hub, "docker-run-"+randomToken(4), runCmd, 120)
+	res, err := execOnAgent(hub, "docker-run-"+randomToken(4), runCmd, 120)
 	if err != nil {
 		fail("启动新容器失败: %v", err)
 		return
@@ -361,12 +424,12 @@ docker inspect --format '{{.State.Status}}' %[1]s`, container, nextName)
 	}
 
 	// Step 6: prune old image tags (keep the newest few for rollback).
-	pruneCmd := fmt.Sprintf(`docker images %[1]s --format '{{.Tag}}' | grep -v latest | head -n 6 | tail -n +6 | while read t; do docker rmi %[1]s:$$t 2>/dev/null; done`, imageTag)
+	pruneCmd := fmt.Sprintf(`docker images %[1]s --format '{{.Tag}}' | grep -v latest | head -n 6 | tail -n +6 | while read t; do docker rmi %[1]s:$$t 2>/dev/null; done`, imageRef)
 	if _, err := execOnAgent(hub, "docker-prune-"+randomToken(4), pruneCmd, 60); err != nil {
 		e.log.Warn("image prune failed", "err", err, "app", app.ID)
 	}
 
-		e.finishDeploySuccess(app, dep, commit, imageTag, container, logBuf)
+		e.finishDeploySuccess(app, dep, dep.CommitHash, imageRef, container, logBuf)
 	}
 
 	func (e *Engine) finishDeploySuccess(app *Application, dep *Deployment, commit, imageRef, container string, logBuf *logBuffer) {
@@ -601,16 +664,17 @@ func parseCommitMeta(stdout []byte) (commit, message string) {
 	return commit, message
 }
 
-// injectToken embeds an access token into a https git URL for clone/fetch.
+// injectToken embeds an access token into a git URL for clone/fetch.
 func injectToken(repoURL, token string) string {
-	// https://host/path -> https://x-access-token:TOKEN@host/path
-	if strings.HasPrefix(repoURL, "https://") {
-		return "https://x-access-token:" + token + "@" + strings.TrimPrefix(repoURL, "https://")
+	if token == "" {
+		return repoURL
 	}
-	if strings.HasPrefix(repoURL, "http://") {
-		return "http://x-access-token:" + token + "@" + strings.TrimPrefix(repoURL, "http://")
+	u, err := url.Parse(repoURL)
+	if err != nil {
+		return repoURL
 	}
-	return repoURL
+	u.User = url.UserPassword("git", token)
+	return u.String()
 }
 
 // shellQuote single-quotes a value for the POSIX shell.

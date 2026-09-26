@@ -243,11 +243,15 @@ message SysInfoSnapshot {
 
 message DockerOp {
   string op_id = 1;
-  // op is one of: ps, images, start, stop, restart, rm, logs, exec, inspect,
-  // remove_image, prune_images.
+  // op is one of: ps, images, start, stop, restart, rm, logs, inspect,
+  // remove_image, prune_images, pull, run, get_mirrors, set_mirrors.
   string op = 2;
   string container = 3;
   string image = 4;
+  // args_json carries op-specific options:
+  // - For op "run": {"name":"...","ports":[...],"volumes":[...],"env":[...],"restart_policy":"...","command":[...]}
+  // - For op "set_mirrors": {"mirrors":["https://...","https://..."]}
+  // all fields optional; empty dynamic rows are skipped.
   bytes args_json = 5;
 }
 

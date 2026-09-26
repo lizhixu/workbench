@@ -325,6 +325,10 @@ const expiryTooltip = computed(() => {
             <span class="spec-label">月流量</span>
             <span class="spec-value" :title="trafficTooltip">{{ trafficDisplay }}</span>
           </div>
+          <div v-if="host.notes" class="spec-row" :title="`备注: ${host.notes}`">
+            <span class="spec-label">备注</span>
+            <span class="spec-value" style="max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ host.notes }}</span>
+          </div>
           <div v-if="host.renewal_url" class="spec-row">
             <span class="spec-label">续费</span>
             <a :href="host.renewal_url" target="_blank" rel="noopener noreferrer" class="renewal-link">

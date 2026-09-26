@@ -154,3 +154,136 @@ func (c *Client) ListBranches(ctx context.Context, token, owner, repo string) ([
 	}
 	return out, nil
 }
+
+func (c *Client) post(ctx context.Context, token, path string, in, out any) error {
+	var bodyReader io.Reader
+	if in != nil {
+		b, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		bodyReader = strings.NewReader(string(b))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, githubAPIBase+path, bodyReader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", "watchman-control-server")
+	if in != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("GitHub 凭据无效或已过期 (401 Unauthorized)")
+	}
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("GitHub 权限不足或仓库不存在 (%d): %s", resp.StatusCode, string(body))
+	}
+	if resp.StatusCode/100 != 2 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("GitHub API 响应异常 (%d): %s", resp.StatusCode, string(body))
+	}
+
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	return nil
+}
+
+func (c *Client) delete(ctx context.Context, token, path string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, githubAPIBase+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", "watchman-control-server")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("GitHub 凭据无效或已过期 (401 Unauthorized)")
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return fmt.Errorf("GitHub API 删除失败 (%d): %s", resp.StatusCode, string(body))
+}
+
+type gitHubHook struct {
+	ID     int64 `json:"id"`
+	Config struct {
+		URL string `json:"url"`
+	} `json:"config"`
+}
+
+// EnsureRepoWebhook registers a push webhook on the target GitHub repository if
+// not already present. It returns the existing or created hook ID.
+func (c *Client) EnsureRepoWebhook(ctx context.Context, token, owner, repo, webhookURL string) (int64, error) {
+	ownerEnc := url.PathEscape(owner)
+	repoEnc := url.PathEscape(repo)
+	listPath := fmt.Sprintf("/repos/%s/%s/hooks?per_page=100", ownerEnc, repoEnc)
+
+	var existing []gitHubHook
+	if err := c.get(ctx, token, listPath, &existing); err == nil {
+		for _, h := range existing {
+			if strings.EqualFold(strings.TrimRight(h.Config.URL, "/"), strings.TrimRight(webhookURL, "/")) {
+				return h.ID, nil
+			}
+		}
+	}
+
+	createPath := fmt.Sprintf("/repos/%s/%s/hooks", ownerEnc, repoEnc)
+	payload := map[string]any{
+		"name":   "web",
+		"active": true,
+		"events": []string{"push"},
+		"config": map[string]string{
+			"url":          webhookURL,
+			"content_type": "json",
+			"insecure_ssl": "0",
+		},
+	}
+
+	var created gitHubHook
+	if err := c.post(ctx, token, createPath, payload, &created); err != nil {
+		// If it failed because it already exists, retry list
+		if strings.Contains(err.Error(), "already exists") {
+			var retryList []gitHubHook
+			if err2 := c.get(ctx, token, listPath, &retryList); err2 == nil {
+				for _, h := range retryList {
+					if strings.EqualFold(strings.TrimRight(h.Config.URL, "/"), strings.TrimRight(webhookURL, "/")) {
+						return h.ID, nil
+					}
+				}
+			}
+		}
+		return 0, err
+	}
+	return created.ID, nil
+}
+
+// DeleteRepoWebhook removes a push webhook from the target GitHub repository.
+func (c *Client) DeleteRepoWebhook(ctx context.Context, token, owner, repo string, hookID int64) error {
+	if hookID <= 0 {
+		return nil
+	}
+	deletePath := fmt.Sprintf("/repos/%s/%s/hooks/%d", url.PathEscape(owner), url.PathEscape(repo), hookID)
+	return c.delete(ctx, token, deletePath)
+}

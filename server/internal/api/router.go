@@ -169,6 +169,8 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	authed.GET("/hosts/:id/docker/ps", h.dockerPs)
 	authed.GET("/hosts/:id/docker/images", h.dockerImages)
 	authed.GET("/hosts/:id/docker/all", h.dockerAll)
+	authed.GET("/hosts/:id/docker/mirrors", h.dockerGetMirrors)
+	hostWrite.PUT("/hosts/:id/docker/mirrors", h.dockerSetMirrors)
 	hostWrite.POST("/hosts/:id/docker/:op", h.dockerOp)
 
 	// App Store & templates. Installing an app or Docker runs commands on the
@@ -182,8 +184,11 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// webhook endpoint is public with its own per-app token.
 	if appStore != nil {
 		appWrite := authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator), h.auditMutation())
-		appHandlers := apps.NewAppHandlers(reg, appStore, appEngine)
-		if aiAssistant != nil {
+			appHandlers := apps.NewAppHandlers(reg, appStore, appEngine)
+			if gitProviderStore != nil {
+				appHandlers.SetGitProvider(gitProviderStore)
+			}
+			if aiAssistant != nil {
 			appHandlers.SetAI(func(ctx context.Context, command, stdout, stderr string, exitCode int32) (any, error) {
 				return aiAssistant.AnalyzeExecResult(ctx, command, stdout, stderr, exitCode)
 			})
@@ -195,7 +200,9 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		// Reverse-proxy domain binding (cert + nginx vhost distribution),
 		// available when both the app store and the cert hub are wired.
 		if certHub != nil {
-			apps.NewProxyHandler(reg, appStore, certHub).Register(appWrite)
+			ph := apps.NewProxyHandler(reg, appStore, certHub)
+			ph.SetNetworkStore(networkStore)
+			ph.Register(appWrite)
 		}
 	}
 
@@ -1155,29 +1162,30 @@ func (h *handlers) sysInfoCall(hub *rpc.Hub, q *agentpb.SysInfoQuery) (int, []by
 // ---- Docker ----------------------------------------------------------
 
 func (h *handlers) dockerPs(c *gin.Context) {
-	h.dockerCall(c, "ps", "")
+	h.dockerCall(c, "ps", "", "", nil)
 }
 
 func (h *handlers) dockerImages(c *gin.Context) {
-	h.dockerCall(c, "images", "")
+	h.dockerCall(c, "images", "", "", nil)
 }
 
 // dockerAll fetches containers + images in a single round trip to the agent
 // (op "ps_images"), collapsing two HTTP calls into one for the dashboard.
 func (h *handlers) dockerAll(c *gin.Context) {
-	h.dockerCall(c, "ps_images", "")
+	h.dockerCall(c, "ps_images", "", "", nil)
 }
 
 func (h *handlers) dockerOp(c *gin.Context) {
 	op := c.Param("op")
 	var body struct {
-		Container string `json:"container"`
-		Image     string `json:"image"`
+		Container string          `json:"container"`
+		Image     string          `json:"image"`
+		Args      json.RawMessage `json:"args_json"` // run op options (name/ports/volumes/env/...)
 	}
 	_ = c.ShouldBindJSON(&body)
 	// Mutating docker operations are audited; read-only ones (ps/images) are not.
 	switch op {
-	case "start", "stop", "restart", "rm", "pull", "rmi", "prune", "remove_image":
+	case "start", "stop", "restart", "rm", "pull", "rmi", "prune", "remove_image", "run":
 		target := body.Container
 		if target == "" {
 			target = body.Image
@@ -1189,10 +1197,10 @@ func (h *handlers) dockerOp(c *gin.Context) {
 		h.recordAudit(c, "docker_op", "host", c.Param("id"),
 			fmt.Sprintf("Docker 操作 %s %s", op, target), risk, audit.ResultSuccess)
 	}
-	h.dockerCall(c, op, body.Container, body.Image)
+	h.dockerCall(c, op, body.Container, body.Image, body.Args)
 }
 
-func (h *handlers) dockerCall(c *gin.Context, op, container string, image ...string) {
+func (h *handlers) dockerCall(c *gin.Context, op, container, image string, argsJSON []byte) {
 	hub := h.reg.Hub(c.Param("id"))
 	if hub == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline"})
@@ -1208,17 +1216,14 @@ func (h *handlers) dockerCall(c *gin.Context, op, container string, image ...str
 		}
 		resultCh <- msg.GetDocker()
 	})
-	img := ""
-	if len(image) > 0 {
-		img = image[0]
-	}
 	hub.Send(&agentpb.ServerMessage{
 		Payload: &agentpb.ServerMessage_DockerOp{
 			DockerOp: &agentpb.DockerOp{
 				OpId:      opID,
 				Op:        op,
 				Container: container,
-				Image:     img,
+				Image:     image,
+				ArgsJson:  argsJSON,
 			},
 		},
 	})
@@ -1264,11 +1269,12 @@ func (h *handlers) dockerCall(c *gin.Context, op, container string, image ...str
 	}
 }
 
-// dockerOpTimeout returns the HTTP-side wait budget for a docker op. Pulls
-// can take minutes, so match the agent's longer budget instead of forcing a
-// 504 at 30s while the agent keeps working.
+// dockerOpTimeout returns the HTTP-side wait budget for a docker op. Pulls can
+// take minutes, and `docker run` pulls a missing image before creating the
+// container, so both match the agent's longer budget instead of forcing a 504
+// at 30s while the agent keeps working.
 func dockerOpTimeout(op string) time.Duration {
-	if op == "pull" {
+	if op == "pull" || op == "run" {
 		return 5 * time.Minute
 	}
 	return 30 * time.Second
@@ -1294,6 +1300,209 @@ func parseNDJSON(raw []byte) []any {
 		return nil
 	}
 	return rows
+}
+
+// dockerGetMirrors reads the Docker daemon registry-mirrors configuration from the agent.
+func (h *handlers) dockerGetMirrors(c *gin.Context) {
+	hostID := c.Param("id")
+	hub := h.reg.Hub(hostID)
+	if hub == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline"})
+		return
+	}
+
+	cmd := `if [ -f /etc/docker/daemon.json ]; then cat /etc/docker/daemon.json; else echo "{}"; fi`
+	shell := "sh"
+	agent := h.reg.GetAgent(hostID)
+	if agent != nil && strings.Contains(strings.ToLower(agent.OS), "windows") {
+		cmd = `$p = "$env:ProgramData\Docker\config\daemon.json"; if (Test-Path $p) { Get-Content $p -Raw } else { "{}" }`
+		shell = "powershell"
+	}
+
+	execID := randomToken(8)
+	resultCh := make(chan *agentpb.ExecResult, 1)
+	hub.SetRespHandler(execID, func(msg *agentpb.AgentMessage) {
+		hub.SetRespHandler(execID, nil)
+		if msg != nil {
+			resultCh <- msg.GetExecResult()
+		} else {
+			resultCh <- nil
+		}
+	})
+
+	hub.Send(&agentpb.ServerMessage{
+		Payload: &agentpb.ServerMessage_Exec{
+			Exec: &agentpb.ExecRequest{
+				ExecId:     execID,
+				Shell:      shell,
+				Command:    cmd,
+				IsScript:   false,
+				TimeoutSec: 15,
+			},
+		},
+	})
+	defer hub.SetRespHandler(execID, nil)
+
+	select {
+	case res := <-resultCh:
+		if res == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent disconnected"})
+			return
+		}
+		if res.GetExitCode() != 0 {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read daemon.json: " + string(res.GetStderr())})
+			return
+		}
+		var daemonCfg struct {
+			RegistryMirrors []string `json:"registry-mirrors"`
+		}
+		out := bytes.TrimSpace(res.GetStdout())
+		if len(out) > 0 {
+			_ = json.Unmarshal(out, &daemonCfg)
+		}
+		if daemonCfg.RegistryMirrors == nil {
+			daemonCfg.RegistryMirrors = []string{}
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true, "mirrors": daemonCfg.RegistryMirrors})
+	case <-time.After(20 * time.Second):
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "timeout reading mirrors from host"})
+	}
+}
+
+// dockerSetMirrors updates the Docker daemon registry-mirrors configuration on the agent and reloads Docker.
+func (h *handlers) dockerSetMirrors(c *gin.Context) {
+	hostID := c.Param("id")
+	hub := h.reg.Hub(hostID)
+	if hub == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline"})
+		return
+	}
+
+	var body struct {
+		Mirrors []string `json:"mirrors"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	cleanMirrors := make([]string, 0, len(body.Mirrors))
+	for _, m := range body.Mirrors {
+		m = strings.TrimSpace(m)
+		if m != "" {
+			cleanMirrors = append(cleanMirrors, m)
+		}
+	}
+
+	mirrorsJSON, _ := json.Marshal(cleanMirrors)
+	agent := h.reg.GetAgent(hostID)
+	isWindows := agent != nil && strings.Contains(strings.ToLower(agent.OS), "windows")
+
+	var cmd, shell string
+	if isWindows {
+		shell = "powershell"
+		cmd = fmt.Sprintf(`$cfgPath = "$env:ProgramData\Docker\config\daemon.json"
+$dir = Split-Path $cfgPath
+if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+$cfg = @{}
+if (Test-Path $cfgPath) {
+    try { $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json -AsHashtable } catch { $cfg = @{} }
+}
+$m = '%s' | ConvertFrom-Json
+$cfg["registry-mirrors"] = $m
+$cfg | ConvertTo-Json -Depth 10 | Set-Content $cfgPath -Encoding UTF8
+Restart-Service docker -ErrorAction SilentlyContinue
+`, string(mirrorsJSON))
+	} else {
+		shell = "sh"
+		cmd = fmt.Sprintf(`set -e
+mkdir -p /etc/docker
+CFG="/etc/docker/daemon.json"
+if [ ! -f "$CFG" ]; then
+    echo "{}" > "$CFG"
+fi
+python3 -c '
+import json, sys
+cfg_path = "/etc/docker/daemon.json"
+mirrors = json.loads(sys.argv[1])
+try:
+    with open(cfg_path, "r") as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data["registry-mirrors"] = mirrors
+with open(cfg_path, "w") as f:
+    json.dump(data, f, indent=2)
+' '%s' 2>/dev/null || perl -MJSON::PP -e '
+my $path = "/etc/docker/daemon.json";
+my $mirrors = decode_json($ARGV[0]);
+my $data = {};
+if (open my $fh, "<", $path) {
+    local $/;
+    eval { $data = decode_json(<$fh>); };
+    close $fh;
+}
+$data->{"registry-mirrors"} = $mirrors;
+open my $out, ">", $path;
+print $out encode_json($data);
+close $out;
+' '%s' 2>/dev/null || {
+    echo "{\"registry-mirrors\": %s}" > "$CFG"
+}
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl reload docker || systemctl restart docker || true
+elif command -v service >/dev/null 2>&1; then
+    service docker reload || service docker restart || true
+fi
+`, string(mirrorsJSON), string(mirrorsJSON), string(mirrorsJSON))
+	}
+
+	execID := randomToken(8)
+	resultCh := make(chan *agentpb.ExecResult, 1)
+	hub.SetRespHandler(execID, func(msg *agentpb.AgentMessage) {
+		hub.SetRespHandler(execID, nil)
+		if msg != nil {
+			resultCh <- msg.GetExecResult()
+		} else {
+			resultCh <- nil
+		}
+	})
+
+	hub.Send(&agentpb.ServerMessage{
+		Payload: &agentpb.ServerMessage_Exec{
+			Exec: &agentpb.ExecRequest{
+				ExecId:     execID,
+				Shell:      shell,
+				Command:    cmd,
+				IsScript:   true,
+				TimeoutSec: 30,
+			},
+		},
+	})
+	defer hub.SetRespHandler(execID, nil)
+
+	select {
+	case res := <-resultCh:
+		if res == nil {
+			h.recordAudit(c, "docker_mirrors", "host", hostID, "更新镜像加速失败(agent断开)", audit.RiskLow, audit.ResultFailed)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent disconnected"})
+			return
+		}
+		if res.GetExitCode() != 0 {
+			errStr := res.GetError()
+			if errStr == "" {
+				errStr = string(res.GetStderr())
+			}
+			h.recordAudit(c, "docker_mirrors", "host", hostID, fmt.Sprintf("更新镜像加速失败: %s", errStr), audit.RiskLow, audit.ResultFailed)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update daemon.json: " + errStr})
+			return
+		}
+		h.recordAudit(c, "docker_mirrors", "host", hostID, fmt.Sprintf("配置 Docker 镜像加速: %v", cleanMirrors), audit.RiskLow, audit.ResultSuccess)
+		c.JSON(http.StatusOK, gin.H{"ok": true, "mirrors": cleanMirrors})
+	case <-time.After(35 * time.Second):
+		h.recordAudit(c, "docker_mirrors", "host", hostID, "更新镜像加速超时", audit.RiskLow, audit.ResultFailed)
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "timeout updating mirrors on host"})
+	}
 }
 
 // ---- Agent Upgrade ---------------------------------------------------

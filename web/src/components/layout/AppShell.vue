@@ -231,6 +231,52 @@ function handleCloseTab(e: MouseEvent, tabKey: string) {
   syncRouteToActiveTab()
 }
 
+// ---- 页签拖拽排序 ----
+const draggedIndex = ref<number | null>(null)
+const dragOverIndex = ref<number | null>(null)
+const dragOverPosition = ref<'left' | 'right' | null>(null)
+
+function handleDragStart(e: DragEvent, index: number) {
+  draggedIndex.value = index
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', String(index))
+  }
+}
+
+function handleDragOver(e: DragEvent, index: number) {
+  if (draggedIndex.value === null) return
+  e.preventDefault()
+  if (e.dataTransfer) {
+    e.dataTransfer.dropEffect = 'move'
+  }
+  const target = e.currentTarget as HTMLElement | null
+  if (!target) return
+  const rect = target.getBoundingClientRect()
+  const offset = e.clientX - rect.left
+  const position = offset < rect.width / 2 ? 'left' : 'right'
+  dragOverIndex.value = index
+  dragOverPosition.value = position
+}
+
+function handleDrop(e: DragEvent, targetIndex: number) {
+  e.preventDefault()
+  const from = draggedIndex.value
+  const pos = dragOverPosition.value || 'left'
+  if (from !== null && from !== targetIndex) {
+    workspace.moveTab(from, targetIndex, pos)
+  }
+  draggedIndex.value = null
+  dragOverIndex.value = null
+  dragOverPosition.value = null
+}
+
+function handleDragEnd() {
+  draggedIndex.value = null
+  dragOverIndex.value = null
+  dragOverPosition.value = null
+}
+
 // ---- 页签右键菜单 ----
 const tabMenuVisible = ref(false)
 const tabMenuX = ref(0)
@@ -357,10 +403,20 @@ function handleUser(key: string) {
         <!-- 顶部 Workspace 多页签栏 -->
         <div class="workspace-tabs" @wheel.prevent="onTabsWheel">
           <div
-            v-for="tab in workspace.tabs"
+            v-for="(tab, index) in workspace.tabs"
             :key="tab.key"
             class="workspace-tab-item"
-            :class="{ active: workspace.activeKey === tab.key }"
+            :class="{
+              active: workspace.activeKey === tab.key,
+              'is-dragging': draggedIndex === index,
+              'drop-left': dragOverIndex === index && dragOverPosition === 'left' && draggedIndex !== index,
+              'drop-right': dragOverIndex === index && dragOverPosition === 'right' && draggedIndex !== index,
+            }"
+            draggable="true"
+            @dragstart="handleDragStart($event, index)"
+            @dragover="handleDragOver($event, index)"
+            @drop="handleDrop($event, index)"
+            @dragend="handleDragEnd"
             @click="handleSelectTab(tab)"
             @contextmenu="(e) => openTabMenu(e, tab.key)"
           >
@@ -369,6 +425,7 @@ function handleUser(key: string) {
             <button
               v-if="tab.closable !== false"
               class="tab-close-btn"
+              @mousedown.stop
               @click="(e) => handleCloseTab(e, tab.key)"
             >
               <NIcon size="12"><CloseOutline /></NIcon>
@@ -611,6 +668,7 @@ function handleUser(key: string) {
     }
 
     .workspace-tab-item {
+      position: relative;
       display: flex;
       align-items: center;
       gap: 6px;
@@ -626,6 +684,37 @@ function handleUser(key: string) {
       &:hover {
         color: var(--text-primary);
         background-color: var(--tab-hover);
+      }
+
+      &.is-dragging {
+        opacity: 0.45;
+        cursor: grabbing;
+      }
+
+      &.drop-left::before {
+        content: '';
+        position: absolute;
+        left: -4px;
+        top: 4px;
+        bottom: 4px;
+        width: 3px;
+        background-color: #6366f1;
+        border-radius: 2px;
+        z-index: 10;
+        pointer-events: none;
+      }
+
+      &.drop-right::after {
+        content: '';
+        position: absolute;
+        right: -4px;
+        top: 4px;
+        bottom: 4px;
+        width: 3px;
+        background-color: #6366f1;
+        border-radius: 2px;
+        z-index: 10;
+        pointer-events: none;
       }
 
       &.active {

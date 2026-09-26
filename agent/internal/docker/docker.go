@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -103,6 +106,16 @@ func (m *Manager) run(op *agentpb.DockerOp) {
 		return
 	}
 
+	// "run" takes op-specific args (name/ports/volumes/env/restart policy)
+	// instead of the plain container/image pairs every other op uses, so it
+	// gets its own path. A missing image is pulled by `docker run` itself,
+	// hence the long budget on both sides.
+	if op.GetOp() == "run" {
+		m.runRun(ctx, op, result)
+		m.send(result)
+		return
+	}
+
 	args, ok := dockerArgs(op.GetOp(), op.GetContainer(), op.GetImage())
 	if !ok {
 		result.Ok = false
@@ -178,6 +191,140 @@ func (m *Manager) runPsImages(ctx context.Context, result *agentpb.DockerEvent) 
 	result.PayloadJson = payload
 }
 
+// runRunArgs is the args_json payload of op "run". Empty entries are skipped
+// so the console can submit dynamic form rows that were never filled in.
+type runRunArgs struct {
+	Name          string   `json:"name"`
+	Ports         []string `json:"ports"`          // "hostPort:containerPort"
+	Volumes       []string `json:"volumes"`        // "/hostPath:/containerPath"
+	Env           []string `json:"env"`            // "KEY=VALUE"
+	RestartPolicy string   `json:"restart_policy"` // no / on-failure / always / unless-stopped
+	Command       []string `json:"command"`
+}
+
+// Run-argument whitelists. exec.CommandContext never spawns a shell, but the
+// values still flow into `docker` flags, where a crafted token could smuggle
+// extra flags (--privileged, -v /, ...) into the run. Every args_json field is
+// validated against these before it may join the argv.
+var (
+	runNameRe   = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+	runPortRe   = regexp.MustCompile(`^[0-9]{1,5}:[0-9]{1,5}$`)
+	runVolumeRe = regexp.MustCompile(`^[^\s:]+:[^\s:]+$`)
+	runEnvRe    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=\S.*$`)
+	runPolicyRe = regexp.MustCompile(`^(no|on-failure|always|unless-stopped)$`)
+	// Image references: optional host[:port]/repo path segments then an
+	// optional :tag or @digest. Rejects leading dashes so a payload cannot
+	// masquerade as a docker flag. An env *value* may contain any bytes, but
+	// env entries only ever land behind -e, and the KEY charset is locked
+	// down, so `A=-v /:/host` is safe: docker treats it as a literal value.
+	// Image reference grammar: body (:tag)? (@digest)? where the body is
+	// either `host[:port]/path/...` (registry form, must contain a slash)
+	// or a plain `name[/path...]`. Rejects leading dashes so a payload
+	// cannot masquerade as a docker flag.
+	runImageRe = regexp.MustCompile(`^([a-zA-Z0-9][a-zA-Z0-9._-]*(:[0-9]+)?(/[a-zA-Z0-9._-]+)+|[a-zA-Z0-9][a-zA-Z0-9._-]*(/[a-zA-Z0-9._-]+)*)(:[a-zA-Z0-9._-]+)?(@sha256:[a-f0-9]{64})?$`)
+)
+
+// runRun executes `docker run -d ...` per the args_json payload and reports
+// the created container's ID as the payload. Every field is whitelist-checked
+// (see the regexes above) so a hostile payload cannot inject docker flags.
+func (m *Manager) runRun(ctx context.Context, op *agentpb.DockerOp, result *agentpb.DockerEvent) {
+	var args runRunArgs
+	if len(op.GetArgsJson()) > 0 {
+		if err := json.Unmarshal(op.GetArgsJson(), &args); err != nil {
+			result.Ok = false
+			result.Error = "invalid run args_json: " + err.Error()
+			return
+		}
+	}
+	image := strings.TrimSpace(op.GetImage())
+	if image == "" {
+		result.Ok = false
+		result.Error = "run requires an image"
+		return
+	}
+
+	policy := strings.TrimSpace(args.RestartPolicy)
+	if policy == "" {
+		policy = "no"
+	}
+	if !runPolicyRe.MatchString(policy) {
+		result.Ok = false
+		result.Error = "invalid restart_policy: " + policy
+		return
+	}
+
+	argv := []string{"run", "-d", "--restart", policy}
+	if name := strings.TrimSpace(args.Name); name != "" {
+		if !runNameRe.MatchString(name) {
+			result.Ok = false
+			result.Error = "invalid container name: " + name
+			return
+		}
+		argv = append(argv, "--name", name)
+	}
+	for _, p := range args.Ports {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !runPortRe.MatchString(p) {
+			result.Ok = false
+			result.Error = "invalid port mapping: " + p
+			return
+		}
+		argv = append(argv, "-p", p)
+	}
+	for _, v := range args.Volumes {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if !runVolumeRe.MatchString(v) {
+			result.Ok = false
+			result.Error = "invalid volume: " + v
+			return
+		}
+		argv = append(argv, "-v", v)
+	}
+	for _, e := range args.Env {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if !runEnvRe.MatchString(e) {
+			result.Ok = false
+			result.Error = "invalid env entry: " + e
+			return
+		}
+		argv = append(argv, "-e", e)
+	}
+	if !runImageRe.MatchString(image) {
+		result.Ok = false
+		result.Error = "invalid image reference: " + image
+		return
+	}
+	argv = append(argv, image)
+	for _, c := range args.Command {
+		if strings.TrimSpace(c) == "" {
+			continue
+		}
+		argv = append(argv, c)
+	}
+
+	out, err := exec.CommandContext(ctx, "docker", argv...).Output()
+	if err != nil {
+		errOut := ""
+		if ee, ok := err.(*exec.ExitError); ok {
+			errOut = string(ee.Stderr)
+		}
+		result.Ok = false
+		result.Error = err.Error() + ": " + errOut
+		return
+	}
+	result.Ok = true
+	result.PayloadJson = []byte(`{"container_id":` + strconv.Quote(strings.TrimSpace(string(out))) + `}`)
+}
+
 // dockerArgs maps an op to its `docker` CLI argv.
 func dockerArgs(op, container, image string) ([]string, bool) {
 	switch op {
@@ -219,9 +366,10 @@ func (m *Manager) send(ev *agentpb.DockerEvent) {
 }
 
 // opTimeout returns the command timeout for a given docker op. Image pulls can
-// take minutes, so they get a longer budget than the default.
+// take minutes — and `docker run` pulls a missing image before creating the
+// container — so both get a long budget like the server side.
 func opTimeout(op string) time.Duration {
-	if op == "pull" {
+	if op == "pull" || op == "run" {
 		return 5 * time.Minute
 	}
 	if op == "ps_images" {

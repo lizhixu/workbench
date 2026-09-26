@@ -15,7 +15,7 @@ import {
 } from '@vicons/ionicons5'
 import {
   deployApp, diagnoseDeployment, getApp, getAppStatus, listDeployments, restartApp,
-  rollbackApp, startApp, stopApp, updateApp, type AppEntity, type AppStatus, type Deployment,
+  rollbackApp, startApp, stopApp, updateApp, syncAppWebhook, type AppEntity, type AppStatus, type Deployment,
   type AIDiagnosis,
 } from '../../api/apps'
 import { bindProxy, unbindProxy, type Certificate } from '../../api/certs'
@@ -88,6 +88,7 @@ async function loadProxyData() {
     const res = await listHosts()
     const hosts = ((res as { data: { id: string; hostname: string; status: string }[] }).data ?? []) as { id: string; hostname: string; status: string }[]
     hostOptions.value = hosts.map((h) => ({ label: h.hostname, value: h.id }))
+    hostnameById.value = new Map(hosts.map((h) => [h.id, h.hostname]))
   } catch {
     hostOptions.value = []
   }
@@ -102,6 +103,19 @@ const certOptions = computed(() => [
   { label: '按域名自动匹配', value: '' },
   ...certs.value.map((c) => ({ label: c.domains.join(', '), value: c.id })),
 ])
+
+// 拓扑展示用：应用所在主机与网关主机的名称
+const hostnameById = ref<Map<string, string>>(new Map())
+
+const appHostname = computed(() => {
+  if (!app.value) return ''
+  return hostnameById.value.get(app.value.host_id) || app.value.host_id
+})
+
+const gatewayHostname = computed(() => {
+  if (!app.value?.proxy_gateway_host_id) return ''
+  return hostnameById.value.get(app.value.proxy_gateway_host_id) || app.value.proxy_gateway_host_id
+})
 
 async function doBindProxy() {
   if (!proxyForm.value.domain.trim()) {
@@ -154,6 +168,16 @@ const webhookURL = computed(() => {
   if (!app.value?.webhook_token) return ''
   const base = window.location.origin
   return `${base}/api/v1/apps/webhook/${app.value.webhook_token}`
+})
+
+const sourceTypeLabel = computed(() => {
+  switch (app.value?.source_type) {
+    case 'git': return 'Git 仓库'
+    case 'image': return '单镜像'
+    case 'template': return '应用模板'
+    case 'raw_compose': return 'Compose 编排'
+    default: return app.value?.source_type ?? '-'
+  }
 })
 
 const composeEditContent = ref('')
@@ -258,6 +282,21 @@ async function copyWebhook() {
   if (!webhookURL.value) return
   const ok = await copyToClipboard(webhookURL.value)
   ok ? message.success('已复制 Webhook 地址') : message.warning('复制失败，请手动复制')
+}
+
+const syncingWebhook = ref(false)
+async function doSyncWebhook() {
+  if (!app.value?.id) return
+  syncingWebhook.value = true
+  try {
+    const res = await syncAppWebhook(app.value.id)
+    message.success(res.message || '已成功通过 GitHub API 配置 Webhook')
+    app.value = res.data
+  } catch (e: any) {
+    message.error(e.message || '同步失败')
+  } finally {
+    syncingWebhook.value = false
+  }
 }
 
 function openLog(dep: Deployment) {
@@ -454,13 +493,21 @@ onDeactivated(() => {
         <NTabPane name="overview" tab="概览">
           <div class="overview-scroll">
             <NDescriptions :column="2" bordered size="small" label-placement="left">
-              <NDescriptionsItem label="Git 仓库">
+              <NDescriptionsItem label="部署来源">
+                <NTag size="small" :bordered="false">
+                  {{ sourceTypeLabel }}
+                </NTag>
+              </NDescriptionsItem>
+              <NDescriptionsItem v-if="app.source_type === 'template'" label="应用模板">
+                <span class="mono">{{ app.template_id }}</span>
+              </NDescriptionsItem>
+              <NDescriptionsItem v-if="app.source_type === 'git'" label="Git 仓库">
                 <span class="mono">{{ app.repo_url }}</span>
               </NDescriptionsItem>
-              <NDescriptionsItem label="监听分支">
+              <NDescriptionsItem v-if="app.source_type === 'git'" label="监听分支">
                 <NTag size="small" :bordered="false">{{ app.branch }}</NTag>
               </NDescriptionsItem>
-              <NDescriptionsItem label="当前 Commit">
+              <NDescriptionsItem v-if="app.source_type === 'git'" label="当前 Commit">
                 <NTag v-if="app.current_commit" size="small" type="info">
                   <template #icon>
                     <NIcon><GitCommitOutline /></NIcon>
@@ -469,26 +516,49 @@ onDeactivated(() => {
                 </NTag>
                 <span v-else>-</span>
               </NDescriptionsItem>
+              <NDescriptionsItem v-if="app.source_type === 'image' || app.source_type === 'template'" label="镜像">
+                <span class="mono">{{ app.image || '-' }}</span>
+              </NDescriptionsItem>
               <NDescriptionsItem label="容器名">
                 <span class="mono">{{ app.container_name || '-' }}</span>
-              </NDescriptionsItem>
-              <NDescriptionsItem label="镜像">
-                <span class="mono">{{ app.image || '-' }}</span>
               </NDescriptionsItem>
               <NDescriptionsItem label="健康检查">
                 <span class="mono">{{ app.healthcheck_url || '未配置' }}</span>
               </NDescriptionsItem>
               <NDescriptionsItem label="端口映射">
-                <span class="mono">{{ (app.ports ?? []).map((p) => `${p.host}:${p.container}`).join(', ') || '-' }}</span>
+                <span class="mono">
+                  {{ (app.ports ?? [])
+                    .map((p) => `${p.host}:${p.container}${p.bind_scope === 'mesh' ? '（仅组网）' : ''}`)
+                    .join(', ') || '-' }}
+                </span>
               </NDescriptionsItem>
               <NDescriptionsItem label="挂载卷">
                 <span class="mono">{{ (app.volumes ?? []).join(', ') || '-' }}</span>
               </NDescriptionsItem>
+              <NDescriptionsItem v-if="app.domain" label="域名">
+                <NTag size="small" type="success" :bordered="false">{{ app.domain }}</NTag>
+              </NDescriptionsItem>
             </NDescriptions>
 
-            <NAlert v-if="app.auto_deploy && webhookURL" type="success" style="margin-top: 14px" :show-icon="true">
-              <template #header>自动部署 Webhook</template>
-              将此地址配置到代码仓库的 Webhooks（push 事件）即可实现推送自动构建：
+            <NAlert v-if="app.auto_deploy && app.webhook_auto_managed" type="success" style="margin-top: 14px" :show-icon="true">
+              <template #header>自动部署已生效 (GitHub 自动托管)</template>
+              <div>
+                系统已自动通过已连接的 GitHub 账号在仓库中配置了 Webhook。每当向 <code>{{ app.branch || 'main' }}</code> 分支推送代码（git push）时，将自动触发构建并重新部署（无需手动配置 Webhook）。
+              </div>
+              <div style="margin-top: 8px">
+                <NButton size="tiny" secondary :loading="syncingWebhook" @click="doSyncWebhook">
+                  重新同步 Webhook
+                </NButton>
+              </div>
+            </NAlert>
+            <NAlert v-else-if="app.auto_deploy && webhookURL" type="info" style="margin-top: 14px" :show-icon="true">
+              <template #header>自动部署 Webhook（手动模式）</template>
+              <span v-if="app.webhook_error" style="color: var(--n-error-color); margin-bottom: 6px; display: block">
+                自动注册 Webhook 失败（{{ app.webhook_error }}），您可以手动将此地址配置到代码仓库的 Webhooks（push 事件）：
+              </span>
+              <span v-else>
+                将此地址配置到代码仓库的 Webhooks（push 事件）即可实现推送自动构建：
+              </span>
               <div class="webhook-row">
                 <NCode :code="webhookURL" />
                 <NButton size="tiny" secondary @click="copyWebhook">
@@ -496,6 +566,9 @@ onDeactivated(() => {
                     <NIcon><CopyOutline /></NIcon>
                   </template>
                   复制
+                </NButton>
+                <NButton v-if="app.repo_url?.includes('github.com')" size="tiny" secondary :loading="syncingWebhook" @click="doSyncWebhook">
+                  重试自动同步
                 </NButton>
               </div>
             </NAlert>
@@ -543,6 +616,33 @@ onDeactivated(() => {
             >
               尚未绑定域名。绑定后 Watchman 会自动把证书与 Nginx 反代配置下发到网关主机并热加载。
             </NAlert>
+
+            <!-- 流量拓扑：让用户直观看到公网流量如何到达内网应用 -->
+            <div v-if="app.domain" class="topology-box">
+              <div class="topology-line">
+                <div class="topology-node">
+                  <div class="topology-label">公网用户</div>
+                  <div class="topology-value">{{ app.domain }}</div>
+                </div>
+                <div class="topology-arrow">-&gt;</div>
+                <div class="topology-node">
+                  <div class="topology-label">
+                    {{ app.proxy_mode === 'gateway' ? '网关节点（Nginx / SSL 终止）' : '应用主机（Nginx / SSL 终止）' }}
+                  </div>
+                  <div class="topology-value">
+                    {{ gatewayHostname || appHostname }}
+                  </div>
+                </div>
+                <div v-if="app.proxy_mode === 'gateway'" class="topology-arrow">Tailscale 组网</div>
+                <div class="topology-node">
+                  <div class="topology-label">应用容器</div>
+                  <div class="topology-value">{{ app.container_name || app.name }}（{{ app.proxy_upstream }}）</div>
+                </div>
+              </div>
+              <div v-if="app.proxy_mode === 'gateway'" class="topology-hint">
+                应用主机无需公网 IP：公网流量在网关主机卸载 TLS 后，经 Tailscale 内网转发到应用容器的上游端口。
+              </div>
+            </div>
 
             <NForm label-placement="top" style="max-width: 640px">
               <NFormItem label="域名" required>
@@ -714,6 +814,55 @@ onDeactivated(() => {
 .mono {
   font-family: 'JetBrains Mono', Consolas, monospace;
   font-size: 12px;
+}
+
+.topology-box {
+  background: rgba(99, 102, 241, 0.06);
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 14px;
+}
+
+.topology-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.topology-node {
+  flex: 1;
+  min-width: 140px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px 12px;
+
+  .topology-label {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-bottom: 2px;
+  }
+
+  .topology-value {
+    font-size: 13px;
+    font-weight: 600;
+    word-break: break-all;
+  }
+}
+
+.topology-arrow {
+  color: #6366f1;
+  font-weight: 600;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.topology-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 .cmd-box {

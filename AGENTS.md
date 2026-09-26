@@ -66,7 +66,12 @@
 
 ### 3.4 Docker 管理
 
+> Docker 面板定位为**运行时观测与运维**（容器/镜像的查看、启停、日志、终端、镜像加速），**不再承担应用部署入口**。所有新建服务一律走 §3.7 应用中心统一部署。
+
 - **容器管理**：容器运行状态、名称、镜像、资源使用、暴露端口、创建时间；支持启停、重启、删除、查看日志；支持批量操作。
+- **纳管状态列**：容器列表识别 `watchman.app=<appID>` 标签：由应用中心部署的容器显示「应用中心纳管」并可跳转对应应用详情；标签指向的应用已删除时显示警告；无标签的外部/临时容器如实标注。
+- **部署新应用**：容器页签工具栏提供「部署新应用」入口，跳转 `/apps/create?host_id=<当前主机>`，预选目标主机后由应用中心完成创建。
+- **镜像加速**：主机详情 Docker「镜像」页签提供「镜像加速」入口，支持查看当前主机的 `registry-mirrors`、快捷选取常用国内加速源（DaoCloud、1ms 等）、手动编辑加速镜像列表，保存后自动平滑更新 `daemon.json` 并重载 Docker 守护进程，无需停机或重启现有容器。
 - **容器终端**：一键进入容器 shell。
 - **镜像管理**：镜像名称、ID、大小、创建时间；支持删除单个、批量删除、清除未使用镜像。
 - **一键安装 Docker**：若主机未安装 Docker，控制端可一键为其安装。
@@ -88,12 +93,25 @@
 - **初始化路径**：可配置进入文件管理时的默认路径。
 - **大文件/进度**：上传下载需展示进度。
 
-### 3.7 应用市场
+### 3.7 应用中心（统一部署入口）
 
-- **一键安装常用应用**：Nginx、Redis、MySQL、以及部分安全应用（如雷池 WAF 社区版等），只需填入基本参数即可拉起。
-- **基于 Docker**：应用以 Docker 方式运行；未装 Docker 时可一键安装。
-- **已安装管理**：展示已安装应用列表，支持重启、停止、查看日志、卸载、查看安装参数。
-- **可扩展**：应用定义为可贡献/自定义的配置（对标原产品的开源应用仓库思路），支持自定义接入应用。
+> 原主机级「应用市场」Tab 与 Docker「创建容器」表单已废弃删除：所有应用部署（模板/单镜像/Compose/Git）统一收敛到全局应用中心，主机详情不再有应用市场页签。模板目录 API `GET /apps/catalog` 保留，作为应用中心「应用模板」来源的数据。
+
+- **四种部署来源**（`Application.source_type`）：
+  - `template`：内置模板一键部署（Nginx、Redis、MySQL、PostgreSQL、雷池 WAF 等），只填模板参数即可拉起；模板经 `ResolveTemplate` 解析为镜像 + 环境变量 + 默认端口/卷，走与应用中心一致的引擎部署流（持久化、健康检查、滚动替换）。
+  - `image`：直接输入镜像引用（`nginx:alpine`、`registry.example.com/app:1.0`）部署单容器。
+  - `raw_compose`：在线编写 Docker Compose YAML 编排微服务栈。
+  - `git`：链接 Git 仓库（GitHub 授权选择或手动 URL），Dockerfile / Compose 构建，支持推送自动部署（Webhook）。
+- **端口绑定范围**（`PortMapping.bind_scope`）：每条端口映射可选「公网开放」（默认，`-p host:container` 绑定 0.0.0.0）或「仅异地组网」（`-p <tailscaleIP>:host:container` 只绑定主机 Tailscale IP，公网不可达）。选择「仅异地组网」时目标主机必须已加入组网，引擎找不到 Mesh IP 时降级为公网绑定并在部署日志中告警。
+- **域名与反代集成**（`PUT /apps/:id/proxy`）：
+  - `local` 模式：应用所在主机自建 Nginx（`watchman-app-nginx` 容器）反代，上游 `127.0.0.1:<port>`。
+  - `gateway` 模式：另选一台有公网 IP 的网关主机运行 Nginx，上游指向**应用主机的 Tailscale Mesh IP**（经 `network.Store.GetNodeStatus` 解析），公网流量在网关卸载 TLS 后经组网内网穿透到无公网的应用主机。
+  - 证书自动化：绑定域名时若证书中心无覆盖证书，自动用默认 ACME 账户签发后写入 Nginx 并热加载。
+  - 网关主机 ID 持久化在 `Application.proxy_gateway_host_id`，解绑时同时清理应用主机与网关主机两侧配置。
+- **创建时即可绑定域名**：创建页填写域名与网关节点后，提交依次执行 创建应用 → 自动签发证书 → 下发反代；绑定失败不回滚应用创建，可稍后在详情页重试。
+- **全生命周期管理**：部署历史、构建日志、健康检查探活失败自动保留旧版本（`-next`/`-prev` 滚动替换）、回滚、启停、AI 排障诊断，对所有来源的应用一致生效。
+- **已安装管理**：应用列表/详情支持重启、停止、启动、查看日志、删除（`watchman.app` 标签标记容器归属）。
+- **可扩展**：模板定义为服务端声明式配置（`server/internal/apps/templates.go` 的 `Catalog`），支持自定义接入新模板。
 
 ### 3.8 推送命令（批量执行）
 
@@ -616,10 +634,18 @@ GET    /api/v1/auth/me
 
 # 主机
 GET    /api/v1/hosts?group=&status=&q=
-POST   /api/v1/hosts/enroll                → 生成 enroll_token + 安装命令
+POST   /api/v1/hosts/enroll                → 生成 enroll_token + 安装命令（install=Linux curl 一键脚本，install_win=Windows irm|iex 一键脚本）
 POST   /api/v1/hosts/:id/unbind
 GET    /api/v1/hosts/:id
 PATCH  /api/v1/hosts/:id  (tags/group)
+
+# Docker（ op 透传给 Agent，清单见 B.8.3 ）
+GET    /api/v1/hosts/:id/docker/ps
+GET    /api/v1/hosts/:id/docker/images
+GET    /api/v1/hosts/:id/docker/all       # 容器+镜像一次往返
+GET    /api/v1/hosts/:id/docker/mirrors   # 获取 Docker daemon registry-mirrors
+PUT    /api/v1/hosts/:id/docker/mirrors   # 更新 Docker registry-mirrors 并 reload daemon
+POST   /api/v1/hosts/:id/docker/:op        # body {container,image,args_json?}；写操作记审计，rm/rmi/prune 为 high risk；pull/run 下发超时 5 分钟
 
 # 系统状态
 GET    /api/v1/hosts/:id/processes
@@ -840,9 +866,21 @@ notify_rules(channel_id, alert_severity, enabled)
 ai_tools(name, schema json, backend_handler, read_only, enabled, min_role)
   # list_hosts/get_host_detail/query_metrics 等，见 A.7 草案
 
-# 应用市场（P2，预留）
-app_catalog(app_id, name, category, version, params_schema json, source)
-app_instances(id, host_id, app_id, version, params json, status, installed_at)
+# 应用中心（3.7 统一部署入口；模板目录为服务端声明式配置）
+# 持久化实体走 apps.Store 的 Application/Deployment（JSONL 落盘），逻辑模型：
+applications(id, name, host_id, source_type,        # git | image | template | raw_compose
+             template_id, template_params json,
+             repo_url, branch, auth_vault_id, auto_deploy,
+             build_type, dockerfile, build_context, build_timeout_sec, compose_content,
+             image, env_vars json,
+             ports json,                              # [{host, container, bind_scope}]，bind_scope: public|mesh
+             volumes json, healthcheck_url, container_name,
+             domain, proxy_mode,                      # local | gateway
+             proxy_gateway_host_id,                   # gateway 模式下的网关主机
+             proxy_upstream,                          # 127.0.0.1:port 或应用主机 Mesh IP:port
+             current_commit, last_deploy_at, created_at)
+deployments(id, app_id, commit_hash, commit_message, trigger, status,
+            started_by, started_at, finished_at, duration_ms, exit_code, error, build_log)
 
 # 动态组网（P2，预留）
 network_nodes(host_id, virtual_ip, status, joined_at)
@@ -878,11 +916,20 @@ GET/POST/PATCH/DELETE /api/v1/notify-rules
 # AI 工具
 GET/PUT /api/v1/ai/tools                  # 开关/权限
 
-# 应用市场（P2）
-GET    /api/v1/apps                       # 应用目录
-POST   /api/v1/hosts/:id/apps             # 安装
-GET    /api/v1/hosts/:id/apps             # 已安装列表
-POST   /api/v1/hosts/:id/apps/:iid/restart|stop|uninstall
+# 应用中心（3.7）
+GET    /api/v1/apps                        # 应用列表（全部来源统一管理）
+GET    /api/v1/apps/catalog                # 内置模板目录（声明式 Catalog）
+POST   /api/v1/apps                        # 创建应用 {source_type, host_id, template_id/template_params | image | compose_content | repo_url/branch, ports[{host,container,bind_scope}], ...}
+GET    /api/v1/apps/:id                    # 应用详情
+PUT    /api/v1/apps/:id                    # 更新（如 Compose 内容）
+DELETE /api/v1/apps/:id                    # 删除
+POST   /api/v1/apps/:id/deploy|rollback    # 部署 / 回滚
+POST   /api/v1/apps/:id/stop|start|restart
+GET    /api/v1/apps/:id/deployments        # 部署历史（分页）
+POST   /api/v1/apps/:id/deployments/:depID/diagnose   # AI 排障
+PUT    /api/v1/apps/:id/proxy              # 绑定域名 {domain, mode: local|gateway, gateway_host_id, cert_id?, upstream?}；无证书时用默认 ACME 账户自动签发
+DELETE /api/v1/apps/:id/proxy              # 解绑（同时清理应用主机与网关主机配置）
+POST   /api/v1/apps/webhook/:token         # Git push 自动部署（token 鉴权）
 
 # 组网（P2）
 POST   /api/v1/networks/:id/join          # 选中主机加入
@@ -897,7 +944,7 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
 
 ### B.8.3 协议补充
 
-- **DockerOp/DockerEvent（P2）**：`op` 含 `ps/images/start/stop/restart/rm/logs/exec/inspect`；Agent 通过 Docker SDK（`github.com/docker/docker/client`）执行。
+- **DockerOp/DockerEvent（P2）**：`op` 含 `ps/images/start/stop/restart/rm/logs/inspect/remove_image/prune_images/pull/run`；Agent 侧 shelling out to the docker CLI 执行（`agent/internal/docker/docker.go`）。`run` 的参数走 `DockerOp.args_json`：`{"name":"...","ports":["hostPort:containerPort"],"volumes":["/host:/container"],"env":["KEY=VALUE"],"restart_policy":"no|on-failure|always|unless-stopped","command":["arg1","arg2"]}`，空值条目跳过；**每个字段先过字符白名单正则（容器名/端口/卷/环境变量键/重启策略/镜像引用，拒绝以 `-` 开头等伪装 docker flag 的载荷）再进 argv，exec 不走 shell**；镜像缺失由 docker CLI 自动拉取，故 `pull/run` 的服务端下发与 agent 执行均取 5 分钟超时。
 - **安全扫描（P3）**：新增 `ScanRequest(type, rule_set)` / `ScanResult(progress, findings json, report_ref)`，走 exec + 结果回传，不引入新通道。
 - **Agent 自更新**：新增 `UpgradeRequest(version, url, sha256)` / `UpgradeProgress`，控制端可下发升级，Agent 校验签名后热更新（解耦发布）。
 - **证书轮换**：`RegisterResponse` 增加可选 `client_cert`/`cert_expires_at`；Agent 持有证书，控制端在到期前通过现有 mTLS 通道下发新证书（带签名），Agent 热加载。
@@ -1162,6 +1209,20 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
 4. **表格卡片背景色与无边框规范**：
    - 所有承载表格的卡片容器背景统一绑定为 `var(--bg-card)`，杜绝因未定义 `--n-color` 导致回退到发灰的伪透明背景；
    - 消除表格外层硬编码的 `border: 1px solid var(--border-color)` 与内缩 `padding`，保持平整、沉浸的控制台无边框视觉。
+
+### 8.9 顶部 Workspace 多页签拖拽排序
+
+顶部多工作区页签（`AppShell.vue` 中的 `workspace-tab-item`）承载多任务多视图上下文，支持鼠标拖拽水平调整页签顺序：
+
+1. **零第三方库原生拖拽**：使用 HTML5 Drag and Drop API（`draggable="true"`, `@dragstart`, `@dragover`, `@drop`, `@dragend`），不引入任何臃肿的外置拖拽包。
+2. **位置动态感知与视觉指示线**：
+   - 拖拽经过目标页签时，计算鼠标在元素内的水平相对偏移量（左半区 / 右半区），确定插入方位为 `left` 或 `right`；
+   - 使用 CSS 伪类 `.drop-left::before` 与 `.drop-right::after` 渲染 3px 品牌色插入垂直指示线，定位在页签间隙中（带 `pointer-events: none`）；
+   - 正在拖拽的源页签赋予 `.is-dragging` 状态（半透明 `opacity: 0.45` 与 `cursor: grabbing`）。
+3. **状态同步与偏移校准**：
+   - Pinia `workspace` store 提供 `moveTab(fromIndex, targetIndex, position)`，在数组切片 `splice` 移动时自动校准由于元素抽取导致的索引位移，实现无缝平滑重排；
+   - 页签关闭按钮附加 `@mousedown.stop`，避免点击关闭图标时误触发父级拖拽。
+
 
 
 

@@ -1,6 +1,7 @@
 # Local session/cache directories (per-session sandbox state)
 .zcode/
 .workbuddy/
+.mimosa/
 260814094426488/
 tmp/
 reports/

@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"watchman/proto/agentpb"
 	"watchman/server/internal/cert"
+	"watchman/server/internal/network"
 	"watchman/server/internal/rpc"
 )
 
@@ -36,11 +37,17 @@ type ProxyHandler struct {
 	reg   *rpc.Registry
 	store *Store
 	hub   *cert.Hub
+	networkStore *network.Store
 }
 
 // NewProxyHandler creates the reverse-proxy binding handlers.
 func NewProxyHandler(reg *rpc.Registry, store *Store, hub *cert.Hub) *ProxyHandler {
 	return &ProxyHandler{reg: reg, store: store, hub: hub}
+}
+
+// SetNetworkStore injects the overlay network store to resolve Tailscale mesh IPs.
+func (h *ProxyHandler) SetNetworkStore(ns *network.Store) {
+	h.networkStore = ns
 }
 
 // Register mounts the proxy binding routes (mutations audited by caller).
@@ -117,10 +124,21 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 	} else {
 		got, ok := h.hub.FindByDomain(domain)
 		if !ok {
-			c.JSON(http.StatusConflict, gin.H{"error": "证书中心没有覆盖该域名的证书，请先签发"})
-			return
+			// Auto-issue certificate using default account if not found
+			acc, err := h.hub.GetDefaultAccount()
+			if err != nil {
+				c.JSON(http.StatusConflict, gin.H{"error": "证书中心没有覆盖该域名的证书，且未配置默认 ACME 账户，请先在证书中心签发"})
+				return
+			}
+			newCert, err := h.hub.Issue([]string{domain}, acc.ID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("自动签发证书失败: %v", err)})
+				return
+			}
+			crt = newCert
+		} else {
+			crt = got
 		}
-		crt = got
 	}
 	if crt.KeyPEM == "" {
 		c.JSON(http.StatusConflict, gin.H{"error": "证书材料缺失，请先重新签发该证书"})
@@ -177,6 +195,11 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		a.Domain = domain
 		a.ProxyMode = mode
 		a.ProxyUpstream = upstream
+		if mode == "gateway" {
+			a.ProxyGatewayHostID = req.GatewayHostID
+		} else {
+			a.ProxyGatewayHostID = ""
+		}
 		return nil
 	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -196,13 +219,10 @@ func (h *ProxyHandler) unbindProxy(c *gin.Context) {
 		return
 	}
 
-	// Remove the vhost config from wherever it was deployed. Best effort on
-	// both hosts since the mode may have changed since the last bind.
+	// Remove the vhost config from wherever it was deployed.
 	targets := []string{app.HostID}
-	if app.ProxyMode == "gateway" && app.ProxyUpstream != "" {
-		// The gateway host id is not persisted separately; try removing from
-		// the app host too, which covers the common single-gateway setups.
-		targets = append(targets, targets[0])
+	if app.ProxyMode == "gateway" && app.ProxyGatewayHostID != "" {
+		targets = append(targets, app.ProxyGatewayHostID)
 	}
 	for _, hostID := range dedupe(targets) {
 		hub := h.reg.Hub(hostID)
@@ -236,9 +256,12 @@ func (h *ProxyHandler) defaultUpstream(app *Application, mode string) string {
 		return fmt.Sprintf("127.0.0.1:%d", port)
 	}
 	// Gateway mode: prefer the app host's overlay IP (100.x.y.z), which works
-	// even when the app host sits behind NAT. Mesh IP lookup would go through
-	// the network store; as a first cut use the loopback of the app host is
-	// wrong here — fall back to the app host id resolution at bind time.
+	// even when the app host sits behind NAT.
+	if h.networkStore != nil {
+		if st, ok := h.networkStore.GetNodeStatus(app.HostID); ok && st.IP != "" {
+			return fmt.Sprintf("%s:%d", st.IP, port)
+		}
+	}
 	return fmt.Sprintf("127.0.0.1:%d", port)
 }
 
@@ -321,6 +344,11 @@ func writeFileOnAgent(hub *rpc.Hub, path string, data []byte) error {
 					Offset:   int64(offset),
 					ChunkSeq: seq,
 					Data:     data[offset:end],
+					// The agent's write session completes only when a frame
+					// carries total_size and the byte count reaches it, so the
+					// final chunk must repeat the header's TotalSize.
+					TotalSize: int64(len(data)),
+					Sha256:    expected,
 				},
 			},
 		})

@@ -636,7 +636,7 @@ onActivated(() => {
         </NTabPane>
 
         <!-- S3 存储配置 -->
-        <NTabPane name="s3" tab="S3 异地存储配置 (Cloudflare R2 / MinIO / AWS S3 等)">
+        <NTabPane name="s3" tab="S3 异地存储配置">
           <div class="tab-pane-content">
             <NAlert type="info" :show-icon="true" style="margin-bottom: 10px; flex-shrink: 0">
               配置多个 S3 存储桶后，可设置默认存储位置。每个备份任务可选择使用默认、本地主机或指定某个具体的 S3 目标进行异地备份上云。

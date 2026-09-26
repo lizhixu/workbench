@@ -317,6 +317,16 @@ export function dockerOp(hostId: string, op: string, container = '', image = '')
   return unwrap<any>(http.post(`/hosts/${hostId}/docker/${op}`, { container, image }))
 }
 
+export function dockerGetMirrors(hostId: string) {
+  return unwrap<{ ok: boolean; mirrors: string[] }>(http.get(`/hosts/${hostId}/docker/mirrors`))
+}
+
+export function dockerSetMirrors(hostId: string, mirrors: string[]) {
+  return unwrap<{ ok: boolean; mirrors: string[] }>(
+    http.put(`/hosts/${hostId}/docker/mirrors`, { mirrors }, { timeout: 45000 }),
+  )
+}
+
 // ---- Sessions ----
 export function listSessions(params?: { offset?: number; page_size?: number }) {
   return unwrap<ListResponse<SessionRecord>>(http.get('/sessions', { params }))

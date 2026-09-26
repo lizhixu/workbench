@@ -36,6 +36,7 @@ import {
   ArrowUpCircleOutline,
   GitNetworkOutline,
   CardOutline,
+  LinkOutline,
 } from '@vicons/ionicons5'
 import OsLogo from '../../components/common/OsLogo.vue'
 import HostBillingModal from '../../components/host/HostBillingModal.vue'
@@ -63,6 +64,7 @@ const search = ref('')
 const showEnroll = ref(false)
 const enrollToken = ref('')
 const enrollCmd = ref('')
+const enrollWinCmd = ref('')
 const enrolling = ref(false)
 const showBillingModal = ref(false)
 const selectedBillingHost = ref<Host | null>(null)
@@ -113,7 +115,8 @@ const filteredHosts = computed(() => {
       (h.distro || '').toLowerCase().includes(q) ||
       (h.internal_ip || '').toLowerCase().includes(q) ||
       (h.public_ip || '').toLowerCase().includes(q) ||
-      (h.group || '').toLowerCase().includes(q)
+      (h.group || '').toLowerCase().includes(q) ||
+      (h.notes || '').toLowerCase().includes(q)
     )
   })
 })
@@ -197,11 +200,24 @@ function goDetail(host: Host, tab = 'metrics') {
   router.push({ path: `/hosts/${host.id}`, query: { tab } })
 }
 
+function hasPrice(h: Host): boolean {
+  return h.price !== undefined && h.price !== null && !isNaN(Number(h.price))
+}
+
+function hasBilling(h: Host): boolean {
+  return (
+    hasPrice(h) ||
+    (h.traffic_limit_gb !== undefined && h.traffic_limit_gb !== null && Number(h.traffic_limit_gb) > 0) ||
+    !!h.expires_at ||
+    (!!h.notes && h.notes.trim() !== '')
+  )
+}
+
 function formatPrice(h: Host): string {
-  if (h.price === undefined && !h.billing_cycle) return '-'
+  if (!hasPrice(h)) return '-'
   const curMap: Record<string, string> = { CNY: '¥', USD: '$', EUR: '€', HKD: 'HK$', JPY: '¥', GBP: '£', USDT: 'USDT ' }
   const cur = curMap[h.currency || 'CNY'] || `${h.currency || ''} `
-  const p = h.price !== undefined ? `${cur}${h.price}` : ''
+  const p = `${cur}${h.price}`
   const c = h.billing_cycle ? ` / ${h.billing_cycle}` : ''
   return `${p}${c}`.trim()
 }
@@ -216,12 +232,27 @@ function formatHostTraffic(h: Host): string {
   return `${usedGB.toFixed(1)}G/${h.traffic_limit_gb}G (${pct}%)`
 }
 
+function getTrafficTooltip(h: Host): string {
+  if (!h.traffic_limit_gb) return ''
+  const rxGB = ((h.month_rx || 0) / (1024 * 1024 * 1024)).toFixed(2)
+  const txGB = ((h.month_tx || 0) / (1024 * 1024 * 1024)).toFixed(2)
+  return `本月入向: ${rxGB} GB | 本月出向: ${txGB} GB | 重置日: 每月 ${h.traffic_reset_day || 1} 号`
+}
+
 function getExpiryClass(exp?: string): string {
   if (!exp) return ''
   const days = (new Date(exp).getTime() - Date.now()) / (1000 * 3600 * 24)
   if (days < 0) return 'text-error'
-  if (days <= 7) return 'text-warning'
+  if (days <= 30) return 'text-warning'
   return ''
+}
+
+function getExpiryDaysText(exp?: string): string {
+  if (!exp) return ''
+  const diffDays = Math.ceil((new Date(exp).getTime() - Date.now()) / (1000 * 3600 * 24))
+  if (diffDays < 0) return `已逾期 ${Math.abs(diffDays)} 天`
+  if (diffDays === 0) return '今天到期'
+  return `剩 ${diffDays} 天`
 }
 
 function goExec(host?: Host) {
@@ -390,12 +421,15 @@ const menuOptions = [
 ]
 
 const copied = ref(false)
+const copiedWin = ref(false)
 let copyTimer: any = null
+let copyWinTimer: any = null
 
 async function openEnroll() {
   showEnroll.value = true
   enrolling.value = true
   copied.value = false
+  copiedWin.value = false
   try {
     const res = await enroll()
     enrollToken.value = res.enroll_token
@@ -403,6 +437,7 @@ async function openEnroll() {
     const host = window.location.hostname || 'localhost'
     const port = window.location.port ? `:${window.location.port}` : ''
     enrollCmd.value = res.install || `curl -kfsSL '${proto}//${host}${port}/install?token=${res.enroll_token}' | sudo bash`
+    enrollWinCmd.value = res.install_win || `irm '${proto}//${host}${port}/install?os_type=windows^&token=${res.enroll_token}' | iex`
   } catch (e: any) {
     message.error(e.message || '获取安装脚本失败')
   } finally {
@@ -419,7 +454,22 @@ async function copyCmd() {
     copyTimer = setTimeout(() => {
       copied.value = false
     }, 2500)
-    message.success('已复制安装脚本命令到剪贴板')
+    message.success('已复制 Linux 安装命令到剪贴板')
+  } else {
+    message.error('复制失败，请手动选中文本复制')
+  }
+}
+
+async function copyWinCmd() {
+  if (!enrollWinCmd.value) return
+  const ok = await copyToClipboard(enrollWinCmd.value)
+  if (ok) {
+    copiedWin.value = true
+    if (copyWinTimer) clearTimeout(copyWinTimer)
+    copyWinTimer = setTimeout(() => {
+      copiedWin.value = false
+    }, 2500)
+    message.success('已复制 Windows 安装命令到剪贴板')
   } else {
     message.error('复制失败，请手动选中文本复制')
   }
@@ -605,19 +655,38 @@ onMounted(() => {
               </div>
             </div>
 
-            <!-- 6. 财务与流量规格 (若有配置) -->
-            <div v-if="host.price !== undefined || host.expires_at || host.traffic_limit_gb" class="col-billing">
-              <div v-if="host.price !== undefined || host.billing_cycle" class="billing-line">
+            <!-- 6. 财务与规格概要（配置什么展示什么，未配置不展示） -->
+            <div v-if="hasBilling(host)" class="col-billing">
+              <div v-if="hasPrice(host)" class="billing-line">
                 <span class="billing-label">资费</span>
-                <span class="billing-value">{{ formatPrice(host) }}</span>
+                <span class="billing-value" :title="formatPrice(host)">{{ formatPrice(host) }}</span>
               </div>
-              <div v-if="host.traffic_limit_gb" class="billing-line">
+              <div v-if="host.traffic_limit_gb" class="billing-line" :title="getTrafficTooltip(host)">
                 <span class="billing-label">流量</span>
                 <span class="billing-value">{{ formatHostTraffic(host) }}</span>
               </div>
               <div v-if="host.expires_at" class="billing-line">
                 <span class="billing-label">到期</span>
-                <span class="billing-value" :class="getExpiryClass(host.expires_at)">{{ host.expires_at }}</span>
+                <div class="expiry-group" :class="getExpiryClass(host.expires_at)" :title="`${host.expires_at} (${getExpiryDaysText(host.expires_at)})`">
+                  <span class="expiry-date">{{ host.expires_at }}</span>
+                  <span class="expiry-badge">{{ getExpiryDaysText(host.expires_at) }}</span>
+                  <span v-if="host.auto_renewal" class="auto-renew-badge">自续</span>
+                  <a
+                    v-if="host.renewal_url"
+                    :href="host.renewal_url"
+                    target="_blank"
+                    class="renewal-link-icon"
+                    title="点击跳转服务商控制台续费"
+                    @click.stop
+                  >
+                    <NIcon :component="LinkOutline" size="12" />
+                  </a>
+                </div>
+              </div>
+              <!-- 备注行：配了就展示，没配隐藏 -->
+              <div v-if="host.notes && host.notes.trim()" class="billing-line" :title="`备注: ${host.notes}`">
+                <span class="billing-label">备注</span>
+                <span class="billing-value muted-notes">{{ host.notes }}</span>
               </div>
             </div>
 
@@ -655,7 +724,7 @@ onMounted(() => {
           <div class="code-container">
             <NCode :code="enrollCmd" language="bash" word-wrap />
           </div>
-          <NSpace justify="end" style="margin-top: 14px">
+          <NSpace justify="end" style="margin-top: 10px">
             <NButton
               :type="copied ? 'success' : 'primary'"
               @click="copyCmd"
@@ -664,6 +733,24 @@ onMounted(() => {
                 <NIcon :component="copied ? CheckmarkCircleOutline : CopyOutline" />
               </template>
               {{ copied ? '已复制命令' : '复制命令' }}
+            </NButton>
+          </NSpace>
+
+          <p class="guide-text" style="margin-top: 6px">
+            在目标 Windows 主机以管理员身份运行 PowerShell，执行以下安装指令：
+          </p>
+          <div class="code-container">
+            <NCode :code="enrollWinCmd" language="powershell" word-wrap />
+          </div>
+          <NSpace justify="end" style="margin-top: 10px">
+            <NButton
+              :type="copiedWin ? 'success' : 'primary'"
+              @click="copyWinCmd"
+            >
+              <template #icon>
+                <NIcon :component="copiedWin ? CheckmarkCircleOutline : CopyOutline" />
+              </template>
+              {{ copiedWin ? '已复制命令' : '复制命令' }}
             </NButton>
           </NSpace>
         </div>
@@ -862,7 +949,7 @@ onMounted(() => {
 
           // 5. 内网与外网 IP
           .col-ips {
-            flex: 1;
+            flex: 0 0 250px;
             min-width: 0;
             display: flex;
             flex-direction: column;
@@ -935,48 +1022,118 @@ onMounted(() => {
             }
           }
 
-	          // 6. 财务与规格概要
-	          .col-billing {
-	            flex: 0 0 170px;
-	            display: flex;
-	            flex-direction: column;
-	            gap: 4px;
-	            font-size: 13px;
-	            padding-right: 12px;
+          // 6. 财务与规格概要
+          .col-billing {
+            flex: 0 0 240px;
+            margin-left: 28px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            font-size: 13px;
+            padding-right: 12px;
+            min-width: 0;
 
-	            .billing-line {
-	              display: flex;
-	              align-items: center;
+            .billing-line {
+              display: flex;
+              align-items: center;
+              gap: 4px;
+              min-width: 0;
 
-	              .billing-label {
-	                color: var(--text-tertiary, #8c8c8c);
-	                width: 36px;
-	                flex-shrink: 0;
-	              }
+              .billing-label {
+                color: var(--text-tertiary, #8c8c8c);
+                width: 32px;
+                flex-shrink: 0;
+                font-size: 12px;
+              }
 
-	              .billing-value {
-	                color: var(--text-primary);
-	                font-weight: 500;
-	                white-space: nowrap;
-	                overflow: hidden;
-	                text-overflow: ellipsis;
+              .billing-value {
+                color: var(--text-primary);
+                font-weight: 500;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
 
-	                &.text-error {
-	                  color: #ef4444;
-	                  font-weight: 600;
-	                }
+                &.muted-notes {
+                  color: var(--text-secondary);
+                  font-weight: 400;
+                  font-size: 12px;
+                }
+              }
 
-	                &.text-warning {
-	                  color: #f59e0b;
-	                  font-weight: 600;
-	                }
-	              }
-	            }
-	          }
+              .expiry-group {
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                min-width: 0;
+                overflow: hidden;
+                white-space: nowrap;
 
-	          // 7. 更多操作按钮
-	          .col-actions {
+                .expiry-date {
+                  font-weight: 500;
+                  color: var(--text-primary);
+                }
+
+                .expiry-badge {
+                  font-size: 10px;
+                  padding: 1px 4px;
+                  border-radius: 3px;
+                  background: rgba(148, 163, 184, 0.14);
+                  color: var(--text-secondary);
+                  flex-shrink: 0;
+                  line-height: 1.2;
+                }
+
+                .auto-renew-badge {
+                  font-size: 10px;
+                  padding: 1px 4px;
+                  border-radius: 3px;
+                  background: rgba(16, 185, 129, 0.12);
+                  color: #10b981;
+                  font-weight: 600;
+                  flex-shrink: 0;
+                  line-height: 1.2;
+                }
+
+                .renewal-link-icon {
+                  display: inline-flex;
+                  align-items: center;
+                  justify-content: center;
+                  color: var(--primary-color, #6366f1);
+                  padding: 2px;
+                  border-radius: 3px;
+                  flex-shrink: 0;
+                  transition: background-color 0.15s ease;
+
+                  &:hover {
+                    background: rgba(99, 102, 241, 0.12);
+                  }
+                }
+
+                &.text-error {
+                  .expiry-date,
+                  .expiry-badge {
+                    color: #ef4444;
+                    background: rgba(239, 68, 68, 0.14);
+                    font-weight: 600;
+                  }
+                }
+
+                &.text-warning {
+                  .expiry-date,
+                  .expiry-badge {
+                    color: #f59e0b;
+                    background: rgba(245, 158, 11, 0.14);
+                    font-weight: 600;
+                  }
+                }
+              }
+            }
+          }
+
+          // 7. 更多操作按钮
+          .col-actions {
             flex: 0 0 44px;
+            margin-left: auto;
             display: flex;
             align-items: center;
             justify-content: flex-end;
@@ -1153,6 +1310,23 @@ onMounted(() => {
               white-space: nowrap;
               overflow: hidden;
               text-overflow: ellipsis;
+            }
+          }
+
+          .col-billing {
+            order: 7;
+            flex: 1 1 100%;
+            font-size: 11px;
+            padding-top: 4px;
+            border-top: 1px dashed var(--border-dashed, rgba(0, 0, 0, 0.06));
+            display: flex;
+            flex-direction: row;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+
+            .billing-line {
+              margin-right: 6px;
             }
           }
         }

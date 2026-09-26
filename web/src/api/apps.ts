@@ -3,18 +3,27 @@ import { http, unwrap } from './http'
 export interface PortMapping {
   host: number
   container: number
+  /** "public" binds 0.0.0.0; "mesh" binds the host's Tailscale IP. Empty means public. */
+  bind_scope?: 'public' | 'mesh' | ''
 }
+
+export type AppSourceType = 'git' | 'image' | 'template' | 'raw_compose'
 
 export interface AppEntity {
   id: string
   name: string
   host_id: string
-  source_type: 'git' | 'image' | 'compose' | 'raw_compose'
+  source_type: AppSourceType
+  template_id?: string
+  template_params?: Record<string, string>
   repo_url?: string
   branch?: string
   auth_vault_id?: string
   auto_deploy: boolean
   webhook_token?: string
+  webhook_auto_managed?: boolean
+  github_hook_id?: number
+  webhook_error?: string
   build_type?: string
   dockerfile?: string
   build_context?: string
@@ -28,6 +37,7 @@ export interface AppEntity {
   container_name?: string
   domain?: string
   proxy_mode?: 'local' | 'gateway'
+  proxy_gateway_host_id?: string
   proxy_upstream?: string
   current_commit?: string
   last_deploy_at?: string
@@ -53,7 +63,9 @@ export interface Deployment {
 export interface AppCreateRequest {
   name: string
   host_id: string
-  source_type?: 'git' | 'raw_compose'
+  source_type?: AppSourceType
+  template_id?: string
+  template_params?: Record<string, string>
   repo_url?: string
   branch?: string
   auth_vault_id?: string
@@ -63,11 +75,39 @@ export interface AppCreateRequest {
   build_context?: string
   build_timeout_sec?: number
   compose_content?: string
+  image?: string
   env_vars?: Record<string, string>
   ports?: PortMapping[]
   volumes?: string[]
   healthcheck_url?: string
   container_name?: string
+}
+
+export interface EnvField {
+  key: string
+  label: string
+  description: string
+  default: string
+  required: boolean
+  is_secret: boolean
+}
+
+export interface AppTemplate {
+  id: string
+  name: string
+  category: string
+  icon: string
+  version: string
+  description: string
+  image: string
+  default_port: number
+  container_port: number
+  default_volume: string
+  env_fields: EnvField[]
+}
+
+export function listAppCatalog() {
+  return unwrap<{ data: AppTemplate[] }>(http.get('/apps/catalog')).then((r) => r.data)
 }
 
 export interface AppStatus {
@@ -144,4 +184,10 @@ export function diagnoseDeployment(appId: string, depId: string) {
 
 export function getAppStatus(id: string) {
   return unwrap<{ data: AppStatus }>(http.get(`/apps/${id}/status`)).then((r) => r.data)
+}
+
+export function syncAppWebhook(appId: string) {
+  return unwrap<{ ok: boolean; message: string; data: AppEntity }>(
+    http.post(`/apps/${encodeURIComponent(appId)}/webhook/sync`),
+  )
 }

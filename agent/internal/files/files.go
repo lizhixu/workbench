@@ -382,8 +382,14 @@ func (m *Manager) handleWrite(op *agentpb.FileOp) {
 			ws.written += int64(len(op.GetData()))
 		}
 		ws.nextSeq++
-		// Check if we've written everything (total_size known and reached).
-		if op.GetTotalSize() > 0 && ws.written >= op.GetTotalSize() {
+		// Check if we've written everything. The completing frame carries
+		// total_size; fall back to the header's session total when a chunk
+		// omits it, so the write still acks and the session is cleaned up.
+		total := op.GetTotalSize()
+		if total == 0 {
+			total = ws.total
+		}
+		if total > 0 && ws.written >= total {
 			actual := ""
 			if ws.hasher != nil {
 				actual = hex.EncodeToString(ws.hasher.Sum(nil))

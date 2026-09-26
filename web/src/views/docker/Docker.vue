@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, h } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NCard,
   NSpace,
@@ -14,6 +14,7 @@ import {
   NIcon,
   NModal,
   NAlert,
+  NSpin,
   useMessage,
 } from 'naive-ui'
 import {
@@ -22,19 +23,31 @@ import {
   DownloadOutline,
   TerminalOutline,
   ConstructOutline,
+  AddOutline,
+  SpeedometerOutline,
 } from '@vicons/ionicons5'
-import { dockerAll, dockerOp, installDocker } from '../../api/hosts'
+import {
+  dockerAll,
+  dockerOp,
+  dockerGetMirrors,
+  dockerSetMirrors,
+  installDocker,
+} from '../../api/hosts'
+import { listApps, type AppEntity } from '../../api/apps'
 import TerminalPane from '../../components/host/TerminalPane.vue'
 import { useAuthStore } from '../../stores/auth'
+import { useWorkspaceStore } from '../../stores/workspace'
 import { useTablePagination } from '../../composables/useTablePagination'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'Docker' })
 
 const route = useRoute()
+const router = useRouter()
 const message = useMessage()
 const hostId = route.params.id as string
 const auth = useAuthStore()
+const workspace = useWorkspaceStore()
 
 // Installing Docker changes host state, matching the server-side role gate on
 // POST /hosts/:id/docker/install-script.
@@ -48,6 +61,10 @@ const logsContainer = ref('')
 const logsText = ref('')
 const pullImageName = ref('')
 const dockerNotInstalled = ref(false)
+
+// 应用中心部署的容器带 watchman.app=<appID> 标签（Labels 在 docker ps
+// --format {{json .}} 输出里），用来区分纳管容器与外部/临时容器。
+const managedApps = ref<Map<string, AppEntity>>(new Map())
 
 // 容器与镜像列表都可能很长（AGENTS.md 8.2），各自独立分页。
 const containerCount = computed(() => containers.value.length)
@@ -63,6 +80,18 @@ const targetContainer = ref('')
 const showInstallModal = ref(false)
 const installing = ref(false)
 const installOutput = ref('')
+
+// 应用中心是唯一的部署入口；Docker 面板只保留观测与运维。
+function openDeployApp() {
+  workspace.openTab({
+    key: `/apps/create`,
+    title: '创建应用',
+    path: `/apps/create?host_id=${hostId}`,
+    closable: true,
+    viewName: 'AppCreate',
+  })
+  router.push(`/apps/create?host_id=${hostId}`)
+}
 
 // loadAll fetches containers + images in a single round trip via the
 // /docker/all endpoint, so the dashboard doesn't pay two sequential calls.
@@ -89,6 +118,58 @@ async function loadAll() {
   } finally {
     loading.value = false
   }
+}
+
+// watchmanAppLabel 从 docker ps 的 Labels 字段里提取 watchman.app=<appID>。
+// `docker ps --format {{json .}}` 把 Labels 渲染成逗号分隔的 key=value 字符串
+// （`watchman.app=app_xxx,...`），而非 JSON 对象，两种形态都兼容。
+function watchmanAppLabel(labels: unknown): string {
+  if (!labels) return ''
+  if (typeof labels === 'object') {
+    const v = (labels as Record<string, string>)['watchman.app']
+    return v || ''
+  }
+  if (typeof labels !== 'string') return ''
+  try {
+    const parsed = JSON.parse(labels)
+    if (parsed && typeof parsed === 'object') {
+      return parsed['watchman.app'] || ''
+    }
+  } catch {
+    // Not JSON — fall through to the comma-separated key=value form.
+  }
+  const entry = labels
+    .split(',')
+    .map((kv) => kv.trim())
+    .find((kv) => kv.startsWith('watchman.app='))
+  return entry ? entry.slice('watchman.app='.length) : ''
+}
+
+// loadManagedApps 拉一次全局应用清单，建立 watchman.app 标签 -> 应用实体的
+// 映射，供容器列表的「纳管状态」列跳转应用详情。
+async function loadManagedApps() {
+  try {
+    const apps = (await listApps()) as AppEntity[]
+    const m = new Map<string, AppEntity>()
+    for (const a of apps) {
+      if (a.host_id === hostId) m.set(a.id, a)
+    }
+    managedApps.value = m
+  } catch {
+    managedApps.value = new Map()
+  }
+}
+
+function openAppDetail(appID: string) {
+  const app = managedApps.value.get(appID)
+  workspace.openTab({
+    key: `/apps/${appID}`,
+    title: `应用 ${app?.name ?? appID}`,
+    path: `/apps/${appID}`,
+    closable: true,
+    viewName: 'AppDetail',
+  })
+  router.push(`/apps/${appID}`)
 }
 
 async function loadContainers() {
@@ -213,6 +294,69 @@ async function startInstallDocker() {
   }
 }
 
+// 镜像加速配置状态
+const showMirrorsModal = ref(false)
+const mirrorsLoading = ref(false)
+const mirrorsSaving = ref(false)
+const mirrorList = ref<string[]>([])
+
+const PRESET_MIRRORS = [
+  { label: 'DaoCloud 镜像站', value: 'https://docker.m.daocloud.io' },
+  { label: '1ms 加速源', value: 'https://docker.1ms.run' },
+  { label: 'Docker 代理加速', value: 'https://dockerproxy.net' },
+  { label: 'AtomHub 镜像', value: 'https://atomhub.openatom.cn' },
+]
+
+function addPresetMirror(val: string) {
+  if (mirrorList.value.includes(val)) {
+    message.info('该镜像加速源已在列表中')
+    return
+  }
+  if (mirrorList.value.length === 1 && !mirrorList.value[0].trim()) {
+    mirrorList.value[0] = val
+  } else {
+    mirrorList.value.push(val)
+  }
+}
+
+async function openMirrorsModal() {
+  showMirrorsModal.value = true
+  mirrorsLoading.value = true
+  try {
+    const res = await dockerGetMirrors(hostId)
+    mirrorList.value = res.mirrors && res.mirrors.length > 0 ? [...res.mirrors] : ['']
+  } catch (e: any) {
+    message.error(e.message || '获取镜像加速配置失败')
+    mirrorList.value = ['']
+  } finally {
+    mirrorsLoading.value = false
+  }
+}
+
+async function handleSaveMirrors() {
+  const clean = mirrorList.value
+    .map((m) => m.trim())
+    .filter(Boolean)
+
+  for (const m of clean) {
+    if (!/^https?:\/\//i.test(m)) {
+      message.warning(`加速源地址格式不正确（需以 http:// 或 https:// 开头）：${m}`)
+      return
+    }
+  }
+
+  mirrorsSaving.value = true
+  try {
+    await dockerSetMirrors(hostId, clean)
+    message.success('Docker 镜像加速配置已更新并成功重载守护进程')
+    showMirrorsModal.value = false
+  } catch (e: any) {
+    message.error(e.message || '更新 Docker 镜像加速失败')
+  } finally {
+    mirrorsSaving.value = false
+  }
+}
+
 const containerColumns = [
   { title: '名称', key: 'Names', width: 140, ellipsis: { tooltip: true } },
   { title: '镜像', key: 'Image', ellipsis: { tooltip: true } },
@@ -230,6 +374,25 @@ const containerColumns = [
     },
   },
   { title: '端口', key: 'Ports', ellipsis: { tooltip: true } },
+  {
+    title: '纳管状态',
+    key: 'managed',
+    width: 110,
+    render: (row: any) => {
+      const appID = watchmanAppLabel(row.Labels)
+      if (appID && managedApps.value.get(appID)) {
+        return h(
+          NButton,
+          { size: 'tiny', tertiary: true, type: 'info', onClick: () => openAppDetail(appID) },
+          { default: () => '应用中心纳管' },
+        )
+      }
+      if (appID) {
+        return h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => '纳管记录已删除' })
+      }
+      return h(NTag, { size: 'small', bordered: false }, { default: () => '外部/临时' })
+    },
+  },
   {
     title: '操作',
     key: 'actions',
@@ -313,7 +476,10 @@ const imageColumns = [
   },
 ]
 
-onMounted(loadContainers)
+onMounted(() => {
+  loadContainers()
+  loadManagedApps()
+})
 </script>
 
 <template>
@@ -355,10 +521,16 @@ onMounted(loadContainers)
         <NTabPane name="containers" tab="容器" display-directive="show:lazy">
           <div class="tab-body">
             <NSpace align="center" justify="space-between" class="tab-toolbar">
-              <NButton size="small" :loading="loading" @click="loadContainers">
-                <template #icon><NIcon :component="RefreshOutline" /></template>
-                刷新
-              </NButton>
+              <NSpace align="center" :size="8">
+                <NButton size="small" :loading="loading" @click="loadContainers">
+                  <template #icon><NIcon :component="RefreshOutline" /></template>
+                  刷新
+                </NButton>
+                <NButton size="small" type="primary" @click="openDeployApp">
+                  <template #icon><NIcon :component="AddOutline" /></template>
+                  部署新应用
+                </NButton>
+              </NSpace>
               <NButton
                 v-if="dockerNotInstalled && canInstall"
                 size="small"
@@ -385,27 +557,33 @@ onMounted(loadContainers)
 
         <NTabPane name="images" tab="镜像" display-directive="show:lazy">
           <div class="tab-body">
-            <NSpace align="center" class="tab-toolbar">
-              <NButton size="small" :loading="loading" @click="loadImages">
-                <template #icon><NIcon :component="RefreshOutline" /></template>
-                刷新
+            <NSpace align="center" justify="space-between" class="tab-toolbar">
+              <NSpace align="center">
+                <NButton size="small" :loading="loading" @click="loadImages">
+                  <template #icon><NIcon :component="RefreshOutline" /></template>
+                  刷新
+                </NButton>
+                <NInput
+                  v-model:value="pullImageName"
+                  placeholder="nginx:latest"
+                  size="small"
+                  style="width: 200px"
+                />
+                <NButton size="small" type="primary" @click="pullImage">
+                  <template #icon><NIcon :component="DownloadOutline" /></template>
+                  拉取
+                </NButton>
+                <NPopconfirm @positive-click="pruneImages">
+                  <template #trigger>
+                    <NButton size="small" type="warning">清除未使用</NButton>
+                  </template>
+                  确认清除所有未使用镜像？
+                </NPopconfirm>
+              </NSpace>
+              <NButton size="small" @click="openMirrorsModal">
+                <template #icon><NIcon :component="SpeedometerOutline" /></template>
+                镜像加速
               </NButton>
-              <NInput
-                v-model:value="pullImageName"
-                placeholder="nginx:latest"
-                size="small"
-                style="width: 200px"
-              />
-              <NButton size="small" type="primary" @click="pullImage">
-                <template #icon><NIcon :component="DownloadOutline" /></template>
-                拉取
-              </NButton>
-              <NPopconfirm @positive-click="pruneImages">
-                <template #trigger>
-                  <NButton size="small" type="warning">清除未使用</NButton>
-                </template>
-                确认清除所有未使用镜像？
-              </NPopconfirm>
             </NSpace>
             <NDataTable
               flex-height
@@ -464,6 +642,56 @@ onMounted(loadContainers)
           </NButton>
         </NSpace>
       </NSpace>
+    </NModal>
+
+    <!-- Docker 镜像加速配置弹窗 -->
+    <NModal
+      v-model:show="showMirrorsModal"
+      preset="card"
+      title="Docker 镜像加速配置"
+      style="width: 580px"
+    >
+      <NSpin :show="mirrorsLoading">
+        <NForm label-placement="top" size="small">
+          <NAlert type="info" :bordered="false" style="margin-bottom: 14px">
+            配置后将写入主机的 Docker 守护进程配置文件（Linux 为 <code>/etc/docker/daemon.json</code>），并通过优雅重载（<code>reload</code>）生效，无需重启运行中的容器。
+          </NAlert>
+          <NFormItem label="常用加速源快捷添加">
+            <NSpace :size="6" style="margin-bottom: 4px">
+              <NButton
+                v-for="preset in PRESET_MIRRORS"
+                :key="preset.value"
+                size="tiny"
+                secondary
+                @click="addPresetMirror(preset.value)"
+              >
+                + {{ preset.label }}
+              </NButton>
+            </NSpace>
+          </NFormItem>
+          <NFormItem label="镜像加速源地址 (Registry Mirrors)">
+            <NDynamicInput
+              v-model:value="mirrorList"
+              placeholder="https://..."
+              :min="1"
+              :on-create="() => ''"
+            />
+          </NFormItem>
+        </NForm>
+      </NSpin>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton :disabled="mirrorsSaving" @click="showMirrorsModal = false">取消</NButton>
+          <NButton
+            type="primary"
+            :loading="mirrorsSaving"
+            :disabled="mirrorsLoading"
+            @click="handleSaveMirrors"
+          >
+            保存并重载 Docker
+          </NButton>
+        </NSpace>
+      </template>
     </NModal>
   </div>
 </template>
@@ -548,6 +776,7 @@ onMounted(loadContainers)
   color: var(--text-secondary);
   font-size: 12px;
 }
+
 .log-output {
   background: var(--code-box-bg);
   color: var(--text-primary);

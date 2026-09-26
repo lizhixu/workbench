@@ -118,6 +118,28 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     activeKey.value = key
   }
 
+  /**
+   * 拖拽调整页签顺序：将 fromIndex 位置的页签移动到 targetIndex 的前面(left)或后面(right)
+   */
+  function moveTab(fromIndex: number, targetIndex: number, position: 'left' | 'right' = 'left') {
+    if (fromIndex < 0 || fromIndex >= tabs.value.length) return
+    if (targetIndex < 0 || targetIndex >= tabs.value.length) return
+    if (fromIndex === targetIndex) return
+
+    const item = tabs.value[fromIndex]
+    tabs.value.splice(fromIndex, 1)
+
+    let newIdx = targetIndex
+    if (fromIndex < targetIndex) {
+      newIdx = position === 'right' ? targetIndex : targetIndex - 1
+    } else {
+      newIdx = position === 'right' ? targetIndex + 1 : targetIndex
+    }
+    if (newIdx < 0) newIdx = 0
+    if (newIdx > tabs.value.length) newIdx = tabs.value.length
+    tabs.value.splice(newIdx, 0, item)
+  }
+
   return {
     tabs,
     activeKey,
@@ -131,5 +153,6 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     hasClosableRight,
     ensureViewName,
     setActiveKey,
+    moveTab,
   }
 })

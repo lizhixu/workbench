@@ -469,7 +469,7 @@ onDeactivated(() => {
           </div>
         </NTabPane>
 
-        <NTabPane name="accounts" tab="ACME 机构账户 (Let's Encrypt / Google / ZeroSSL / SSL.com 等)">
+        <NTabPane name="accounts" tab="ACME 机构账户">
           <div class="tab-pane-content">
             <NAlert type="info" :show-icon="true" style="margin-bottom: 10px; flex-shrink: 0">
               系统支持多 CA 机构并存。配置 Google Trust Services、ZeroSSL、SSL.com 等机构时需填入官方颁发的 EAB (External Account Binding) 凭据。

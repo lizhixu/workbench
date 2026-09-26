@@ -11,16 +11,23 @@ type Application struct {
 	Name   string `json:"name"`
 	HostID string `json:"host_id"`
 	// SourceType: "git" (build from a linked Git repo) | "image" (pre-built
-	// image, i.e. the one-click catalog apps) | "compose" (multi-service
-	// stack, phase 4).
+	// image) | "template" (built-in one-click catalog app) | "raw_compose"
+	// (multi-service stack via raw YAML).
 	SourceType string `json:"source_type"`
 
+	// Template configuration (SourceType == "template").
+	TemplateID     string            `json:"template_id,omitempty"`
+	TemplateParams map[string]string `json:"template_params,omitempty"`
+
 	// Git link configuration (SourceType == "git").
-	RepoURL      string `json:"repo_url,omitempty"`
-	Branch       string `json:"branch,omitempty"`
-	AuthVaultID  string `json:"auth_vault_id,omitempty"` // vault credential: git token / deploy key
-	AutoDeploy   bool   `json:"auto_deploy"`
-	WebhookToken string `json:"webhook_token,omitempty"` // secret path segment for /apps/webhook/:token
+	RepoURL            string `json:"repo_url,omitempty"`
+	Branch             string `json:"branch,omitempty"`
+	AuthVaultID        string `json:"auth_vault_id,omitempty"` // vault credential: git token / deploy key
+	AutoDeploy         bool   `json:"auto_deploy"`
+	WebhookToken       string `json:"webhook_token,omitempty"` // secret path segment for /apps/webhook/:token
+	WebhookAutoManaged bool   `json:"webhook_auto_managed,omitempty"`
+	GitHubHookID       int64  `json:"github_hook_id,omitempty"`
+	WebhookError       string `json:"webhook_error,omitempty"`
 
 	// Build configuration.
 	BuildType      string `json:"build_type,omitempty"`      // "dockerfile" | "compose"
@@ -37,10 +44,11 @@ type Application struct {
 	HealthcheckURL string            `json:"healthcheck_url,omitempty"` // e.g. "http://127.0.0.1:8080/healthz"
 	ContainerName  string            `json:"container_name,omitempty"`
 
-	// Reverse proxy binding (phase 2: local node vs gateway mesh mode).
-	Domain        string `json:"domain,omitempty"`
-	ProxyMode     string `json:"proxy_mode,omitempty"`     // "local" | "gateway"
-	ProxyUpstream string `json:"proxy_upstream,omitempty"` // e.g. "127.0.0.1:8080" or mesh IP
+	// Reverse proxy binding.
+	Domain            string `json:"domain,omitempty"`
+	ProxyMode         string `json:"proxy_mode,omitempty"`           // "local" | "gateway"
+	ProxyGatewayHostID string `json:"proxy_gateway_host_id,omitempty"` // gateway node host id
+	ProxyUpstream     string `json:"proxy_upstream,omitempty"`       // e.g. "127.0.0.1:8080" or mesh IP
 
 	// Runtime state.
 	CurrentCommit string    `json:"current_commit,omitempty"`
@@ -50,8 +58,11 @@ type Application struct {
 
 // PortMapping is one published container port.
 type PortMapping struct {
-	Host      int `json:"host"`
-	Container int `json:"container"`
+	Host      int    `json:"host"`
+	Container int    `json:"container"`
+	// BindScope: "public" (binds to 0.0.0.0) | "mesh" (binds to Tailscale IP).
+	// Empty string defaults to "public".
+	BindScope string `json:"bind_scope,omitempty"`
 }
 
 // Deployment statuses.

@@ -35,10 +35,11 @@ import (
 	"watchman/server/internal/metrics"
 	"watchman/server/internal/network"
 	"watchman/server/internal/policy"
-	"watchman/server/internal/settings"
+	"watchman/server/internal/release"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/session"
+	"watchman/server/internal/settings"
 	"watchman/server/internal/snapshots"
 	"watchman/server/internal/vault"
 	"watchman/server/internal/ws"
@@ -58,6 +59,8 @@ func main() {
 	aiModel := flag.String("ai-model", "qwen2.5:14b", "LLM model name")
 	aiKey := flag.String("ai-key", "", "LLM API key (for vLLM/OpenAI-compatible; empty for Ollama)")
 	wsOrigins := flag.String("ws-origins", "", "comma-separated extra browser origins allowed to open WebSocket sessions (same-origin and loopback are always allowed; \"*\" disables the check)")
+	manifestPath := flag.String("manifest", "/opt/watchman/manifest.json", "release manifest (deployed by install.sh); source of truth for agent upgrades")
+	publicURL := flag.String("public-url", "", "agent-facing public base URL (e.g. https://watchman.example.com); overrides the request Host header when building agent download URLs")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate for gRPC (empty = insecure)")
 	tlsKey := flag.String("tls-key", "", "TLS private key for gRPC")
 	httpTLS := flag.Bool("http-tls", false, "serve HTTPS on -http using -tls-cert/-tls-key")
@@ -79,6 +82,35 @@ func main() {
 		list := strings.Split(*wsOrigins, ",")
 		ws.SetAllowedOrigins(list)
 		log.Info("ws extra allowed origins", "origins", list)
+	}
+
+	// Release manifest: the source of truth for agent upgrades (target
+	// version + per-arch sha256). Absent in dev; then the server falls
+	// back to its own build version.
+	if m, err := release.Load(*manifestPath); err != nil {
+		log.Warn("release manifest not loaded, agent upgrades fall back to server build version", "path", *manifestPath, "err", err)
+	} else {
+		api.SetAgentRelease(m)
+		log.Info("release manifest loaded", "agent_version", m.Version, "commit", m.Commit)
+	}
+
+	// Agent-facing public URL for download links handed to agents.
+	if *publicURL != "" {
+		api.SetPublicURL(*publicURL)
+		log.Info("public URL configured", "url", *publicURL)
+	}
+
+	// Upgrade signing: derive a persistent Ed25519 key from the vault
+	// passphrase so upgrade payloads are signed. Agents without a pinned
+	// key ignore signatures; agents with -upgrade-pubkey verify them.
+	if *vaultPass != "" {
+		if pubkey, err := api.InitSigner(*vaultPass); err != nil {
+			log.Warn("upgrade signer not initialized", "err", err)
+		} else {
+			log.Info("upgrade signer initialized", "pubkey", pubkey)
+		}
+	} else {
+		log.Warn("vault-pass empty, upgrade payloads will be unsigned")
 	}
 
 	// User store + JWT auth.
@@ -320,6 +352,7 @@ func main() {
 	hr := api.Router(reg, log, authStore, sessStore, alertStore, vaultStore, aiAssistant, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore, settingsStore, backupStore, networkStore, appStore, appEngine, certHub, snapshotStore, snapshotEngine, gitProviderStore, alertMonitor)
 	// Install endpoints (one-line agent install + binary download).
 	installHandler := install.NewHandler(reg, "bin")
+	installHandler.UpgradePubKey = api.UpgradePubKeyHex
 	installHandler.RegisterRoutes(hr)
 	hs := &http.Server{
 		Addr:              *httpAddr,

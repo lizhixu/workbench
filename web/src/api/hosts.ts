@@ -17,8 +17,10 @@ export function health() {
   return unwrap<HealthResponse>(http.get('/system/health'))
 }
 
-export function deleteHost(id: string) {
-  return unwrap<{ ok: boolean }>(http.delete(`/hosts/${id}`))
+export function deleteHost(id: string, uninstallAgent = false) {
+  return unwrap<{ ok: boolean; uninstalled?: boolean; warning?: string }>(
+    http.delete(`/hosts/${id}`, { params: { uninstall_agent: uninstallAgent } }),
+  )
 }
 
 export function setHostGroup(id: string, group: string) {

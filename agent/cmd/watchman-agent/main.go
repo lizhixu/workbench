@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"watchman/agent/internal/config"
@@ -19,6 +20,7 @@ import (
 	"watchman/agent/internal/shell"
 	"watchman/agent/internal/sysinfo"
 	"watchman/agent/internal/tunnel"
+	"watchman/agent/internal/uninstall"
 	"watchman/agent/internal/upgrade"
 )
 
@@ -88,6 +90,7 @@ func main() {
 	d.SetUpgradeManager(upMgr)
 	d.SetScanManager(scan.NewManager(log))
 	d.SetTunnelManager(tunnel.NewManager(log))
+	d.SetUninstallExecutor(uninstall.New(log, filepath.Dir(*state)))
 
 	go d.Run(ctx)
 

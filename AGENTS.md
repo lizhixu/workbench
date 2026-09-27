@@ -842,7 +842,7 @@ curl -fsSL https://watchman.example.com/install?token=<enroll_token> | bash
 - tag 规范：`v1.2.3` 为正式版；`v1.3.0-rc.1` / `v1.3.0-beta.1`（带 `-` 后缀）由 CI 自动标记为 pre-release。
 - 构建矩阵：server（linux amd64/arm64）+ agent（linux amd64/arm64、windows amd64），全部 `CGO_ENABLED=0` 静态编译。
 - 产物：`watchman-dist-v1.2.3-linux-{amd64,arm64}.tar.gz`（内含 `bin/` 二进制——agent 文件名遵循 `watchman-agent-{goos}-{goarch}` 以便 `install.FindAgentBinary` 直接找到、`web-dist.tar.gz`、`manifest.json`）+ `CHECKSUMS.txt`（sha256）。
-- `manifest.json`：`{version, commit, build_time, agents: {"linux/amd64": {file, sha256}, ...}}`。P1 起控制端启动时读取它，作为 agent 升级的版本/sha256 基准（替代 server 自身构建版本，解除"最新 = 控制端自己"的闭环）。
+- `manifest.json`：`{version, commit, build_time, agents: {"linux/amd64": {file, sha256}, ...}}`。已落地（2026-09-27）：控制端启动时读 `-manifest`（默认 `/opt/watchman/manifest.json`，由 install.sh 部署），作为 agent 升级的版本/sha256 基准，替代 server 自身构建版本，解除"最新 = 控制端自己"的闭环；无 manifest 时（dev）回退到 `CurrentAgentVersion`。单台/批量升级的版本判定、sha256（优先 manifest，其次 `install.AgentBinarySha256`）、签名、下载 URL 全部走这套基准。`GET /api/v1/version`（authed）返回 server 构建信息 + `agent_target_version` + `agent_manifest` + `upgrade_pubkey` + `public_url`。
 - 版本通道：`stable`（默认，GitHub `/releases/latest`，自动排除 pre-release）、`beta`（releases API 列表第一条，含 pre-release）、`--version` 精确锁定（优先级最高）。
 - 手动触发：workflow_dispatch 只构建打包、上传 artifacts，不创建 Release（正式打 tag 前验证管线用）。
 
@@ -1005,7 +1005,8 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
 
 - **DockerOp/DockerEvent（P2）**：`op` 含 `ps/images/start/stop/restart/rm/logs/inspect/remove_image/prune_images/pull/run`；Agent 侧 shelling out to the docker CLI 执行（`agent/internal/docker/docker.go`）。`run` 的参数走 `DockerOp.args_json`：`{"name":"...","ports":["hostPort:containerPort"],"volumes":["/host:/container"],"env":["KEY=VALUE"],"restart_policy":"no|on-failure|always|unless-stopped","command":["arg1","arg2"]}`，空值条目跳过；**每个字段先过字符白名单正则（容器名/端口/卷/环境变量键/重启策略/镜像引用，拒绝以 `-` 开头等伪装 docker flag 的载荷）再进 argv，exec 不走 shell**；镜像缺失由 docker CLI 自动拉取，故 `pull/run` 的服务端下发与 agent 执行均取 5 分钟超时。
 - **安全扫描（P3）**：新增 `ScanRequest(type, rule_set)` / `ScanResult(progress, findings json, report_ref)`，走 exec + 结果回传，不引入新通道。
-- **Agent 自更新**：新增 `UpgradeRequest(version, url, sha256)` / `UpgradeProgress`，控制端可下发升级，Agent 校验签名后热更新（解耦发布）。
+- **Agent 自更新**：新增 `UpgradeRequest(version, url, sha256)` / `UpgradeProgress`，控制端可下发升级，Agent 校验签名后热更新（解耦发布）。升级签名密钥由控制端启动时从 `vault-pass` 经域分隔 SHA-256 派生 Ed25519（重启稳定、无需新密钥文件，`api.InitSigner`），公钥 hex 经 `GET /api/v1/version` 的 `upgrade_pubkey` 公开；agent 安装脚本自动带上 `-upgrade-pubkey`，agent 验签（未配置则跳过，只校验 sha256）。下载 URL 优先 `-public-url`，未配置时回退到请求 Host（解决反代/NAT 下 Host 不可信）。
+- **Agent 卸载**：`UninstallRequest(remove_data)`（proto field 15）。三条路径：① 控制端解绑：`DELETE /api/v1/hosts/:id?uninstall_agent=true`（adminOnly），在线则下发卸载指令并等 agent 下线（15s 超时），离线直接 409（记录不删，提示先上线或去掉勾选）；超时未下线仍删记录但返回 `warning`。② agent 自卸载：`agent/internal/uninstall`，Linux 停/disable systemd（或 sysvinit，unit 文件须含 watchman-agent 才碰）→ 删自身二进制 → 可选删 data dir（路径须含 watchman 且非系统根目录）；Windows 用 `sc.exe stop/delete` + 延迟 cmd 自删（运行中 exe 删不掉）。③ 安装脚本：`bash -s -- uninstall` / `-Uninstall` 开关，停服务、删二进制与数据目录。
 - **证书轮换**：`RegisterResponse` 增加可选 `client_cert`/`cert_expires_at`；Agent 持有证书，控制端在到期前通过现有 mTLS 通道下发新证书（带签名），Agent 热加载。
 
 ### B.8.4 安全与运维补充

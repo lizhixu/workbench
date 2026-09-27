@@ -57,6 +57,7 @@ message ServerMessage {
     TunnelOpen tunnel_open = 17; // ask agent to open a TCP tunnel leg
     TunnelData tunnel_data = 18; // reverse TCP tunnel payload (server -> agent)
     TunnelClose tunnel_close = 19;
+    UninstallRequest uninstall = 15; // ask agent to uninstall itself
   }
 }
 
@@ -298,6 +299,15 @@ message UpgradeProgress {
   string stage = 1; // downloading / verifying / replacing / restarting
   double progress = 2; // 0..1
   string error = 3;
+}
+
+// ---- Agent uninstall -------------------------------------------------
+
+message UninstallRequest {
+  // remove_data also deletes the agent's local data dir (/var/lib/watchman,
+  // holding agent.conf with the enroll/auth token). When false, only the
+  // service registration and binary are removed.
+  bool remove_data = 1;
 }
 
 // ---- Maintenance handshake ------------------------------------------

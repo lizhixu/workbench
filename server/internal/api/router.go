@@ -35,10 +35,10 @@ import (
 	"watchman/server/internal/metrics"
 	"watchman/server/internal/network"
 	"watchman/server/internal/policy"
-	"watchman/server/internal/settings"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/session"
+	"watchman/server/internal/settings"
 	"watchman/server/internal/snapshots"
 	"watchman/server/internal/vault"
 	"watchman/server/internal/ws"
@@ -46,10 +46,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// CurrentAgentVersion is the latest release version of the Watchman Agent
-// binary built into or hosted by this control server. It comes from the linker
-// (see internal/version) so releasing a new agent only requires rebuilding with
-// -ldflags, never editing a hardcoded string.
+// CurrentAgentVersion is the fallback agent target version, used only when
+// no release manifest is deployed (dev builds). In production install.sh
+// deploys /opt/watchman/manifest.json and api.SetAgentRelease makes the
+// manifest the source of truth — see agentTargetVersion in release.go.
+// It comes from the linker (see internal/version) so releasing a new agent
+// only requires rebuilding with -ldflags, never editing a hardcoded string.
 var CurrentAgentVersion = version.Get()
 
 // HostDTO is the public representation of a managed host.
@@ -68,21 +70,21 @@ type HostDTO struct {
 	Uptime     int64    `json:"uptime"`
 	CPUCores   int32    `json:"cpu_cores"`
 	MemTotal   int64    `json:"mem_total"`
-		InternalIP string   `json:"internal_ip"`
-		PublicIP   string   `json:"public_ip"`
-		Location   string   `json:"location"`
-		// Optional billing & traffic quota configurations
-		Price           float64 `json:"price,omitempty"`
-		Currency        string  `json:"currency,omitempty"`
-		BillingCycle    string  `json:"billing_cycle,omitempty"`
-		ExpiresAt       string  `json:"expires_at,omitempty"`
-		AutoRenewal     bool    `json:"auto_renewal,omitempty"`
-		TrafficLimitGB  float64 `json:"traffic_limit_gb,omitempty"`
-		TrafficCalcType string  `json:"traffic_calc_type,omitempty"`
-		TrafficResetDay int     `json:"traffic_reset_day,omitempty"`
-		RenewalURL      string  `json:"renewal_url,omitempty"`
-		Notes           string  `json:"notes,omitempty"`
-		// Extended live metrics (from the agent's latest sample).
+	InternalIP string   `json:"internal_ip"`
+	PublicIP   string   `json:"public_ip"`
+	Location   string   `json:"location"`
+	// Optional billing & traffic quota configurations
+	Price           float64 `json:"price,omitempty"`
+	Currency        string  `json:"currency,omitempty"`
+	BillingCycle    string  `json:"billing_cycle,omitempty"`
+	ExpiresAt       string  `json:"expires_at,omitempty"`
+	AutoRenewal     bool    `json:"auto_renewal,omitempty"`
+	TrafficLimitGB  float64 `json:"traffic_limit_gb,omitempty"`
+	TrafficCalcType string  `json:"traffic_calc_type,omitempty"`
+	TrafficResetDay int     `json:"traffic_reset_day,omitempty"`
+	RenewalURL      string  `json:"renewal_url,omitempty"`
+	Notes           string  `json:"notes,omitempty"`
+	// Extended live metrics (from the agent's latest sample).
 	CpuModel  string  `json:"cpu_model,omitempty"`
 	Load1     float64 `json:"load1"`
 	SwapUsage float64 `json:"swap_usage"`
@@ -136,9 +138,9 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	authed.GET("/hosts", h.listHosts)
 	authed.GET("/hosts/:id", h.getHost)
 	adminOnly.DELETE("/hosts/:id", h.deleteHost)
-		adminOnly.PUT("/hosts/:id/group", h.setHostGroup)
-		adminOnly.PUT("/hosts/:id/tags", h.setHostTags)
-		adminOnly.PUT("/hosts/:id/billing", h.setHostBilling)
+	adminOnly.PUT("/hosts/:id/group", h.setHostGroup)
+	adminOnly.PUT("/hosts/:id/tags", h.setHostTags)
+	adminOnly.PUT("/hosts/:id/billing", h.setHostBilling)
 
 	// Terminal. An interactive shell is full write access to the host.
 	hostWrite.POST("/hosts/:id/terminals", h.openTerminal)
@@ -185,11 +187,11 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// webhook endpoint is public with its own per-app token.
 	if appStore != nil {
 		appWrite := authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator), h.auditMutation())
-			appHandlers := apps.NewAppHandlers(reg, appStore, appEngine)
-			if gitProviderStore != nil {
-				appHandlers.SetGitProvider(gitProviderStore)
-			}
-			if aiAssistant != nil {
+		appHandlers := apps.NewAppHandlers(reg, appStore, appEngine)
+		if gitProviderStore != nil {
+			appHandlers.SetGitProvider(gitProviderStore)
+		}
+		if aiAssistant != nil {
 			appHandlers.SetAI(func(ctx context.Context, command, stdout, stderr string, exitCode int32) (any, error) {
 				return aiAssistant.AnalyzeExecResult(ctx, command, stdout, stderr, exitCode)
 			})
@@ -249,6 +251,9 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 
 	// Health.
 	authed.GET("/system/health", h.health)
+
+	// Version info: server build + agent upgrade source of truth.
+	authed.GET("/version", h.versionInfo)
 
 	// Agent upgrade.
 	adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
@@ -327,15 +332,15 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	}
 
 	// Overlay networking (Tailscale / Headscale).
-		if networkStore != nil {
-			network.NewHandlers(networkStore, reg, auditStore).Register(
-				authed.Group(""),
-				hostWrite.Group("", h.auditMutation()),
-			)
-		}
+	if networkStore != nil {
+		network.NewHandlers(networkStore, reg, auditStore).Register(
+			authed.Group(""),
+			hostWrite.Group("", h.auditMutation()),
+		)
+	}
 
-		// Reverse TCP tunnels (§3.9).
-		h.registerTunnelRoutes(authed)
+	// Reverse TCP tunnels (§3.9).
+	h.registerTunnelRoutes(authed)
 
 	// WebSocket endpoint (token via query param, since browsers can't set
 	// Authorization headers on WebSocket upgrades easily; also supports share_token or code).
@@ -490,12 +495,57 @@ func (h *handlers) getHost(c *gin.Context) {
 }
 
 func (h *handlers) deleteHost(c *gin.Context) {
-	if err := h.reg.DeleteAgent(c.Param("id")); err != nil {
+	id := c.Param("id")
+	uninstallAgent := c.DefaultQuery("uninstall_agent", "false") == "true"
+
+	uninstalled := false
+	uninstallNote := ""
+	if uninstallAgent {
+		hub := h.reg.Hub(id)
+		if hub == nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "agent offline: cannot remote-uninstall; unbind without uninstall, or bring the host online first"})
+			return
+		}
+		// Ask the agent to uninstall itself, then wait for it to go
+		// offline (it exits after cleanup). Best-effort: old agents
+		// ignore the message and stay online.
+		hub.Send(&agentpb.ServerMessage{
+			Payload: &agentpb.ServerMessage_Uninstall{
+				Uninstall: &agentpb.UninstallRequest{RemoveData: true},
+			},
+		})
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			if h.reg.Hub(id) == nil {
+				uninstalled = true
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if !uninstalled {
+			uninstallNote = "agent 未确认卸载（可能版本过旧不支持远程卸载），请手动处理被管机"
+			h.log.Warn("host unbind: agent did not go offline after uninstall request", "host_id", id)
+		}
+	}
+
+	if err := h.reg.DeleteAgent(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	h.recordAudit(c, "host_unbind", "host", c.Param("id"), "解绑并移除主机", audit.RiskHigh, audit.ResultSuccess)
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	detail := "解绑并移除主机"
+	if uninstallAgent {
+		if uninstalled {
+			detail = "解绑主机并远程卸载 Agent"
+		} else {
+			detail = "解绑主机（Agent 远程卸载未确认）"
+		}
+	}
+	h.recordAudit(c, "host_unbind", "host", id, detail, audit.RiskHigh, audit.ResultSuccess)
+	resp := gin.H{"ok": true, "uninstalled": uninstalled}
+	if uninstallNote != "" {
+		resp["warning"] = uninstallNote
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (h *handlers) setHostGroup(c *gin.Context) {
@@ -1533,16 +1583,11 @@ func (h *handlers) upgradeAgent(c *gin.Context) {
 	}
 	_ = c.ShouldBindJSON(&body)
 	if body.Version == "" {
-		body.Version = CurrentAgentVersion
+		body.Version = agentTargetVersion()
 	}
 
-	// Build the binary download URL from the server's own address.
-	scheme := "http"
-	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-		scheme = "https"
-	}
-	host := c.Request.Host
-
+	// Build the binary download URL: -public-url when configured,
+	// else the server's own address from this request.
 	osName := strings.ToLower(a.OS)
 	if osName == "" {
 		osName = "linux"
@@ -1551,8 +1596,8 @@ func (h *handlers) upgradeAgent(c *gin.Context) {
 	if archName == "" {
 		archName = "amd64"
 	}
-	binaryURL := fmt.Sprintf("%s://%s/api/v1/agent/binary?os=%s&arch=%s",
-		scheme, host, osName, archName)
+	binaryURL := fmt.Sprintf("%s/api/v1/agent/binary?os=%s&arch=%s",
+		upgradeDownloadBase(c), osName, archName)
 
 	// Collect upgrade progress messages.
 	progressCh := make(chan *agentpb.UpgradeProgress, 16)
@@ -1573,7 +1618,11 @@ func (h *handlers) upgradeAgent(c *gin.Context) {
 	}
 
 	if body.Sha256 == "" {
-		if sha, err := install.AgentBinarySha256("", osName, archName); err == nil {
+		// Prefer the release manifest: its sha256 matches the binaries in
+		// /opt/watchman/bin that /api/v1/agent/binary actually serves.
+		if sum, ok := manifestAgentSha256(osName, archName); ok {
+			body.Sha256 = sum
+		} else if sha, err := install.AgentBinarySha256("", osName, archName); err == nil {
 			body.Sha256 = sha
 		}
 	}
@@ -1930,10 +1979,26 @@ func (h *handlers) health(c *gin.Context) {
 		"ok":                   true,
 		"agents":               len(h.reg.ListAgents()),
 		"version":              version.Get(),
-		"agent_latest_version": CurrentAgentVersion,
+		"agent_latest_version": agentTargetVersion(),
 		"os":                   runtime.GOOS,
 		"arch":                 runtime.GOARCH,
 		"online_agents":        h.reg.CountOnline(),
+	})
+}
+
+// versionInfo exposes build metadata and the agent-upgrade source of
+// truth: which agent version upgrades target, whether it comes from the
+// release manifest, and the public key agents can pin (-upgrade-pubkey)
+// to verify upgrade signatures.
+func (h *handlers) versionInfo(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"server_version":       version.Get(),
+		"server_commit":        version.Commit,
+		"build_time":           version.BuildTime,
+		"agent_target_version": agentTargetVersion(),
+		"agent_manifest":       agentRelease != nil,
+		"upgrade_pubkey":       UpgradePubKeyHex,
+		"public_url":           publicURL,
 	})
 }
 
@@ -1945,35 +2010,35 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 		tags = []string{}
 	}
 	dto := HostDTO{
-		ID:         a.ID,
-		Hostname:   a.Hostname,
-		OS:         a.OS,
-		Arch:       a.Arch,
-		Distro:     a.Distro,
-		Version:    a.Version,
-		Status:     a.Status,
-		LastSeen:   a.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
-		Registered: a.Registered.Format("2006-01-02T15:04:05Z07:00"),
-		Group:      a.Group,
-		Tags:       tags,
-		Uptime:     a.Uptime,
-		CPUCores:   a.CPUCores,
-		MemTotal:   a.MemTotal,
-			InternalIP:      a.InternalIP,
-			PublicIP:        a.PublicIP,
-			Location:        a.Location,
-			Price:           a.Price,
-			Currency:        a.Currency,
-			BillingCycle:    a.BillingCycle,
-			ExpiresAt:       a.ExpiresAt,
-			AutoRenewal:     a.AutoRenewal,
-			TrafficLimitGB:  a.TrafficLimitGB,
-			TrafficCalcType: a.TrafficCalcType,
-			TrafficResetDay: a.TrafficResetDay,
-			RenewalURL:      a.RenewalURL,
-			Notes:           a.Notes,
-		}
-		// Surface the real OS uptime and latest metrics
+		ID:              a.ID,
+		Hostname:        a.Hostname,
+		OS:              a.OS,
+		Arch:            a.Arch,
+		Distro:          a.Distro,
+		Version:         a.Version,
+		Status:          a.Status,
+		LastSeen:        a.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
+		Registered:      a.Registered.Format("2006-01-02T15:04:05Z07:00"),
+		Group:           a.Group,
+		Tags:            tags,
+		Uptime:          a.Uptime,
+		CPUCores:        a.CPUCores,
+		MemTotal:        a.MemTotal,
+		InternalIP:      a.InternalIP,
+		PublicIP:        a.PublicIP,
+		Location:        a.Location,
+		Price:           a.Price,
+		Currency:        a.Currency,
+		BillingCycle:    a.BillingCycle,
+		ExpiresAt:       a.ExpiresAt,
+		AutoRenewal:     a.AutoRenewal,
+		TrafficLimitGB:  a.TrafficLimitGB,
+		TrafficCalcType: a.TrafficCalcType,
+		TrafficResetDay: a.TrafficResetDay,
+		RenewalURL:      a.RenewalURL,
+		Notes:           a.Notes,
+	}
+	// Surface the real OS uptime and latest metrics
 	if hub := h.reg.Hub(a.ID); hub != nil {
 		if m := hub.LastMetrics(); m != nil {
 			if m.GetUptime() > 0 {
@@ -2190,7 +2255,7 @@ func (h *handlers) upgradeAgentsBatch(c *gin.Context) {
 			if a.Status != "online" {
 				continue
 			}
-			if body.Force || a.Version != CurrentAgentVersion {
+			if body.Force || a.Version != agentTargetVersion() {
 				targets = append(targets, a)
 			}
 		}
@@ -2205,18 +2270,14 @@ func (h *handlers) upgradeAgentsBatch(c *gin.Context) {
 		return
 	}
 
-	scheme := "http"
-	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-		scheme = "https"
-	}
-	// TODO(server.public_url): the download URL is derived from the request's
-	// Host header, which a client controls. Once the documented
-	// server.public_url setting exists it must take precedence here, otherwise
-	// a crafted Host header can point agents at an attacker-supplied binary.
-	hostHeader := c.Request.Host
+	// Agent-facing download base: -public-url when configured, else this
+	// request's own address. (Resolves the old server.public_url TODO: a
+	// client-controlled Host header must not be the only source.)
+	downloadBase := upgradeDownloadBase(c)
 
 	dispatched := make([]string, 0, len(targets))
 	shaCache := make(map[string]string)
+	targetVersion := agentTargetVersion()
 	for _, a := range targets {
 		hub := h.reg.Hub(a.ID)
 		if hub == nil {
@@ -2236,24 +2297,28 @@ func (h *handlers) upgradeAgentsBatch(c *gin.Context) {
 		if archName == "" {
 			archName = "amd64"
 		}
-		binaryURL := fmt.Sprintf("%s://%s/api/v1/agent/binary?os=%s&arch=%s", scheme, hostHeader, osName, archName)
+		binaryURL := fmt.Sprintf("%s/api/v1/agent/binary?os=%s&arch=%s", downloadBase, osName, archName)
 
 		key := osName + "/" + archName
 		sha256Val, ok := shaCache[key]
 		if !ok {
-			if sha, err := install.AgentBinarySha256("", osName, archName); err == nil {
+			// Prefer the release manifest: its sha256 matches the binaries
+			// in /opt/watchman/bin that /api/v1/agent/binary serves.
+			if sum, ok := manifestAgentSha256(osName, archName); ok {
+				sha256Val = sum
+			} else if sha, err := install.AgentBinarySha256("", osName, archName); err == nil {
 				sha256Val = sha
 			} else {
 				h.log.Warn("batch upgrade: binary sha256 not found for agent", "agent_id", a.ID, "os", osName, "arch", archName, "err", err)
 			}
 			shaCache[key] = sha256Val
 		}
-		sig := signUpgrade(CurrentAgentVersion, sha256Val)
+		sig := signUpgrade(targetVersion, sha256Val)
 
 		hub.Send(&agentpb.ServerMessage{
 			Payload: &agentpb.ServerMessage_Upgrade{
 				Upgrade: &agentpb.UpgradeRequest{
-					Version:   CurrentAgentVersion,
+					Version:   targetVersion,
 					Url:       binaryURL,
 					Sha256:    sha256Val,
 					Signature: sig,
@@ -2264,7 +2329,7 @@ func (h *handlers) upgradeAgentsBatch(c *gin.Context) {
 	}
 
 	h.recordAudit(c, "batch_upgrade", "system", "agents",
-		fmt.Sprintf("批量升级 %d 台在线 Agent 到最新版本 %s", len(dispatched), CurrentAgentVersion),
+		fmt.Sprintf("批量升级 %d 台在线 Agent 到最新版本 %s", len(dispatched), targetVersion),
 		audit.RiskMedium, audit.ResultSuccess)
 
 	c.JSON(http.StatusOK, gin.H{

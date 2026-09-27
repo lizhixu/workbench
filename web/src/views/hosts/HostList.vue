@@ -11,6 +11,7 @@ import {
   NSelect,
   NSpace,
   NTag,
+  NCheckbox,
   useMessage,
   useDialog,
   NIcon,
@@ -345,15 +346,39 @@ function handleMenuSelect(key: string, host: Host) {
       },
     })
   } else if (key === 'unbind') {
+    const uninstallAgent = ref(true)
     dialog.warning({
       title: '解绑主机确认',
-      content: `确定要解绑主机 "${host.hostname}" (${host.id}) 吗？解绑后该主机将从控制台移除。`,
+      content: () =>
+        h('div', [
+          h('div', `确定要解绑主机 "${host.hostname}" (${host.id}) 吗？解绑后该主机将从控制台移除。`),
+          h(
+            'div',
+            { style: 'margin-top: 12px;' },
+            h(
+              NCheckbox,
+              {
+                checked: uninstallAgent.value,
+                'onUpdate:checked': (v: boolean) => {
+                  uninstallAgent.value = v
+                },
+              },
+              { default: () => '同时卸载被管机上的 Agent（需主机在线）' },
+            ),
+          ),
+        ]),
       positiveText: '确认解绑',
       negativeText: '取消',
       onPositiveClick: async () => {
         try {
-          await deleteHost(host.id)
-          message.success('已成功解绑主机')
+          const res = await deleteHost(host.id, uninstallAgent.value)
+          if (res.warning) {
+            message.warning(`已解绑主机，但${res.warning}`)
+          } else if (uninstallAgent.value && res.uninstalled) {
+            message.success('已解绑主机并远程卸载 Agent')
+          } else {
+            message.success('已成功解绑主机')
+          }
           await store.fetchList()
         } catch (e: any) {
           message.error(e.message || '解绑失败')

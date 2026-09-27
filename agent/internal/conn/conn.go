@@ -25,6 +25,7 @@ import (
 	"watchman/agent/internal/shell"
 	"watchman/agent/internal/sysinfo"
 	"watchman/agent/internal/tunnel"
+	"watchman/agent/internal/uninstall"
 	"watchman/agent/internal/upgrade"
 	"watchman/internal/version"
 	"watchman/proto/agentpb"
@@ -49,6 +50,8 @@ type Dialer struct {
 	upgrade *upgrade.Manager
 	scan    *scan.Manager
 	tunnel  *tunnel.Manager
+
+	uninstall *uninstall.Executor
 }
 
 // Hub is the agent-side view of an established stream.
@@ -92,6 +95,9 @@ func (d *Dialer) SetScanManager(m *scan.Manager) { d.scan = m }
 
 // SetTunnelManager wires reverse TCP tunnels.
 func (d *Dialer) SetTunnelManager(m *tunnel.Manager) { d.tunnel = m }
+
+// SetUninstallExecutor wires agent self-uninstall.
+func (d *Dialer) SetUninstallExecutor(e *uninstall.Executor) { d.uninstall = e }
 
 // Run dials and maintains the connection forever (until ctx is cancelled).
 func (d *Dialer) Run(ctx context.Context) {
@@ -404,6 +410,15 @@ func (d *Dialer) handleServerMessage(msg *agentpb.ServerMessage) error {
 			return nil
 		}
 		d.tunnel.HandleClose(p.TunnelClose)
+		return nil
+
+	// Self-uninstall requested by the server (host unbound with
+	// "uninstall agent"). Runs async, then the process exits.
+	case *agentpb.ServerMessage_Uninstall:
+		if d.uninstall == nil {
+			return fmt.Errorf("uninstall not available")
+		}
+		d.uninstall.Handle(p.Uninstall)
 		return nil
 	// Maintenance notice from server (e.g. server restart). Persist it so the
 	// reconnect after the restart carries the reason and stays quiet.

@@ -145,3 +145,52 @@ func TestUnbindThenRebindChannelFreshness(t *testing.T) {
 	}
 	hub2.unbind()
 }
+
+// TestSendConcurrentUnbindNoStarvationOrPanic verifies that when sendCh is full,
+// a blocking Send does not cause unbind() to stall or panic when unbind() closes sendCh.
+func TestSendConcurrentUnbindNoStarvationOrPanic(t *testing.T) {
+	r := NewRegistry("", slog.Default())
+	hub := newHub("agent-1", 30, r)
+	hub.MockConnectForTest()
+
+	// Fill sendCh to capacity so next Send will block in select
+	for i := 0; i < cap(hub.sendCh); i++ {
+		hub.sendCh <- &agentpb.ServerMessage{}
+	}
+
+	sendDone := make(chan bool, 1)
+	go func() {
+		// This Send will block because sendCh is full
+		ok := hub.Send(&agentpb.ServerMessage{})
+		sendDone <- ok
+	}()
+
+	// Give the goroutine time to enter select
+	time.Sleep(50 * time.Millisecond)
+
+	unbindStart := time.Now()
+	unbindDone := make(chan struct{})
+	go func() {
+		hub.unbind()
+		close(unbindDone)
+	}()
+
+	select {
+	case <-unbindDone:
+		if dur := time.Since(unbindStart); dur > 1*time.Second {
+			t.Fatalf("unbind took too long (%v), write starvation occurred", dur)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("unbind hung waiting for Send lock")
+	}
+
+	select {
+	case sent := <-sendDone:
+		if sent {
+			t.Fatal("Send should have returned false after unbind closed channel")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send hung and did not recover on channel close")
+	}
+}
+

@@ -31,6 +31,7 @@ import (
 	"watchman/server/internal/commands"
 	"watchman/server/internal/gitprovider"
 	"watchman/server/internal/groups"
+	"watchman/server/internal/install"
 	"watchman/server/internal/metrics"
 	"watchman/server/internal/network"
 	"watchman/server/internal/policy"
@@ -326,12 +327,15 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	}
 
 	// Overlay networking (Tailscale / Headscale).
-	if networkStore != nil {
-		network.NewHandlers(networkStore, reg, auditStore).Register(
-			authed.Group(""),
-			hostWrite.Group("", h.auditMutation()),
-		)
-	}
+		if networkStore != nil {
+			network.NewHandlers(networkStore, reg, auditStore).Register(
+				authed.Group(""),
+				hostWrite.Group("", h.auditMutation()),
+			)
+		}
+
+		// Reverse TCP tunnels (§3.9).
+		h.registerTunnelRoutes(authed)
 
 	// WebSocket endpoint (token via query param, since browsers can't set
 	// Authorization headers on WebSocket upgrades easily; also supports share_token or code).
@@ -1568,12 +1572,20 @@ func (h *handlers) upgradeAgent(c *gin.Context) {
 		h.alertMon.SetHostMaintenance(agentID, 180*time.Second, "agent_upgrade")
 	}
 
+	if body.Sha256 == "" {
+		if sha, err := install.AgentBinarySha256("", osName, archName); err == nil {
+			body.Sha256 = sha
+		}
+	}
+	sig := signUpgrade(body.Version, body.Sha256)
+
 	hub.Send(&agentpb.ServerMessage{
 		Payload: &agentpb.ServerMessage_Upgrade{
 			Upgrade: &agentpb.UpgradeRequest{
-				Version: body.Version,
-				Url:     binaryURL,
-				Sha256:  body.Sha256,
+				Version:   body.Version,
+				Url:       binaryURL,
+				Sha256:    body.Sha256,
+				Signature: sig,
 			},
 		},
 	})
@@ -1664,6 +1676,8 @@ func deriveMutationAction(method, pattern string) (string, bool) {
 		{http.MethodPost, "/api/v1/hosts/:id/apps/install", "app_install"},
 		{http.MethodDelete, "/api/v1/hosts/:id/apps/:name", "app_uninstall"},
 		{http.MethodPost, "/api/v1/hosts/:id/docker/install-script", "docker_install"},
+		{http.MethodPut, "/api/v1/me/settings", "user_settings_update"},
+		{http.MethodPut, "/api/v1/settings", "system_settings_update"},
 		// Control-plane backup / restore: a restore rewrites the whole dataset,
 		// so it is recorded as a high-risk action.
 		{http.MethodPost, "/api/v1/system/backup", "system_backup"},
@@ -2202,6 +2216,7 @@ func (h *handlers) upgradeAgentsBatch(c *gin.Context) {
 	hostHeader := c.Request.Host
 
 	dispatched := make([]string, 0, len(targets))
+	shaCache := make(map[string]string)
 	for _, a := range targets {
 		hub := h.reg.Hub(a.ID)
 		if hub == nil {
@@ -2223,11 +2238,25 @@ func (h *handlers) upgradeAgentsBatch(c *gin.Context) {
 		}
 		binaryURL := fmt.Sprintf("%s://%s/api/v1/agent/binary?os=%s&arch=%s", scheme, hostHeader, osName, archName)
 
+		key := osName + "/" + archName
+		sha256Val, ok := shaCache[key]
+		if !ok {
+			if sha, err := install.AgentBinarySha256("", osName, archName); err == nil {
+				sha256Val = sha
+			} else {
+				h.log.Warn("batch upgrade: binary sha256 not found for agent", "agent_id", a.ID, "os", osName, "arch", archName, "err", err)
+			}
+			shaCache[key] = sha256Val
+		}
+		sig := signUpgrade(CurrentAgentVersion, sha256Val)
+
 		hub.Send(&agentpb.ServerMessage{
 			Payload: &agentpb.ServerMessage_Upgrade{
 				Upgrade: &agentpb.UpgradeRequest{
-					Version: CurrentAgentVersion,
-					Url:     binaryURL,
+					Version:   CurrentAgentVersion,
+					Url:       binaryURL,
+					Sha256:    sha256Val,
+					Signature: sig,
 				},
 			},
 		})

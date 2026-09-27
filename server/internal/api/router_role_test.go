@@ -85,7 +85,9 @@ func newTestRouter(t *testing.T) (*gin.Engine, *auth.Store) {
 	must(err)
 	appEngine := apps.NewEngine(nil, appStore, vaultStore, log)
 
-	r := Router(rpc.NewRegistry(dir, log), log, authStore, sessStore, alertStore, vaultStore,
+	reg := rpc.NewRegistry(dir, log)
+	reg.SetTunnelCoordinator(rpc.NewTunnelCoordinator(reg, log))
+	r := Router(reg, log, authStore, sessStore, alertStore, vaultStore,
 		nil, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore,
 		settingsStore, backupStore, networkStore, appStore, appEngine, nil, nil, nil, nil, nil)
 	return r, authStore

@@ -153,7 +153,8 @@ func uploadFile(localPath, remotePath string, mode os.FileMode) error {
 
 		remoteClean := strings.ReplaceAll(remotePath, "\\", "/")
 		dir := remoteClean[:strings.LastIndex(remoteClean, "/")]
-		cmd := fmt.Sprintf("mkdir -p %s && gzip -dc > %s && chmod %o %s", dir, remoteClean, mode, remoteClean)
+		tmp := fmt.Sprintf("%s.tmp.%d", remoteClean, time.Now().UnixNano())
+		cmd := fmt.Sprintf("mkdir -p %q && gzip -dc > %q && chmod %o %q && mv -f %q %q", dir, tmp, mode, tmp, tmp, remoteClean)
 
 		stdin, err := session.StdinPipe()
 		if err != nil {

@@ -120,15 +120,38 @@ const transferTitle = computed(() => {
 
 const editorDirty = computed(() => editorContent.value !== editorOriginal.value)
 
+function isPathCompatibleWithOS(path: string, isWin: boolean): boolean {
+  if (!path) return false
+  const isWinFormat = /^[a-zA-Z]:[\\/]/.test(path)
+  const isPosixFormat = path.startsWith('/') || path.startsWith('~')
+  return isWin ? isWinFormat : isPosixFormat
+}
+
+function applyDefaultPath(custom: string) {
+  if (custom && isPathCompatibleWithOS(custom, isWindows.value)) {
+    currentPath.value = custom
+    pathInput.value = custom
+  } else if (isWindows.value && !isPathCompatibleWithOS(currentPath.value, true)) {
+    currentPath.value = 'C:\\'
+    pathInput.value = 'C:\\'
+  } else if (!isWindows.value && !isPathCompatibleWithOS(currentPath.value, false)) {
+    currentPath.value = '/root'
+    pathInput.value = '/root'
+  }
+}
+
 async function detectOS() {
   if (!hostOs.value && props.hostId) {
     try {
       const h = await getHost(props.hostId)
       if (h && h.os) {
         hostOs.value = h.os
-        if (isWindows.value && currentPath.value === '/root') {
+        if (isWindows.value && !isPathCompatibleWithOS(currentPath.value, true)) {
           currentPath.value = 'C:\\'
           pathInput.value = 'C:\\'
+        } else if (!isWindows.value && !isPathCompatibleWithOS(currentPath.value, false)) {
+          currentPath.value = '/root'
+          pathInput.value = '/root'
         }
       }
     } catch {
@@ -596,20 +619,21 @@ const columns: DataTableColumns<FileInfo> = [
 
 watch(
   () => props.hostId,
-  () => {
-    detectOS().then(() => load())
+  async () => {
+    hostOs.value = ''
+    await detectOS()
+    const custom = settingsStore.getUserKey<string>(SETTING_KEYS.filesDefaultPath, '').trim()
+    applyDefaultPath(custom)
+    load()
   }
 )
 
 onMounted(async () => {
   await detectOS()
-  // 通用设置里配了文件默认路径就优先用；留空沿用按 OS 的旧默认值。
+  // 通用设置里配了文件默认路径就优先用（但须与目标主机 OS 路径格式匹配）；留空或格式不兼容则沿用按 OS 的默认值。
   await settingsStore.load()
   const custom = settingsStore.getUserKey<string>(SETTING_KEYS.filesDefaultPath, '').trim()
-  if (custom) {
-    currentPath.value = custom
-    pathInput.value = custom
-  }
+  applyDefaultPath(custom)
   load()
 })
 </script>

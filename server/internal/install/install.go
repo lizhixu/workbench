@@ -8,7 +8,10 @@
 package install
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -106,50 +109,92 @@ func (h *Handler) installScript(c *gin.Context) {
 	c.String(http.StatusOK, script)
 }
 
-// agentBinary serves the pre-built agent binary for the requested OS/arch.
-func (h *Handler) agentBinary(c *gin.Context) {
-	goos := c.DefaultQuery("os", "linux")
-	goarch := c.DefaultQuery("arch", "amd64")
+// FindAgentBinary returns the path to the pre-built agent binary for the requested OS/arch.
+// binDir is searched first if non-empty, followed by standard fallback locations.
+func FindAgentBinary(binDir, goos, goarch string) (string, error) {
+	if goos == "" {
+		goos = "linux"
+	}
+	if goarch == "" {
+		goarch = "amd64"
+	}
 
 	filename := fmt.Sprintf("watchman-agent-%s-%s", goos, goarch)
 	if goos == "windows" {
 		filename += ".exe"
 	}
 
-	candidates := []string{
-		filepath.Join(h.binDir, filename),
+	var candidates []string
+	if binDir != "" {
+		candidates = append(candidates, filepath.Join(binDir, filename))
+	}
+	candidates = append(candidates,
 		filepath.Join("/opt/watchman/bin", filename),
 		filepath.Join("bin", filename),
 		filepath.Join("bin/linux_amd64", filename),
-	}
+	)
 	if goos == "linux" && goarch == "amd64" {
+		if binDir != "" {
+			candidates = append(candidates, filepath.Join(binDir, "watchman-agent"))
+		}
 		candidates = append(candidates,
-			filepath.Join(h.binDir, "watchman-agent"),
 			filepath.Join("/opt/watchman/bin", "watchman-agent"),
 			filepath.Join("bin/linux_amd64", "watchman-agent"),
 			filepath.Join("bin", "watchman-agent"),
 		)
 	}
 	if goos == "windows" && goarch == "amd64" {
+		if binDir != "" {
+			candidates = append(candidates, filepath.Join(binDir, "watchman-agent.exe"))
+		}
 		candidates = append(candidates,
-			filepath.Join(h.binDir, "watchman-agent.exe"),
 			filepath.Join("bin", "watchman-agent.exe"),
 		)
 	}
 
-	var foundPath string
 	for _, p := range candidates {
 		if info, err := os.Stat(p); err == nil && !info.IsDir() {
-			foundPath = p
-			break
+			return p, nil
 		}
 	}
+	return "", fmt.Errorf("agent binary not found for %s/%s", goos, goarch)
+}
 
-	if foundPath == "" {
+// AgentBinarySha256 computes the hex-encoded SHA-256 checksum of the agent binary for OS/arch.
+func AgentBinarySha256(binDir, goos, goarch string) (string, error) {
+	path, err := FindAgentBinary(binDir, goos, goarch)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// agentBinary serves the pre-built agent binary for the requested OS/arch.
+func (h *Handler) agentBinary(c *gin.Context) {
+	goos := c.DefaultQuery("os", "linux")
+	goarch := c.DefaultQuery("arch", "amd64")
+
+	foundPath, err := FindAgentBinary(h.binDir, goos, goarch)
+	if err != nil {
+		filename := fmt.Sprintf("watchman-agent-%s-%s", goos, goarch)
+		if goos == "windows" {
+			filename += ".exe"
+		}
 		c.String(http.StatusNotFound, "binary not found: %s (build it with: GOOS=%s GOARCH=%s go build -o %s ./agent/cmd/watchman-agent)", filename, goos, goarch, filepath.Join(h.binDir, filename))
 		return
 	}
 
+	filename := filepath.Base(foundPath)
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 	c.Header("Content-Type", "application/octet-stream")
 	c.File(foundPath)

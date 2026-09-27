@@ -206,6 +206,7 @@ func main() {
 	log.Info("certificate hub ready", "certs", len(certHub.List()))
 
 	reg := rpc.NewRegistry(*dataDir, log)
+	reg.SetTunnelCoordinator(rpc.NewTunnelCoordinator(reg, log))
 	appEngine := apps.NewEngine(reg, appStore, vaultStore, log)
 	appEngine.SetNetworkStore(networkStore)
 

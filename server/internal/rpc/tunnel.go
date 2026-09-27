@@ -157,6 +157,17 @@ func (c *Coordinator) List() []Tunnel {
 	return out
 }
 
+// Get returns the tunnel with the given ID, or false if not found.
+func (c *Coordinator) Get(id string) (Tunnel, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st := c.tunnels[id]
+	if st == nil {
+		return Tunnel{}, false
+	}
+	return st.Tunnel, true
+}
+
 // Close shuts down a tunnel and all its connections.
 func (c *Coordinator) Close(id string) error {
 	c.mu.Lock()

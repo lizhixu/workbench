@@ -815,27 +815,33 @@ func (h *Hub) sendPump(stream agentpb.AgentService_ConnectServer) {
 	}
 }
 
-func (h *Hub) Send(msg *agentpb.ServerMessage) bool {
-	// Hold a read lock across the channel send so unbind() — which closes
-	// sendCh under the write lock — can never run concurrently with a send.
-	// This rules out the "send on closed channel" panic that a check-then-
-	// send without the lock would still have (unbind could close sendCh in
-	// the window between the check and the send). It blocks up to 5 seconds
-	// waiting for sendCh capacity instead of silently dropping the message;
-	// callers get false when the hub is gone or the timeout hits.
+func (h *Hub) Send(msg *agentpb.ServerMessage) (sent bool) {
+	// Check stream availability and closed state under read lock, then release
+	// immediately before attempting the channel send. Holding RLock across a
+	// blocking channel send causes write starvation on Go's write-preferring
+	// sync.RWMutex: any unbind() attempting to acquire Lock() stalls, and
+	// subsequent RLock() readers (e.g. LastMetrics, ReapStale) stall behind it,
+	// freezing the alert monitor and registry operations.
+	//
+	// A concurrent unbind() closing sendCh while Send is waiting is caught by
+	// recover(), safely returning false without panicking.
 	h.mu.RLock()
-	defer h.mu.RUnlock()
 	if h.stream == nil || h.closed {
-		slog.Default().Warn("hub.Send: stream is nil", "agent_id", h.AgentID)
+		h.mu.RUnlock()
+		slog.Default().Warn("hub.Send: stream is nil or hub closed", "agent_id", h.AgentID)
 		return false
 	}
-	// Block up to 5 seconds waiting for sendCh capacity instead of silently
-	// dropping op messages (DockerOp, FileOp, Exec) — a drop causes the HTTP
-	// handler to wait the full 30s timeout with no response. Heartbeat and
-	// other fire-and-forget messages can afford the wait too (sendCh is
-	// buffered 128 and sendPump drains continuously).
+	ch := h.sendCh
+	h.mu.RUnlock()
+
+	defer func() {
+		if r := recover(); r != nil {
+			sent = false
+		}
+	}()
+
 	select {
-	case h.sendCh <- msg:
+	case ch <- msg:
 		return true
 	case <-time.After(5 * time.Second):
 		slog.Default().Warn("hub.Send: sendCh full after 5s", "agent_id", h.AgentID)

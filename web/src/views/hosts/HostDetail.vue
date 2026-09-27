@@ -8,6 +8,7 @@ import { useWorkspaceStore } from '../../stores/workspace'
 import { useSettingsStore } from '../../stores/settings'
 import { SETTING_KEYS } from '../../api/settings'
 import HostHeaderBanner from '../../components/host/HostHeaderBanner.vue'
+import { subNavItems, validHostTabs } from './hostTabs'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'HostDetail' })
@@ -30,8 +31,6 @@ const settings = useSettingsStore()
 
 const host = ref<Host | null>(null)
 const loading = ref(true)
-
-import { subNavItems, validHostTabs } from './hostTabs'
 
 // 无显式页签时的兜底：用户在通用设置里配的首选页签；非法值退回文件管理。
 function defaultTab(): string {

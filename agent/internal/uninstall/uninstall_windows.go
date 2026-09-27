@@ -7,22 +7,24 @@ import (
 	"strings"
 )
 
-// removeService stops and deletes the Windows service registration.
-// The running executable cannot delete itself on Windows, so file
-// removal is deferred to a detached cmd that runs after we exit.
-func (e *Executor) removeService(self string) {
-	if out, err := exec.Command("sc.exe", "query", "watchman-agent").CombinedOutput(); err != nil {
-		e.log.Info("uninstall: no watchman-agent service", "out", strings.TrimSpace(string(out)))
-	} else {
-		e.runCmd("sc.exe", "stop", "watchman-agent")
-		e.runCmd("sc.exe", "delete", "watchman-agent")
-	}
+// removeService deletes the agent's Scheduled Task registration.
+//
+// The official installer registers the agent as the Scheduled Task
+// "WatchmanAgent" (NOT a Windows service), so sc.exe is the wrong tool
+// here. schtasks /Delete removes the task definition while the running
+// instance keeps going; we exit ourselves afterwards, so there is
+// nothing left for the task's restart policy to resurrect.
+func (e *Executor) removeService(self string, removeData bool) {
+	e.runCmd("schtasks", "/Delete", "/TN", "WatchmanAgent", "/F")
+	// Best-effort fallback for a manually registered service, if any.
+	// No "sc.exe stop": that would kill this process mid-uninstall.
+	e.runCmd("sc.exe", "delete", "watchman-agent")
 
 	// Schedule self + data dir deletion after exit: a running image
 	// cannot be removed on Windows. The child cmd survives our exit.
 	if self != "" {
 		batch := "ping -n 3 127.0.0.1 >nul & del /f /q \"" + self + "\""
-		if safeDataDir(e.stateDir) {
+		if removeData && safeDataDir(e.stateDir) {
 			// Data dir is removed by the shared removeDataDir() too, but
 			// files may be locked while we run; retry here after exit.
 			batch += " & rmdir /s /q \"" + e.stateDir + "\""

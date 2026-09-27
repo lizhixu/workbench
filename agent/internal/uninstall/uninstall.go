@@ -61,7 +61,7 @@ func (e *Executor) run(removeData bool) {
 		self = real
 	}
 
-	e.removeService(self)
+	e.removeService(self, removeData)
 
 	if self != "" {
 		if err := os.Remove(self); err != nil && !os.IsNotExist(err) {

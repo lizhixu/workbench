@@ -337,7 +337,8 @@ func windowsInstallScript(serverURL, token, upgradePubKey string) string {
 	return fmt.Sprintf(`# Watchman Agent - one-line installer (Windows)
 # Run in PowerShell as Administrator:
 #   Install:   irm %s/install?os_type=windows^&token=%s | iex
-#   Uninstall: irm %s/install?os_type=windows^&token=%s | iex -Uninstall
+#   Uninstall: $f="$env:TEMP\watchman-install.ps1"; irm %s/install?os_type=windows^&token=%s -OutFile $f; & $f -Uninstall
+#     (piping to iex cannot pass the -Uninstall switch, so save to a file first)
 param([switch]$Uninstall)
 
 $ErrorActionPreference = "Stop"

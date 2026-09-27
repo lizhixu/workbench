@@ -117,9 +117,13 @@ type Hub struct {
 	heartbeat int32
 	lastSeen  time.Time
 	sendCh    chan *agentpb.ServerMessage
-	// closed is set under mu before sendCh is closed, so Send can fail fast
-	// once the hub is unbound: writing to a closed channel panics, and Send
-	// races with unbind otherwise.
+	// doneCh is closed by unbind to broadcast "hub is gone". Send selects on
+	// it so a blocked send wakes up immediately; sendCh itself is NEVER
+	// closed, which rules out the send-on-closed-channel panic (and the data
+	// race the detector reports for concurrent send vs close) by construction.
+	doneCh chan struct{}
+	// closed is set under mu in unbind before doneCh is closed, so Send can
+	// fail fast once the hub is unbound.
 	closed       bool
 	stream       agentpb.AgentService_ConnectServer
 	tunnel       *Coordinator // reverse TCP tunnels (nil = disabled)
@@ -768,6 +772,7 @@ func newHub(agentID string, heartbeatSec int32, reg *Registry) *Hub {
 		heartbeat:    heartbeatSec,
 		lastSeen:     time.Now(),
 		sendCh:       make(chan *agentpb.ServerMessage, 128),
+		doneCh:       make(chan struct{}),
 		termHandlers: make(map[string]func(*agentpb.TerminalOutput)),
 		respHandlers: make(map[string]func(*agentpb.AgentMessage)),
 		registry:     reg,
@@ -784,8 +789,13 @@ func (h *Hub) bind(stream agentpb.AgentService_ConnectServer) {
 func (h *Hub) unbind() {
 	h.mu.Lock()
 	h.stream = nil
-	h.closed = true
-	close(h.sendCh)
+	if !h.closed {
+		h.closed = true
+		// Wake blocked Senders via doneCh; sendCh itself is never closed so
+		// a concurrent Send can neither panic nor race the detector (§8.10).
+		// The closed-guard also makes a second unbind a safe no-op.
+		close(h.doneCh)
+	}
 	// Snapshot all handlers and clear the maps BEFORE invoking callbacks: the
 	// handlers (e.g. metrics-poll in metrics.Store) re-enter SetRespHandler to
 	// deregister themselves, which would self-deadlock on this non-reentrant
@@ -808,23 +818,29 @@ func (h *Hub) unbind() {
 }
 
 func (h *Hub) sendPump(stream agentpb.AgentService_ConnectServer) {
-	for msg := range h.sendCh {
-		if err := stream.Send(msg); err != nil {
+	for {
+		select {
+		case msg := <-h.sendCh:
+			if err := stream.Send(msg); err != nil {
+				return
+			}
+		case <-h.doneCh:
+			// Hub unbound: the stream is dead, drop the rest and exit.
 			return
 		}
 	}
 }
 
-func (h *Hub) Send(msg *agentpb.ServerMessage) (sent bool) {
+func (h *Hub) Send(msg *agentpb.ServerMessage) bool {
 	// Check stream availability and closed state under read lock, then release
 	// immediately before attempting the channel send. Holding RLock across a
 	// blocking channel send causes write starvation on Go's write-preferring
-	// sync.RWMutex: any unbind() attempting to acquire Lock() stalls, and
-	// subsequent RLock() readers (e.g. LastMetrics, ReapStale) stall behind it,
-	// freezing the alert monitor and registry operations.
+	// sync.RWMutex: a pending unbind() Lock() would stall every subsequent
+	// RLock reader (LastMetrics, ReapStale), freezing the alert monitor.
 	//
-	// A concurrent unbind() closing sendCh while Send is waiting is caught by
-	// recover(), safely returning false without panicking.
+	// sendCh is never closed (unbind closes doneCh instead), so the send below
+	// cannot race a channel close: no panic, no recover, race-detector clean.
+	// A concurrent unbind wakes the select via doneCh and Send returns false.
 	h.mu.RLock()
 	if h.stream == nil || h.closed {
 		h.mu.RUnlock()
@@ -832,17 +848,14 @@ func (h *Hub) Send(msg *agentpb.ServerMessage) (sent bool) {
 		return false
 	}
 	ch := h.sendCh
+	done := h.doneCh
 	h.mu.RUnlock()
-
-	defer func() {
-		if r := recover(); r != nil {
-			sent = false
-		}
-	}()
 
 	select {
 	case ch <- msg:
 		return true
+	case <-done:
+		return false
 	case <-time.After(5 * time.Second):
 		slog.Default().Warn("hub.Send: sendCh full after 5s", "agent_id", h.AgentID)
 		return false

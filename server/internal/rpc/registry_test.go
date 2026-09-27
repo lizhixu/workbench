@@ -147,7 +147,8 @@ func TestUnbindThenRebindChannelFreshness(t *testing.T) {
 }
 
 // TestSendConcurrentUnbindNoStarvationOrPanic verifies that when sendCh is full,
-// a blocking Send does not cause unbind() to stall or panic when unbind() closes sendCh.
+// a blocking Send neither stalls unbind() (no RLock held across the send, so
+// no RWMutex write starvation) nor panics/races when unbind() fires doneCh.
 func TestSendConcurrentUnbindNoStarvationOrPanic(t *testing.T) {
 	r := NewRegistry("", slog.Default())
 	hub := newHub("agent-1", 30, r)
@@ -193,4 +194,3 @@ func TestSendConcurrentUnbindNoStarvationOrPanic(t *testing.T) {
 		t.Fatal("Send hung and did not recover on channel close")
 	}
 }
-

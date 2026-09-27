@@ -183,4 +183,3 @@ func TestUpgradeAgentAttachesSignature(t *testing.T) {
 		t.Errorf("expected signature %s, got %s", expectedSig, string(receivedSig))
 	}
 }
-

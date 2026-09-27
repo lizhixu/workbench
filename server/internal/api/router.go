@@ -37,6 +37,7 @@ import (
 	"watchman/server/internal/policy"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
+	"watchman/server/internal/secentry"
 	"watchman/server/internal/session"
 	"watchman/server/internal/settings"
 	"watchman/server/internal/snapshots"
@@ -109,7 +110,21 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	r := gin.New()
 	r.Use(gin.Recovery(), requestLogger(log))
 
+	// Secure entry (安全入口): once enabled in system settings, the panel can
+	// only be logged in through the secret entry URL. The guard 404s direct
+	// page/API access without a valid JWT or entry cookie; agent
+	// install/enroll, webhooks and share links stay exempt.
+	// NOTE: r.Use must come before any group/route registration, otherwise
+	// gin silently drops the middleware for the earlier routes.
+	var jwtKey []byte
+	if authStore != nil {
+		jwtKey = authStore.SigningKey()
+	}
+	entryGuard := secentry.NewGuard(settingsStore, authStore, jwtKey, log)
+	r.Use(entryGuard.Middleware())
+
 	v1 := r.Group("/api/v1")
+	entryGuard.RegisterRoutes(v1)
 	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, settings: settingsStore, alertMon: alertMon}
 
 	// ---- Public routes (no auth) ----

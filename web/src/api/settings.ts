@@ -32,6 +32,8 @@ export const SETTING_KEYS = {
   termScrollback: 'terminal.scrollback',
   defaultHostTab: 'navigation.default_host_tab',
   filesDefaultPath: 'files.default_path',
+  secureEntryEnabled: 'security.secure_entry_enabled',
+  secureEntryPath: 'security.secure_entry_path',
 } as const
 
 export interface SettingSchemaEntry {

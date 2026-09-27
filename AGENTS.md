@@ -109,6 +109,7 @@
   - 证书自动化：绑定域名时若证书中心无覆盖证书，自动用默认 ACME 账户签发后写入 Nginx 并热加载。
   - 网关主机 ID 持久化在 `Application.proxy_gateway_host_id`，解绑时同时清理应用主机与网关主机两侧配置。
 - **创建时即可绑定域名**：创建页填写域名与网关节点后，提交依次执行 创建应用 → 自动签发证书 → 下发反代；绑定失败不回滚应用创建，可稍后在详情页重试。
+- **系统设置安全入口**（2026-09-27）：「系统设置 → 证书与域名」分区（`web/src/views/settings/CertDomain.vue`，`sections.ts` 注册 `key: 'cert-domain'`）把证书签发/续期/ACME 账户管理与应用域名绑定收拢到一处；分区标记 `adminOnly`，SettingsLayout 按 `auth.role` 过滤，深链 `?s=cert-domain` 对非管理员回退到默认分区。后端对应写接口本就 admin/operator + 审计（`cert/handlers.go` 的 writeRG、`apps/proxy.go` 的 appWrite），前端隐藏是纵深防御。证书管理 UI 抽为可复用组件 `web/src/components/cert/CertManager.vue`（原 CertList 页面内容），独立「证书中心」路由保留做深链。
 - **全生命周期管理**：部署历史、构建日志、健康检查探活失败自动保留旧版本（`-next`/`-prev` 滚动替换）、回滚、启停、AI 排障诊断，对所有来源的应用一致生效。
 - **已安装管理**：应用列表/详情支持重启、停止、启动、查看日志、删除（`watchman.app` 标签标记容器归属）。
 - **可扩展**：模板定义为服务端声明式配置（`server/internal/apps/templates.go` 的 `Catalog`），支持自定义接入新模板。
@@ -193,6 +194,7 @@
 - **登录认证**：控制端登录（账号密码，可扩展 OAuth/SSO）。
 - **多用户**：支持多用户，配合分组权限实现隔离。
 - **操作审计（自研增量）**：记录谁在何时对哪台主机做了什么操作（原产品为 SaaS，自研需自保审计日志，满足「停服自担」背景下的可追溯要求）。
+- **安全入口（宝塔式，2026-09-27）**：系统设置 → 安全入口（`web/src/views/settings/SecureEntry.vue`，`sections.ts` 注册 `key: 'secure-entry'`，`adminOnly` 仅管理员可见）。开启后只能通过秘密入口地址访问/登录面板：`GET /api/v1/secure-entry/<路径>` 校验通过后签发 HttpOnly cookie（`wm_secure_entry=<路径>.<HMAC>`，密钥由 JWT 签名密钥域分离派生 `server/internal/secentry`）并 302 到 `/`；之后才能看到登录页并发起登录。直接访问常规页面/API、无有效 JWT 又无入口 cookie 的请求一律 404（不暴露面板存在）。豁免：Agent 安装/注册（`/install*`、`/agent/*`、`/api/v1/hosts/enroll` 等，B.4 公开注册设计）、应用 webhook、终端分享链接、入口自身端点。nginx 模板（`deploy/install.sh`）对 `/`、`/index.html`、`/assets/` 加 `auth_request /api/v1/secure-entry/check`（401 转 404），静态页面层同样隐藏。配置键：`security.secure_entry_enabled`（bool）、`security.secure_entry_path`（6~64 位 URL 安全字符，`settings` 注册表校验）；`PUT /settings` 本就 adminOnly + 审计。**忘记路径**：控制机执行 `watchman-server -reset-secure-entry -data <数据目录>`（置 false 后退出）或改 settings.json 后重启。
 
 ### 3.16 AI 能力（增强）
 

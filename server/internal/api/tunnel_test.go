@@ -11,7 +11,7 @@ import (
 )
 
 func TestTunnelRoutesRegisteredAndRoleGated(t *testing.T) {
-	r, authStore := newTestRouter(t)
+	r, authStore, _ := newTestRouter(t)
 
 	viewer := tokenFor(t, authStore, "tunnel_viewer", auth.RoleViewer)
 	operator := tokenFor(t, authStore, "tunnel_operator", auth.RoleOperator)

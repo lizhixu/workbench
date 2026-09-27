@@ -236,8 +236,14 @@ func TestPhase3Keys(t *testing.T) {
 func TestSchemaAndEffective(t *testing.T) {
 	s := newTestStore(t)
 	schema := s.Schema(ScopeUser)
-	if len(schema) != len(Definitions) {
-		t.Fatalf("schema has %d entries, want %d", len(schema), len(Definitions))
+	want := 0
+	for _, d := range Definitions {
+		if d.Scope == ScopeUser {
+			want++
+		}
+	}
+	if len(schema) != want {
+		t.Fatalf("schema has %d entries, want %d", len(schema), want)
 	}
 	eff := s.Effective(ScopeUser, "nobody")
 	for _, d := range Definitions {
@@ -248,8 +254,20 @@ func TestSchemaAndEffective(t *testing.T) {
 			t.Errorf("effective missing key %s", d.Key)
 		}
 	}
-	if len(s.Schema(ScopeSystem)) != 0 {
-		t.Fatal("system schema should be empty in Phase 2")
+	sysSchema := s.Schema(ScopeSystem)
+	if len(sysSchema) != 2 {
+		t.Fatalf("system schema has %d entries, want 2 (secure_entry keys)", len(sysSchema))
+	}
+	for _, k := range []string{"security.secure_entry_enabled", "security.secure_entry_path"} {
+		found := false
+		for _, e := range sysSchema {
+			if e.Key == k {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("system schema missing key %s", k)
+		}
 	}
 }
 

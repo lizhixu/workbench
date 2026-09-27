@@ -20,10 +20,10 @@ import (
 	"watchman/server/internal/metrics"
 	"watchman/server/internal/network"
 	"watchman/server/internal/policy"
-	"watchman/server/internal/settings"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/session"
+	"watchman/server/internal/settings"
 	"watchman/server/internal/vault"
 
 	"github.com/gin-gonic/gin"
@@ -44,7 +44,7 @@ func tokenFor(t *testing.T, store *auth.Store, username string, role auth.Role) 
 
 // newTestRouter builds a router with every store wired, so all routes register
 // and the test exercises real authorization rather than a 404.
-func newTestRouter(t *testing.T) (*gin.Engine, *auth.Store) {
+func newTestRouter(t *testing.T) (*gin.Engine, *auth.Store, *settings.Store) {
 	t.Helper()
 	dir := t.TempDir()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -90,13 +90,13 @@ func newTestRouter(t *testing.T) (*gin.Engine, *auth.Store) {
 	r := Router(reg, log, authStore, sessStore, alertStore, vaultStore,
 		nil, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore,
 		settingsStore, backupStore, networkStore, appStore, appEngine, nil, nil, nil, nil, nil)
-	return r, authStore
+	return r, authStore, settingsStore
 }
 
 // TestRoleGates locks in the read/write split across roles. A viewer must never
 // reach a route that changes a host, and host lifecycle stays admin-only.
 func TestRoleGates(t *testing.T) {
-	r, authStore := newTestRouter(t)
+	r, authStore, _ := newTestRouter(t)
 	viewer := tokenFor(t, authStore, "qa_viewer", auth.RoleViewer)
 	operator := tokenFor(t, authStore, "qa_operator", auth.RoleOperator)
 	admin := tokenFor(t, authStore, "qa_admin", auth.RoleAdmin)
@@ -175,7 +175,7 @@ func TestRoleGates(t *testing.T) {
 
 // An unauthenticated request must never reach a handler.
 func TestUnauthenticatedRejected(t *testing.T) {
-	r, _ := newTestRouter(t)
+	r, _, _ := newTestRouter(t)
 	for _, path := range []string{
 		"/api/v1/hosts", "/api/v1/sessions", "/api/v1/users", "/api/v1/audit",
 		"/api/v1/vault/credentials", "/api/v1/groups", "/api/v1/alerts/rules",
@@ -190,7 +190,7 @@ func TestUnauthenticatedRejected(t *testing.T) {
 
 // Login must not leak the stored password hash.
 func TestLoginResponseHasNoHash(t *testing.T) {
-	r, _ := newTestRouter(t)
+	r, _, _ := newTestRouter(t)
 	req := httptest.NewRequest("POST", "/api/v1/auth/login",
 		strings.NewReader(`{"username":"admin","password":"admin"}`))
 	req.Header.Set("Content-Type", "application/json")

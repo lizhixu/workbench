@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { NInput, NIcon, NEmpty } from 'naive-ui'
 import { SearchOutline } from '@vicons/ionicons5'
 import { useWorkspaceStore } from '../../stores/workspace'
+import { useAuthStore } from '../../stores/auth'
 import {
   settingsSections,
   resolveSectionKey,
@@ -19,9 +20,15 @@ defineOptions({ name: 'Settings' })
 const route = useRoute()
 const router = useRouter()
 const workspace = useWorkspaceStore()
+const auth = useAuthStore()
 
 const keyword = ref('')
-const activeKey = ref(resolveSectionKey(route.query.s))
+// 安全入口：adminOnly 分区（证书签发/域名绑定）仅管理员可见。
+// 后端对应接口本就 adminOnly + 审计写操作，前端隐藏是纵深防御。
+const visibleSections = computed(() =>
+  settingsSections.filter((s) => !s.adminOnly || auth.role === 'admin'),
+)
+const activeKey = ref(resolveSectionKey(route.query.s, visibleSections.value))
 
 function selectSection(key: string) {
   if (activeKey.value === key) return
@@ -41,14 +48,14 @@ watch(
   () => route.query.s,
   (raw) => {
     if (route.name !== 'settings') return
-    activeKey.value = resolveSectionKey(raw)
+    activeKey.value = resolveSectionKey(raw, visibleSections.value)
   },
 )
 
 const filteredSections = computed(() => {
   const kw = keyword.value.trim().toLowerCase()
-  if (!kw) return settingsSections
-  return settingsSections.filter((s) =>
+  if (!kw) return visibleSections.value
+  return visibleSections.value.filter((s) =>
     `${s.label} ${s.keywords}`.toLowerCase().includes(kw),
   )
 })
@@ -61,7 +68,7 @@ const groupedSections = computed(() => {
 })
 
 const activeSection = computed<SettingsSection>(
-  () => settingsSections.find((s) => s.key === activeKey.value) ?? settingsSections[0],
+  () => visibleSections.value.find((s) => s.key === activeKey.value) ?? visibleSections.value[0],
 )
 
 function onSearchEnter() {

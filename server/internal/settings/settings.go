@@ -33,6 +33,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -149,6 +150,11 @@ var Definitions = []Definition{
 	{Key: "appearance.show_tips", Scope: ScopeUser, Kind: KindBool, Title: "显示功能提示语", Default: true},
 	{Key: "files.default_path", Scope: ScopeUser, Kind: KindString, Title: "文件管理默认路径", Default: "",
 		MaxLen: 500, Validate: validateAbsPath},
+	// 安全入口（宝塔式）：开启后只能通过秘密入口路径签发 cookie 后登录面板，
+	// 直接访问常规页面/API 一律 404。system 域，管理员专属。
+	{Key: "security.secure_entry_enabled", Scope: ScopeSystem, Kind: KindBool, Title: "安全入口", Default: false},
+	{Key: "security.secure_entry_path", Scope: ScopeSystem, Kind: KindString, Title: "安全入口路径", Default: "",
+		MaxLen: 64, Validate: validateSecureEntryPath},
 }
 
 // validateAbsPath accepts an empty value (OS default applies) or an absolute
@@ -169,6 +175,21 @@ func validateAbsPath(v any) error {
 
 func isASCIILetter(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+var secureEntryPathRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{5,63}$`)
+
+// validateSecureEntryPath 校验安全入口路径：空表示未配置；非空必须 6~64 位
+// 的 URL 安全字符（字母数字/_/-，首字符不能是 -/_，避免与路由语义混淆）。
+func validateSecureEntryPath(v any) error {
+	s, _ := v.(string)
+	if s == "" {
+		return nil
+	}
+	if !secureEntryPathRe.MatchString(s) {
+		return errors.New("安全入口路径必须为 6~64 位字母、数字、_、-，且首字符为字母或数字")
+	}
+	return nil
 }
 
 // defByKey indexes Definitions for validation lookups.

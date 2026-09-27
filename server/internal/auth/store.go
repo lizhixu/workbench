@@ -210,6 +210,17 @@ func (s *Store) Validate(tokenStr string) (*Claims, error) {
 	return claims, nil
 }
 
+// SigningKey exposes the raw JWT signing key for domain-separated derived
+// uses (e.g. the secure-entry cookie HMAC). Callers must never transmit or
+// persist it elsewhere; derivation must always apply domain separation.
+func (s *Store) SigningKey() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]byte, len(s.jwtKey))
+	copy(out, s.jwtKey)
+	return out
+}
+
 // List returns all users (without password hashes).
 func (s *Store) List() []*User {
 	s.mu.RLock()

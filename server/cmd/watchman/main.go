@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log/slog"
@@ -64,10 +65,28 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "TLS certificate for gRPC (empty = insecure)")
 	tlsKey := flag.String("tls-key", "", "TLS private key for gRPC")
 	httpTLS := flag.Bool("http-tls", false, "serve HTTPS on -http using -tls-cert/-tls-key")
+	resetSecureEntry := flag.Bool("reset-secure-entry", false, "lockout recovery: disable the secure entry (安全入口) by flipping security.secure_entry_enabled to false in -data, then exit")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(log)
+
+	// Secure-entry lockout recovery: runs before any other init and exits.
+	if *resetSecureEntry {
+		st, err := settings.NewStore(*dataDir, log)
+		if err != nil {
+			log.Error("settings store init", "err", err)
+			os.Exit(1)
+		}
+		if err := st.SetMany(settings.ScopeSystem, "", map[string]json.RawMessage{
+			"security.secure_entry_enabled": json.RawMessage("false"),
+		}); err != nil {
+			log.Error("reset secure entry", "err", err)
+			os.Exit(1)
+		}
+		log.Info("secure entry disabled; panel login is open again")
+		os.Exit(0)
+	}
 
 	// TLS must be configured as a pair: half-configured TLS must not
 	// silently fall back to plaintext.

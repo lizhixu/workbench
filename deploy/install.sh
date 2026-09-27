@@ -362,8 +362,19 @@ server {
         application/wasm
         image/svg+xml;
 
+    # 安全入口（面板）：未通过入口校验时隐藏静态页面，避免扫描器发现面板。
+    # auth_request 子请求打到 Go 的 /api/v1/secure-entry/check（动态判定：
+    # 未启用时直接 200 放行；启用后要求入口 cookie 或有效会话），401 在此
+    # 转为 404，不暴露面板存在。需要 ngx_http_auth_request_module
+    #（Debian 官方 nginx 默认包含）。
+    location @secure_entry_denied {
+        return 404;
+    }
+
     # Vite 产物文件名带 hash，可硬缓存
     location /assets/ {
+        auth_request /api/v1/secure-entry/check;
+        error_page 401 = @secure_entry_denied;
         expires 1y;
         add_header Cache-Control "public, immutable";
         access_log off;
@@ -372,10 +383,14 @@ server {
 
     # index.html 引用 chunk 文件名，绝不能缓存
     location = /index.html {
+        auth_request /api/v1/secure-entry/check;
+        error_page 401 = @secure_entry_denied;
         add_header Cache-Control "no-cache, must-revalidate";
     }
 
     location / {
+        auth_request /api/v1/secure-entry/check;
+        error_page 401 = @secure_entry_denied;
         try_files \$uri \$uri/ /index.html;
     }
 

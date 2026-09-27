@@ -846,7 +846,24 @@ curl -fsSL https://watchman.example.com/install?token=<enroll_token> | bash
 - 版本通道：`stable`（默认，GitHub `/releases/latest`，自动排除 pre-release）、`beta`（releases API 列表第一条，含 pre-release）、`--version` 精确锁定（优先级最高）。
 - 手动触发：workflow_dispatch 只构建打包、上传 artifacts，不创建 Release（正式打 tag 前验证管线用）。
 
-控制端一键安装脚本（`deploy/install.sh`，P2，未落地）：单二进制 + systemd；参数 `--version/--channel/--mirror/--base-url/--uninstall`；`--mirror`（或 `GITHUB_MIRROR` 环境变量）改写下载 URL 以走 GitHub 镜像，`--base-url` 允许整体替换下载源；重跑即升级（保留 `/opt/watchman/data` 与密钥），`--uninstall` 卸载（默认保留数据，`--purge` 才删）。
+控制端一键安装脚本（`deploy/install.sh`，P2，已落地 2026-09-27）：单二进制 + systemd，对标宝塔/1Panel：
+`curl -fsSL https://raw.githubusercontent.com/lizhixu/workbench/main/deploy/install.sh | bash`
+（合并到 main 前用 feature 分支的 raw URL）。
+参数：`--version v1.2.3`（优先级最高）/ `--channel stable|beta`（默认 stable）/
+`--mirror URL`（或 `GITHUB_MIRROR`）/ `--base-url URL`（完全自定义源，布局 `{base}/{tag}/watchman-dist-{tag}-linux-{arch}.tar.gz`）/
+`--repo` / `--port` / `--force` / `--uninstall` / `--purge` / `-y`。
+版本解析：stable 用 `/releases/latest` 的 302 落点取 tag（GitHub 自动排除 pre-release），
+beta 取 Release 列表第一项（含 pre-release）；仓库暂无正式版时 stable 明确报错并指引 beta/--version。
+流程：root+Linux+架构检测 → 依赖检查 → 版本解析 → 下载 tarball+CHECKSUMS.txt → sha256 校验 →
+停旧服务 → 解压到 /opt/watchman（`--strip-components=1`，不碰 data）→ web dist 落盘 →
+密钥只生成一次（`watchman.env`，升级复用）→ 写 systemd（server + 本机自纳管 agent，
+enroll token 只在无 agent-state.json 时申请）→ nginx 站点（配置与 `cmd/deploy/main.go` 同源，
+缺 nginx 时 Debian 系可 apt 自动装）→ 启动 → 健康检查（首页 200 + admin 登录）→ 打印访问信息。
+幂等：重跑=升级（保留 data 与密钥）；同版本默认跳过，`--force` 强制重装；
+`--uninstall` 默认保留数据，`--purge` 才删 /opt/watchman。
+已验证（2026-09-27）：bash -n、`--help`、stable/beta/--version 解析（打真实 GitHub API）、
+真实 test release 的下载+sha256 校验、nginx 配置渲染与 deploy/main.go 指令级一致、
+EXIT trap 退出码、`installed_version` 边界。systemd/nginx 真机安装未在本 VM 验证（无 systemd）。
 
 ## B.7 MVP 推进顺序（落地路线）
 

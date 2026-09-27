@@ -834,6 +834,20 @@ curl -fsSL https://watchman.example.com/install?token=<enroll_token> | bash
 | ai.mask_on_external | true | 外送脱敏 |
 | tunnel.cidr | 100.64.0.0/10 | 组网虚拟 IP 段 |
 
+### 发版流程（GitHub Actions + tag 驱动）
+
+版本唯一真相源是 git tag。`internal/version` 的 `Version`/`Commit`/`BuildTime` 由构建时 ldflags 注入（见 `Makefile` 的 `LDFLAGS`）；`Get()` 取值优先级：ldflags 注入 > `debug.ReadBuildInfo()`（`go install` 装 tagged commit 时工具链自带）> `0.1.0-dev` 占位。
+
+- 打 tag 即发版：`git tag v1.2.3 && git push --tags` 触发 `.github/workflows/release.yml`。
+- tag 规范：`v1.2.3` 为正式版；`v1.3.0-rc.1` / `v1.3.0-beta.1`（带 `-` 后缀）由 CI 自动标记为 pre-release。
+- 构建矩阵：server（linux amd64/arm64）+ agent（linux amd64/arm64、windows amd64），全部 `CGO_ENABLED=0` 静态编译。
+- 产物：`watchman-dist-v1.2.3-linux-{amd64,arm64}.tar.gz`（内含 `bin/` 二进制——agent 文件名遵循 `watchman-agent-{goos}-{goarch}` 以便 `install.FindAgentBinary` 直接找到、`web-dist.tar.gz`、`manifest.json`）+ `CHECKSUMS.txt`（sha256）。
+- `manifest.json`：`{version, commit, build_time, agents: {"linux/amd64": {file, sha256}, ...}}`。P1 起控制端启动时读取它，作为 agent 升级的版本/sha256 基准（替代 server 自身构建版本，解除"最新 = 控制端自己"的闭环）。
+- 版本通道：`stable`（默认，GitHub `/releases/latest`，自动排除 pre-release）、`beta`（releases API 列表第一条，含 pre-release）、`--version` 精确锁定（优先级最高）。
+- 手动触发：workflow_dispatch 只构建打包、上传 artifacts，不创建 Release（正式打 tag 前验证管线用）。
+
+控制端一键安装脚本（`deploy/install.sh`，P2，未落地）：单二进制 + systemd；参数 `--version/--channel/--mirror/--base-url/--uninstall`；`--mirror`（或 `GITHUB_MIRROR` 环境变量）改写下载 URL 以走 GitHub 镜像，`--base-url` 允许整体替换下载源；重跑即升级（保留 `/opt/watchman/data` 与密钥），`--uninstall` 卸载（默认保留数据，`--purge` 才删）。
+
 ## B.7 MVP 推进顺序（落地路线）
 
 1. **打通回连骨架**：`proto` 定义 → 控制端 gRPC server + Agent 反向 Connect + 注册/心跳；前端主机列表显示在线状态。

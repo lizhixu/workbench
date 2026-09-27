@@ -1,0 +1,171 @@
+# Release pipeline: tag-driven builds (see AGENTS.md B.6).
+#
+# Pushing a tag `v1.2.3` (or `v1.3.0-rc.1` for a pre-release) builds the
+# server + agent binaries, the web UI, assembles per-arch dist tarballs and
+# publishes them as a GitHub Release. install.sh (P2) downloads these
+# artifacts; the `stable` channel resolves via /releases/latest, `beta`
+# via the releases API, and --version pins an exact tag.
+#
+# Manual runs (workflow_dispatch) build + package only and upload the
+# tarballs as workflow artifacts — no release is created. Useful for
+# validating the pipeline before cutting a real tag.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version label for the dist tarball (e.g. v1.2.3-ci-test)'
+        required: true
+        default: 'v0.0.0-ci'
+
+permissions:
+  contents: write # create GitHub Releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Resolve version metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.version }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          case "$TAG" in v*) ;; *) TAG="v$TAG";; esac
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if [[ "$TAG" == *-* ]]; then PRERELEASE="true"; else PRERELEASE="false"; fi
+          {
+            echo "tag=$TAG"
+            echo "commit=$COMMIT"
+            echo "build_time=$BUILD_TIME"
+            echo "prerelease=$PRERELEASE"
+            echo "is_tag=$([ "${{ github.event_name }}" = "push" ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG commit=$COMMIT prerelease=$PRERELEASE"
+
+      - name: Build server + agent binaries
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          COMMIT="${{ steps.meta.outputs.commit }}"
+          BUILD_TIME="${{ steps.meta.outputs.build_time }}"
+          LDFLAGS="-s -w -X watchman/internal/version.Version=${TAG} -X watchman/internal/version.Commit=${COMMIT} -X watchman/internal/version.BuildTime=${BUILD_TIME}"
+          mkdir -p dist/bin
+          # control plane (linux only)
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchman-server-linux-amd64 ./server/cmd/watchman
+          GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchman-server-linux-arm64 ./server/cmd/watchman
+          # agent binaries, served to managed hosts per os/arch (see install.FindAgentBinary)
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchman-agent-linux-amd64 ./agent/cmd/watchman-agent
+          GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchman-agent-linux-arm64 ./agent/cmd/watchman-agent
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchman-agent-windows-amd64.exe ./agent/cmd/watchman-agent
+          # canonical bare name for linux/amd64 (matches deploy/main.go uploads)
+          cp dist/bin/watchman-agent-linux-amd64 dist/bin/watchman-agent
+          ls -la dist/bin
+
+      - name: Build web UI
+        run: |
+          set -euo pipefail
+          cd web
+          npm ci
+          npm run build
+          tar -czf ../dist/web-dist.tar.gz -C dist .
+
+      - name: Package dist tarballs
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          BUILD_TIME: ${{ steps.meta.outputs.build_time }}
+        run: |
+          set -euo pipefail
+          for ARCH in amd64 arm64; do
+            STAGE="stage-linux-${ARCH}"
+            mkdir -p "${STAGE}/bin"
+            cp "dist/bin/watchman-server-linux-${ARCH}" "${STAGE}/bin/watchman-server"
+            cp dist/bin/watchman-agent-linux-amd64 "${STAGE}/bin/"
+            cp dist/bin/watchman-agent-linux-arm64 "${STAGE}/bin/"
+            cp dist/bin/watchman-agent-windows-amd64.exe "${STAGE}/bin/"
+            cp dist/bin/watchman-agent "${STAGE}/bin/"
+            cp dist/web-dist.tar.gz "${STAGE}/"
+            if [ -f deploy/install.sh ]; then
+              cp deploy/install.sh "${STAGE}/"
+            else
+              echo "WARN: deploy/install.sh not present yet (lands in P2); skipping"
+            fi
+            # manifest.json: release version + source commit + per-arch agent sha256.
+            # The control plane (P1) reads it as the source of truth for agent
+            # upgrades; install.sh (P2) writes it to /opt/watchman.
+            sha_amd64="$(sha256sum "${STAGE}/bin/watchman-agent-linux-amd64" | cut -d' ' -f1)"
+            sha_arm64="$(sha256sum "${STAGE}/bin/watchman-agent-linux-arm64" | cut -d' ' -f1)"
+            sha_win="$(sha256sum "${STAGE}/bin/watchman-agent-windows-amd64.exe" | cut -d' ' -f1)"
+            jq -n \
+              --arg version "$TAG" \
+              --arg commit "$COMMIT" \
+              --arg build_time "$BUILD_TIME" \
+              --arg sha_amd64 "$sha_amd64" \
+              --arg sha_arm64 "$sha_arm64" \
+              --arg sha_win "$sha_win" \
+              '{
+                version: $version,
+                commit: $commit,
+                build_time: $build_time,
+                agents: {
+                  "linux/amd64":   {file: "bin/watchman-agent-linux-amd64",   sha256: $sha_amd64},
+                  "linux/arm64":   {file: "bin/watchman-agent-linux-arm64",   sha256: $sha_arm64},
+                  "windows/amd64": {file: "bin/watchman-agent-windows-amd64.exe", sha256: $sha_win}
+                }
+              }' > "${STAGE}/manifest.json"
+            tar -czf "dist/watchman-dist-${TAG}-linux-${ARCH}.tar.gz" -C "${STAGE}" .
+            rm -rf "${STAGE}"
+          done
+          (cd dist && sha256sum watchman-dist-*.tar.gz > CHECKSUMS.txt)
+          ls -la dist/*.tar.gz dist/CHECKSUMS.txt
+
+      - name: Create GitHub Release
+        if: steps.meta.outputs.is_tag == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          ARGS=(--title "$TAG" --generate-notes)
+          if [ "${{ steps.meta.outputs.prerelease }}" = "true" ]; then
+            ARGS+=(--prerelease)
+          fi
+          gh release create "$TAG" "${ARGS[@]}" dist/watchman-dist-*.tar.gz dist/CHECKSUMS.txt
+
+      - name: Upload dist artifacts (manual run only)
+        if: steps.meta.outputs.is_tag != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: watchman-dist-${{ steps.meta.outputs.tag }}
+          path: |
+            dist/watchman-dist-*.tar.gz
+            dist/CHECKSUMS.txt

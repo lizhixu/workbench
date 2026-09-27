@@ -5,7 +5,9 @@
 # specific release with `make VERSION=v1.2.3 build-all`; otherwise the version
 # is derived from git.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 0.1.0-dev)
-LDFLAGS := -s -w -X watchman/internal/version.Version=$(VERSION)
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS := -s -w -X watchman/internal/version.Version=$(VERSION) -X watchman/internal/version.Commit=$(COMMIT) -X watchman/internal/version.BuildTime=$(BUILD_TIME)
 
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)

@@ -14,6 +14,14 @@ import "runtime/debug"
 // See the Makefile targets build-server / build-agent / build-all.
 var Version = "0.1.0-dev"
 
+// Commit is the git commit SHA the binary was built from (short form).
+// Injected at build time; empty for plain `go build` without ldflags.
+var Commit = ""
+
+// BuildTime is the UTC timestamp the binary was built at (RFC3339).
+// Injected at build time; empty for plain `go build` without ldflags.
+var BuildTime = ""
+
 // devVersion is the placeholder used when no version was injected.
 const devVersion = "0.1.0-dev"
 

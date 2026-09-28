@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { defineAsyncComponent, onMounted, ref, watch } from 'vue'
+import { defineAsyncComponent, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NSpin, NIcon, useMessage, NTooltip } from 'naive-ui'
 import { getHost } from '../../api/hosts'
@@ -88,6 +88,45 @@ watch(
   },
 )
 
+let pollTimer: any = null
+
+function checkPolling() {
+  if (host.value?.upgrading) {
+    if (!pollTimer) {
+      pollTimer = setInterval(async () => {
+        try {
+          const hostId = route.params.id as string
+          if (!hostId || route.name !== 'host-detail') return
+          const updated = await getHost(hostId)
+          host.value = updated
+          if (!updated.upgrading && pollTimer) {
+            clearInterval(pollTimer)
+            pollTimer = null
+          }
+        } catch {
+          // ignore
+        }
+      }, 3000)
+    }
+  } else {
+    if (pollTimer) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
+  }
+}
+
+watch(() => host.value?.upgrading, () => {
+  checkPolling()
+})
+
+onUnmounted(() => {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+})
+
 async function load() {
   loading.value = true
   try {
@@ -104,6 +143,7 @@ async function load() {
     message.error(e.message || '加载主机信息失败')
   } finally {
     loading.value = false
+    checkPolling()
   }
 }
 

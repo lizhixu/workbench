@@ -92,6 +92,10 @@ type HostDTO struct {
 	SwapUsage float64 `json:"swap_usage"`
 	MonthRx   int64   `json:"month_rx"`
 	MonthTx   int64   `json:"month_tx"`
+	// In-progress upgrade tracking (survives page refreshes until reconnected or timeout).
+	Upgrading     bool   `json:"upgrading"`
+	UpgradeStage  string `json:"upgrade_stage,omitempty"`
+	UpgradeTarget string `json:"upgrade_target,omitempty"`
 }
 
 // Router builds the gin engine with all routes mounted under /api/v1.
@@ -1639,6 +1643,7 @@ func (h *handlers) upgradeAgent(c *gin.Context) {
 	if h.alertMon != nil {
 		h.alertMon.SetHostMaintenance(agentID, 180*time.Second, "agent_upgrade")
 	}
+	h.reg.SetAgentUpgrading(agentID, body.Version)
 
 	if body.Sha256 == "" {
 		// Prefer the release manifest: its sha256 matches the binaries in
@@ -2079,6 +2084,11 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 			}
 		}
 	}
+	if upg := h.reg.GetAgentUpgrade(a.ID); upg != nil {
+		dto.Upgrading = true
+		dto.UpgradeStage = upg.Stage
+		dto.UpgradeTarget = upg.TargetVersion
+	}
 	return dto
 }
 
@@ -2311,6 +2321,7 @@ func (h *handlers) upgradeAgentsBatch(c *gin.Context) {
 		if h.alertMon != nil {
 			h.alertMon.SetHostMaintenance(a.ID, 180*time.Second, "agent_upgrade")
 		}
+		h.reg.SetAgentUpgrading(a.ID, targetVersion)
 
 		osName := strings.ToLower(a.OS)
 		if osName == "" {

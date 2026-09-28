@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
-import { NButton, NIcon, NPopconfirm, useMessage } from 'naive-ui'
+import { NButton, NIcon, NPopconfirm, NSpin, useMessage } from 'naive-ui'
 import {
   PowerOutline,
   ChevronUpOutline,
@@ -15,6 +15,7 @@ import { listNetworkNodes } from '../../api/network'
 import type { Host } from '../../api/types'
 import type { NetworkNode } from '../../api/network'
 import { copyToClipboard } from '../../utils/clipboard'
+import { formatUpgradeStage } from '../../utils/upgrade'
 import { useAuthStore } from '../../stores/auth'
 
 const props = defineProps<{
@@ -148,23 +149,23 @@ async function handlePowerOff() {
 	  }
 	}
 
-		async function handleUpgradeAgent() {
-		  if (props.host.status !== 'online') {
-		    message.warning('主机已离线，无法下发在线升级指令')
-		    return
-		  }
-		  upgrading.value = true
-		  message.info('正在向 Agent 下发热升级任务，下载并替换二进制中…')
-		  try {
-		    const res = await upgradeAgent(props.host.id)
-		    message.success(res.message || 'Agent 升级成功，正在重启自愈连线！')
-		    emit('refresh')
-		  } catch (e: any) {
-		    message.error(e.message || 'Agent 升级失败')
-		  } finally {
-		    upgrading.value = false
-		  }
-		}
+  async function handleUpgradeAgent() {
+    if (props.host.status !== 'online') {
+      message.warning('主机已离线，无法下发在线升级指令')
+      return
+    }
+    upgrading.value = true
+    message.info('正在向 Agent 下发热升级任务，下载并替换二进制中…')
+    try {
+      const res = await upgradeAgent(props.host.id)
+      message.success(res.message || '已成功下发升级任务，正在后台更新中！')
+      emit('refresh')
+    } catch (e: any) {
+      message.error(e.message || 'Agent 升级失败')
+    } finally {
+      upgrading.value = false
+    }
+  }
 
 const hasBillingOrTraffic = computed(() => {
   const h = props.host
@@ -285,7 +286,15 @@ const expiryTooltip = computed(() => {
             <span class="spec-label">Agent</span>
             <div class="agent-version-wrap">
               <span class="spec-value mono-font">{{ host.agent_version || '-' }}</span>
-              <NPopconfirm v-if="isAdmin && host.status === 'online'" @positive-click="handleUpgradeAgent">
+              <span
+                v-if="host.upgrading"
+                class="upgrading-badge"
+                :title="`Agent 正在升级至 ${host.upgrade_target || '最新版'}${host.upgrade_stage ? ` (${formatUpgradeStage(host.upgrade_stage)})` : ''}`"
+              >
+                <NSpin :size="12" style="margin-right: 4px;" />
+                <span>{{ host.upgrade_stage ? formatUpgradeStage(host.upgrade_stage) : '升级中' }}</span>
+              </span>
+              <NPopconfirm v-else-if="isAdmin && host.status === 'online'" @positive-click="handleUpgradeAgent">
                 <template #trigger>
                   <button
                     class="upgrade-agent-btn"
@@ -513,6 +522,17 @@ const expiryTooltip = computed(() => {
         display: flex;
         align-items: center;
         gap: 6px;
+
+        .upgrading-badge {
+          display: inline-flex;
+          align-items: center;
+          padding: 1px 6px;
+          border-radius: 4px;
+          background: rgba(99, 102, 241, 0.12);
+          color: #6366f1;
+          font-size: 11px;
+          font-weight: 500;
+        }
 
         .upgrade-agent-btn {
           display: inline-flex;

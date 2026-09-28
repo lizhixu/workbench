@@ -57,14 +57,22 @@ type persistedAgent struct {
 // persisted to disk (dataDir/agents.json) so a server restart does not
 // invalidate already-installed agents.
 type Registry struct {
-	mu      sync.RWMutex
-	agents  map[string]*Agent        // by agent_id (persisted)
-	tokens  map[string]string        // auth_token -> agent_id (persisted; mirror of Agent.AuthToken for fast lookup)
-	hubs    map[string]*Hub          // by agent_id (only when connected; runtime-only)
-	enroll  map[string]*enrollTicket // enroll_token -> ticket (in-memory MVP)
-	tunnel  *Coordinator             // reverse TCP tunnels (nil = disabled)
-	dataDir string
-	log     *slog.Logger
+	mu       sync.RWMutex
+	agents   map[string]*Agent        // by agent_id (persisted)
+	tokens   map[string]string        // auth_token -> agent_id (persisted; mirror of Agent.AuthToken for fast lookup)
+	hubs     map[string]*Hub          // by agent_id (only when connected; runtime-only)
+	enroll   map[string]*enrollTicket // enroll_token -> ticket (in-memory MVP)
+	upgrades map[string]*UpgradeState // agent_id -> active upgrade state
+	tunnel   *Coordinator             // reverse TCP tunnels (nil = disabled)
+	dataDir  string
+	log      *slog.Logger
+}
+
+type UpgradeState struct {
+	TargetVersion string    `json:"target_version"`
+	Stage         string    `json:"stage"` // "dispatched", "downloading", "verifying", "replacing", "restarting", "error"
+	StartedAt     time.Time `json:"started_at"`
+	Error         string    `json:"error,omitempty"`
 }
 
 type enrollTicket struct {
@@ -145,12 +153,13 @@ func NewRegistry(dataDir string, log *slog.Logger) *Registry {
 		log = slog.Default()
 	}
 	r := &Registry{
-		agents:  make(map[string]*Agent),
-		hubs:    make(map[string]*Hub),
-		tokens:  make(map[string]string),
-		enroll:  make(map[string]*enrollTicket),
-		dataDir: dataDir,
-		log:     log,
+		agents:   make(map[string]*Agent),
+		hubs:     make(map[string]*Hub),
+		tokens:   make(map[string]string),
+		enroll:   make(map[string]*enrollTicket),
+		upgrades: make(map[string]*UpgradeState),
+		dataDir:  dataDir,
+		log:      log,
 	}
 	if dataDir != "" {
 		if err := r.loadAgents(); err != nil {
@@ -368,6 +377,11 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 		applyReg(a, req)
 		a.Status = "online"
 		a.LastSeen = time.Now()
+		if upg, ok := r.upgrades[agentID]; ok {
+			if req.GetAgentVersion() == upg.TargetVersion || req.GetReconnectReason() == "upgrade" || upg.TargetVersion == "" {
+				delete(r.upgrades, agentID)
+			}
+		}
 		_ = r.persistAgentsLocked() // persist updated hostname/os/etc.
 
 		hub := newHub(agentID, heartbeatSec, r)
@@ -415,6 +429,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 		AuthToken:  authTokenNew,
 	}
 	applyReg(a, req)
+	delete(r.upgrades, agentID)
 	r.agents[agentID] = a
 	r.tokens[authTokenNew] = agentID
 	_ = r.persistAgentsLocked() // safe: caller holds r.mu
@@ -544,6 +559,60 @@ func (r *Registry) ClearReconnectReason(id string) {
 	if a, ok := r.agents[id]; ok {
 		a.ReconnectReason = ""
 	}
+}
+
+// SetAgentUpgrading marks an agent as actively undergoing an upgrade.
+func (r *Registry) SetAgentUpgrading(agentID, targetVersion string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.upgrades[agentID] = &UpgradeState{
+		TargetVersion: targetVersion,
+		Stage:         "dispatched",
+		StartedAt:     time.Now(),
+	}
+}
+
+// SetAgentUpgradeProgress updates the current progress stage of an agent upgrade.
+func (r *Registry) SetAgentUpgradeProgress(agentID, stage, errStr string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st, ok := r.upgrades[agentID]
+	if !ok {
+		st = &UpgradeState{
+			StartedAt: time.Now(),
+		}
+		r.upgrades[agentID] = st
+	}
+	if stage != "" {
+		st.Stage = stage
+	}
+	if errStr != "" {
+		st.Error = errStr
+	}
+}
+
+// GetAgentUpgrade returns the active upgrade state for an agent, if any.
+// States older than 180 seconds are automatically expired.
+func (r *Registry) GetAgentUpgrade(agentID string) *UpgradeState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st, ok := r.upgrades[agentID]
+	if !ok {
+		return nil
+	}
+	if time.Since(st.StartedAt) > 180*time.Second {
+		delete(r.upgrades, agentID)
+		return nil
+	}
+	cp := *st
+	return &cp
+}
+
+// ClearAgentUpgrade removes the upgrade state for an agent.
+func (r *Registry) ClearAgentUpgrade(agentID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.upgrades, agentID)
 }
 
 // HostBillingConfig carries optional user-managed finance, traffic quota and note configs for a host.
@@ -707,6 +776,7 @@ func (r *Registry) DeleteAgent(id string) error {
 	}
 	delete(r.agents, id)
 	delete(r.hubs, id)
+	delete(r.upgrades, id)
 	// Clean up auth tokens pointing to this agent.
 	for tok, aid := range r.tokens {
 		if aid == id {
@@ -912,6 +982,9 @@ func (h *Hub) handleAgentMessage(msg *agentpb.AgentMessage) error {
 		return nil
 	case *agentpb.AgentMessage_UpgradeProgress:
 		h.dispatchResp("upgrade", msg)
+		if h.registry != nil && p.UpgradeProgress != nil {
+			h.registry.SetAgentUpgradeProgress(h.AgentID, p.UpgradeProgress.GetStage(), p.UpgradeProgress.GetError())
+		}
 		return nil
 	case *agentpb.AgentMessage_TunnelData:
 		if h.tunnel != nil {

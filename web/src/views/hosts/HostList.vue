@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, computed, h } from 'vue'
+import { onMounted, onUnmounted, watch, ref, computed, h } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NButton,
@@ -48,6 +48,7 @@ import { enroll, deleteHost, setHostGroup, upgradeAgent } from '../../api/hosts'
 import { listNetworkNodes } from '../../api/network'
 import { listGroups, type HostGroup } from '../../api/groups'
 import { copyToClipboard } from '../../utils/clipboard'
+import { formatUpgradeStage } from '../../utils/upgrade'
 import type { Host } from '../../api/types'
 import type { NetworkNode } from '../../api/network'
 
@@ -338,8 +339,9 @@ function handleMenuSelect(key: string, host: Host) {
         message.loading('正在下发升级指令并等待 Agent 替换重启…', { duration: 6000 })
         try {
           const res = await upgradeAgent(host.id)
-          message.success(res.message || 'Agent 升级成功，正在重启自愈连线！')
-          setTimeout(() => store.fetchList(), 4000)
+          message.success(res.message || '已成功下发升级指令，正在后台更新中！')
+          await store.fetchList()
+          checkPolling()
         } catch (e: any) {
           message.error(e.message || 'Agent 升级失败')
         }
@@ -515,15 +517,45 @@ async function copyIp(ip?: string) {
   }
 }
 
+const isAnyUpgrading = computed(() => store.hosts.some((h) => h.upgrading))
+let pollTimer: any = null
+
+function checkPolling() {
+  if (isAnyUpgrading.value) {
+    if (!pollTimer) {
+      pollTimer = setInterval(() => {
+        store.fetchList().catch(() => {})
+      }, 3000)
+    }
+  } else {
+    if (pollTimer) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
+  }
+}
+
+watch(isAnyUpgrading, () => {
+  checkPolling()
+})
+
 async function refresh() {
   await Promise.all([store.fetchList(), loadGroups(), loadNetworkNodes()])
+  checkPolling()
 }
 
 onMounted(() => {
   workspace.setActiveKey('/hosts')
-  store.fetchList().catch((e) => message.error(e.message))
+  store.fetchList().catch((e) => message.error(e.message)).finally(() => checkPolling())
   loadGroups()
   loadNetworkNodes()
+})
+
+onUnmounted(() => {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
 })
 </script>
 
@@ -632,6 +664,15 @@ onMounted(() => {
             <!-- 3. 开机状态 Pill 标签 -->
             <div class="col-status">
               <div
+                v-if="host.upgrading"
+                class="uptime-pill is-upgrading"
+                :title="`Agent 正在升级至 ${host.upgrade_target || '最新版'}${host.upgrade_stage ? ` (${formatUpgradeStage(host.upgrade_stage)})` : ''}`"
+              >
+                <NSpin :size="12" style="margin-right: 4px;" />
+                升级中{{ host.upgrade_stage ? ` (${formatUpgradeStage(host.upgrade_stage)})` : '' }}
+              </div>
+              <div
+                v-else
                 class="uptime-pill"
                 :class="{ 'is-online': host.status === 'online', 'is-offline': host.status !== 'online' }"
               >
@@ -947,6 +988,11 @@ onMounted(() => {
               &.is-offline {
                 background-color: rgba(148, 163, 184, 0.15);
                 color: #94a3b8;
+              }
+
+              &.is-upgrading {
+                background-color: rgba(99, 102, 241, 0.12);
+                color: #6366f1;
               }
             }
           }

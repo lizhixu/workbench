@@ -36,6 +36,10 @@ export interface Host {
   distro: string
   agent_version: string
   status: 'online' | 'offline' | 'maintenance'
+  // In-progress agent upgrade state tracking
+  upgrading?: boolean
+  upgrade_stage?: string
+  upgrade_target?: string
   last_seen: string
   registered: string
   group: string

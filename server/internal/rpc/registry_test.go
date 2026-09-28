@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 	"time"
@@ -192,5 +193,65 @@ func TestSendConcurrentUnbindNoStarvationOrPanic(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Send hung and did not recover on channel close")
+	}
+}
+
+func TestAgentUpgradeStateTrackingAndCleanup(t *testing.T) {
+	r := NewRegistry("", slog.Default())
+	agentID := "test-upg-agent"
+
+	// 1. Initial state: nil
+	if upg := r.GetAgentUpgrade(agentID); upg != nil {
+		t.Fatalf("expected nil upgrade state initially, got %+v", upg)
+	}
+
+	// 2. Set upgrading
+	r.SetAgentUpgrading(agentID, "v1.0.0")
+	upg := r.GetAgentUpgrade(agentID)
+	if upg == nil || upg.TargetVersion != "v1.0.0" || upg.Stage != "dispatched" {
+		t.Fatalf("expected dispatched state, got %+v", upg)
+	}
+
+	// 3. Update progress stage
+	r.SetAgentUpgradeProgress(agentID, "downloading", "")
+	upg = r.GetAgentUpgrade(agentID)
+	if upg == nil || upg.Stage != "downloading" {
+		t.Fatalf("expected downloading stage, got %+v", upg)
+	}
+
+	// 4. Simulate agent reconnecting with target version
+	req := &agentpb.RegisterRequest{
+		EnrollToken:     r.IssueEnrollToken(),
+		AgentId:         agentID,
+		Hostname:        "test-host",
+		AgentVersion:    "v1.0.0",
+		ReconnectReason: "upgrade",
+	}
+	_, _, err := r.Register(context.Background(), req, "")
+	if err != nil {
+		t.Fatalf("register failed: %v", err)
+	}
+
+	// Upgrade state should be cleared upon successful registration
+	if upg := r.GetAgentUpgrade(agentID); upg != nil {
+		t.Fatalf("expected upgrade state to be cleared after reconnect, got %+v", upg)
+	}
+
+	// 5. Test reconnect branch
+	r.SetAgentUpgrading(agentID, "v1.0.1")
+	if upg := r.GetAgentUpgrade(agentID); upg == nil || upg.TargetVersion != "v1.0.1" {
+		t.Fatalf("expected v1.0.1 upgrading state, got %+v", upg)
+	}
+	reqReconnect := &agentpb.RegisterRequest{
+		AgentId:         agentID,
+		AgentVersion:    "v1.0.1",
+		ReconnectReason: "upgrade",
+	}
+	_, _, err = r.Register(context.Background(), reqReconnect, "")
+	if err != nil {
+		t.Fatalf("reconnect register failed: %v", err)
+	}
+	if upg := r.GetAgentUpgrade(agentID); upg != nil {
+		t.Fatalf("expected upgrade state to be cleared after version match on reconnect, got %+v", upg)
 	}
 }

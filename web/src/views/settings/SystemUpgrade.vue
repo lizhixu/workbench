@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch, onUnmounted } from 'vue'
 import {
   NCard, NSpace, NTag, NButton, NAlert, NPopconfirm,
   NIcon, useMessage, NDescriptions, NDescriptionsItem, NUpload,
-  NModal, NProgress, NDivider, NSwitch,
+  NModal, NProgress, NDivider, NSwitch, NSpin,
 } from 'naive-ui'
 import {
   RocketOutline, CloudUploadOutline, RefreshOutline, ArrowUpCircleOutline,
@@ -14,6 +14,7 @@ import { health, listHosts } from '../../api/hosts'
 import { SETTING_KEYS, getSystemSettings, saveSystemSettings } from '../../api/settings'
 import { useAuthStore } from '../../stores/auth'
 import type { Host } from '../../api/types'
+import { formatUpgradeStage } from '../../utils/upgrade'
 
 const auth = useAuthStore()
 const isAdmin = computed(() => auth.role === 'admin')
@@ -52,6 +53,46 @@ const outdatedHosts = computed(() => {
 const onlineHosts = computed(() => hosts.value.filter((h) => h.status === 'online'))
 const targetUpgradeHosts = computed(() => isForceUpgrade.value ? onlineHosts.value : outdatedHosts.value)
 
+// 追踪当前正在执行升级的主机与轮询器
+const upgradingHosts = computed(() => hosts.value.filter((h) => h.upgrading))
+const isAnyUpgrading = computed(() => upgradingHosts.value.length > 0)
+let pollTimer: any = null
+
+function checkPolling() {
+  if (isAnyUpgrading.value) {
+    if (!pollTimer) {
+      pollTimer = setInterval(async () => {
+        try {
+          const [hRes, hList] = await Promise.all([
+            health().catch(() => null),
+            listHosts().catch(() => ({ data: [] })),
+          ])
+          if (hRes) healthData.value = hRes
+          if (hList?.data) hosts.value = hList.data
+        } catch {
+          // ignore
+        }
+      }, 3000)
+    }
+  } else {
+    if (pollTimer) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
+  }
+}
+
+watch(isAnyUpgrading, () => {
+  checkPolling()
+})
+
+onUnmounted(() => {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+})
+
 // 控制端运行环境取自 /system/health，避免展示硬编码的假数据
 const runtimeEnv = computed(() => {
   const os = healthData.value?.os
@@ -62,8 +103,8 @@ const runtimeEnv = computed(() => {
 
 const serverHealthy = computed(() => healthData.value?.ok === true)
 
-async function refreshData() {
-  loading.value = true
+async function refreshData(silent = false) {
+  if (!silent) loading.value = true
   try {
     const [hRes, hList] = await Promise.all([
       health().catch(() => null),
@@ -72,7 +113,8 @@ async function refreshData() {
     healthData.value = hRes
     hosts.value = hList.data || []
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
+    checkPolling()
   }
 }
 
@@ -157,12 +199,10 @@ async function doBatchUpgradeAgents(force = false) {
     const res = await batchUpgradeAgents([], force)
     message.success(res.message || '已成功下发批量升级任务')
     showBatchUpgradeModal.value = false
-    setTimeout(() => {
-      refreshData()
-      batchUpgrading.value = false
-    }, 5000)
+    await refreshData(true)
   } catch (e: any) {
     message.error(e.message || '批量升级失败')
+  } finally {
     batchUpgrading.value = false
   }
 }
@@ -222,7 +262,7 @@ onMounted(() => {
     </template>
     <template #header-extra>
       <NSpace align="center" :size="8">
-        <NButton size="small" quaternary :loading="loading" @click="refreshData">
+        <NButton size="small" quaternary :loading="loading" @click="() => refreshData(false)">
           <template #icon><NIcon><RefreshOutline /></NIcon></template>
           刷新
         </NButton>
@@ -323,7 +363,11 @@ onMounted(() => {
             <div class="section-header">
               <div class="title-wrap">
                 <span class="sec-title">被管端 Agent (全网批量维护)</span>
-                <NTag v-if="outdatedHosts.length > 0" size="small" type="warning" :bordered="false" round>
+                <NTag v-if="isAnyUpgrading" size="small" type="info" :bordered="false" round>
+                  <template #icon><NSpin :size="12" style="margin-right: 4px;" /></template>
+                  {{ upgradingHosts.length }} 台正在升级中
+                </NTag>
+                <NTag v-else-if="outdatedHosts.length > 0" size="small" type="warning" :bordered="false" round>
                   {{ outdatedHosts.length }} 台需升级
                 </NTag>
                 <NTag v-else size="small" type="success" :bordered="false" round>
@@ -333,6 +377,12 @@ onMounted(() => {
               <p class="sec-desc">
                 自动比对全网已纳管主机的 Agent 版本。支持一键并发批量下发自升级指令，并自动开启 3 分钟维护静默期，平滑升级零假告警。
               </p>
+              <NAlert v-if="isAnyUpgrading" type="info" :bordered="false" style="margin-top: 10px">
+                <template #icon>
+                  <NSpin :size="14" />
+                </template>
+                正在执行后台升级中（{{ upgradingHosts.map(h => `${h.hostname}${h.upgrade_stage ? ` [${formatUpgradeStage(h.upgrade_stage)}]` : ''}`).join('、') }}），已开启 3 分钟维护静默期，请稍候...
+              </NAlert>
             </div>
 
             <div class="sec-actions">
@@ -341,25 +391,27 @@ onMounted(() => {
                   v-if="isAdmin && outdatedHosts.length > 0"
                   type="primary"
                   size="small"
-                  :loading="batchUpgrading"
+                  :loading="batchUpgrading || isAnyUpgrading"
+                  :disabled="isAnyUpgrading"
                   @click="openBatchUpgrade(false)"
                 >
                   <template #icon><NIcon :component="ArrowUpCircleOutline" /></template>
-                  一键批量升级过时 Agent ({{ outdatedHosts.length }}台)
+                  {{ isAnyUpgrading ? '正在批量升级中...' : `一键批量升级过时 Agent (${outdatedHosts.length}台)` }}
                 </NButton>
 
                 <NButton
                   v-if="isAdmin && outdatedHosts.length === 0 && onlineHosts.length > 0"
                   size="small"
-                  :loading="batchUpgrading"
+                  :loading="batchUpgrading || isAnyUpgrading"
+                  :disabled="isAnyUpgrading"
                   @click="openBatchUpgrade(true)"
                 >
                   <template #icon><NIcon :component="ArrowUpCircleOutline" /></template>
-                  强制重推升级 ({{ onlineHosts.length }}台)
+                  {{ isAnyUpgrading ? '正在批量升级中...' : `强制重推升级 (${onlineHosts.length}台)` }}
                 </NButton>
 
                 <span v-if="onlineHosts.length === 0" class="muted-hint">当前没有在线主机</span>
-                <span v-else-if="outdatedHosts.length === 0" class="muted-hint">
+                <span v-else-if="!isAnyUpgrading && outdatedHosts.length === 0" class="muted-hint">
                   <NIcon :component="CheckmarkCircleOutline" color="#10b981" style="vertical-align: middle; margin-right: 4px;" />
                   当前所有在线主机已运行最新版本 Agent
                 </span>

@@ -850,14 +850,16 @@ curl -fsSL https://watchman.example.com/install?token=<enroll_token> | bash
 - 版本通道：`stable`（默认，GitHub `/releases/latest`，自动排除 pre-release）、`beta`（releases API 列表第一条，含 pre-release）、`--version` 精确锁定（优先级最高）。
 - 手动触发：workflow_dispatch 只构建打包、上传 artifacts，不创建 Release（正式打 tag 前验证管线用）。
 
-控制端一键安装脚本（`deploy/install.sh`，P2，已落地 2026-09-27）：单二进制 + systemd，对标宝塔/1Panel：
+控制端一键安装脚本（`deploy/install.sh`，P2，已落地 2026-09-27；2026-09-28 去掉 `--channel`）：单二进制 + systemd，对标宝塔/1Panel：
 `curl -fsSL https://raw.githubusercontent.com/lizhixu/workbench/main/deploy/install.sh | bash`
 （合并到 main 前用 feature 分支的 raw URL）。
-参数：`--version v1.2.3`（优先级最高）/ `--channel stable|beta`（默认 stable）/
+参数：`--version v1.2.3`（精确锁定，优先级最高）/
 `--mirror URL`（或 `GITHUB_MIRROR`）/ `--base-url URL`（完全自定义源，布局 `{base}/{tag}/watchman-dist-{tag}-linux-{arch}.tar.gz`）/
 `--repo` / `--port` / `--force` / `--uninstall` / `--purge` / `-y`。
-版本解析：stable 用 `/releases/latest` 的 302 落点取 tag（GitHub 自动排除 pre-release），
-beta 取 Release 列表第一项（含 pre-release）；仓库暂无正式版时 stable 明确报错并指引 beta/--version。
+版本解析：默认跟踪正式版（`/releases/latest` 的 302 落点取 tag，GitHub 自动排除 pre-release）；
+测试版改由面板开关控制——「系统设置 → 系统升级」中的「加入测试计划」（后端键 `system.join_beta_program`，system 域/Bool/默认 false，管理员专属），
+install.sh 升级时从 `$DATA_DIR/settings.json` 的 system 域读取该开关，开启则取 Release 列表第一项（含 pre-release）。
+仓库暂无正式版且未加入测试计划时明确报错，指引 `--version` 或去面板开测试计划。
 流程：root+Linux+架构检测 → 依赖检查 → 版本解析 → 下载 tarball+CHECKSUMS.txt → sha256 校验 →
 停旧服务 → 解压到 /opt/watchman（`--strip-components=1`，不碰 data）→
 密钥只生成一次（`watchman.env`，升级复用）→ 写 systemd（server 直接监听 `--port`（默认 18789，冷门端口，不占业务常用的 80/8080）同时提供 Web 页面与 API，无需 nginx；server + 本机自纳管 agent，

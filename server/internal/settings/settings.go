@@ -155,6 +155,10 @@ var Definitions = []Definition{
 	{Key: "security.secure_entry_enabled", Scope: ScopeSystem, Kind: KindBool, Title: "安全入口", Default: false},
 	{Key: "security.secure_entry_path", Scope: ScopeSystem, Kind: KindString, Title: "安全入口路径", Default: "",
 		MaxLen: 64, Validate: validateSecureEntryPath},
+	// 测试计划：开启后，控制端升级（重跑 deploy/install.sh）会跟踪预发布版本
+	// （含 pre-release 的 GitHub Release）；关闭则只跟踪正式版。system 域，
+	// 管理员专属。install.sh 在升级时从 <data>/settings.json 的 system 域读取。
+	{Key: "system.join_beta_program", Scope: ScopeSystem, Kind: KindBool, Title: "加入测试计划", Default: false},
 }
 
 // validateAbsPath accepts an empty value (OS default applies) or an absolute

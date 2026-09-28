@@ -3,7 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import {
   NCard, NSpace, NTag, NButton, NAlert, NPopconfirm,
   NIcon, useMessage, NDescriptions, NDescriptionsItem, NUpload,
-  NModal, NProgress,
+  NModal, NProgress, NDivider, NSwitch,
 } from 'naive-ui'
 import {
   RocketOutline, CloudUploadOutline, RefreshOutline, ArrowUpCircleOutline,
@@ -11,6 +11,7 @@ import {
 } from '@vicons/ionicons5'
 import { uploadServerBinary, restartServer, batchUpgradeAgents, type ServerUpgradeResult } from '../../api/upgrade'
 import { health, listHosts } from '../../api/hosts'
+import { SETTING_KEYS, getSystemSettings, saveSystemSettings } from '../../api/settings'
 import { useAuthStore } from '../../stores/auth'
 import type { Host } from '../../api/types'
 
@@ -157,8 +158,44 @@ async function doBatchUpgradeAgents(force = false) {
   }
 }
 
+// 加入测试计划（仅管理员）：控制安装脚本升级时跟踪的版本通道。
+// 开启后，重跑 deploy/install.sh 会解析含 pre-release 的最新版本；
+// 关闭则只跟踪正式版。后端键 system.join_beta_program（system 域）。
+const betaProgram = ref(false)
+const betaLoading = ref(false)
+const betaSaving = ref(false)
+
+async function loadBetaProgram() {
+  if (!isAdmin.value) return
+  betaLoading.value = true
+  try {
+    const res = await getSystemSettings()
+    betaProgram.value = res.data[SETTING_KEYS.joinBetaProgram] === true
+  } catch (e: any) {
+    message.error(e?.message || '加载测试计划配置失败')
+  } finally {
+    betaLoading.value = false
+  }
+}
+
+async function onBetaProgramChange(v: boolean) {
+  betaSaving.value = true
+  try {
+    await saveSystemSettings({ [SETTING_KEYS.joinBetaProgram]: v })
+    message.success(v
+      ? '已加入测试计划：下次用安装脚本升级时会跟踪预发布版本'
+      : '已退出测试计划：升级时只跟踪正式版')
+  } catch (e: any) {
+    message.error(e?.message || '保存失败')
+    betaProgram.value = !v
+  } finally {
+    betaSaving.value = false
+  }
+}
+
 onMounted(() => {
   refreshData()
+  loadBetaProgram()
 })
 </script>
 
@@ -242,6 +279,24 @@ onMounted(() => {
                 </NPopconfirm>
               </NSpace>
             </div>
+
+            <!-- 测试计划：决定安装脚本升级时跟踪正式版还是预发布版（仅管理员） -->
+            <template v-if="isAdmin">
+              <NDivider style="margin: 12px 0" />
+              <div class="beta-row">
+                <div class="beta-text">
+                  <div class="beta-title">加入测试计划</div>
+                  <p class="sec-desc" style="margin: 4px 0 0">
+                    开启后，通过安装脚本升级控制端时会跟踪预发布版本（含 pre-release），第一时间体验新功能；关闭则只跟踪正式版，更加稳定。立即生效，下次重跑安装脚本时起作用。
+                  </p>
+                </div>
+                <NSwitch
+                  v-model:value="betaProgram"
+                  :loading="betaLoading || betaSaving"
+                  @update:value="onBetaProgramChange"
+                />
+              </div>
+            </template>
           </div>
         </div>
 
@@ -445,6 +500,23 @@ onMounted(() => {
       .muted-hint {
         font-size: 12px;
         color: var(--n-text-color-3);
+      }
+    }
+
+    .beta-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+
+      .beta-text {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .beta-title {
+        font-weight: 700;
+        font-size: 13px;
       }
     }
   }

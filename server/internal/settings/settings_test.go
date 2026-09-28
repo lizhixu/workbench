@@ -255,10 +255,10 @@ func TestSchemaAndEffective(t *testing.T) {
 		}
 	}
 	sysSchema := s.Schema(ScopeSystem)
-	if len(sysSchema) != 2 {
-		t.Fatalf("system schema has %d entries, want 2 (secure_entry keys)", len(sysSchema))
+	if len(sysSchema) != 3 {
+		t.Fatalf("system schema has %d entries, want 3 (secure_entry keys + join_beta_program)", len(sysSchema))
 	}
-	for _, k := range []string{"security.secure_entry_enabled", "security.secure_entry_path"} {
+	for _, k := range []string{"security.secure_entry_enabled", "security.secure_entry_path", "system.join_beta_program"} {
 		found := false
 		for _, e := range sysSchema {
 			if e.Key == k {

@@ -41,7 +41,7 @@ agent ── gRPC over TLS ─────────────────�
 ```bash
 bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/quick_start.sh)"
 # 带参数（原样透传给 install.sh）：
-bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/quick_start.sh)" -- --channel beta
+bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/quick_start.sh)" -- --port 18789
 bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/quick_start.sh)" -- --help
 ```
 
@@ -49,11 +49,13 @@ bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/install.sh -o install.sh
-sudo bash install.sh            # 默认 stable 通道，面板监听 18789
-sudo bash install.sh --help    # 查看全部选项（--channel beta、--port、--mirror 等）
+sudo bash install.sh            # 默认跟踪正式版，面板监听 18789
+sudo bash install.sh --help    # 查看全部选项（--version、--port、--mirror 等）
 ```
 
 安装目录 `/opt/watchman`，数据目录 `/opt/watchman/data`。
+
+> 版本通道：默认只跟踪正式版。想尝鲜预发布版时，在面板「系统设置 → 系统升级」中打开「加入测试计划」，之后重跑安装脚本升级即可（不再用 `--channel` 这类命令参数区分）。
 
 ### 源码构建
 

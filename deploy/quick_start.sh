@@ -4,13 +4,15 @@
 # 用法：
 #   bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/quick_start.sh)"
 #   # 带参数（参数原样透传给 install.sh）：
-#   bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/quick_start.sh)" -- --channel beta
 #   bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/quick_start.sh)" -- --port 18789 --uninstall
 #
 # 只做两件事：
 #   1. 下载 master 分支最新的 deploy/install.sh（安装逻辑以它为准，
-#      版本解析 --channel/--version 由 install.sh 在运行时完成）；
+#      版本解析 --version 由 install.sh 在运行时完成）；
 #   2. 把全部参数透传给 install.sh 并执行。
+#
+# 说明：不再用命令行区分测试版。想跟踪预发布版时，先在面板
+# 「系统设置 → 系统升级」中打开「加入测试计划」，再重跑本命令升级即可。
 #
 # 环境变量（调试用）：WATCHMAN_INSTALL_URL 可覆盖下载地址。
 set -euo pipefail

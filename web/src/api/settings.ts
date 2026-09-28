@@ -34,6 +34,7 @@ export const SETTING_KEYS = {
   filesDefaultPath: 'files.default_path',
   secureEntryEnabled: 'security.secure_entry_enabled',
   secureEntryPath: 'security.secure_entry_path',
+  joinBetaProgram: 'system.join_beta_program',
 } as const
 
 export interface SettingSchemaEntry {

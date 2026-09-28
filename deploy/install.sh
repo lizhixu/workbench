@@ -5,15 +5,20 @@
 # 控制端是单个 Go 二进制：Web 控制台经 go:embed 打进二进制，
 # 直接监听端口同时提供静态页面与 API（对标 1Panel/宝塔面板模式）。
 #
-# 一键安装（stable 通道，默认）：
+# 一键安装（默认跟踪正式版）：
 #   curl -fsSL https://raw.githubusercontent.com/lizhixu/workbench/main/deploy/install.sh | bash
 #
 # 常用姿势：
 #   bash install.sh --version v1.2.3        # 精确锁定版本
-#   bash install.sh --channel beta          # 尝鲜预发布版
 #   bash install.sh --mirror https://ghproxy.example.com   # 走 GitHub 镜像
 #   bash install.sh --uninstall             # 卸载（保留数据）
 #   bash install.sh --uninstall --purge     # 卸载并删除所有数据
+#
+# 版本策略（不再用命令行区分测试版）：
+#   - 首次安装：跟踪最新正式版（GitHub /releases/latest，自动排除 pre-release）。
+#   - 想尝鲜预发布版：在面板「系统设置 → 系统升级」中打开「加入测试计划」，
+#     之后重跑本脚本升级时会自动跟踪含 pre-release 的最新版本。
+#   - --version 可精确锁定任意版本（优先级最高）。
 #
 # 语义：
 #   - 首次运行 = 安装；重跑 = 升级（保留 /opt/watchman/data 与密钥）。
@@ -24,8 +29,7 @@ set -euo pipefail
 
 # ---------------- 默认值（可用环境变量覆盖） ----------------
 REPO="${WATCHMAN_REPO:-lizhixu/workbench}"   # --repo 可覆盖
-CHANNEL="stable"                             # stable | beta
-VERSION_TAG=""                               # --version，高于 --channel
+VERSION_TAG=""                               # --version，精确锁定版本
 MIRROR="${GITHUB_MIRROR:-}"                  # --mirror，GitHub 镜像前缀
 BASE_URL=""                                  # --base-url，完全自定义下载源
 HTTP_PORT=18789                             # --port，面板监听端口（冷门端口，避免占用业务常用的 80/8080）
@@ -50,10 +54,7 @@ usage() {
 用法: install.sh [选项]
 
 选项:
-  --version v1.2.3     精确锁定版本（优先级高于 --channel）
-  --channel stable|beta
-                       stable（默认）：最新正式版，自动排除 pre-release
-                       beta：最新版（含 pre-release）
+  --version v1.2.3     精确锁定版本（优先级最高）
   --mirror URL         GitHub 镜像前缀，如 https://ghproxy.example.com
                        （或 GITHUB_MIRROR 环境变量）
   --base-url URL       完全自定义下载源，布局需与 GitHub Release 一致：
@@ -72,7 +73,6 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version)   VERSION_TAG="$2"; shift 2 ;;
-    --channel)   CHANNEL="$2"; shift 2 ;;
     --mirror)    MIRROR="$2"; shift 2 ;;
     --base-url)  BASE_URL="$2"; shift 2 ;;
     --repo)      REPO="$2"; shift 2 ;;
@@ -148,6 +148,15 @@ check_deps() {
   [[ ${#missing[@]} -eq 0 ]] || die "缺少依赖: ${missing[*]}，请先安装"
 }
 
+beta_opted_in() {
+  # 测试计划开关在面板「系统设置 → 系统升级」中，由管理员开启；
+  # 落盘在 $DATA_DIR/settings.json 的 system 域（点分键 system.join_beta_program）。
+  # 文件不存在（全新安装）或开关未开 → 走正式版。
+  local f="$DATA_DIR/settings.json"
+  [[ -f "$f" ]] || return 1
+  grep -q '"system\.join_beta_program"[[:space:]]*:[[:space:]]*true' "$f" 2>/dev/null
+}
+
 resolve_version() {
   if [[ -n "$VERSION_TAG" ]]; then
     TAG="$VERSION_TAG"
@@ -155,30 +164,24 @@ resolve_version() {
     log_info "使用指定版本: $TAG"
     return
   fi
-  case "$CHANNEL" in
-    stable)
-      local url="https://github.com/${REPO}/releases/latest"
-      [[ -n "$MIRROR" ]] && url="${MIRROR}/https://github.com/${REPO}/releases/latest"
-      log_info "解析 stable 通道最新版本..."
-      local eff
-      eff=$(curl -fsSIL -o /dev/null -w '%{url_effective}' "$url") || die "版本解析失败（$url）"
-      # GitHub 的 /releases/latest 只认正式版：仓库暂无正式版时会落到 /releases 列表页
-      [[ "$eff" == */tag/v* ]] || die "stable 通道暂无正式版，可用 --channel beta 或 --version vX.Y.Z 指定版本"
-      TAG="${eff##*/tag/}"
-      ;;
-    beta)
-      local api="https://api.github.com/repos/${REPO}/releases?per_page=1"
-      [[ -n "$MIRROR" ]] && api="${MIRROR}/https://api.github.com/repos/${REPO}/releases?per_page=1"
-      log_info "解析 beta 通道最新版本..."
-      TAG=$(curl -fsSL "$api" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4) \
-        || die "版本解析失败（$api）"
-      ;;
-    *)
-      die "未知通道: $CHANNEL（用 stable 或 beta）"
-      ;;
-  esac
+  if beta_opted_in; then
+    local api="https://api.github.com/repos/${REPO}/releases?per_page=1"
+    [[ -n "$MIRROR" ]] && api="${MIRROR}/https://api.github.com/repos/${REPO}/releases?per_page=1"
+    log_info "已加入测试计划：解析最新版本（含 pre-release）..."
+    TAG=$(curl -fsSL "$api" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4) \
+      || die "版本解析失败（$api）"
+  else
+    local url="https://github.com/${REPO}/releases/latest"
+    [[ -n "$MIRROR" ]] && url="${MIRROR}/https://github.com/${REPO}/releases/latest"
+    log_info "解析最新正式版..."
+    local eff
+    eff=$(curl -fsSIL -o /dev/null -w '%{url_effective}' "$url") || die "版本解析失败（$url）"
+    # GitHub 的 /releases/latest 只认正式版：仓库暂无正式版时会落到 /releases 列表页
+    [[ "$eff" == */tag/v* ]] || die "暂无正式版：可用 --version vX.Y.Z 指定版本，或在面板「系统设置 → 系统升级」中加入测试计划后重试"
+    TAG="${eff##*/tag/}"
+  fi
   [[ -n "$TAG" && "$TAG" == v* ]] || die "解析到的版本非法: '$TAG'"
-  log_ok "目标版本: $TAG（$CHANNEL 通道）"
+  log_ok "目标版本: $TAG"
 }
 
 download_tarball() {

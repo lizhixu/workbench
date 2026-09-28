@@ -36,6 +36,8 @@ const restarting = ref(false)
 
 // 批量升级 Agent
 const batchUpgrading = ref(false)
+const showBatchUpgradeModal = ref(false)
+const isForceUpgrade = ref(false)
 
 // 统计过时的在线 Agent 列表
 const currentAgentVersion = computed(() => healthData.value?.agent_latest_version || '0.1.0-dev')
@@ -48,6 +50,7 @@ const outdatedHosts = computed(() => {
 })
 
 const onlineHosts = computed(() => hosts.value.filter((h) => h.status === 'online'))
+const targetUpgradeHosts = computed(() => isForceUpgrade.value ? onlineHosts.value : outdatedHosts.value)
 
 // 控制端运行环境取自 /system/health，避免展示硬编码的假数据
 const runtimeEnv = computed(() => {
@@ -141,6 +144,11 @@ async function doRestartServer() {
   }
 }
 
+function openBatchUpgrade(force = false) {
+  isForceUpgrade.value = force
+  showBatchUpgradeModal.value = true
+}
+
 async function doBatchUpgradeAgents(force = false) {
   batchUpgrading.value = true
   try {
@@ -148,6 +156,7 @@ async function doBatchUpgradeAgents(force = false) {
     // force=true 重推全部在线主机（开发版版本号相同时用）。
     const res = await batchUpgradeAgents([], force)
     message.success(res.message || '已成功下发批量升级任务')
+    showBatchUpgradeModal.value = false
     setTimeout(() => {
       refreshData()
       batchUpgrading.value = false
@@ -156,6 +165,10 @@ async function doBatchUpgradeAgents(force = false) {
     message.error(e.message || '批量升级失败')
     batchUpgrading.value = false
   }
+}
+
+async function confirmBatchUpgrade() {
+  await doBatchUpgradeAgents(isForceUpgrade.value)
 }
 
 // 加入测试计划（仅管理员）：控制安装脚本升级时跟踪的版本通道。
@@ -274,8 +287,12 @@ onMounted(() => {
                       平滑重启服务 (维护握手模式)
                     </NButton>
                   </template>
-                  确认平滑重启控制端服务？<br />
-                  系统将在关机前向全网在线 Agent 广播维护通知，并在重启后的维护窗口内自动消除误报。
+                  <div style="max-width: 320px; line-height: 1.5">
+                    <div style="font-weight: 600; margin-bottom: 4px">确认平滑重启控制端服务？</div>
+                    <div style="font-size: 12px; color: var(--text-secondary)">
+                      系统将在关机前向全网在线 Agent 广播维护通知，并在重启后的维护窗口内自动消除误报。
+                    </div>
+                  </div>
                 </NPopconfirm>
               </NSpace>
             </div>
@@ -320,36 +337,26 @@ onMounted(() => {
 
             <div class="sec-actions">
               <NSpace :size="10" align="center">
-                <NPopconfirm
+                <NButton
                   v-if="isAdmin && outdatedHosts.length > 0"
-                  @positive-click="doBatchUpgradeAgents(false)"
+                  type="primary"
+                  size="small"
+                  :loading="batchUpgrading"
+                  @click="openBatchUpgrade(false)"
                 >
-                  <template #trigger>
-                    <NButton type="primary" size="small" :loading="batchUpgrading">
-                      <template #icon><NIcon :component="ArrowUpCircleOutline" /></template>
-                      一键批量升级过时 Agent ({{ outdatedHosts.length }}台)
-                    </NButton>
-                  </template>
-                  确认向以下 {{ outdatedHosts.length }} 台版本偏旧的主机下发在线升级任务？<br />
-                  <span class="text-secondary" style="font-size: 12px">
-                    {{ outdatedHosts.map((h) => h.hostname).join(', ') }}
-                  </span><br />
-                  升级过程已自动配置专属维护静默期，不会触发离线与上线告警通知。
-                </NPopconfirm>
+                  <template #icon><NIcon :component="ArrowUpCircleOutline" /></template>
+                  一键批量升级过时 Agent ({{ outdatedHosts.length }}台)
+                </NButton>
 
-                <NPopconfirm
+                <NButton
                   v-if="isAdmin && outdatedHosts.length === 0 && onlineHosts.length > 0"
-                  @positive-click="doBatchUpgradeAgents(true)"
+                  size="small"
+                  :loading="batchUpgrading"
+                  @click="openBatchUpgrade(true)"
                 >
-                  <template #trigger>
-                    <NButton size="small" :loading="batchUpgrading">
-                      <template #icon><NIcon :component="ArrowUpCircleOutline" /></template>
-                      强制重推升级 ({{ onlineHosts.length }}台)
-                    </NButton>
-                  </template>
-                  所有在线主机均已是版本 {{ currentAgentVersion }}，仍要强制重新推送一次升级？<br />
-                  适用于开发版（版本号相同但需要重刷二进制）的场景。
-                </NPopconfirm>
+                  <template #icon><NIcon :component="ArrowUpCircleOutline" /></template>
+                  强制重推升级 ({{ onlineHosts.length }}台)
+                </NButton>
 
                 <span v-if="onlineHosts.length === 0" class="muted-hint">当前没有在线主机</span>
                 <span v-else-if="outdatedHosts.length === 0" class="muted-hint">
@@ -425,6 +432,93 @@ onMounted(() => {
               开始上传替换
             </NButton>
           </NSpace>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- 批量升级 Agent 确认 Modal -->
+    <NModal
+      v-model:show="showBatchUpgradeModal"
+      preset="card"
+      :title="isForceUpgrade ? '强制重推 Agent 升级' : '批量下发 Agent 在线升级'"
+      style="width: 580px; max-width: 92vw"
+    >
+      <div class="batch-upgrade-dialog">
+        <div class="dialog-prompt">
+          <template v-if="!isForceUpgrade">
+            确认向以下 <strong class="highlight-count">{{ targetUpgradeHosts.length }}</strong> 台版本偏旧的主机下发在线升级任务？
+          </template>
+          <template v-else>
+            所有在线主机已是版本 <code class="mono-font">{{ currentAgentVersion }}</code>，确认强制向以下 <strong class="highlight-count">{{ targetUpgradeHosts.length }}</strong> 台主机重新推送升级？
+          </template>
+        </div>
+
+        <div class="target-version-banner">
+          <span class="banner-label">目标版本：</span>
+          <NTag type="primary" size="small" :bordered="false" round class="mono-font">
+            {{ currentAgentVersion }}
+          </NTag>
+          <span v-if="isForceUpgrade" class="force-hint">（开发版重推模式）</span>
+        </div>
+
+        <div class="hosts-preview-box">
+          <div class="hosts-preview-header">
+            <span>目标主机清单（{{ targetUpgradeHosts.length }} 台）</span>
+            <span class="version-col-title">当前版本 → 目标版本</span>
+          </div>
+          <div class="hosts-preview-list">
+            <div
+              v-for="h in targetUpgradeHosts"
+              :key="h.id"
+              class="host-preview-item"
+            >
+              <div class="host-info">
+                <span class="host-name">{{ h.hostname }}</span>
+                <span class="host-ip mono-font">{{ h.public_ip || h.internal_ip || '未知 IP' }}</span>
+              </div>
+              <div class="host-version-change">
+                <NTag
+                  size="tiny"
+                  :type="h.agent_version === currentAgentVersion ? 'default' : 'warning'"
+                  :bordered="false"
+                  round
+                  class="mono-font"
+                >
+                  {{ h.agent_version || '未知' }}
+                </NTag>
+                <span class="arrow">→</span>
+                <NTag
+                  size="tiny"
+                  type="success"
+                  :bordered="false"
+                  round
+                  class="mono-font"
+                >
+                  {{ currentAgentVersion }}
+                </NTag>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <NAlert type="info" :bordered="false" class="maintenance-alert">
+          <template #icon>
+            <NIcon :component="CheckmarkCircleOutline" />
+          </template>
+          升级过程已自动配置专属维护静默期（3 分钟），升级期间告警引擎将自动静默，不会触发离线与上线误报告警。
+        </NAlert>
+      </div>
+
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showBatchUpgradeModal = false">取消</NButton>
+          <NButton
+            type="primary"
+            :loading="batchUpgrading"
+            @click="confirmBatchUpgrade"
+          >
+            确认下发升级
+          </NButton>
         </NSpace>
       </template>
     </NModal>
@@ -529,6 +623,115 @@ onMounted(() => {
       margin-top: 10px;
       font-size: 12.5px;
       color: var(--text-secondary);
+    }
+  }
+
+  .batch-upgrade-dialog {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+
+    .dialog-prompt {
+      font-size: 14px;
+      line-height: 1.6;
+
+      .highlight-count {
+        color: var(--warning-color, #f59e0b);
+        font-weight: 700;
+      }
+    }
+
+    .target-version-banner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      background: rgba(99, 102, 241, 0.06);
+      padding: 8px 12px;
+      border-radius: 6px;
+      border: 1px solid rgba(99, 102, 241, 0.15);
+
+      .banner-label {
+        color: var(--n-text-color-2);
+        font-weight: 600;
+      }
+
+      .force-hint {
+        color: var(--text-secondary);
+        font-size: 12px;
+      }
+    }
+
+    .hosts-preview-box {
+      border: 1px solid var(--n-border-color);
+      border-radius: 6px;
+      background: var(--n-color-modal);
+      overflow: hidden;
+
+      .hosts-preview-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 8px 12px;
+        background: rgba(125, 125, 125, 0.06);
+        border-bottom: 1px solid var(--n-border-color);
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-secondary);
+      }
+
+      .hosts-preview-list {
+        max-height: 200px;
+        overflow-y: auto;
+
+        .host-preview-item {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          padding: 8px 12px;
+          transition: background-color 0.15s ease;
+
+          &:not(:last-child) {
+            border-bottom: 1px dashed var(--n-border-color);
+          }
+
+          &:hover {
+            background: rgba(99, 102, 241, 0.06);
+          }
+
+          .host-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+
+            .host-name {
+              font-weight: 600;
+              font-size: 13px;
+            }
+
+            .host-ip {
+              font-size: 12px;
+              color: var(--text-secondary);
+            }
+          }
+
+          .host-version-change {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+
+            .arrow {
+              color: var(--text-secondary);
+              font-size: 12px;
+            }
+          }
+        }
+      }
+    }
+
+    .maintenance-alert {
+      font-size: 12.5px;
+      line-height: 1.5;
     }
   }
 }

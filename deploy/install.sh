@@ -342,6 +342,15 @@ start_services() {
   log_ok "watchman-server 运行中"
 }
 
+remove_legacy_webdir() {
+  # 旧版把前端落盘在 $INSTALL_DIR/web（+ 残留的 web-dist.tar.gz）；
+  # 新版 Web 控制台已 go:embed 进 watchman-server，这些成了死重，清理掉。
+  local removed=0
+  if [[ -d "$INSTALL_DIR/web" ]]; then rm -rf "$INSTALL_DIR/web"; removed=1; fi
+  if [[ -f "$INSTALL_DIR/web-dist.tar.gz" ]]; then rm -f "$INSTALL_DIR/web-dist.tar.gz"; removed=1; fi
+  [[ "$removed" -eq 1 ]] && log_ok "已清理旧版落盘前端（新版已内置进二进制）"
+}
+
 secure_entry_enabled() {
   # data 目录在升级时保留，安全入口一旦开启就会一直生效
   [[ -f "$DATA_DIR/settings.json" ]] || return 1
@@ -421,6 +430,7 @@ main() {
   stop_services
   remove_legacy_nginx
   extract_tarball
+  remove_legacy_webdir
   provision_secrets
   write_systemd_server
   start_services

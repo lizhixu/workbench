@@ -87,6 +87,22 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "域名不能为空"})
 		return
 	}
+	// The domain is interpolated verbatim into an nginx server block that is
+	// written as root on the gateway host. A strict hostname check keeps
+	// metacharacters (`;{}#$\n` …) from breaking out of the server_name
+	// directive — `nginx -t` only validates syntax, not intent.
+	if !validProxyDomain(domain) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "域名格式非法：仅允许小写字母、数字、连字符与点分隔"})
+		return
+	}
+	// One domain maps to exactly one app: two vhosts with the same
+	// server_name would both pass `nginx -t` and route unpredictably.
+	for _, a := range h.store.ListApps() {
+		if a.ID != app.ID && a.Domain != "" && strings.EqualFold(a.Domain, domain) {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("域名已被应用 %q 绑定，请先解绑", a.Name)})
+			return
+		}
+	}
 	mode := req.Mode
 	if mode == "" {
 		mode = "local"
@@ -150,7 +166,12 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 	// it has one, else its internal IP.
 	upstream := strings.TrimSpace(req.Upstream)
 	if upstream == "" {
-		upstream = h.defaultUpstream(app, mode)
+		var err error
+		upstream, err = h.defaultUpstream(app, mode)
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	// 1. Push cert + key to the gateway host.
@@ -244,7 +265,7 @@ func (h *ProxyHandler) unbindProxy(c *gin.Context) {
 }
 
 // defaultUpstream derives the proxy target for the app.
-func (h *ProxyHandler) defaultUpstream(app *Application, mode string) string {
+func (h *ProxyHandler) defaultUpstream(app *Application, mode string) (string, error) {
 	var port int
 	if len(app.Ports) > 0 {
 		port = app.Ports[0].Host
@@ -253,16 +274,40 @@ func (h *ProxyHandler) defaultUpstream(app *Application, mode string) string {
 		port = 8080
 	}
 	if mode == "local" {
-		return fmt.Sprintf("127.0.0.1:%d", port)
+		return fmt.Sprintf("127.0.0.1:%d", port), nil
 	}
 	// Gateway mode: prefer the app host's overlay IP (100.x.y.z), which works
-	// even when the app host sits behind NAT.
+	// even when the app host sits behind NAT. There is no sane default
+	// without one — 127.0.0.1 would point at the gateway itself and
+	// blackhole traffic — so refuse with a clear message instead.
 	if h.networkStore != nil {
 		if st, ok := h.networkStore.GetNodeStatus(app.HostID); ok && st.IP != "" {
-			return fmt.Sprintf("%s:%d", st.IP, port)
+			return fmt.Sprintf("%s:%d", st.IP, port), nil
 		}
 	}
-	return fmt.Sprintf("127.0.0.1:%d", port)
+	return "", fmt.Errorf("网关模式需要应用主机已加入异地组网（未找到其组网 IP），或手动填写 Upstream")
+}
+
+// validProxyDomain enforces a strict RFC-1035-ish hostname shape.
+func validProxyDomain(d string) bool {
+	if len(d) == 0 || len(d) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(d, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // renderVhost produces the nginx server block for one application domain.

@@ -391,11 +391,11 @@ func (h *AppHandlers) deployApp(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": dep})
 }
 
-// rollbackApp re-deploys a historical successful commit. Rather than
-// rebuilding from the old source, it re-runs the pipeline pinned to the
-// recorded commit; the engine's fetch step always checks out the branch
-// head, so rollback passes the target commit through the same path for
-// consistency and auditability.
+// rollbackApp re-deploys a historical version. For git-backed apps it
+// re-runs the pipeline pinned to the recorded commit (checkout after fetch,
+// so the rollback goes through the same audited path as a normal deploy).
+// For raw_compose apps there is no git history; rollback restores the
+// compose.yaml snapshot recorded on the target deployment.
 func (h *AppHandlers) rollbackApp(c *gin.Context) {
 	app, ok := h.store.GetApp(c.Param("id"))
 	if !ok {
@@ -417,14 +417,28 @@ func (h *AppHandlers) rollbackApp(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "目标部署记录不存在或未成功"})
 		return
 	}
+	pinned := *app
+	pinned.Branch = app.Branch
+	if app.SourceType == "raw_compose" {
+		if target.ComposeContent == "" {
+			c.JSON(http.StatusConflict, gin.H{"error": "该历史版本没有 Compose 内容快照，无法回滚（仅支持此次更新之后的部署）"})
+			return
+		}
+		pinned.ComposeContent = target.ComposeContent
+		dep, err := h.engine.StartRollback(&pinned, "", usernameOf(c))
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": dep})
+		return
+	}
 	if target.CommitHash == "" {
 		c.JSON(http.StatusConflict, gin.H{"error": "该部署记录缺少 Commit 信息，无法回滚"})
 		return
 	}
 	// Check out the recorded commit after fetch: simplest reliable path is a
 	// deploy whose fetch script additionally pins to the target commit.
-	pinned := *app
-	pinned.Branch = app.Branch
 	dep, err := h.engine.StartRollback(&pinned, target.CommitHash, usernameOf(c))
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -490,7 +504,7 @@ func (h *AppHandlers) containerAction(c *gin.Context, op string) {
 		c.JSON(http.StatusConflict, gin.H{"error": "应用尚未部署过"})
 		return
 	}
-	res, err := execOnAgent(hub, "app-ctl-"+randomToken(4), "docker "+op+" "+container, 60)
+	res, err := execOnAgent(hub, "app-ctl-"+randomToken(4), "docker "+op+" "+shellQuote(container), 60)
 	if err != nil {
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": err.Error()})
 		return
@@ -547,7 +561,7 @@ func (h *AppHandlers) appStatus(c *gin.Context) {
 		return
 	}
 	res, err := execOnAgent(hub, "app-stat-"+randomToken(4),
-		fmt.Sprintf("docker inspect --format '{{.State.Status}}|{{.State.StartedAt}}' %s 2>/dev/null || echo 'missing'", container), 20)
+		fmt.Sprintf("docker inspect --format '{{.State.Status}}|{{.State.StartedAt}}' %s 2>/dev/null || echo 'missing'", shellQuote(container)), 20)
 	if err != nil {
 		resp["state"] = "unknown"
 		c.JSON(http.StatusOK, gin.H{"data": resp})

@@ -357,6 +357,7 @@ func main() {
 	// Application auto-healing: continuously checks application endpoints
 	// and automatically restarts containers failing 3 consecutive probes.
 	autoHealer := apps.NewAutoHealer(reg, appStore, log)
+	autoHealer.SetEngine(appEngine)
 	autoHealer.Start(ctx.Done())
 
 	go func() {

@@ -4,7 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
-	"net/url"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -181,7 +181,12 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 
 	// Branch for raw Docker Compose applications (online YAML editor):
 	if app.SourceType == "raw_compose" {
-		e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
+		e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
+			d.Status = DeployDeploying
+			// Snapshot the compose content so a later rollback can restore
+			// exactly this version (the live app.ComposeContent keeps moving).
+			d.ComposeContent = app.ComposeContent
+		})
 		logBuf.WriteString("$ deploy raw docker compose stack\n")
 		appDir := fmt.Sprintf("/var/lib/watchman/apps/%s", app.ID)
 		composePath := fmt.Sprintf("%s/compose.yaml", appDir)
@@ -195,8 +200,8 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 			return
 		}
 
-		composeCmd := fmt.Sprintf("docker compose -f %s -p watchman-%s up -d --remove-orphans",
-			shellQuote(composePath), app.ID)
+		composeCmd := fmt.Sprintf("docker compose -f %s -p %s up -d --remove-orphans",
+			shellQuote(composePath), shellQuote("watchman-"+app.ID))
 		logBuf.WriteString("$ " + composeCmd + "\n")
 		res, err := execOnAgent(hub, "compose-up-"+randomToken(4), composeCmd, buildTimeout)
 		if err != nil {
@@ -234,22 +239,25 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 
 	// Step 1: fetch or clone the linked repository, then check out the branch
 	// head — or the pinned commit for a rollback.
-	fetchURL := app.RepoURL
-	if authToken != "" {
-		fetchURL = injectToken(app.RepoURL, authToken)
-	}
+	// The git credential (when configured) travels as an http.extraHeader on
+	// these two commands only; it is never written into the on-disk remote
+	// URL, so a token cannot linger in the agent's .git/config.
+	authArgs := gitAuthArgs(authToken)
 	checkout := "origin/" + branch
 	branchLabel := branch
 	if pin != "" {
 		checkout = pin
 		branchLabel = branch + " @ " + pin
 	}
-	fetchScript := fmt.Sprintf(`if [ -d %[1]s/.git ]; then
-  git -C %[1]s remote set-url origin %[2]s 2>/dev/null
-  git -C %[1]s fetch --force origin
+	// NOTE: set -e is load-bearing. Without it, a failed `fetch` would fall
+	// through to `checkout --force` on the stale local copy and the pipeline
+	// would silently build + deploy the previous commit as if it succeeded.
+	fetchScript := fmt.Sprintf(`set -e
+if [ -d %[1]s/.git ]; then
+  git %[5]s -C %[1]s fetch --force origin
 else
   mkdir -p %[1]s
-  git clone --branch %[3]s %[2]s %[1]s
+  git %[5]s clone --branch %[3]s %[2]s %[1]s
 fi
 git -C %[1]s checkout --force %[4]s
 git -C %[1]s reset --hard %[4]s
@@ -258,7 +266,7 @@ COMMIT=$(git -C %[1]s rev-parse --short HEAD)
 MESSAGE=$(git -C %[1]s log -1 --pretty=%%s)
 echo "WATCHMAN_COMMIT=$COMMIT"
 echo "WATCHMAN_MESSAGE=$MESSAGE"`,
-		shellQuote(repoDir), shellQuote(fetchURL), shellQuote(branch), shellQuote(checkout))
+		shellQuote(repoDir), shellQuote(app.RepoURL), shellQuote(branch), shellQuote(checkout), authArgs)
 	logBuf.WriteString("$ git fetch/checkout " + app.RepoURL + " (" + branchLabel + ")\n")
 	res, err := execOnAgent(hub, "git-env-"+randomToken(4), fetchScript, 300)
 	if err != nil {
@@ -291,8 +299,8 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 		if composeFile == "" || composeFile == "Dockerfile" {
 			composeFile = "compose.yaml"
 		}
-		composeCmd := fmt.Sprintf("docker compose -f %s -p watchman-%s up -d --build --remove-orphans",
-			shellQuote(composeFile), app.ID)
+		composeCmd := fmt.Sprintf("docker compose -f %s -p %s up -d --build --remove-orphans",
+			shellQuote(composeFile), shellQuote("watchman-"+app.ID))
 		logBuf.WriteString("$ " + composeCmd + "\n")
 		res, err = execOnAgent(hub, "compose-up-"+randomToken(4),
 			fmt.Sprintf("cd %s && %s", shellQuote(repoDir), composeCmd), buildTimeout)
@@ -310,7 +318,8 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 	}
 
 	// Standard Dockerfile build:
-	buildCmd := fmt.Sprintf("docker build -t %s -f %s %s", imageRef, dockerfile, context)
+	buildCmd := fmt.Sprintf("docker build -t %s -f %s %s",
+		shellQuote(imageRef), shellQuote(dockerfile), shellQuote(context))
 	logBuf.WriteString("$ " + buildCmd + "\n")
 	res, err = execOnAgent(hub, "docker-build-"+randomToken(4),
 		fmt.Sprintf("cd %s && %s", shellQuote(repoDir), buildCmd), buildTimeout)
@@ -359,13 +368,7 @@ func (e *Engine) deploySingleContainer(hub *rpc.Hub, app *Application, dep *Depl
 		}
 	}
 	if needsMesh {
-		if e.networkStore == nil {
-			logBuf.WriteString("WARN: 需要绑定异地组网，但 NetworkStore 未初始化，回退为公网绑定\n")
-		} else if st, ok := e.networkStore.GetNodeStatus(app.HostID); ok && st.IP != "" {
-			meshIP = st.IP
-		} else {
-			logBuf.WriteString("WARN: 无法获取主机异地组网 IP，回退为公网绑定\n")
-		}
+		meshIP = e.resolveMeshIP(hub, app.HostID, logBuf)
 	}
 
 	for _, pm := range app.Ports {
@@ -376,11 +379,15 @@ func (e *Engine) deploySingleContainer(hub *rpc.Hub, app *Application, dep *Depl
 		}
 	}
 	for _, v := range app.Volumes {
-		runArgs = append(runArgs, "-v", v)
+		runArgs = append(runArgs, "-v", shellQuote(v))
 	}
-	runArgs = append(runArgs, "--label", fmt.Sprintf("watchman.app=%s", app.ID))
+	runArgs = append(runArgs, "--label", shellQuote("watchman.app="+app.ID))
+	// All interpolated values are shell-quoted: container names, env values
+	// and image refs all originate from user input (spaces would otherwise
+	// break `docker run`, metacharacters would inject commands — and the
+	// audit log would not reflect what actually ran).
 	runCmd := fmt.Sprintf("docker rm -f %s 2>/dev/null; docker run -d --name %s --restart unless-stopped %s %s %s",
-		container, nextName, strings.Join(envArgs, " "), strings.Join(runArgs, " "), imageRef)
+		shellQuote(nextName), shellQuote(nextName), strings.Join(envArgs, " "), strings.Join(runArgs, " "), shellQuote(imageRef))
 	logBuf.WriteString("$ start replacement container\n")
 	res, err := execOnAgent(hub, "docker-run-"+randomToken(4), runCmd, 120)
 	if err != nil {
@@ -405,12 +412,18 @@ func (e *Engine) deploySingleContainer(hub *rpc.Hub, app *Application, dep *Depl
 	// Step 5: swap. Old container is renamed aside (not deleted) so an
 	// operator can still inspect it; it is dropped on the next successful
 	// deploy of the same app.
-	swapCmd := fmt.Sprintf(`docker rm -f %[1]s-prev 2>/dev/null
-if docker inspect %[1]s >/dev/null 2>&1; then
-  docker rename %[1]s %[1]s-prev && docker stop %[1]s-prev >/dev/null
+	// set -e: a failed `docker rename` must abort the script — otherwise the
+	// trailing `docker inspect` would still exit 0 against the OLD container
+	// and the deploy would wrongly report success.
+	swapCmd := fmt.Sprintf(`set -e
+docker rm -f %[1]s 2>/dev/null || true
+if docker inspect %[2]s >/dev/null 2>&1; then
+  docker rename %[2]s %[1]s
+  docker stop %[1]s >/dev/null 2>&1 || true
 fi
-docker rename %[2]s %[1]s
-docker inspect --format '{{.State.Status}}' %[1]s`, container, nextName)
+docker rename %[3]s %[2]s
+docker inspect --format '{{.State.Status}}' %[2]s`,
+		shellQuote(container+"-prev"), shellQuote(container), shellQuote(nextName))
 	logBuf.WriteString("$ swap containers\n")
 	res, err = execOnAgent(hub, "docker-swap-"+randomToken(4), swapCmd, 60)
 	if err != nil {
@@ -423,37 +436,103 @@ docker inspect --format '{{.State.Status}}' %[1]s`, container, nextName)
 		return
 	}
 
-	// Step 6: prune old image tags (keep the newest few for rollback).
-	pruneCmd := fmt.Sprintf(`docker images %[1]s --format '{{.Tag}}' | grep -v latest | head -n 6 | tail -n +6 | while read t; do docker rmi %[1]s:$$t 2>/dev/null; done`, imageRef)
-	if _, err := execOnAgent(hub, "docker-prune-"+randomToken(4), pruneCmd, 60); err != nil {
-		e.log.Warn("image prune failed", "err", err, "app", app.ID)
+	// Step 6: prune old image tags built by Watchman (keep the newest 5 for
+	// rollback). Only images we built (watchman-app-*) are touched — never
+	// upstream/pulled images the operator may share with other workloads.
+	// NOTE: the previous version listed `docker images <repo>:<tag>` (which
+	// matches a single tag, so pruning never fired) and used
+	// `head -n 6 | tail -n +6` (which selects exactly one line).
+	if strings.HasPrefix(imageRef, "watchman-app-") {
+		repo := imageRef
+		if i := strings.LastIndex(repo, ":"); i > strings.LastIndex(repo, "/") {
+			repo = repo[:i]
+		}
+		pruneCmd := fmt.Sprintf(`docker images %[1]s --format '{{.CreatedAt}}|{{.Tag}}' | sort -r | cut -d'|' -f2- | grep -v '^latest$' | tail -n +6 | while read t; do docker rmi %[1]s:$$t 2>/dev/null; done`, shellQuote(repo))
+		if _, err := execOnAgent(hub, "docker-prune-"+randomToken(4), pruneCmd, 60); err != nil {
+			e.log.Warn("image prune failed", "err", err, "app", app.ID)
+		}
 	}
 
-		e.finishDeploySuccess(app, dep, dep.CommitHash, imageRef, container, logBuf)
-	}
+	e.finishDeploySuccess(app, dep, dep.CommitHash, imageRef, container, logBuf)
+}
 
-	func (e *Engine) finishDeploySuccess(app *Application, dep *Deployment, commit, imageRef, container string, logBuf *logBuffer) {
-		now := time.Now()
-		finalLog := logBuf.String()
-		e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
-			d.Status = DeploySuccess
-			d.FinishedAt = now
-			d.DurationMS = now.Sub(d.StartedAt).Milliseconds()
-			d.BuildLog = finalLog
-		})
-		e.store.UpdateApp(app.ID, func(a *Application) error {
-			a.CurrentCommit = commit
-			if imageRef != "" {
-				a.Image = imageRef
-			}
-			if container != "" {
-				a.ContainerName = container
-			}
-			a.LastDeployAt = now
-			return nil
-		})
-		e.log.Info("deployment succeeded", "app", app.ID, "commit", commit, "deployment", dep.ID)
+// resolveMeshIP returns the host's current Tailscale IPv4 for mesh-scoped port
+// bindings. It probes the node live first (one exec round-trip) because the
+// cached NodeStatus.IP goes stale when the tailnet address changes outside
+// Watchman (e.g. `tailscale up --reset` re-registers the node and Headscale
+// reassigns its 100.x). The cache is only a fallback; an empty return means
+// "fall back to public binding".
+func (e *Engine) resolveMeshIP(hub *rpc.Hub, hostID string, logBuf *logBuffer) string {
+	if e.networkStore == nil {
+		logBuf.WriteString("WARN: 需要绑定异地组网，但 NetworkStore 未初始化，回退为公网绑定\n")
+		return ""
 	}
+	// Live probe first: `tailscale ip -4` takes no arguments and is
+	// shell-agnostic (sh/bash/powershell/cmd), so no quoting concerns.
+	liveIP := ""
+	if res, err := execOnAgent(hub, "mesh-ip-"+randomToken(4), "tailscale ip -4", 15); err == nil && res != nil && res.GetExitCode() == 0 {
+		liveIP = parseIPv4(string(res.GetStdout()))
+	}
+	cached, ok := e.networkStore.GetNodeStatus(hostID)
+	ip, warn := pickMeshIP(liveIP, cached, ok)
+	if warn != "" {
+		logBuf.WriteString("WARN: " + warn + "\n")
+	}
+	if liveIP != "" {
+		// Refresh the cache so the gateway proxy and UI see the fresh value.
+		cached.HostID = hostID
+		cached.IP = liveIP
+		_ = e.networkStore.SetNodeStatus(cached)
+	}
+	return ip
+}
+
+// pickMeshIP decides which Mesh IP to bind: the live probe wins; the cached
+// NodeStatus.IP is only a fallback for when the probe fails (e.g. tailscaled
+// mid-restart). It returns the chosen IP ("" = fall back to public binding)
+// and a warning message ("" = none).
+func pickMeshIP(liveIP string, cached network.NodeStatus, cacheOK bool) (string, string) {
+	if liveIP != "" {
+		return liveIP, ""
+	}
+	if cacheOK && cached.IP != "" {
+		return cached.IP, "异地组网 IP 实时探测失败，使用缓存值 " + cached.IP + "；若部署失败请检查节点组网状态"
+	}
+	return "", "无法获取主机异地组网 IP，回退为公网绑定"
+}
+
+// parseIPv4 extracts the first valid IPv4 address from command output.
+func parseIPv4(out string) string {
+	for _, f := range strings.Fields(out) {
+		if ip := net.ParseIP(f); ip != nil && ip.To4() != nil {
+			return f
+		}
+	}
+	return ""
+}
+
+func (e *Engine) finishDeploySuccess(app *Application, dep *Deployment, commit, imageRef, container string, logBuf *logBuffer) {
+	now := time.Now()
+	finalLog := logBuf.String()
+	e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
+		d.Status = DeploySuccess
+		d.FinishedAt = now
+		d.DurationMS = now.Sub(d.StartedAt).Milliseconds()
+		d.BuildLog = finalLog
+	})
+	e.store.UpdateApp(app.ID, func(a *Application) error {
+		a.CurrentCommit = commit
+		if imageRef != "" {
+			a.Image = imageRef
+		}
+		if container != "" {
+			a.ContainerName = container
+		}
+		a.LastDeployAt = now
+		return nil
+	})
+	e.log.Info("deployment succeeded", "app", app.ID, "commit", commit, "deployment", dep.ID)
+}
 
 func (e *Engine) fail(app *Application, dep *Deployment, logBuf *logBuffer, msg string) {
 	now := time.Now()
@@ -494,7 +573,7 @@ func (e *Engine) probe(hub *rpc.Hub, app *Application, container string, logBuf 
 	// container to still be running.
 	time.Sleep(5 * time.Second)
 	res, err := execOnAgent(hub, "probe-"+randomToken(4),
-		fmt.Sprintf("docker inspect --format '{{.State.Status}}' %s", container), 15)
+		fmt.Sprintf("docker inspect --format '{{.State.Status}}' %s", shellQuote(container)), 15)
 	if err != nil {
 		logBuf.WriteString("probe transport error: " + err.Error() + "\n")
 		return false
@@ -524,7 +603,10 @@ func (e *Engine) resolveEnvArgs(app *Application, logBuf *logBuffer) []string {
 	args := make([]string, 0, len(keys)*2)
 	for _, k := range keys {
 		v := resolveVaultRef(e.vault, app.EnvVars[k])
-		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+		// Quote the whole K=V pair: values routinely contain spaces
+		// (e.g. JAVA_OPTS) which would otherwise split into extra argv
+		// entries and break `docker run`.
+		args = append(args, "-e", shellQuote(k+"="+v))
 	}
 	return args
 }
@@ -558,7 +640,7 @@ func (e *Engine) removeContainer(hub *rpc.Hub, name string) {
 		Payload: &agentpb.ServerMessage_Exec{
 			Exec: &agentpb.ExecRequest{
 				ExecId:     opID,
-				Command:    "docker rm -f " + name,
+				Command:    "docker rm -f " + shellQuote(name),
 				TimeoutSec: 30,
 			},
 		},
@@ -664,17 +746,16 @@ func parseCommitMeta(stdout []byte) (commit, message string) {
 	return commit, message
 }
 
-// injectToken embeds an access token into a git URL for clone/fetch.
-func injectToken(repoURL, token string) string {
+// gitAuthArgs renders the `git -c http.extraHeader=...` fragment that carries
+// the access token as a Basic auth header on clone/fetch. The semantics match
+// the old token-in-URL approach (user "git", token as password — what GitHub
+// expects), but the secret never lands in the agent's .git/config on disk.
+func gitAuthArgs(token string) string {
 	if token == "" {
-		return repoURL
+		return ""
 	}
-	u, err := url.Parse(repoURL)
-	if err != nil {
-		return repoURL
-	}
-	u.User = url.UserPassword("git", token)
-	return u.String()
+	b64 := base64.StdEncoding.EncodeToString([]byte("git:" + token))
+	return "-c " + shellQuote("http.extraHeader=Authorization: Basic "+b64)
 }
 
 // shellQuote single-quotes a value for the POSIX shell.

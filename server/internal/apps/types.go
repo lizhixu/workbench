@@ -91,4 +91,8 @@ type Deployment struct {
 	// BuildLog holds the captured stdout/stderr of the build+rollout steps,
 	// trimmed to a sane bound so the JSONL history stays readable.
 	BuildLog string `json:"build_log,omitempty"`
+	// ComposeContent snapshots the raw compose.yaml for source_type ==
+	// "raw_compose" deployments, so rollback can restore exactly this
+	// version. Older records predate the snapshot and cannot be rolled back.
+	ComposeContent string `json:"compose_content,omitempty"`
 }

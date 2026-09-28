@@ -111,6 +111,8 @@
 - **创建时即可绑定域名**：创建页填写域名与网关节点后，提交依次执行 创建应用 → 自动签发证书 → 下发反代；绑定失败不回滚应用创建，可稍后在详情页重试。
 - **系统设置安全入口**（2026-09-27）：「系统设置 → 证书与域名」分区（`web/src/views/settings/CertDomain.vue`，`sections.ts` 注册 `key: 'cert-domain'`）把证书签发/续期/ACME 账户管理与应用域名绑定收拢到一处；分区标记 `adminOnly`，SettingsLayout 按 `auth.role` 过滤，深链 `?s=cert-domain` 对非管理员回退到默认分区。后端对应写接口本就 admin/operator + 审计（`cert/handlers.go` 的 writeRG、`apps/proxy.go` 的 appWrite），前端隐藏是纵深防御。证书管理 UI 抽为可复用组件 `web/src/components/cert/CertManager.vue`（原 CertList 页面内容），独立「证书中心」路由保留做深链。
 - **全生命周期管理**：部署历史、构建日志、健康检查探活失败自动保留旧版本（`-next`/`-prev` 滚动替换）、回滚、启停、AI 排障诊断，对所有来源的应用一致生效。
+  - 实现备注（2026-09-28）：`deploySingleContainer` 的起新容器命令只清理残留的 `-next` 容器（`docker rm -f <name>-next`），旧版本容器在 swap 前全程运行、失败时原样保留——此前曾误删旧容器（`rm -f` 目标写成了正式容器名），与"探活失败自动保留旧版本"的设计相悖，已修复。
+  - 实现备注（2026-09-28，发布流程 review）：git 拉取脚本必须 `set -e`——此前 `fetch` 失败会落到 `checkout --force` 用本地旧代码继续部署并上报成功；Git token 只持久化在 server 端 vault，下发时经 `git -c http.extraHeader="Authorization: Basic <base64(git:token)>"` 随单次 clone/fetch 使用，不再 `remote set-url` 写进 agent 的 `.git/config`（自动发布每次从 vault 现取，不受影响）；下发到 agent 的命令里所有用户输入变量必须 shell 转义（环境变量值曾因空格打散 `docker run` 参数）；swap 脚本 `set -e`，`docker rename` 失败不得被末尾 `docker inspect` 的退出码掩盖；镜像清理只针对 `watchman-app-*` 自建镜像、按创建时间保留最新 5 个（此前 `docker images repo:tag` 只匹配单个 tag 导致从不清，且 `head -n 6 | tail -n +6` 语义错误）；store 的 `GetApp/ListApps/FindAppByWebhookToken` 返回深拷贝——部署协程 `ResolveTemplate` 原地写 EnvVars map 时 HTTP 层正 marshal 同一对象，曾有 crash 风险；反代域名做严格 hostname 校验并检查跨应用重复绑定；网关模式拿不到 Mesh IP 时直接报错（此前回退 `127.0.0.1` 会指向网关自身造成流量黑洞）；`raw_compose` 每次部署快照 compose 内容到部署记录，回滚时恢复快照（此前"回滚"实际重部署了当前内容）；healer 跳过有部署在途的应用。
 - **已安装管理**：应用列表/详情支持重启、停止、启动、查看日志、删除（`watchman.app` 标签标记容器归属）。
 - **可扩展**：模板定义为服务端声明式配置（`server/internal/apps/templates.go` 的 `Catalog`），支持自定义接入新模板。
 
@@ -1258,6 +1260,15 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
 
 5. **密钥永不经 GET 接口回显**：
    - `GET /network/config` 曾明文返回 Tailscale Auth Key，而该接口挂在 `authed` 分组（所有登录用户，含只读 viewer）——viewer 拿 key 就能把自己的设备加进 tailnet，直达所有 100.x 节点。现只返回 `auth_key_set` 布尔值；PUT 空值表示"保持原密钥"（无清除语义，轮换请写入新值）；前端密钥输入框只写不读，保存后清空。
+
+6. **部署用 Mesh IP 必须实时探测，缓存只做兜底**：
+   - `bind_scope=mesh` 部署时（`apps/deploy.go:resolveMeshIP`）先对目标主机实时执行 `tailscale ip -4`（1 次 exec，无参数、与 shell 无关、无需转义），命中则直接采用并回写 `network.Store` 缓存（网关反代与 UI 同步受益）。
+   - 实时探测失败时才用缓存 IP，并写 `WARN: 异地组网 IP 实时探测失败，使用缓存值 …` 明示；两者皆无才降级公网绑定。**禁止**在探测失败时静默降级公网——用户选了 mesh-only，静默公网暴露是安全回退。
+   - 背景：`--reset` 重加入会让 Headscale 重新分配 100.x，纯缓存方案（`checkNode`/`joinNode` 才刷新）会拿过期 IP 去 `docker -p` 绑定，导致部署失败。网关反代侧（`proxy.go`）保持读缓存（per-request exec 不可行），由部署/探测/加入时的刷新覆盖。
+
+7. **Alpine 一键安装对照官方 installer.sh 补齐预检**：
+   - `installNode` 的 `sh` 分支（`buildInstallCommand`）先检查 `/etc/apk/repositories` 是否启用 community（`grep -Eq '^http.*/community$'`），缺失时 `setup-apkrepos -c -1` 自动启用；两者皆无则明确报错退出，不再是泛化的"安装脚本执行失败"。
+   - 服务启动用 `rc-service tailscale start || rc-service tailscale restart`（与官方一致走 `start` 优先）：`restart` 在从未启动过的服务上退出码不可靠，曾导致"装好了但 UI 报失败"的误报。
 
 ### 8.8 组件选用与页面布局进阶规范
 

@@ -18,6 +18,11 @@ type AutoHealer struct {
 	store *Store
 	log   *slog.Logger
 
+	// engine, when set, lets the healer skip applications that currently
+	// have a deployment in flight — restarting a container mid-swap would
+	// fight the deploy pipeline.
+	engine interface{ IsRunning(string) bool }
+
 	mu       sync.Mutex
 	failures map[string]int // app_id -> consecutive failure count
 }
@@ -51,10 +56,19 @@ func (h *AutoHealer) Start(stop <-chan struct{}) {
 	}()
 }
 
+// SetEngine injects the deployment engine so the healer can skip apps
+// with a deployment currently running.
+func (h *AutoHealer) SetEngine(e interface{ IsRunning(string) bool }) {
+	h.engine = e
+}
+
 func (h *AutoHealer) sweep() {
 	apps := h.store.ListApps()
 	for _, app := range apps {
 		if app.HealthcheckURL == "" || app.ContainerName == "" {
+			continue
+		}
+		if h.engine != nil && h.engine.IsRunning(app.ID) {
 			continue
 		}
 		hub := h.reg.Hub(app.HostID)

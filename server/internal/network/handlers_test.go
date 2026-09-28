@@ -169,3 +169,39 @@ func TestUpdateConfigKeepsKeyWhenEmpty(t *testing.T) {
 		t.Errorf("key rotation failed, got %q", got)
 	}
 }
+
+// TestBuildInstallCommandAlpine: the Alpine (sh) install path must precheck
+// the community repo (tailscale is not in main) and must start the OpenRC
+// service with `start` first — a bare `restart` on a never-started service
+// has unreliable exit codes and used to report failure on success.
+func TestBuildInstallCommandAlpine(t *testing.T) {
+	cmd := buildInstallCommand("sh")
+	for _, want := range []string{
+		"setup-apkrepos",
+		"community",
+		"/etc/apk/repositories",
+		"rc-service tailscale start",
+		"apk add tailscale",
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("alpine install command missing %q:\n%s", want, cmd)
+		}
+	}
+	if strings.Contains(cmd, "; rc-service tailscale restart") {
+		t.Errorf("alpine install must not use a bare restart as the terminal action:\n%s", cmd)
+	}
+}
+
+// TestBuildInstallCommandOtherShells: powershell/bash paths are unchanged.
+func TestBuildInstallCommandOtherShells(t *testing.T) {
+	if cmd := buildInstallCommand("powershell"); !strings.Contains(cmd, "tailscale-setup-latest.msi") {
+		t.Errorf("powershell install command changed unexpectedly:\n%s", cmd)
+	}
+	if cmd := buildInstallCommand("bash"); !strings.Contains(cmd, "tailscale.com/install.sh") {
+		t.Errorf("bash install command changed unexpectedly:\n%s", cmd)
+	}
+	// Unknown shells fall back to the systemd path.
+	if cmd := buildInstallCommand("cmd"); !strings.Contains(cmd, "systemctl") {
+		t.Errorf("default install command changed unexpectedly:\n%s", cmd)
+	}
+}

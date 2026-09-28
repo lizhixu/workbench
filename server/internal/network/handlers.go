@@ -280,6 +280,24 @@ func (h *Handlers) checkNode(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": st})
 }
 
+// buildInstallCommand returns the one-shot Tailscale install command for the
+// given agent shell. Extracted from installNode for testability.
+func buildInstallCommand(shell string) string {
+	switch shell {
+	case "powershell":
+		return `$msi = "$env:TEMP\tailscale-setup.msi"; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi', $msi); Start-Process msiexec.exe -Wait -ArgumentList "/i ` + "`\"$msi`\"" + ` /qn /norestart"; Start-Sleep -Seconds 3; Start-Service Tailscale`
+	case "sh":
+		// Alpine/BusyBox: tailscale lives in the community repo (same precheck
+		// as tailscale's own installer.sh), and the OpenRC service is started
+		// with `start` first — `restart` on a never-started service has
+		// unreliable exit codes on some OpenRC versions, which used to make
+		// installNode report failure even though the install succeeded.
+		return `rm -rf /tmp/tailscale* /tmp/lighter-installer*; if ! grep -Eq '^http.*/community$' /etc/apk/repositories 2>/dev/null; then if command -v setup-apkrepos >/dev/null 2>&1; then setup-apkrepos -c -1; else echo 'tailscale needs the Alpine community repository enabled in /etc/apk/repositories' >&2; exit 1; fi; fi; apk update && apk add tailscale && rc-update add tailscale default 2>/dev/null; rc-service tailscale start || rc-service tailscale restart`
+	default:
+		return `curl -fsSL https://tailscale.com/install.sh | sh && systemctl enable --now tailscaled`
+	}
+}
+
 // installNode executes automated Tailscale installation script on the host.
 func (h *Handlers) installNode(c *gin.Context) {
 	hostID := c.Param("id")
@@ -296,15 +314,7 @@ func (h *Handlers) installNode(c *gin.Context) {
 	}
 
 	shell := agentShellFor(agent)
-	var cmd string
-	switch shell {
-	case "powershell":
-		cmd = `$msi = "$env:TEMP\tailscale-setup.msi"; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi', $msi); Start-Process msiexec.exe -Wait -ArgumentList "/i ` + "`\"$msi`\"" + ` /qn /norestart"; Start-Sleep -Seconds 3; Start-Service Tailscale`
-	case "sh":
-		cmd = `rm -rf /tmp/tailscale* /tmp/lighter-installer*; apk update && apk add tailscale && rc-update add tailscale default 2>/dev/null; rc-service tailscale restart`
-	default:
-		cmd = `curl -fsSL https://tailscale.com/install.sh | sh && systemctl enable --now tailscaled`
-	}
+	cmd := buildInstallCommand(shell)
 
 	h.recordAudit(c, "install", "network_node", hostID, "一键安装 Tailscale 客户端")
 

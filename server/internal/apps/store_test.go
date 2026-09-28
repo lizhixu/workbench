@@ -121,3 +121,31 @@ func TestStoreDeploymentJSONLResilience(t *testing.T) {
 		t.Fatalf("corrupt tail should drop only the broken record: total=%d", total)
 	}
 }
+
+// TestCloneApplicationDeepCopy ensures store reads never share maps/slices
+// with the live object: the deploy engine mutates EnvVars in place
+// (ResolveTemplate) while HTTP handlers marshal the same app.
+func TestCloneApplicationDeepCopy(t *testing.T) {
+	orig := &Application{
+		ID:      "app_x",
+		EnvVars: map[string]string{"A": "1"},
+		Ports:   []PortMapping{{Host: 8080, Container: 80}},
+		Volumes: []string{"/d:/d"},
+	}
+	cp := cloneApplication(orig)
+	cp.EnvVars["B"] = "2"
+	cp.Ports[0].Host = 9090
+	cp.Volumes[0] = "/e:/e"
+	if _, ok := orig.EnvVars["B"]; ok {
+		t.Error("EnvVars map shared with original")
+	}
+	if orig.Ports[0].Host != 8080 {
+		t.Error("Ports slice shared with original")
+	}
+	if orig.Volumes[0] != "/d:/d" {
+		t.Error("Volumes slice shared with original")
+	}
+	if cloneApplication(nil) != nil {
+		t.Error("cloneApplication(nil) should be nil")
+	}
+}

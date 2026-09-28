@@ -149,12 +149,44 @@ func (s *Store) appendDeploymentLocked(d *Deployment) error {
 }
 
 // ListApps returns all applications ordered by creation time.
+// cloneApplication deep-copies an application so callers (deploy goroutines,
+// the auto-healer, HTTP handlers) never share maps/slices with the live
+// store object. This matters because the deploy engine mutates EnvVars
+// in place (ResolveTemplate) while other goroutines marshal the same
+// object — a shallow copy would risk "concurrent map iteration and map
+// write" crashes.
+func cloneApplication(a *Application) *Application {
+	if a == nil {
+		return nil
+	}
+	cp := *a
+	if a.EnvVars != nil {
+		cp.EnvVars = make(map[string]string, len(a.EnvVars))
+		for k, v := range a.EnvVars {
+			cp.EnvVars[k] = v
+		}
+	}
+	if a.TemplateParams != nil {
+		cp.TemplateParams = make(map[string]string, len(a.TemplateParams))
+		for k, v := range a.TemplateParams {
+			cp.TemplateParams[k] = v
+		}
+	}
+	if a.Ports != nil {
+		cp.Ports = append([]PortMapping(nil), a.Ports...)
+	}
+	if a.Volumes != nil {
+		cp.Volumes = append([]string(nil), a.Volumes...)
+	}
+	return &cp
+}
+
 func (s *Store) ListApps() []*Application {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	list := make([]*Application, 0, len(s.apps))
 	for _, a := range s.apps {
-		list = append(list, a)
+		list = append(list, cloneApplication(a))
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
 	return list
@@ -168,8 +200,7 @@ func (s *Store) GetApp(id string) (*Application, bool) {
 	if !ok {
 		return nil, false
 	}
-	cp := *a
-	return &cp, true
+	return cloneApplication(a), true
 }
 
 // PutApp inserts or replaces one application and persists the snapshot.
@@ -214,8 +245,7 @@ func (s *Store) FindAppByWebhookToken(token string) (*Application, bool) {
 	defer s.mu.RUnlock()
 	for _, a := range s.apps {
 		if a.WebhookToken == token {
-			cp := *a
-			return &cp, true
+			return cloneApplication(a), true
 		}
 	}
 	return nil, false

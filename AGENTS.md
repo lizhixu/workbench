@@ -455,9 +455,9 @@ watchman/                       # 仓库名（暂定，可改）
 │   │   └── store/             # Pinia 状态
 │   ├── package.json
 │   └── vite.config.ts
-├── deploy/                     # 部署脚本/compose
-│   ├── docker-compose.yml     # 控制端 +（可选）PG/Redis/vLLM
-│   └── install-agent.sh       # 一键绑定脚本模板
+├── deploy/                     # 部署与引导脚本
+│   ├── install.sh             # 控制端一键安装/升级/卸载脚本（单二进制 + systemd）
+│   └── quick_start.sh         # 一键引导脚本（下载最新 install.sh 并透传参数）
 └── docs/
 ```
 
@@ -755,91 +755,120 @@ Agent internal/shell
 
 ## B.6 部署与配置
 
-### 控制端单机部署（Docker Compose，推荐）
+### B.6.1 控制端自托管部署架构（Go 单二进制 + systemd，对标 1Panel / 宝塔）
 
-```yaml
-# deploy/docker-compose.yml
-services:
-  watchman:
-    image: watchman:latest
-    ports: ["443:443"]            # 唯一对外端口（WS/gRPC/REST 统一 443）
-    volumes:
-      - ./data:/data              # SQLite + 录像 + 审计
-      - ./config.yaml:/etc/watchman/config.yaml
-    environment:
-      - WATCHMAN_MASTER_KEY=${MASTER_KEY}   # 凭证加密主密钥
-```
+控制端为单个静态编译的 Go 二进制文件（`watchman-server`），Web 控制台前端产物在构建阶段经 `go:embed` 完整嵌入二进制（`server/web/embed.go`）。控制端启动后直接通过内置 HTTP 引擎提供 Web 页面（含 SPA 路由兜底）、RESTful API 与 WebSocket 终端/文件流，**无需任何外部 Nginx 或独立前端反代容器**。
 
-`config.yaml` 关键项：
+- **默认监听端口**：
+  - `HTTP / Web 控制台`：`:18789`（通过 `-http :18789` 指定，采用冷门高位端口，不占用宿主机 80/443/8080 等常用 Web 业务端口）。
+  - `gRPC 被控端长连接`：`:9090`（通过 `-grpc :9090` 指定，所有被纳管 Agent 均主动出站回连该端口）。
+  - `TLS / HTTPS`：支持 `-http-tls` 配合 `-tls-cert` 与 `-tls-key` 启用控制端 HTTPS 与加密 gRPC 通道。
+- **文件与目录布局**：
+  - 安装根目录：`/opt/watchman`
+  - 程序文件：`/opt/watchman/bin/watchman-server`、`/opt/watchman/bin/watchman-agent-*`
+  - 数据目录：`/opt/watchman/data`（存储用户凭据 `users.json`、设置中心 `settings.json`、终端会话与录像 `sessions/`、发布清单 `manifest.json` 等）
+  - 密钥环境文件：`/opt/watchman/watchman.env`（`WATCHMAN_JWT_KEY` 与 `WATCHMAN_VAULT_PASS`，权限 `0600`，重装与平滑升级时持久化复用）
+- **Systemd 托管规范**：
+  - 控制端服务：`/etc/systemd/system/watchman-server.service`（自动加载 `watchman.env`，`Restart=always`，`RestartSec=3`）；
+  - 本机自纳管 Agent：`/etc/systemd/system/watchman-agent.service`（安装时自动向控制端注册并纳管控制机自身，复用 `agent-state.json` 凭据，防止重复注册）。
 
-```yaml
-server:
-  listen: ":443"
-  tls:
-    cert: /etc/watchman/cert.pem
-    key:  /etc/watchman/key.pem
-  public_url: https://watchman.example.com   # 生成安装命令用
+### B.6.2 一键安装部署与自动升级（install.sh / quick_start.sh）
 
-store:
-  driver: sqlite            # 或 postgres
-  dsn: /data/watchman.db
+提供对标 1Panel 的单行命令极简引导与全功能安装脚本：
 
-agent:
-  heartbeat_sec: 30
-  session_keep_sec: 60      # 断连保留 PTY 时长
+- **一键引导安装（推荐，自动获取 master 分支最新脚本）**：
+  ```bash
+  bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/quick_start.sh)"
+  ```
+  可追加参数（原样透传给 `install.sh`）：
+  ```bash
+  bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/quick_start.sh)" -- --port 18789
+  ```
 
-ai:
-  enabled: true
-  default_provider: ollama
-  providers:
-    ollama: {base_url: http://host.docker.internal:11434/v1, model: qwen2.5-coder:7b}
-    deepseek: {base_url: https://api.deepseek.com, model: deepseek-chat, api_key: ${DEEPSEEK_KEY}}
-  fallbacks: [ollama, deepseek]
-  limits: {rpm: 60, tpm: 100000, monthly_budget_tokens: 5000000}
-  mask_on_external: true    # 外送第三方前脱敏
+- **直接使用主安装脚本**：
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/install.sh | bash
+  ```
 
-tunnel:                     # 组网
-  enabled: true
-  cidr: 100.64.0.0/10        # 虚拟 IP 段
+- **命令行参数清单（`deploy/install.sh`）**：
+  - `--version <tag>`：精确锁定官方 Release 版本（如 `--version v1.2.3`，优先级最高）；
+  - `--port <port>`：自定义 Web 控制台端口（默认 `18789`）；
+  - `--mirror <url>`（或环境变量 `GITHUB_MIRROR`）：指定 GitHub 下载加速镜像（如 `https://ghproxy.example.com`）；
+  - `--base-url <url>`：完全自定义归档下载源（源结构须满足 `{base}/{tag}/watchman-dist-{tag}-linux-{arch}.tar.gz`）；
+  - `--repo <owner/repo>`：指定 GitHub 仓库（默认 `lizhixu/workbench`）；
+  - `--force`：强制重新下载并覆盖安装当前版本；
+  - `--force-new-keys`：检测到已有数据目录但缺失 `watchman.env` 时，确认强制生成新密钥；
+  - `--uninstall`：停止并注销 systemd 服务，删除二进制程序（保留 `/opt/watchman/data` 与密钥）；
+  - `--uninstall --purge`：完全卸载并彻底清除所有数据。
 
-retention:
-  metrics_days: 7
-  recordings_days: 90
-```
+- **版本解析与升级策略**：
+  - **版本来源唯一真相**：**版本完全由官方 Release 提供，严禁任何自行决定或拼凑版本的行为**。发布包与升级清单必须 100% 来源于 Git tag 触发 GitHub Actions 产出的官方 Release（如 `v1.2.3` / `v1.2.3-beta.1`）以及由 CI 生成的 `manifest.json`；
+  - **正式版与测试版通道**：默认跟踪 GitHub `/releases/latest`（自动排除 pre-release）。测试版改由面板开关控制——在「系统设置 → 系统升级」中开启「加入测试计划」（`system.join_beta_program`），`install.sh` 升级时读取该开关，若开启则取 release 列表首项（含 pre-release）；
+  - **安装升级幂等性**：重跑脚本即为平滑升级，同版本默认跳过，保留数据目录与密钥；升级时自动停旧服务、替换二进制、复用凭据并热启动。
+  - **架构演进说明（2026-09-28）**：全面移除外置 Nginx 依赖（控制端内嵌前端 `server/web` 自提供），旧版静态目录与 `cmd/deploy/` SSH 部署工具已彻底下线；`install.sh` 在升级时自动检测并清理旧版残留的 nginx 站点配置，避免历史 `auth_request` 指向已下线端点引发静态页 404。
 
-### Agent 一键绑定
+### B.6.3 被控端 Agent 一键绑定与自纳管
 
-控制端生成：
+控制端对外提供动态安装脚本服务，无需向被控端传输静态脚本文件：
 
-```bash
-# deploy/install-agent.sh 模板（控制端渲染后下发）
-curl -fsSL https://watchman.example.com/install?token=<enroll_token> | bash
-```
+- **控制台生成一键安装命令**：
+  在控制台主机列表点击「添加主机」，控制端通过 `POST /api/v1/hosts/enroll` 签发一次性 `enroll_token`（默认 24h 有效期），并生成跨平台绑定命令：
+  - **Linux 主机**：
+    ```bash
+    curl -kfsSL 'http://<server-ip>:18789/install?token=<enroll_token>' | sudo bash
+    ```
+  - **Windows 主机（PowerShell）**：
+    ```powershell
+    irm 'http://<server-ip>:18789/install?os_type=windows&token=<enroll_token>' | iex
+    ```
 
-脚本行为：
-1. 下载对应 OS/arch 的 `watchman-agent` 二进制。
-2. 写入 `enroll_token` + `server_url` 到本地配置。
-3. 注册系统服务（systemd / Windows Service），启动。
-4. Agent 回连 → `RegisterRequest` → 换取 `auth_token` 持久化 → 上线。
+- **Agent 安装流程（`server/internal/install/install.go`）**：
+  1. 安装脚本自动识别目标主机的 OS（Linux / Windows）与架构（amd64 / arm64）；
+  2. 从控制端公开接口 `/api/v1/agent/binary` 下载对应架构的 `watchman-agent` 二进制；
+  3. 服务持久化注册：
+     - Linux：安装至 `/opt/watchman/watchman-agent`，注册 `watchman-agent.service` systemd 服务并开机自启；
+     - Windows：安装至 `C:\Program Files\Watchman\watchman-agent.exe`，注册名为 `WatchmanAgent` 的计划任务开机启动；
+  4. 携带参数启动：`-server <server-ip:9090> -token <enroll_token> [-upgrade-pubkey <pubkey>]`；
+  5. Agent 首次向控制端 gRPC 端口发起 `RegisterRequest` 换取长期凭证 `auth_token` 并持久化到 `agent-state.json`，随后立即清空 `enroll_token` 进入稳定心跳和监控上报状态。
 
-### 配置项清单（关键）
+### B.6.4 控制端命令行参数与运行时配置清单
 
-| 项 | 默认 | 说明 |
-| --- | --- | --- |
-| server.listen | :443 | 唯一对外端口 |
-| server.public_url | — | 生成安装命令/分享链接用 |
-| store.driver | sqlite | sqlite/postgres |
-| agent.heartbeat_sec | 30 | 心跳间隔 |
-| agent.session_keep_sec | 60 | 断连保留会话 |
-| retention.metrics_days | 7 | 监控保留 |
-| retention.recordings_days | 90 | 录像保留 |
-| ai.enabled | true | AI 总开关 |
-| ai.fallbacks | [ollama,...] | 降级链 |
-| ai.limits.* | 见上 | 限速/预算 |
-| ai.mask_on_external | true | 外送脱敏 |
-| tunnel.cidr | 100.64.0.0/10 | 组网虚拟 IP 段 |
+#### 1. 控制端启动参数（CLI Flags）
 
-### 发版流程（GitHub Actions + tag 驱动）
+| 参数 (Flag) | 默认值 | 对应环境变量 | 说明 |
+| --- | --- | --- | --- |
+| `-http` | `:18080` (安装脚本设 `:18789`) | `HTTP_PORT` | HTTP 服务监听地址（Web 页面、REST API 与 WS 网关） |
+| `-grpc` | `:9090` | — | gRPC 服务监听地址（供 Agent 主动回连） |
+| `-data` | `./data` (安装部署为 `/opt/watchman/data`) | `DATA_DIR` | 持久化数据目录（存储用户、会话、录像、统一设置、证书等） |
+| `-jwt-key` | 随机生成 | `WATCHMAN_JWT_KEY` | JWT 鉴权签名密钥（`watchman.env` 持久化 32 字节 hex） |
+| `-vault-pass` | 随机生成 | `WATCHMAN_VAULT_PASS` | 凭证密码箱加密及 Ed25519 升级签名派生根密钥 |
+| `-manifest` | `/opt/watchman/manifest.json` | — | 官方 Release 清单文件路径，Agent 目标版本与 SHA-256 唯一权威基准 |
+| `-public-url` | 空 (自动取请求 Host) | — | 控制端对外公网根地址（如 `https://watchman.example.com`，解决反代/NAT 下载 URL 不一致） |
+| `-ws-origins` | 空 | — | 允许连接 WebSocket 的额外浏览器 Origin 白名单（逗号分隔，`*` 禁用校验） |
+| `-tls-cert` | 空 | — | gRPC 与 HTTPS 服务端 TLS 证书路径 |
+| `-tls-key` | 空 | — | gRPC 与 HTTPS 服务端 TLS 私钥路径 |
+| `-http-tls` | `false` | — | 是否在 `-http` 端口上直接启用 HTTPS（须与 `-tls-cert`/`-tls-key` 成对配置） |
+| `-reset-secure-entry` | `false` | — | 应急工具开关：关闭安全入口（置 `security.secure_entry_enabled=false`）后退出 |
+
+#### 2. 系统与用户统一设置（`settings.json`）
+
+系统配置采用点分命名空间注册表统一校验，分 `system`（管理员全局）与 `user`（当前用户独立）双作用域，秘密（AI Key / Git Token）存放于加密 Vault。
+
+| 配置键 (Key) | 作用域 | 默认值 | 校验与说明 |
+| --- | --- | --- | --- |
+| `system.join_beta_program` | `system` | `false` | 加入测试计划：开启后 `install.sh` 与批量升级将跟踪预发布版本（pre-release） |
+| `security.secure_entry_enabled` | `system` | `false` | 宝塔式安全入口总开关：开启后非秘密路径一律返回 404 |
+| `security.secure_entry_path` | `system` | `"entry"` | 安全入口秘密路径（6~64 位 URL 安全字符） |
+| `navigation.default_host_tab` | `user` | `"overview"` | 进入主机详情时的默认页签（overview / metrics / system / docker / terminal / files / network 等） |
+| `appearance.theme_mode` | `user` | `"dark"` | 外观主题模式（light / dark / auto） |
+| `appearance.show_tips` | `user` | `true` | 是否展示页面功能提示语（开关说明类 `.tip-hint` 段落） |
+| `terminal.theme` | `user` | `"default"` | 在线终端主题方案 |
+| `terminal.default_shell` | `user` | `"bash"` | 默认登录 Shell（bash / sh / powershell / cmd） |
+| `terminal.font_size` | `user` | `14` | 终端字号（10~32） |
+| `terminal.scrollback` | `user` | `5000` | 终端回滚缓冲区最大行数（1000~50000） |
+| `files.default_path` | `user` | `""` | 文件管理器默认进入路径（必须为绝对路径，空则按操作系统默认） |
+
+### B.6.5 发版流程与 Release 管线（GitHub Actions + tag 驱动）
 
 版本唯一真相源是 git tag，**版本完全由官方 Release 提供，严禁任何自行决定或拼接版本的行为**。`internal/version` 的 `Version`/`Commit`/`BuildTime` 由构建时 ldflags 注入（见 `Makefile` 的 `LDFLAGS`）；`Get()` 取值优先级：ldflags 注入 > `debug.ReadBuildInfo()`（`go install` 装 tagged commit 时工具链自带）> `0.1.0-dev` 占位。任何本地部署、发布脚本或测试工具严禁擅自使用 commit hash 等拼接伪版本（如 `0.1.0-<hash>`）；未打 tag 的工作区一律视为开发态，升级管线权威基准必须来自官方 GitHub Releases 发布的 tarball 与 CI 生成的 `manifest.json`。
 
@@ -850,26 +879,6 @@ curl -fsSL https://watchman.example.com/install?token=<enroll_token> | bash
 - `manifest.json`：`{version, commit, build_time, agents: {"linux/amd64": {file, sha256}, ...}}`。已落地（2026-09-27）：控制端启动时读 `-manifest`（默认 `/opt/watchman/manifest.json`，由 install.sh 部署），作为 agent 升级的版本/sha256 基准，替代 server 自身构建版本，解除"最新 = 控制端自己"的闭环；无 manifest 时（dev）回退到 `CurrentAgentVersion`。单台/批量升级的版本判定、sha256（优先 manifest，其次 `install.AgentBinarySha256`）、签名、下载 URL 全部走这套基准。`GET /api/v1/version`（authed）返回 server 构建信息 + `agent_target_version` + `agent_manifest` + `upgrade_pubkey` + `public_url`。
 - 版本通道：`stable`（默认，GitHub `/releases/latest`，自动排除 pre-release）、`beta`（releases API 列表第一条，含 pre-release）、`--version` 精确锁定（优先级最高）。
 - 手动触发：workflow_dispatch 只构建打包、上传 artifacts，不创建 Release（正式打 tag 前验证管线用）。
-
-控制端一键安装脚本（`deploy/install.sh`，P2，已落地 2026-09-27；2026-09-28 去掉 `--channel`）：单二进制 + systemd，对标宝塔/1Panel：
-`curl -fsSL https://raw.githubusercontent.com/lizhixu/workbench/main/deploy/install.sh | bash`
-（合并到 main 前用 feature 分支的 raw URL）。
-参数：`--version v1.2.3`（精确锁定，优先级最高）/
-`--mirror URL`（或 `GITHUB_MIRROR`）/ `--base-url URL`（完全自定义源，布局 `{base}/{tag}/watchman-dist-{tag}-linux-{arch}.tar.gz`）/
-`--repo` / `--port` / `--force` / `--uninstall` / `--purge` / `-y`。
-版本解析：默认跟踪正式版（`/releases/latest` 的 302 落点取 tag，GitHub 自动排除 pre-release）；
-测试版改由面板开关控制——「系统设置 → 系统升级」中的「加入测试计划」（后端键 `system.join_beta_program`，system 域/Bool/默认 false，管理员专属），
-install.sh 升级时从 `$DATA_DIR/settings.json` 的 system 域读取该开关，开启则取 Release 列表第一项（含 pre-release）。
-仓库暂无正式版且未加入测试计划时明确报错，指引 `--version` 或去面板开测试计划。
-流程：root+Linux+架构检测 → 依赖检查 → 版本解析 → 下载 tarball+CHECKSUMS.txt → sha256 校验 →
-停旧服务 → 解压到 /opt/watchman（`--strip-components=1`，不碰 data）→
-密钥只生成一次（`watchman.env`，升级复用）→ 写 systemd（server 直接监听 `--port`（默认 18789，冷门端口，不占业务常用的 80/8080）同时提供 Web 页面与 API，无需 nginx；server + 本机自纳管 agent，
-enroll token 只在无 agent-state.json 时申请）→ 启动 → 健康检查（首页 200 + admin 登录；安全入口已启用时首页期望 404、跳过登录检查）→ 打印访问信息。
-幂等：重跑=升级（保留 data 与密钥）；同版本默认跳过，`--force` 强制重装；
-`--uninstall` 默认保留数据，`--purge` 才删 /opt/watchman。
-已验证（2026-09-27）：bash -n、`--help`、stable/beta/--version 解析（打真实 GitHub API）、
-真实 test release 的下载+sha256 校验、EXIT trap 退出码、`installed_version` 边界。systemd 真机安装未在本 VM 验证（无 systemd）。
-2026-09-28 重构：去掉 nginx（server/web go:embed 自 serve），`cmd/deploy/`（旧 SSH 部署工具，含 web-dist/nginx 逻辑）已删除；install.sh 同步更新，升级时自动清理残留的旧版 nginx 站点配置（其 auth_request 指向已删除的 check 端点，残留会导致静态页全 404）。新增 `deploy/quick_start.sh`（1Panel 式一键引导：`bash -c "$(curl -sSL .../master/deploy/quick_start.sh)"`，下载最新 install.sh 并透传参数）。
 
 ## B.7 MVP 推进顺序（落地路线）
 
@@ -882,7 +891,7 @@ enroll token 只在无 agent-state.json 时申请）→ 启动 → 健康检查�
 7. **用户/分组/权限 + 登录账号配置 + 登录行为**。
 8. **Windows Agent**：conpty 实现 `PTY` 接口，跑通 PowerShell/CMD。
 9. **AI 适配层**：LiteLLM 封装 + `nl2command` + 命令解释（带高危拦截）。
-10. **部署打包**：go:embed 前端 + Docker Compose + 一键绑定脚本。
+10. **部署打包**：go:embed 前端 + 单二进制自托管（install.sh / quick_start.sh）+ 跨平台动态一键安装端点。
 
 ## B.8 后端架构补充（查漏补缺）
 

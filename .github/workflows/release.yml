@@ -69,6 +69,24 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "tag=$TAG commit=$COMMIT prerelease=$PRERELEASE"
 
+      - name: Build web UI
+        run: |
+          set -euo pipefail
+          cd web
+          npm ci
+          npm run build
+
+      - name: Embed web UI into server sources
+        run: |
+          set -euo pipefail
+          # The web console is served by the Go server itself via go:embed
+          # (see server/web/embed.go and DESIGN.md §8.1): copy the build
+          # output into the embed directory before compiling the server.
+          rm -rf server/web/dist
+          mkdir -p server/web/dist
+          cp -r web/dist/. server/web/dist/
+          ls server/web/dist | head
+
       - name: Build server + agent binaries
         env:
           CGO_ENABLED: '0'
@@ -90,14 +108,6 @@ jobs:
           cp dist/bin/watchman-agent-linux-amd64 dist/bin/watchman-agent
           ls -la dist/bin
 
-      - name: Build web UI
-        run: |
-          set -euo pipefail
-          cd web
-          npm ci
-          npm run build
-          tar -czf ../dist/web-dist.tar.gz -C dist .
-
       - name: Package dist tarballs
         env:
           TAG: ${{ steps.meta.outputs.tag }}
@@ -113,7 +123,6 @@ jobs:
             cp dist/bin/watchman-agent-linux-arm64 "${STAGE}/bin/"
             cp dist/bin/watchman-agent-windows-amd64.exe "${STAGE}/bin/"
             cp dist/bin/watchman-agent "${STAGE}/bin/"
-            cp dist/web-dist.tar.gz "${STAGE}/"
             if [ -f deploy/install.sh ]; then
               cp deploy/install.sh "${STAGE}/"
             else

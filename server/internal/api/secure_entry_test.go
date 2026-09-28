@@ -70,4 +70,26 @@ func TestSecureEntryGuardWiredInRouter(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("wrong entry path: got %d, want 404", w.Code)
 	}
+
+	// 5. Static pages are hidden by the same guard (no nginx involved):
+	// without a cookie, GET / is 404.
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("static / without entry cookie: got %d, want 404", w.Code)
+	}
+
+	// 6. With the entry cookie the request reaches the embedded web
+	// handler: 200 when the UI is embedded (release builds), 503 when it
+	// is not (dev checkouts) — either way the guard let it through
+	// instead of 404ing it.
+	req = httptest.NewRequest("GET", "/", nil)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK && w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("static / with entry cookie: got %d, want 200 or 503 (web handler reached)", w.Code)
+	}
 }

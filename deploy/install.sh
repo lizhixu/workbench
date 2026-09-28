@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 #
-# Watchman 控制端一键安装脚本（单二进制 + systemd）
+# Watchman 控制端一键安装脚本（单二进制 + systemd，无需 nginx）
+#
+# 控制端是单个 Go 二进制：Web 控制台经 go:embed 打进二进制，
+# 直接监听端口同时提供静态页面与 API（对标 1Panel/宝塔面板模式）。
 #
 # 一键安装（stable 通道，默认）：
 #   curl -fsSL https://raw.githubusercontent.com/lizhixu/workbench/main/deploy/install.sh | bash
@@ -25,7 +28,7 @@ CHANNEL="stable"                             # stable | beta
 VERSION_TAG=""                               # --version，高于 --channel
 MIRROR="${GITHUB_MIRROR:-}"                  # --mirror，GitHub 镜像前缀
 BASE_URL=""                                  # --base-url，完全自定义下载源
-HTTP_PORT=80                                 # --port，nginx 监听端口
+HTTP_PORT=18789                             # --port，面板监听端口（冷门端口，避免占用业务常用的 80/8080）
 INSTALL_DIR="/opt/watchman"
 DATA_DIR="/opt/watchman/data"
 ASSUME_YES=0
@@ -56,7 +59,7 @@ usage() {
   --base-url URL       完全自定义下载源，布局需与 GitHub Release 一致：
                        {base-url}/{tag}/watchman-dist-{tag}-linux-{arch}.tar.gz
   --repo owner/name    仓库（默认 lizhixu/workbench）
-  --port PORT          nginx 监听端口（默认 80）
+  --port PORT          面板监听端口（默认 18789）
   --force              已是目标版本时仍强制重装
   --uninstall          卸载（保留数据与密钥）
   --purge              配合 --uninstall，删除 /opt/watchman 全部内容
@@ -102,12 +105,13 @@ do_uninstall() {
   rm -f /etc/systemd/system/watchman-server.service /etc/systemd/system/watchman-agent.service
   systemctl daemon-reload 2>/dev/null || true
 
+  # 旧版残留的 nginx 站点（2026-09-28 起不再需要 nginx）
   if [[ -f /etc/nginx/sites-enabled/watchman || -f /etc/nginx/sites-available/watchman ]]; then
     rm -f /etc/nginx/sites-enabled/watchman /etc/nginx/sites-available/watchman
     if systemctl is-active nginx >/dev/null 2>&1; then
-      nginx -t && systemctl reload nginx || log_warn "nginx reload 失败，请手动检查"
+      (nginx -t && systemctl reload nginx) || log_warn "nginx reload 失败，请手动检查"
     fi
-    log_ok "已移除 nginx 站点配置"
+    log_ok "已移除旧版 nginx 站点配置"
   fi
 
   if [[ "$PURGE" -eq 1 ]]; then
@@ -115,7 +119,7 @@ do_uninstall() {
     rm -rf "$INSTALL_DIR"
     log_ok "已删除 $INSTALL_DIR（--purge）"
   else
-    rm -rf "$INSTALL_DIR/bin" "$INSTALL_DIR/web" \
+    rm -rf "$INSTALL_DIR/bin" \
            "$INSTALL_DIR/manifest.json" "$INSTALL_DIR/install.sh"
     log_ok "已卸载程序文件，数据保留在 $DATA_DIR（彻底删除请加 --purge）"
   fi
@@ -123,7 +127,7 @@ do_uninstall() {
 
 # ================= 安装步骤 =================
 check_root() {
-  [[ "$(id -u)" -eq 0 ]] || die "请用 root 运行（一键安装需要写 /opt、systemd 与 nginx 配置）"
+  [[ "$(id -u)" -eq 0 ]] || die "请用 root 运行（一键安装需要写 /opt 与 systemd）"
 }
 
 detect_platform() {
@@ -142,25 +146,6 @@ check_deps() {
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
   [[ ${#missing[@]} -eq 0 ]] || die "缺少依赖: ${missing[*]}，请先安装"
-}
-
-ensure_nginx() {
-  # 返回 0 表示 nginx 可用（已装好或刚装好），1 表示跳过 nginx 配置
-  if command -v nginx >/dev/null 2>&1; then
-    return 0
-  fi
-  log_warn "未检测到 nginx（Web UI 与 API 反代需要它）"
-  if [[ -f /etc/debian_version ]] && command -v apt-get >/dev/null 2>&1; then
-    confirm "是否用 apt 自动安装 nginx？" || return 1
-    log_info "安装 nginx..."
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx
-    command -v nginx >/dev/null 2>&1 || die "nginx 安装失败"
-    log_ok "nginx 已安装"
-    return 0
-  fi
-  log_warn "非 Debian 系或已跳过安装：将不配置 nginx，装完后请自行反代 127.0.0.1:18080"
-  return 1
 }
 
 resolve_version() {
@@ -231,16 +216,28 @@ stop_services() {
   fi
 }
 
+remove_legacy_nginx() {
+  # 2026-09-28 起控制端不再需要 nginx：旧版 install.sh 写下的站点配置若残留，
+  # 会继续反代 127.0.0.1:18080，且其 auth_request 指向已删除的
+  # /api/v1/secure-entry/check（新二进制对该路径返回 404，nginx 只捕获 401），
+  # 导致所有静态页面 404。只删我们自己的站点文件，不碰其他站点。
+  local changed=0
+  for f in /etc/nginx/sites-enabled/watchman /etc/nginx/sites-available/watchman; do
+    if [[ -f "$f" ]]; then rm -f "$f"; changed=1; fi
+  done
+  [[ "$changed" -eq 0 ]] && return 0
+  log_ok "已移除旧版 nginx 站点配置（新版不再需要 nginx）"
+  if systemctl is-active nginx >/dev/null 2>&1; then
+    (nginx -t && systemctl reload nginx) || log_warn "nginx reload 失败，请手动检查"
+  fi
+}
+
 extract_tarball() {
   log_info "解压到 $INSTALL_DIR ..."
   mkdir -p "$INSTALL_DIR"
   tar -xzf "$TARBALL" -C "$INSTALL_DIR" --strip-components=1
   chmod 755 "$INSTALL_DIR/bin/watchman-server" "$INSTALL_DIR/bin"/watchman-agent* 2>/dev/null || true
-  # 前端 dist：nginx 直接 serve
-  rm -rf "$INSTALL_DIR/web/dist"
-  mkdir -p "$INSTALL_DIR/web/dist"
-  tar -xzf "$INSTALL_DIR/web-dist.tar.gz" -C "$INSTALL_DIR/web/dist"
-  rm -f "$INSTALL_DIR/web-dist.tar.gz"
+  # Web 控制台已通过 go:embed 打进 watchman-server，无需单独部署前端
   # 把安装脚本自身留一份，方便以后重跑升级
   cp "$0" "$INSTALL_DIR/install.sh" 2>/dev/null || true
   log_ok "文件已落盘"
@@ -269,7 +266,7 @@ After=network.target
 Type=simple
 WorkingDirectory=$INSTALL_DIR
 EnvironmentFile=$INSTALL_DIR/watchman.env
-ExecStart=$INSTALL_DIR/bin/watchman-server -grpc :9090 -http 127.0.0.1:18080 -data $DATA_DIR -jwt-key \${WATCHMAN_JWT_KEY} -vault-pass \${WATCHMAN_VAULT_PASS}
+ExecStart=$INSTALL_DIR/bin/watchman-server -grpc :9090 -http :$HTTP_PORT -data $DATA_DIR -jwt-key \${WATCHMAN_JWT_KEY} -vault-pass \${WATCHMAN_VAULT_PASS}
 Restart=always
 RestartSec=3
 
@@ -283,7 +280,7 @@ api_login_token() {
   # 登录默认 admin 账号拿 token，重试 30 秒（等 server 启动）
   local out
   for _ in $(seq 1 10); do
-    out=$(curl -sS -X POST http://127.0.0.1:18080/api/v1/auth/login \
+    out=$(curl -sS -X POST http://127.0.0.1:${HTTP_PORT}/api/v1/auth/login \
       -H "Content-Type: application/json" \
       -d '{"username":"admin","password":"admin"}' 2>/dev/null) || true
     local tok
@@ -304,7 +301,7 @@ write_systemd_agent() {
     log_info "申请本机 agent 的 enroll token..."
     local token enroll_json enroll_token
     token=$(api_login_token) || die "server 未就绪或 admin 登录失败，无法为本机 agent 申请 enroll token"
-    enroll_json=$(curl -sS -X POST http://127.0.0.1:18080/api/v1/hosts/enroll \
+    enroll_json=$(curl -sS -X POST http://127.0.0.1:${HTTP_PORT}/api/v1/hosts/enroll \
       -H "Authorization: Bearer $token")
     enroll_token=$(echo "$enroll_json" | grep -o '"enroll_token": *"[^"]*"' | head -1 | cut -d'"' -f4)
     [[ -z "$enroll_token" ]] && enroll_token=$(echo "$enroll_json" | grep -o '"token": *"[^"]*"' | head -1 | cut -d'"' -f4)
@@ -333,126 +330,6 @@ EOF
   log_ok "已写入 watchman-agent.service"
 }
 
-write_nginx() {
-  # $1 = 1 表示 nginx 可用
-  [[ "$1" -eq 1 ]] || return 0
-  cat > /etc/nginx/sites-available/watchman <<EOF
-server {
-    listen $HTTP_PORT default_server;
-    listen [::]:$HTTP_PORT default_server;
-    server_name _;
-
-    root $INSTALL_DIR/web/dist;
-    index index.html;
-
-    # 文件管理上传走这个代理；nginx 默认 1m 会直接 413
-    client_max_body_size 512m;
-
-    gzip on;
-    gzip_vary on;
-    gzip_comp_level 6;
-    gzip_min_length 1024;
-    gzip_proxied any;
-    gzip_types
-        text/plain
-        text/css
-        text/javascript
-        application/javascript
-        application/json
-        application/wasm
-        image/svg+xml;
-
-    # 安全入口（面板）：未通过入口校验时隐藏静态页面，避免扫描器发现面板。
-    # auth_request 子请求打到 Go 的 /api/v1/secure-entry/check（动态判定：
-    # 未启用时直接 200 放行；启用后要求入口 cookie 或有效会话），401 在此
-    # 转为 404，不暴露面板存在。需要 ngx_http_auth_request_module
-    #（Debian 官方 nginx 默认包含）。
-    location @secure_entry_denied {
-        return 404;
-    }
-
-    # Vite 产物文件名带 hash，可硬缓存
-    location /assets/ {
-        auth_request /api/v1/secure-entry/check;
-        error_page 401 = @secure_entry_denied;
-        expires 1y;
-        add_header Cache-Control "public, immutable";
-        access_log off;
-        try_files \$uri =404;
-    }
-
-    # index.html 引用 chunk 文件名，绝不能缓存
-    location = /index.html {
-        auth_request /api/v1/secure-entry/check;
-        error_page 401 = @secure_entry_denied;
-        add_header Cache-Control "no-cache, must-revalidate";
-    }
-
-    location / {
-        auth_request /api/v1/secure-entry/check;
-        error_page 401 = @secure_entry_denied;
-        try_files \$uri \$uri/ /index.html;
-    }
-
-    location /api/v1/ws/ {
-        proxy_pass http://127.0.0.1:18080/api/v1/ws/;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_read_timeout 86400s;
-        proxy_send_timeout 86400s;
-    }
-
-    location /api/v1/ {
-        proxy_pass http://127.0.0.1:18080/api/v1/;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_read_timeout 600s;
-        proxy_send_timeout 600s;
-    }
-
-    # 被管主机的 agent 一键安装脚本与二进制下载
-    location /install {
-        proxy_pass http://127.0.0.1:18080/install;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-    }
-
-    location /install_script {
-        proxy_pass http://127.0.0.1:18080/install_script;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-    }
-
-    location /agent/ {
-        proxy_pass http://127.0.0.1:18080/agent/;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_buffering off;
-    }
-}
-EOF
-  rm -f /etc/nginx/sites-enabled/default
-  ln -sf /etc/nginx/sites-available/watchman /etc/nginx/sites-enabled/watchman
-  nginx -t || die "nginx 配置检查失败"
-  if systemctl is-active nginx >/dev/null 2>&1; then
-    systemctl reload nginx || systemctl restart nginx
-  else
-    systemctl restart nginx
-  fi
-  systemctl enable nginx >/dev/null 2>&1 || true
-  systemctl is-active nginx >/dev/null || die "nginx 启动失败"
-  log_ok "nginx 已配置并启动（监听 $HTTP_PORT）"
-}
-
 start_services() {
   systemctl daemon-reload
   systemctl enable watchman-server >/dev/null 2>&1 || true
@@ -465,14 +342,25 @@ start_services() {
   log_ok "watchman-server 运行中"
 }
 
+secure_entry_enabled() {
+  # data 目录在升级时保留，安全入口一旦开启就会一直生效
+  [[ -f "$DATA_DIR/settings.json" ]] || return 1
+  grep -q '"security\.secure_entry_enabled"[[:space:]]*:[[:space:]]*true' "$DATA_DIR/settings.json" 2>/dev/null
+}
+
 health_check() {
-  # nginx 侧首页
-  if command -v nginx >/dev/null 2>&1 && systemctl is-active nginx >/dev/null 2>&1; then
-    local code
-    code=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${HTTP_PORT}/" 2>/dev/null) || code="000"
-    [[ "$code" == "200" ]] || die "健康检查失败：首页返回 $code"
-    log_ok "Web 首页 200"
+  # Web 首页（Go 直接提供）
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${HTTP_PORT}/" 2>/dev/null) || code="000"
+  if secure_entry_enabled; then
+    # 安全入口开启时，无 cookie 访问首页应被 guard 404（页面隐藏），
+    # 这本身就证明服务正常且 guard 生效；此时登录 API 同样被隐藏，跳过登录检查。
+    [[ "$code" == "404" ]] || die "健康检查失败：首页返回 $code（安全入口已启用，期望 404）"
+    log_ok "Web 服务正常（安全入口隐藏中，首页 404 符合预期）"
+    return 0
   fi
+  [[ "$code" == "200" ]] || die "健康检查失败：首页返回 $code"
+  log_ok "Web 首页 200"
   # API 登录（默认 admin/admin）
   api_login_token >/dev/null || die "健康检查失败：API 登录不通"
   log_ok "API 登录正常"
@@ -529,11 +417,9 @@ main() {
     log_info "全新安装 $TAG"
   fi
 
-  local have_nginx=0
-  ensure_nginx && have_nginx=1 || true
-
   download_tarball
   stop_services
+  remove_legacy_nginx
   extract_tarball
   provision_secrets
   write_systemd_server
@@ -544,7 +430,6 @@ main() {
   sleep 2
   systemctl is-active watchman-agent >/dev/null || die "watchman-agent 启动失败"
   log_ok "watchman-agent 运行中"
-  write_nginx "$have_nginx"
   health_check
   print_summary
 }

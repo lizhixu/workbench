@@ -374,8 +374,11 @@ func main() {
 	installHandler.UpgradePubKey = api.UpgradePubKeyHex
 	installHandler.RegisterRoutes(hr)
 	hs := &http.Server{
-		Addr:              *httpAddr,
-		Handler:           hr,
+		Addr: *httpAddr,
+		// No reverse proxy in front anymore (the web console is embedded
+		// via go:embed and served by this process): keep the 512m request
+		// body ceiling nginx used to enforce for file uploads.
+		Handler:           http.MaxBytesHandler(hr, 512<<20),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {

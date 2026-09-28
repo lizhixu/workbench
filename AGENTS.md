@@ -194,7 +194,7 @@
 - **登录认证**：控制端登录（账号密码，可扩展 OAuth/SSO）。
 - **多用户**：支持多用户，配合分组权限实现隔离。
 - **操作审计（自研增量）**：记录谁在何时对哪台主机做了什么操作（原产品为 SaaS，自研需自保审计日志，满足「停服自担」背景下的可追溯要求）。
-- **安全入口（宝塔式，2026-09-27）**：系统设置 → 安全入口（`web/src/views/settings/SecureEntry.vue`，`sections.ts` 注册 `key: 'secure-entry'`，`adminOnly` 仅管理员可见）。开启后只能通过秘密入口地址访问/登录面板：`GET /api/v1/secure-entry/<路径>` 校验通过后签发 HttpOnly cookie（`wm_secure_entry=<路径>.<HMAC>`，密钥由 JWT 签名密钥域分离派生 `server/internal/secentry`）并 302 到 `/`；之后才能看到登录页并发起登录。直接访问常规页面/API、无有效 JWT 又无入口 cookie 的请求一律 404（不暴露面板存在）。豁免：Agent 安装/注册（`/install*`、`/agent/*`、`/api/v1/hosts/enroll` 等，B.4 公开注册设计）、应用 webhook、终端分享链接、入口自身端点。nginx 模板（`deploy/install.sh`）对 `/`、`/index.html`、`/assets/` 加 `auth_request /api/v1/secure-entry/check`（401 转 404），静态页面层同样隐藏。配置键：`security.secure_entry_enabled`（bool）、`security.secure_entry_path`（6~64 位 URL 安全字符，`settings` 注册表校验）；`PUT /settings` 本就 adminOnly + 审计。**忘记路径**：控制机执行 `watchman-server -reset-secure-entry -data <数据目录>`（置 false 后退出）或改 settings.json 后重启。
+- **安全入口（宝塔式，2026-09-27）**：系统设置 → 安全入口（`web/src/views/settings/SecureEntry.vue`，`sections.ts` 注册 `key: 'secure-entry'`，`adminOnly` 仅管理员可见）。开启后只能通过秘密入口地址访问/登录面板：`GET /api/v1/secure-entry/<路径>` 校验通过后签发 HttpOnly cookie（`wm_secure_entry=<路径>.<HMAC>`，密钥由 JWT 签名密钥域分离派生 `server/internal/secentry`）并 302 到 `/`；之后才能看到登录页并发起登录。直接访问常规页面/API、无有效 JWT 又无入口 cookie 的请求一律 404（不暴露面板存在）。豁免：Agent 安装/注册（`/install*`、`/agent/*`、`/api/v1/hosts/enroll` 等，B.4 公开注册设计）、应用 webhook、终端分享链接、入口自身端点。Web 控制台经 `go:embed` 打进 server 二进制（`server/web`，构建见 DESIGN.md §8.1），由 Go 直接提供静态页面——无需 nginx；安全入口启用时，guard 中间件对 `/`、`/index.html`、`/assets/*` 同样返回 404（无 cookie/JWT 时），静态页面层同样隐藏。配置键：`security.secure_entry_enabled`（bool）、`security.secure_entry_path`（6~64 位 URL 安全字符，`settings` 注册表校验）；`PUT /settings` 本就 adminOnly + 审计。**忘记路径**：控制机执行 `watchman-server -reset-secure-entry -data <数据目录>`（置 false 后退出）或改 settings.json 后重启。
 
 ### 3.16 AI 能力（增强）
 
@@ -843,7 +843,7 @@ curl -fsSL https://watchman.example.com/install?token=<enroll_token> | bash
 - 打 tag 即发版：`git tag v1.2.3 && git push --tags` 触发 `.github/workflows/release.yml`。
 - tag 规范：`v1.2.3` 为正式版；`v1.3.0-rc.1` / `v1.3.0-beta.1`（带 `-` 后缀）由 CI 自动标记为 pre-release。
 - 构建矩阵：server（linux amd64/arm64）+ agent（linux amd64/arm64、windows amd64），全部 `CGO_ENABLED=0` 静态编译。
-- 产物：`watchman-dist-v1.2.3-linux-{amd64,arm64}.tar.gz`（内含 `bin/` 二进制——agent 文件名遵循 `watchman-agent-{goos}-{goarch}` 以便 `install.FindAgentBinary` 直接找到、`web-dist.tar.gz`、`manifest.json`）+ `CHECKSUMS.txt`（sha256）。
+- 产物：`watchman-dist-v1.2.3-linux-{amd64,arm64}.tar.gz`（内含 `bin/` 二进制——agent 文件名遵循 `watchman-agent-{goos}-{goarch}` 以便 `install.FindAgentBinary` 直接找到、`manifest.json`；Web 控制台已通过 `go:embed` 打进 `watchman-server`，无需单独的前端包）+ `CHECKSUMS.txt`（sha256）。
 - `manifest.json`：`{version, commit, build_time, agents: {"linux/amd64": {file, sha256}, ...}}`。已落地（2026-09-27）：控制端启动时读 `-manifest`（默认 `/opt/watchman/manifest.json`，由 install.sh 部署），作为 agent 升级的版本/sha256 基准，替代 server 自身构建版本，解除"最新 = 控制端自己"的闭环；无 manifest 时（dev）回退到 `CurrentAgentVersion`。单台/批量升级的版本判定、sha256（优先 manifest，其次 `install.AgentBinarySha256`）、签名、下载 URL 全部走这套基准。`GET /api/v1/version`（authed）返回 server 构建信息 + `agent_target_version` + `agent_manifest` + `upgrade_pubkey` + `public_url`。
 - 版本通道：`stable`（默认，GitHub `/releases/latest`，自动排除 pre-release）、`beta`（releases API 列表第一条，含 pre-release）、`--version` 精确锁定（优先级最高）。
 - 手动触发：workflow_dispatch 只构建打包、上传 artifacts，不创建 Release（正式打 tag 前验证管线用）。
@@ -857,15 +857,14 @@ curl -fsSL https://watchman.example.com/install?token=<enroll_token> | bash
 版本解析：stable 用 `/releases/latest` 的 302 落点取 tag（GitHub 自动排除 pre-release），
 beta 取 Release 列表第一项（含 pre-release）；仓库暂无正式版时 stable 明确报错并指引 beta/--version。
 流程：root+Linux+架构检测 → 依赖检查 → 版本解析 → 下载 tarball+CHECKSUMS.txt → sha256 校验 →
-停旧服务 → 解压到 /opt/watchman（`--strip-components=1`，不碰 data）→ web dist 落盘 →
-密钥只生成一次（`watchman.env`，升级复用）→ 写 systemd（server + 本机自纳管 agent，
-enroll token 只在无 agent-state.json 时申请）→ nginx 站点（配置与 `cmd/deploy/main.go` 同源，
-缺 nginx 时 Debian 系可 apt 自动装）→ 启动 → 健康检查（首页 200 + admin 登录）→ 打印访问信息。
+停旧服务 → 解压到 /opt/watchman（`--strip-components=1`，不碰 data）→
+密钥只生成一次（`watchman.env`，升级复用）→ 写 systemd（server 直接监听 `--port`（默认 18789，冷门端口，不占业务常用的 80/8080）同时提供 Web 页面与 API，无需 nginx；server + 本机自纳管 agent，
+enroll token 只在无 agent-state.json 时申请）→ 启动 → 健康检查（首页 200 + admin 登录；安全入口已启用时首页期望 404、跳过登录检查）→ 打印访问信息。
 幂等：重跑=升级（保留 data 与密钥）；同版本默认跳过，`--force` 强制重装；
 `--uninstall` 默认保留数据，`--purge` 才删 /opt/watchman。
 已验证（2026-09-27）：bash -n、`--help`、stable/beta/--version 解析（打真实 GitHub API）、
-真实 test release 的下载+sha256 校验、nginx 配置渲染与 deploy/main.go 指令级一致、
-EXIT trap 退出码、`installed_version` 边界。systemd/nginx 真机安装未在本 VM 验证（无 systemd）。
+真实 test release 的下载+sha256 校验、EXIT trap 退出码、`installed_version` 边界。systemd 真机安装未在本 VM 验证（无 systemd）。
+2026-09-28 重构：去掉 nginx（server/web go:embed 自 serve），`cmd/deploy/`（旧 SSH 部署工具，含 web-dist/nginx 逻辑）已删除；install.sh 同步更新，升级时自动清理残留的旧版 nginx 站点配置（其 auth_request 指向已删除的 check 端点，残留会导致静态页全 404）。
 
 ## B.7 MVP 推进顺序（落地路线）
 

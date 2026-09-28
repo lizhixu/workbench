@@ -10,17 +10,17 @@
 
 | 组件 | 技术 | 职责 |
 | --- | --- | --- |
-| 控制端 `watchman-server` | Go | Web 控制台 + API 网关 + Agent 接入（gRPC）+ 数据存储 + 告警引擎 |
+| 控制端 `watchman-server` | Go | Web 控制台（前端 go:embed 进二进制）+ API 网关 + Agent 接入（gRPC）+ 数据存储 + 告警引擎 |
 | 被管端 `watchman-agent` | Go | 采集主机信息、执行下发指令、终端/文件/Docker 通道；Linux/Windows，amd64/arm64 |
 | 前端 `web/` | Vue 3 + TypeScript + Vite + Naive UI | 控制台 UI，构建产物经 `go:embed` 打进 server 单二进制 |
 
 ```
-web/  ──vite build──▶  dist/  ──go:embed──▶  watchman-server ── :18080
+web/  ──vite build──▶  dist/  ──go:embed──▶  watchman-server ── :18789（页面+API 同源）
                                                             ▲
 agent ── gRPC over TLS ────────────────────────────────── :9090
 ```
 
-生产部署经 nginx 反代（默认 80 端口）：`/`、`/index.html`、`/assets/` 走静态文件，`/api/v1` 反代到 Go。
+单二进制直跑，无需 nginx（对标 1Panel/宝塔面板模式）。
 
 ## 核心功能
 
@@ -40,7 +40,7 @@ agent ── gRPC over TLS ─────────────────�
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lizhixu/workbench/main/deploy/install.sh -o install.sh
-sudo bash install.sh            # 默认 stable 通道，nginx 监听 80
+sudo bash install.sh            # 默认 stable 通道，面板监听 18789
 sudo bash install.sh --help    # 查看全部选项（--channel beta、--port、--mirror 等）
 ```
 
@@ -72,7 +72,7 @@ npm run build         # 生产构建
 
 ## 发版
 
-推送 `v*` tag 触发 GitHub Actions：构建 server（linux amd64/arm64）+ agent（linux amd64/arm64、windows amd64），注入版本号/commit/构建时间，打包 `watchman-dist-<tag>-linux-<arch>.tar.gz`（bin + web-dist.tar.gz + manifest.json）+ `CHECKSUMS.txt`，发布 GitHub Release（`-rc`/`-beta` 后缀自动标 pre-release）。
+推送 `v*` tag 触发 GitHub Actions：构建 server（linux amd64/arm64）+ agent（linux amd64/arm64、windows amd64），注入版本号/commit/构建时间，打包 `watchman-dist-<tag>-linux-<arch>.tar.gz`（bin + manifest.json，前端已 embed 进 server）+ `CHECKSUMS.txt`，发布 GitHub Release（`-rc`/`-beta` 后缀自动标 pre-release）。
 
 ```bash
 git tag v1.0.0 && git push origin v1.0.0
@@ -85,7 +85,7 @@ server/     控制端（cmd/watchman 入口，internal/ 按域拆分）
 agent/      被管端
 web/        前端控制台
 proto/      gRPC 协议（buf 管理）
-deploy/     一键安装脚本 install.sh（含 nginx/systemd 模板）
+deploy/     一键安装脚本 install.sh（systemd 模板）
 ```
 
 ## 许可证

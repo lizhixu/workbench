@@ -9,6 +9,11 @@ reports/
 # Build outputs
 bin/
 watchman*.exe
+# The web console is embedded into the server binary (see server/web):
+# its build output is copied here by `make build-server-with-ui` and must
+# not be committed (only the .gitkeep placeholder is tracked).
+server/web/dist/*
+!server/web/dist/.gitkeep
 watchman*.exe~
 # Anchored to the repo root: these are compiled binaries, not the
 # server/cmd/watchman source directory (a bare `watchman` pattern ignored it).

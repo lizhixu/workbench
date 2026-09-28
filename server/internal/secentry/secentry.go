@@ -16,9 +16,9 @@
 //     valid JWT (already logged in), a valid entry cookie, or target an
 //     explicitly exempt infrastructure path (agent install/enroll,
 //     webhooks, the entry endpoints themselves). Everything else gets 404.
-//  4. nginx (deploy/install.sh) additionally hides the static pages via
-//     auth_request to /api/v1/secure-entry/check, which answers 200 for a
-//     valid cookie/session and 401 otherwise (mapped to 404).
+//     The web console's static pages are served by the server itself
+//     (server/web, go:embed) and are hidden by the same guard — no reverse
+//     proxy is involved.
 //
 // Recovery: if the entry path is lost, run
 // `watchman-server -reset-secure-entry` on the control host, or edit
@@ -195,11 +195,10 @@ func (g *Guard) Middleware() gin.HandlerFunc {
 	}
 }
 
-// RegisterRoutes mounts the entry issuance and check endpoints. They are
-// public by design: the entry path itself is the secret.
+// RegisterRoutes mounts the entry issuance endpoint. It is public by
+// design: the entry path itself is the secret.
 func (g *Guard) RegisterRoutes(v1 *gin.RouterGroup) {
 	v1.GET("/secure-entry/:entryPath", g.handleIssue)
-	v1.GET("/secure-entry/check", g.handleCheck)
 }
 
 // handleIssue validates the secret entry path from the URL, sets the signed
@@ -217,20 +216,4 @@ func (g *Guard) handleIssue(c *gin.Context) {
 	c.SetCookie(CookieName, g.issueValue(entryPath), cookieMaxAge, "/", "", false, true)
 	g.log.Info("secure entry visited, cookie issued", "remote", c.ClientIP())
 	c.Redirect(http.StatusFound, "/")
-}
-
-// handleCheck is the nginx auth_request target: 200 when the request may
-// see the static pages (feature disabled, valid cookie, or valid session),
-// 401 otherwise (nginx maps it to 404).
-func (g *Guard) handleCheck(c *gin.Context) {
-	enabled, entryPath := g.config()
-	if !enabled {
-		c.JSON(http.StatusOK, gin.H{"ok": true, "enabled": false})
-		return
-	}
-	if g.validJWT(c) || g.validCookie(c, entryPath) {
-		c.JSON(http.StatusOK, gin.H{"ok": true, "enabled": true})
-		return
-	}
-	c.AbortWithStatus(http.StatusUnauthorized)
 }

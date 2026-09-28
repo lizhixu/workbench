@@ -43,6 +43,7 @@ import (
 	"watchman/server/internal/snapshots"
 	"watchman/server/internal/vault"
 	"watchman/server/internal/ws"
+	"watchman/server/web"
 
 	"github.com/gin-gonic/gin"
 )
@@ -384,6 +385,13 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		}
 		ws.TerminalHandler(reg, log, onEnd).ServeHTTP(c.Writer, c.Request)
 	})
+
+	// Web console (go:embed, see server/web). Mounted last: unknown /api/*
+	// paths keep a JSON 404, everything else falls back to index.html
+	// (Vue Router history mode). When the secure entry is enabled, the
+	// guard middleware above already 404s unauthenticated requests here —
+	// no reverse proxy needed to hide the pages.
+	web.NewHandler().RegisterRoutes(r)
 
 	return r
 }

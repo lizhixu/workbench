@@ -166,35 +166,10 @@ func TestGuardExemptions(t *testing.T) {
 		{"GET", "/api/v1/terminals/share/sometoken"},
 		{"GET", "/install"},
 		{"GET", "/agent/binary"},
-		{"GET", "/api/v1/secure-entry/check"},
 	} {
 		if w := doReq(t, r, tc.method, tc.path, nil, nil); w.Code == http.StatusNotFound {
 			t.Fatalf("exempt path %s must not be 404 (got %d)", tc.path, w.Code)
 		}
-	}
-}
-
-func TestCheckEndpoint(t *testing.T) {
-	g, ss, _ := testGuard(t)
-	r := testEngine(g)
-
-	// Disabled -> 200.
-	setEntry(t, ss, false, "")
-	if w := doReq(t, r, "GET", "/api/v1/secure-entry/check", nil, nil); w.Code != http.StatusOK {
-		t.Fatalf("disabled check got %d, want 200", w.Code)
-	}
-
-	// Enabled, no cookie -> 401.
-	setEntry(t, ss, true, "k9xQ2mZ7aB4cD8eF")
-	if w := doReq(t, r, "GET", "/api/v1/secure-entry/check", nil, nil); w.Code != http.StatusUnauthorized {
-		t.Fatalf("enabled check without cookie got %d, want 401", w.Code)
-	}
-
-	// Enabled, with cookie -> 200.
-	w := doReq(t, r, "GET", "/api/v1/secure-entry/k9xQ2mZ7aB4cD8eF", nil, nil)
-	cookies := w.Result().Cookies()
-	if w := doReq(t, r, "GET", "/api/v1/secure-entry/check", nil, cookies); w.Code != http.StatusOK {
-		t.Fatalf("enabled check with cookie got %d, want 200", w.Code)
 	}
 }
 

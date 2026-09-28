@@ -12,11 +12,26 @@ LDFLAGS := -s -w -X watchman/internal/version.Version=$(VERSION) -X watchman/int
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: all build-server build-agent build-all test vet fmt
+.PHONY: all build-web build-server build-server-with-ui build-agent build-all test vet fmt
 
 all: build-server build-agent
 
+# Web console build. Its output is copied into server/web/dist/ so the Go
+# build embeds it (see DESIGN.md §8.1).
+build-web:
+	cd web && npm ci && npm run build
+
+# Fast Go-only server build for development: embeds whatever is currently
+# in server/web/dist/ (empty on a fresh checkout → the binary answers 503
+# for page requests; the API is unaffected). Use build-server-with-ui for
+# a shippable binary.
 build-server:
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags "$(LDFLAGS)" -o bin/watchman ./server/cmd/watchman
+
+build-server-with-ui: build-web
+	rm -rf server/web/dist
+	mkdir -p server/web/dist
+	cp -r web/dist/. server/web/dist/
 	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags "$(LDFLAGS)" -o bin/watchman ./server/cmd/watchman
 
 build-agent:

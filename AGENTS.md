@@ -7,6 +7,7 @@
 > **必读 + 维护约定**：
 > 1. 本文档**每次会话/每次任务开工前必须完整阅读**，并且**必须严格遵循其中的全部约束**（§7 代码质量校验、§8 前端布局规范、§8.5 终端断线重连、§8.6 维护握手与告警防抖等）。开工前先读、改代码时对照，不得凭印象或惯例行事；与文档冲突时以文档为准，若文档确实过时则先更新文档再改代码。
 > 2. 本文档是需求与设计的唯一事实来源。**所有需求的改动和新增，实现代码的同时必须同步维护本文档**——涉及协议字段、数据模型、REST/WS 接口、配置项、前端布局与交互规范、构建与部署方式的，都要在对应章节补齐或更正，不允许只改代码不更新文档。
+> 3. **版本唯一真相源**：**版本完全由官方 Release 提供，严禁任何自行决定或拼凑版本的行为**。系统版本、安装包与升级清单必须 100% 来源于 Git tag 触发 GitHub Actions 产出的官方 Release（形如 `v1.2.3` / `v1.2.3-beta.1`）及 CI 生成的 `manifest.json`；严禁在任何环境部署或升级流程中私自捏造/拼接版本号（如 `0.1.0-<hash>`）。
 
 ---
 
@@ -840,7 +841,7 @@ curl -fsSL https://watchman.example.com/install?token=<enroll_token> | bash
 
 ### 发版流程（GitHub Actions + tag 驱动）
 
-版本唯一真相源是 git tag。`internal/version` 的 `Version`/`Commit`/`BuildTime` 由构建时 ldflags 注入（见 `Makefile` 的 `LDFLAGS`）；`Get()` 取值优先级：ldflags 注入 > `debug.ReadBuildInfo()`（`go install` 装 tagged commit 时工具链自带）> `0.1.0-dev` 占位。
+版本唯一真相源是 git tag，**版本完全由官方 Release 提供，严禁任何自行决定或拼接版本的行为**。`internal/version` 的 `Version`/`Commit`/`BuildTime` 由构建时 ldflags 注入（见 `Makefile` 的 `LDFLAGS`）；`Get()` 取值优先级：ldflags 注入 > `debug.ReadBuildInfo()`（`go install` 装 tagged commit 时工具链自带）> `0.1.0-dev` 占位。任何本地部署、发布脚本或测试工具严禁擅自使用 commit hash 等拼接伪版本（如 `0.1.0-<hash>`）；未打 tag 的工作区一律视为开发态，升级管线权威基准必须来自官方 GitHub Releases 发布的 tarball 与 CI 生成的 `manifest.json`。
 
 - 打 tag 即发版：`git tag v1.2.3 && git push --tags` 触发 `.github/workflows/release.yml`。
 - tag 规范：`v1.2.3` 为正式版；`v1.3.0-rc.1` / `v1.3.0-beta.1`（带 `-` 后缀）由 CI 自动标记为 pre-release。
@@ -1051,6 +1052,10 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
    - **编译/构建检查**：代码编写完成后，自动执行前端与后端构建测试，验证没有打破既有功能。
    - **功能与视觉对齐**：修改完毕后进行自动化与人工视觉 Review，确保 UI 布局契合长亭百川云/牧云控制台风格规范。
 
+4. **版本权威性与唯一来源准则 (Release-Driven Authority)**：
+   - **版本完全由官方 Release 提供，严禁任何自行决定或拼接行为**：系统所有组件（控制端 Server、被管端 Agent、升级清单 Manifest 等）的版本号唯一来源必须是 Git tag 触发的官方 GitHub Release（形如 `v1.2.3` 或 `v1.2.3-beta.1`）。
+   - **绝对禁止私自捏造/拼接版本**：禁止在开发、部署或测试脚本中自行生成伪版本号（例如取本地 git commit hash 拼凑 `0.1.0-<hash>` 或任意自定义后缀）；未经 tag 发布的代码版本一律为开发环境占位（`0.1.0-dev`），线上与测试环境的升级验证必须且只能来源于官方 Release 产物与由 CI 生成的 `manifest.json`，确保版本链路 100% 可追溯。
+
 ---
 
 ## 8. 前端布局规范
@@ -1228,8 +1233,9 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
 4. **一次性理由自愈消费**：
    - Agent 收到服务端的 `RegisterResponse`（即鉴权注册成功）后，必须立即在本地状态文件中清空 `reconnect_reason`，确保后续运行过程中的异常掉线能恢复常规告警感知。
 
-5. **版本号必须是构建产物，不能硬编码**：
+5. **版本号必须是构建产物，不能硬编码，且完全由 Release 提供**：
    - Agent 上报的 `RegisterRequest.agent_version` 与控制端的 `CurrentAgentVersion` 一律取自 `internal/version`（`version.Get()`），发布时用 `make VERSION=v1.2.3 build-all` 注入（`-ldflags -X watchman/internal/version.Version=...`）。
+   - **版本号完全由官方 Release 提供，绝对禁止自行决定/拼接**：严禁在任何安装、部署、升级或测试脚本中自行生成或捏造版本（例如拼接 commit hash `0.1.0-<hash>`）；所有组件版本与升级清单 `manifest.json` 必须且只能来源于官方 GitHub Releases，确保版本权威性与可复现性。
    - 若两处都写死同一个常量（例如都是 `0.1.0-dev`），「哪些 Agent 需要升级」的判定恒为 false，批量升级与前端「需升级」提示会永久失效；此场景可用批量升级接口的 `force=true` 强制重推。
    - Agent 本地状态（含 `reconnect_reason`）只能经 `config.Update` / `SetReconnectReason` 读写（带互斥锁 + 临时文件原子落盘），升级回调、收包协程、注册协程会并发访问。
 

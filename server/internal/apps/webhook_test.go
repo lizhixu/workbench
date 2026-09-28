@@ -79,9 +79,17 @@ func TestWebhookBranchFiltering(t *testing.T) {
 	req := httptest.NewRequest("POST", "/api/v1/apps/webhook/tok123", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("gitee form payload failed: code=%d body=%s", w.Code, w.Body.String())
-	}
+		if w.Code != http.StatusOK {
+			t.Fatalf("gitee form payload failed: code=%d body=%s", w.Code, w.Body.String())
+		}
+		deadline = time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			_, total := s.ListDeployments("app_hook", 0, 10)
+			if total == 2 && !e.IsRunning("app_hook") {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
 
 	// AutoDeploy disabled -> forbidden.
 	_ = s.UpdateApp("app_hook", func(a *Application) error { a.AutoDeploy = false; return nil })

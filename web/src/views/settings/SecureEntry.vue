@@ -173,6 +173,5 @@ onActivated(load)
 .secure-entry {
   height: 100%;
   overflow-y: auto;
-  padding: 4px 2px;
 }
 </style>

@@ -6,7 +6,7 @@
 # 直接监听端口同时提供静态页面与 API（对标 1Panel/宝塔面板模式）。
 #
 # 一键安装（默认跟踪正式版）：
-#   curl -fsSL https://raw.githubusercontent.com/lizhixu/workbench/main/deploy/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/install.sh | bash
 #
 # 常用姿势：
 #   bash install.sh --version v1.2.3        # 精确锁定版本
@@ -37,6 +37,7 @@ INSTALL_DIR="/opt/watchman"
 DATA_DIR="/opt/watchman/data"
 ASSUME_YES=0
 FORCE=0
+FORCE_NEW_KEYS=0
 UNINSTALL=0
 PURGE=0
 
@@ -62,6 +63,7 @@ usage() {
   --repo owner/name    仓库（默认 lizhixu/workbench）
   --port PORT          面板监听端口（默认 18789）
   --force              已是目标版本时仍强制重装
+  --force-new-keys     已有数据但丢失 watchman.env 时强制生成新密钥
   --uninstall          卸载（保留数据与密钥）
   --purge              配合 --uninstall，删除 /opt/watchman 全部内容
   -y                   全自动，不做交互确认
@@ -72,16 +74,17 @@ EOF
 # ---------------- 参数解析 ----------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --version)   VERSION_TAG="$2"; shift 2 ;;
-    --mirror)    MIRROR="$2"; shift 2 ;;
-    --base-url)  BASE_URL="$2"; shift 2 ;;
-    --repo)      REPO="$2"; shift 2 ;;
-    --port)      HTTP_PORT="$2"; shift 2 ;;
-    --force)     FORCE=1; shift ;;
-    --uninstall) UNINSTALL=1; shift ;;
-    --purge)     PURGE=1; shift ;;
-    -y)          ASSUME_YES=1; shift ;;
-    -h|--help)   usage; exit 0 ;;
+    --version)        VERSION_TAG="$2"; shift 2 ;;
+    --mirror)         MIRROR="$2"; shift 2 ;;
+    --base-url)       BASE_URL="$2"; shift 2 ;;
+    --repo)           REPO="$2"; shift 2 ;;
+    --port)           HTTP_PORT="$2"; shift 2 ;;
+    --force)          FORCE=1; shift ;;
+    --force-new-keys) FORCE_NEW_KEYS=1; shift ;;
+    --uninstall)      UNINSTALL=1; shift ;;
+    --purge)          PURGE=1; shift ;;
+    -y)               ASSUME_YES=1; shift ;;
+    -h|--help)        usage; exit 0 ;;
     *)           die "未知参数: $1（用 --help 查看用法）" ;;
   esac
 done
@@ -250,9 +253,16 @@ provision_secrets() {
   # 密钥只生成一次：重装/升级必须复用，否则已签发的 token 与加密的凭据全废
   local env_file="$INSTALL_DIR/watchman.env"
   if [[ ! -s "$env_file" ]]; then
+    # 若已有历史数据目录但缺少 watchman.env，生成新密钥会破坏凭据库并导致 Agent 签名失配
+    if [[ -d "$DATA_DIR" && -n "$(ls -A "$DATA_DIR" 2>/dev/null)" && "$FORCE_NEW_KEYS" -eq 0 ]]; then
+      die "检测到已有数据目录 $DATA_DIR，但缺少密钥文件 $env_file！
+生成新密钥将导致已有凭据解密失败、Agent 升级验签失配。
+请将原有 watchman.env 拷贝至 $env_file，或追加 --force-new-keys 确认强制生成全新密钥。"
+    fi
     umask 077
     printf 'WATCHMAN_JWT_KEY=%s\nWATCHMAN_VAULT_PASS=%s\n' \
       "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > "$env_file"
+    umask 022
     log_ok "已生成服务密钥 $env_file"
   else
     log_info "复用已有服务密钥 $env_file"
@@ -351,7 +361,9 @@ remove_legacy_webdir() {
   local removed=0
   if [[ -d "$INSTALL_DIR/web" ]]; then rm -rf "$INSTALL_DIR/web"; removed=1; fi
   if [[ -f "$INSTALL_DIR/web-dist.tar.gz" ]]; then rm -f "$INSTALL_DIR/web-dist.tar.gz"; removed=1; fi
-  [[ "$removed" -eq 1 ]] && log_ok "已清理旧版落盘前端（新版已内置进二进制）"
+  if [[ "$removed" -eq 1 ]]; then
+    log_ok "已清理旧版落盘前端（新版已内置进二进制）"
+  fi
 }
 
 secure_entry_enabled() {
@@ -373,9 +385,12 @@ health_check() {
   fi
   [[ "$code" == "200" ]] || die "健康检查失败：首页返回 $code"
   log_ok "Web 首页 200"
-  # API 登录（默认 admin/admin）
-  api_login_token >/dev/null || die "健康检查失败：API 登录不通"
-  log_ok "API 登录正常"
+  # API 登录（默认 admin/admin；改过密码的机器升级时允许失败）
+  if api_login_token >/dev/null; then
+    log_ok "API 默认账号登录正常"
+  else
+    log_warn "API 默认 admin/admin 登录未通过（若已修改密码属正常现象，服务已就绪）"
+  fi
 }
 
 print_summary() {

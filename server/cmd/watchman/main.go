@@ -1,9 +1,8 @@
 // Package main is the watchman control server entrypoint.
 //
-// It starts the gRPC server (agents dial in) and the REST/WS HTTP server
-// (browsers connect) on a single port via h2c-aware muxing. For MVP the two
-// are on separate listeners (gRPC on :9090, HTTP on :8080); a later step
-// collapses them onto :443.
+// It starts the gRPC server (agents dial in) on -grpc and the REST/WS HTTP
+// server (browsers connect) on -http, with the embedded Web console served
+// directly from the binary (no nginx required).
 package main
 
 import (

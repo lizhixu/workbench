@@ -20,7 +20,8 @@ set -euo pipefail
 REPO="lizhixu/workbench"
 BRANCH="master"
 URL="${WATCHMAN_INSTALL_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/deploy/install.sh}"
-TMP="/tmp/watchman-install.sh"
+TMP="$(mktemp /tmp/watchman-install.XXXXXX.sh)"
+trap 'rm -f "$TMP"' EXIT
 
 [[ "$(id -u)" -eq 0 ]] || { echo "请用 root 运行一键安装" >&2; exit 1; }
 command -v curl >/dev/null 2>&1 || { echo "需要 curl，请先安装（apt install curl / yum install curl）" >&2; exit 1; }

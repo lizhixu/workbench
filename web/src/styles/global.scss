@@ -179,7 +179,6 @@ code, .mono-font {
      padding-top: var(--n-padding-bottom)，且其运行时注入的样式排在 global.scss
      之后，同优先级下会覆盖这里的 padding: 0，导致表头上方多出一条空白。
      因此这里必须用 !important 压制，:first-child 也要显式清零。 */
-  :deep(.n-card-content),
   .n-card-content {
     flex: 1;
     min-height: 0;
@@ -194,7 +193,6 @@ code, .mono-font {
   }
 
   /* 表格自身占满容器，由 flex-height 计算内部滚动区 */
-  :deep(.n-data-table),
   .n-data-table {
     flex: 1;
     min-height: 0;

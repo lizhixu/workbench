@@ -286,7 +286,7 @@ onMounted(() => {
               <div class="beta-row">
                 <div class="beta-text">
                   <div class="beta-title">加入测试计划</div>
-                  <p class="sec-desc" style="margin: 4px 0 0">
+                  <p class="sec-desc tip-hint" style="margin: 4px 0 0">
                     开启后，通过安装脚本升级控制端时会跟踪预发布版本（含 pre-release），第一时间体验新功能；关闭则只跟踪正式版，更加稳定。立即生效，下次重跑安装脚本时起作用。
                   </p>
                 </div>

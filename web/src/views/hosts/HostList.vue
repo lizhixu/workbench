@@ -346,7 +346,7 @@ function handleMenuSelect(key: string, host: Host) {
       },
     })
   } else if (key === 'unbind') {
-    const uninstallAgent = ref(true)
+    const uninstallAgent = ref(false)
     dialog.warning({
       title: '解绑主机确认',
       content: () =>
@@ -363,7 +363,7 @@ function handleMenuSelect(key: string, host: Host) {
                   uninstallAgent.value = v
                 },
               },
-              { default: () => '同时卸载被管机上的 Agent（需主机在线）' },
+              { default: () => '同时卸载 Agent 并清除其数据（不可恢复，需主机在线）' },
             ),
           ),
         ]),
@@ -381,7 +381,12 @@ function handleMenuSelect(key: string, host: Host) {
           }
           await store.fetchList()
         } catch (e: any) {
-          message.error(e.message || '解绑失败')
+          const errMsg = e.message || '解绑失败'
+          if (errMsg.includes('agent offline')) {
+            message.error('该主机处于离线状态，无法远程卸载 Agent。请取消勾选“同时卸载 Agent”直接解绑，或等待主机上线后再操作。')
+          } else {
+            message.error(errMsg)
+          }
         }
       },
     })

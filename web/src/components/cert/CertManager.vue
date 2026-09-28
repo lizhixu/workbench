@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onActivated, onDeactivated, onMounted, reactive, ref } from 'vue'
+import { computed, h, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref } from 'vue'
 import {
   NAlert, NButton, NCard, NDataTable, NForm, NFormItem, NIcon, NInput,
   NModal, NPopconfirm, NSelect, NSpace, NSwitch,
@@ -387,25 +387,39 @@ async function doDelete(cert: Certificate) {
   }
 }
 
+function startPolling() {
+  if (pollTimer) return
+  pollTimer = setInterval(loadCerts, 30000)
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
 onMounted(() => {
   loadConfig()
   loadPresets()
   loadAccounts()
   loadCerts()
-  pollTimer = setInterval(loadCerts, 30000)
+  startPolling()
 })
 
 onActivated(() => {
   loadConfig()
   loadAccounts()
   loadCerts()
+  startPolling()
 })
 
 onDeactivated(() => {
-  if (pollTimer) {
-    clearInterval(pollTimer)
-    pollTimer = null
-  }
+  stopPolling()
+})
+
+onUnmounted(() => {
+  stopPolling()
 })
 </script>
 
@@ -466,7 +480,7 @@ onDeactivated(() => {
 
         <NTabPane name="accounts" tab="ACME 机构账户">
           <div class="tab-pane-content">
-            <NAlert type="info" :show-icon="true" style="margin-bottom: 10px; flex-shrink: 0">
+            <NAlert type="info" :show-icon="true" class="tip-hint" style="margin-bottom: 10px; flex-shrink: 0">
               系统支持多 CA 机构并存。配置 Google Trust Services、ZeroSSL、SSL.com 等机构时需填入官方颁发的 EAB (External Account Binding) 凭据。
             </NAlert>
             <NCard :bordered="false" class="table-flex-fill">
@@ -581,7 +595,7 @@ onDeactivated(() => {
       title="申请 SSL 证书（ACME DNS-01）"
       style="width: 560px; max-width: 94vw"
     >
-      <NAlert type="info" :show-icon="true" style="margin-bottom: 12px">
+      <NAlert type="info" :show-icon="true" class="tip-hint" style="margin-bottom: 12px">
         域名的 DNS 解析须已托管在 dns-mng 接入的云解析厂商中。通配符示例：*.example.com 与 example.com。
       </NAlert>
 

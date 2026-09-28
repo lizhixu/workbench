@@ -1252,6 +1252,13 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
    - 失败时返回 `hint`（`pingFailureHint`：no reply / unknown node / not logged in 等），前端展示诊断建议，不能只给一个空白结果框。
    - 「Ping 测速」入口在**未连接**分支也要渲染（Agent 在线即可测），否则弱网/掉线节点无诊断入口。
 
+4. **下发到远端的命令里所有变量必须按目标 shell 转义**：
+   - `joinNode` 曾把 `--hostname`/`--advertise-routes`/`--login-server`/`--authkey` 直接拼进 shell 命令字符串（`pingNode` 用了 `shellQuoteArg` 而这里漏了），operator 可注入任意命令，且审计只记"加入组网"、看不到真实命令。已收敛为 `buildJoinArgs` 统一经 `shellQuoteArg(shell, …)` 转义。
+   - `shellQuoteArg` 按目标 shell 选择转义：PowerShell 单引号内用 `''` 转义单引号，POSIX 用 `'\''`；无特殊字符的值原样返回。
+
+5. **密钥永不经 GET 接口回显**：
+   - `GET /network/config` 曾明文返回 Tailscale Auth Key，而该接口挂在 `authed` 分组（所有登录用户，含只读 viewer）——viewer 拿 key 就能把自己的设备加进 tailnet，直达所有 100.x 节点。现只返回 `auth_key_set` 布尔值；PUT 空值表示"保持原密钥"（无清除语义，轮换请写入新值）；前端密钥输入框只写不读，保存后清空。
+
 ### 8.8 组件选用与页面布局进阶规范
 
 1. **优先使用 Naive UI 原生组件，非必要不封装**：

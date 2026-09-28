@@ -3,7 +3,8 @@ import { http, unwrap } from './http'
 export interface NetworkConfig {
   control_plane: 'headscale' | 'tailscale'
   server_url: string
-  auth_key: string
+  auth_key: string // 只写：GET 永远返回 ""，不回显密钥
+  auth_key_set?: boolean // GET 返回是否已配置密钥
   accept_routes: boolean
   advertise_exit_node: boolean
   updated_at?: string

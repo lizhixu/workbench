@@ -36,6 +36,8 @@ const config = ref<NetworkConfig>({
 })
 const showConfigModal = ref(false)
 const savingConfig = ref(false)
+// 后端 GET 不再回显密钥，只告诉是否已配置
+const authKeySet = ref(false)
 
 // 节点加入网络弹窗
 const showJoinModal = ref(false)
@@ -117,6 +119,7 @@ async function loadData() {
       listNetworkNodes().catch(() => []),
     ])
     config.value = cfg as NetworkConfig
+    authKeySet.value = !!(cfg as NetworkConfig).auth_key_set
     nodes.value = list as NetworkNode[]
   } catch (e: any) {
     message.error(e.message || '获取网络拓扑失败')
@@ -128,7 +131,10 @@ async function loadData() {
 async function saveConfig() {
   savingConfig.value = true
   try {
-    await updateNetworkConfig(config.value)
+    const saved = await updateNetworkConfig(config.value)
+    authKeySet.value = !!saved.auth_key_set
+    // 密钥只写不读：保存后清空本地输入框，不在内存里留存
+    config.value.auth_key = ''
     message.success('组网配置已保存')
     showConfigModal.value = false
   } catch (e: any) {
@@ -176,7 +182,8 @@ async function handleInstall(node: NetworkNode) {
 function openJoinModal(node: NetworkNode) {
   targetNode.value = node
   joinForm.value = {
-    auth_key: config.value.auth_key || '',
+    // 后端不再回显全局密钥；留空则服务端用已存储的预设密钥
+    auth_key: '',
     server_url: config.value.server_url || '',
     accept_routes: config.value.accept_routes,
     advertise_routes: '',
@@ -188,10 +195,6 @@ function openJoinModal(node: NetworkNode) {
 
 async function doJoin() {
   if (!targetNode.value) return
-  if (!joinForm.value.auth_key.trim()) {
-    message.warning('请输入有效 Auth Key（预授权密钥）')
-    return
-  }
   joining.value = true
   try {
     const res = await joinNetworkNode(targetNode.value.host_id, {
@@ -568,7 +571,7 @@ onMounted(loadData)
             v-model:value="config.auth_key"
             type="password"
             show-password-on="click"
-            placeholder="例如: hskey-auth-xxxxxxx"
+            :placeholder="authKeySet ? '已设置，留空保持不变，输入新值则替换' : '例如: hskey-auth-xxxxxxx'"
           />
         </NFormItem>
 
@@ -603,12 +606,12 @@ onMounted(loadData)
       style="width: 520px; max-width: 90vw"
     >
       <NForm v-if="targetNode" label-placement="top">
-        <NFormItem label="Auth Key (入网预授权密钥)" required>
+        <NFormItem label="Auth Key (入网预授权密钥)">
           <NInput
             v-model:value="joinForm.auth_key"
             type="password"
             show-password-on="click"
-            placeholder="输入 Tailscale / Headscale Auth Key"
+            placeholder="留空则使用全局预设密钥"
           />
         </NFormItem>
 

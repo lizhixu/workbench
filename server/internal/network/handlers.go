@@ -47,8 +47,37 @@ func (h *Handlers) Register(rg, writeRG *gin.RouterGroup) {
 	writeRG.POST("/network/nodes/:id/ping", h.pingNode)
 }
 
+// networkConfigView is the API-facing shape of NetworkConfig.
+//
+// The auth key itself is NEVER sent to clients: this endpoint is reachable by
+// any authenticated user (including read-only viewers), and the key is an
+// enrollment credential — whoever holds it can join their own device to the
+// tailnet and reach every mesh node. Callers only learn whether a key is
+// configured.
+type networkConfigView struct {
+	ControlPlane      string    `json:"control_plane"`
+	ServerURL         string    `json:"server_url"`
+	AuthKey           string    `json:"auth_key"` // always "" — never exposed
+	AuthKeySet        bool      `json:"auth_key_set"`
+	AcceptRoutes      bool      `json:"accept_routes"`
+	AdvertiseExitNode bool      `json:"advertise_exit_node"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+func toConfigView(cfg NetworkConfig) networkConfigView {
+	return networkConfigView{
+		ControlPlane:      cfg.ControlPlane,
+		ServerURL:         cfg.ServerURL,
+		AuthKey:           "",
+		AuthKeySet:        cfg.AuthKey != "",
+		AcceptRoutes:      cfg.AcceptRoutes,
+		AdvertiseExitNode: cfg.AdvertiseExitNode,
+		UpdatedAt:         cfg.UpdatedAt,
+	}
+}
+
 func (h *Handlers) getConfig(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"data": h.store.GetConfig()})
+	c.JSON(http.StatusOK, gin.H{"data": toConfigView(h.store.GetConfig())})
 }
 
 func (h *Handlers) updateConfig(c *gin.Context) {
@@ -63,13 +92,20 @@ func (h *Handlers) updateConfig(c *gin.Context) {
 	if in.ControlPlane == "headscale" && in.ServerURL != "" {
 		in.ServerURL = strings.TrimRight(in.ServerURL, "/")
 	}
+	// An empty auth key means "keep the stored one": GET never reveals the key,
+	// so the frontend resubmits "" when the operator didn't type a new one.
+	// (There is deliberately no way to clear the key through this endpoint —
+	// rotate it by writing a new value.)
+	if in.AuthKey == "" {
+		in.AuthKey = h.store.GetConfig().AuthKey
+	}
 
 	if err := h.store.UpdateConfig(in); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	h.recordAudit(c, "update", "network_config", "global", fmt.Sprintf("更新组网控制面配置: %s", in.ControlPlane))
-	c.JSON(http.StatusOK, gin.H{"data": h.store.GetConfig()})
+	c.JSON(http.StatusOK, gin.H{"data": toConfigView(h.store.GetConfig())})
 }
 
 // listNodes returns combined list of registered hosts with overlay network status.
@@ -148,30 +184,30 @@ func (h *Handlers) checkNode(c *gin.Context) {
 		return
 	}
 
-		// 1. Check version & installation
-		resVer, err := h.runExec(hub, hostID, "tailscale version", 15)
-		if err != nil || resVer.ExitCode != 0 {
-			st := NodeStatus{
-				HostID:       hostID,
-				Installed:    false,
-				Online:       false,
-				ErrorMessage: "Tailscale 未安装或未加入 PATH",
-				LastChecked:  time.Now(),
-			}
-			_ = h.store.SetNodeStatus(st)
-			c.JSON(http.StatusOK, gin.H{"data": st})
-			return
+	// 1. Check version & installation
+	resVer, err := h.runExec(hub, hostID, "tailscale version", 15)
+	if err != nil || resVer.ExitCode != 0 {
+		st := NodeStatus{
+			HostID:       hostID,
+			Installed:    false,
+			Online:       false,
+			ErrorMessage: "Tailscale 未安装或未加入 PATH",
+			LastChecked:  time.Now(),
 		}
+		_ = h.store.SetNodeStatus(st)
+		c.JSON(http.StatusOK, gin.H{"data": st})
+		return
+	}
 
-		verStr := strings.TrimSpace(string(resVer.Stdout))
-		verLines := strings.Split(verStr, "\n")
-		cleanVer := ""
-		if len(verLines) > 0 {
-			cleanVer = strings.TrimSpace(verLines[0])
-		}
+	verStr := strings.TrimSpace(string(resVer.Stdout))
+	verLines := strings.Split(verStr, "\n")
+	cleanVer := ""
+	if len(verLines) > 0 {
+		cleanVer = strings.TrimSpace(verLines[0])
+	}
 
-		// 2. Check tailscale status --json
-		resStatus, err := h.runExec(hub, hostID, "tailscale status --json", 20)
+	// 2. Check tailscale status --json
+	resStatus, err := h.runExec(hub, hostID, "tailscale status --json", 20)
 	if err != nil || resStatus.ExitCode != 0 {
 		// Possibly daemon not running
 		errMsg := string(resStatus.Stderr)
@@ -319,6 +355,46 @@ type JoinRequest struct {
 	Reset             bool   `json:"reset"`
 }
 
+// buildJoinArgs assembles the `tailscale up` argument list.
+//
+// Every user- or config-supplied value is quoted for the target shell: the
+// final command is a single string executed by the agent's shell, so an
+// unquoted value such as --hostname='x; rm -rf / #' would run arbitrary
+// commands on the remote host (the audit record only says "join network",
+// hiding the real command).
+func buildJoinArgs(shell, authKey, serverURL string, acceptRoutes bool, advertiseRoutes string, advertiseExitNode bool, hostname string, reset bool) []string {
+	args := []string{"tailscale", "up", "--authkey=" + shellQuoteArg(shell, authKey)}
+
+	if serverURL != "" {
+		args = append(args, "--login-server="+shellQuoteArg(shell, serverURL))
+	}
+	if acceptRoutes {
+		args = append(args, "--accept-routes=true")
+	}
+	// Always disable MagicDNS override on managed servers to prevent host DNS hijacking
+	// and avoid deadlock loops with Docker containers relying on public DNS.
+	args = append(args, "--accept-dns=false")
+
+	if advertiseRoutes != "" {
+		args = append(args, "--advertise-routes="+shellQuoteArg(shell, advertiseRoutes))
+	}
+	if advertiseExitNode {
+		args = append(args, "--advertise-exit-node")
+	}
+	if hostname != "" {
+		args = append(args, "--hostname="+shellQuoteArg(shell, hostname))
+	}
+	// `--reset` discards the local node state and re-enrolls the node with a NEW
+	// node key, so the control plane treats it as a brand new node and hands out
+	// a different 100.x.y.z address. That is why re-joining after a failure used
+	// to silently change the mesh IP. Only reset when explicitly requested
+	// (e.g. the node key is genuinely corrupted or the host was re-imaged).
+	if reset {
+		args = append(args, "--reset")
+	}
+	return args
+}
+
 // joinNode executes `tailscale up` with params to enroll node into the mesh.
 func (h *Handlers) joinNode(c *gin.Context) {
 	hostID := c.Param("id")
@@ -361,37 +437,8 @@ func (h *Handlers) joinNode(c *gin.Context) {
 		acceptRoutes = globalCfg.AcceptRoutes
 	}
 
-	var args []string
-	args = append(args, "tailscale", "up", fmt.Sprintf("--authkey=%s", authKey))
-
-	if serverURL != "" {
-		args = append(args, fmt.Sprintf("--login-server=%s", serverURL))
-	}
-	if acceptRoutes {
-		args = append(args, "--accept-routes=true")
-	}
-	// Always disable MagicDNS override on managed servers to prevent host DNS hijacking
-	// and avoid deadlock loops with Docker containers relying on public DNS.
-	args = append(args, "--accept-dns=false")
-
-	if req.AdvertiseRoutes != "" {
-		args = append(args, fmt.Sprintf("--advertise-routes=%s", req.AdvertiseRoutes))
-	}
-	if req.AdvertiseExitNode {
-		args = append(args, "--advertise-exit-node")
-	}
-	if req.Hostname != "" {
-		args = append(args, fmt.Sprintf("--hostname=%s", req.Hostname))
-	}
-	// `--reset` discards the local node state and re-enrolls the node with a NEW
-	// node key, so the control plane treats it as a brand new node and hands out
-	// a different 100.x.y.z address. That is why re-joining after a failure used
-	// to silently change the mesh IP. Only reset when explicitly requested
-	// (e.g. the node key is genuinely corrupted or the host was re-imaged).
-	if req.Reset {
-		args = append(args, "--reset")
-	}
-
+	agentShell := agentShellFor(agent)
+	args := buildJoinArgs(agentShell, authKey, serverURL, acceptRoutes, req.AdvertiseRoutes, req.AdvertiseExitNode, req.Hostname, req.Reset)
 	cmd := strings.Join(args, " ")
 
 	// Remember the previous address so we can report whether it changed.
@@ -399,8 +446,6 @@ func (h *Handlers) joinNode(c *gin.Context) {
 	prevIP := prevStatus.IP
 
 	h.recordAudit(c, "join", "network_node", hostID, "执行 tailscale up 加入异地组网")
-
-	agentShell := agentShellFor(agent)
 
 	res, err := h.runExecWithTimeout(hub, cmd, agentShell, 90)
 	if err != nil {
@@ -556,7 +601,8 @@ func (h *Handlers) pingNode(c *gin.Context) {
 		req.Count = 3
 	}
 
-	target := shellQuoteArg(req.Target)
+	shell := agentShellFor(h.reg.GetAgent(hostID))
+	target := shellQuoteArg(shell, req.Target)
 	// `--until-direct=false`: since v1.24 `tailscale ping` defaults to
 	// until-direct=true, i.e. it keeps probing until a direct path is
 	// established. The first probes almost always traverse DERP, so the command
@@ -564,7 +610,6 @@ func (h *Handlers) pingNode(c *gin.Context) {
 	// `--timeout`: bound each probe so a black-holed target cannot stall the call.
 	cmd := fmt.Sprintf("tailscale ping --until-direct=false -c %d --timeout=5s %s", req.Count, target)
 
-	shell := agentShellFor(h.reg.GetAgent(hostID))
 	res, err := h.runExecWithTimeout(hub, cmd, shell, 40)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -699,13 +744,20 @@ func pingFailureHint(output, execErr string) string {
 	}
 }
 
-// shellQuoteArg quotes a value so it survives being embedded in a shell command.
-func shellQuoteArg(s string) string {
+// shellQuoteArg quotes a value so it survives being embedded in a shell
+// command string executed by the agent. Quoting follows the target shell:
+// PowerShell single-quoted strings escape an embedded quote by doubling it
+// (”), POSIX shells use '\”. Values without special characters are returned
+// unchanged.
+func shellQuoteArg(shell, s string) string {
 	if s == "" {
 		return "''"
 	}
 	if !strings.ContainsAny(s, " \t\n'\"$&|;<>()\\`*?[]#!{}~") {
 		return s
+	}
+	if shell == "powershell" {
+		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

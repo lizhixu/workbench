@@ -39,7 +39,16 @@ agent ── gRPC over TLS ─────────────────�
 ### 一键部署（推荐）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lizhixu/workbench/main/deploy/install.sh -o install.sh
+bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/quick_start.sh)"
+# 带参数（原样透传给 install.sh）：
+bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/quick_start.sh)" -- --channel beta
+bash -c "$(curl -sSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/quick_start.sh)" -- --help
+```
+
+或手动下载执行（等价）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lizhixu/workbench/master/deploy/install.sh -o install.sh
 sudo bash install.sh            # 默认 stable 通道，面板监听 18789
 sudo bash install.sh --help    # 查看全部选项（--channel beta、--port、--mirror 等）
 ```

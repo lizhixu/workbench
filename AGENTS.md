@@ -864,7 +864,7 @@ enroll token 只在无 agent-state.json 时申请）→ 启动 → 健康检查�
 `--uninstall` 默认保留数据，`--purge` 才删 /opt/watchman。
 已验证（2026-09-27）：bash -n、`--help`、stable/beta/--version 解析（打真实 GitHub API）、
 真实 test release 的下载+sha256 校验、EXIT trap 退出码、`installed_version` 边界。systemd 真机安装未在本 VM 验证（无 systemd）。
-2026-09-28 重构：去掉 nginx（server/web go:embed 自 serve），`cmd/deploy/`（旧 SSH 部署工具，含 web-dist/nginx 逻辑）已删除；install.sh 同步更新，升级时自动清理残留的旧版 nginx 站点配置（其 auth_request 指向已删除的 check 端点，残留会导致静态页全 404）。
+2026-09-28 重构：去掉 nginx（server/web go:embed 自 serve），`cmd/deploy/`（旧 SSH 部署工具，含 web-dist/nginx 逻辑）已删除；install.sh 同步更新，升级时自动清理残留的旧版 nginx 站点配置（其 auth_request 指向已删除的 check 端点，残留会导致静态页全 404）。新增 `deploy/quick_start.sh`（1Panel 式一键引导：`bash -c "$(curl -sSL .../master/deploy/quick_start.sh)"`，下载最新 install.sh 并透传参数）。
 
 ## B.7 MVP 推进顺序（落地路线）
 

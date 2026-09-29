@@ -32,3 +32,42 @@ func TestCompareVersions(t *testing.T) {
 		}
 	}
 }
+
+func TestPickLatestRelease(t *testing.T) {
+	mk := func(tag string, draft bool) GitHubRelease {
+		return GitHubRelease{TagName: tag, Draft: draft}
+	}
+	// Mirrors the real 2026-09-29 API response: NOT sorted by creation date.
+	unordered := []GitHubRelease{
+		mk("v0.1.0-beta.9", false),
+		mk("v0.1.0-beta.8", false),
+		mk("v0.1.0-beta.7", false),
+		mk("v0.1.0-beta.11", false),
+		mk("v0.1.0-beta.10", false),
+	}
+	got := pickLatestRelease(unordered)
+	if got == nil || got.TagName != "v0.1.0-beta.11" {
+		t.Fatalf("pickLatestRelease(unordered) = %v, want v0.1.0-beta.11", got)
+	}
+
+	// Drafts are skipped even when newest.
+	withDraft := append([]GitHubRelease{mk("v0.1.0-beta.12", true)}, unordered...)
+	got = pickLatestRelease(withDraft)
+	if got == nil || got.TagName != "v0.1.0-beta.11" {
+		t.Fatalf("pickLatestRelease(withDraft) = %v, want v0.1.0-beta.11", got)
+	}
+
+	// A stable release beats a newer-looking pre-release of an older core.
+	mixed := []GitHubRelease{mk("v0.1.0-beta.99", false), mk("v0.1.0", false)}
+	got = pickLatestRelease(mixed)
+	if got == nil || got.TagName != "v0.1.0" {
+		t.Fatalf("pickLatestRelease(mixed) = %v, want v0.1.0", got)
+	}
+
+	if pickLatestRelease(nil) != nil {
+		t.Fatal("pickLatestRelease(nil) should be nil")
+	}
+	if pickLatestRelease([]GitHubRelease{mk("v0.1.0-beta.1", true)}) != nil {
+		t.Fatal("pickLatestRelease(all drafts) should be nil")
+	}
+}

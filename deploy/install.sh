@@ -168,10 +168,13 @@ resolve_version() {
     return
   fi
   if beta_opted_in; then
-    local api="https://api.github.com/repos/${REPO}/releases?per_page=1"
-    [[ -n "$MIRROR" ]] && api="${MIRROR}/https://api.github.com/repos/${REPO}/releases?per_page=1"
+    # 注意：GitHub /releases 列表不保证按创建时间排序，且只取第一条会拿到旧版本
+    #（2026-09-29 实测 beta.11 排在 beta.9 之后），因此取前 20 条按版本号取最大。
+    # 未鉴权请求看不到 draft 发布，无需额外过滤。
+    local api="https://api.github.com/repos/${REPO}/releases?per_page=20"
+    [[ -n "$MIRROR" ]] && api="${MIRROR}/https://api.github.com/repos/${REPO}/releases?per_page=20"
     log_info "已加入测试计划：解析最新版本（含 pre-release）..."
-    TAG=$(curl -fsSL "$api" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4) \
+    TAG=$(curl -fsSL "$api" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4 | sort -V | tail -1) \
       || die "版本解析失败（$api）"
   else
     local url="https://github.com/${REPO}/releases/latest"

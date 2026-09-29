@@ -89,8 +89,11 @@ func CheckUpdate(ctx context.Context, currentVersion string, joinBeta bool, forc
 	var targetRelease *GitHubRelease
 
 	if joinBeta {
-		// Beta channel: fetch latest releases (including pre-releases) and pick the first non-draft.
-		apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=5", repo)
+		// Beta channel: fetch recent releases (including pre-releases) and pick
+		// the highest version. GitHub does NOT guarantee the list is sorted by
+		// creation date (observed: v0.1.0-beta.11 listed after beta.9/8/7), so
+		// never trust the first entry — compare versions explicitly.
+		apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=20", repo)
 		req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 		if err != nil {
 			return nil, fmt.Errorf("创建请求失败: %w", err)
@@ -113,12 +116,7 @@ func CheckUpdate(ctx context.Context, currentVersion string, joinBeta bool, forc
 			return nil, fmt.Errorf("解析 GitHub Releases JSON 失败: %w", err)
 		}
 
-		for i := range releases {
-			if !releases[i].Draft {
-				targetRelease = &releases[i]
-				break
-			}
-		}
+		targetRelease = pickLatestRelease(releases)
 	} else {
 		// Stable channel: fetch /releases/latest which GitHub resolves to the latest non-prerelease.
 		apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
@@ -239,6 +237,22 @@ func CheckUpdate(ctx context.Context, currentVersion string, joinBeta bool, forc
 	cacheMu.Unlock()
 
 	return info, nil
+}
+
+// pickLatestRelease returns the non-draft release with the highest version,
+// or nil if none qualifies. The GitHub releases API does not guarantee any
+// particular ordering, so callers must not assume the first entry is newest.
+func pickLatestRelease(releases []GitHubRelease) *GitHubRelease {
+	var best *GitHubRelease
+	for i := range releases {
+		if releases[i].Draft {
+			continue
+		}
+		if best == nil || CompareVersions(best.TagName, releases[i].TagName) < 0 {
+			best = &releases[i]
+		}
+	}
+	return best
 }
 
 // CompareVersions compares two semver strings (e.g. "v0.1.0-beta.6" and "v0.1.0-beta.7").

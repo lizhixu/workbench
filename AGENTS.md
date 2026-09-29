@@ -814,10 +814,10 @@ Agent internal/shell
 
 - **版本解析与升级策略**：
   - **版本来源唯一真相**：**版本完全由官方 Release 提供，严禁任何自行决定或拼凑版本的行为**。发布包与升级清单必须 100% 来源于 Git tag 触发 GitHub Actions 产出的官方 Release（如 `v1.2.3` / `v1.2.3-beta.1`）以及由 CI 生成的 `manifest.json`；
-  - **正式版与测试版通道**：默认跟踪 GitHub `/releases/latest`（自动排除 pre-release）。测试版改由面板开关控制——在「系统设置 → 系统升级」中开启「加入测试计划」（`system.join_beta_program`），`install.sh` 升级时读取该开关，若开启则取 release 列表首项（含 pre-release）；
+  - **正式版与测试版通道**：默认跟踪 GitHub `/releases/latest`（自动排除 pre-release）。测试版改由面板开关控制——在「系统设置 → 系统升级」中开启「加入测试计划」（`system.join_beta_program`），`install.sh` 升级时读取该开关，若开启则取 release 列表前 20 项按 semver 取最大版本（含 pre-release；GitHub 列表不保证按时间排序，不可直接取首项，2026-09-29 已因此踩坑）；
   - **安装升级幂等性**：重跑脚本即为平滑升级，同版本默认跳过，保留数据目录与密钥；升级时自动停旧服务、替换二进制、复用凭据并热启动。
   - **控制端在线检查与一键在线自升级（Web 自升级，2026-09-29）**：
-    - **在线 Release 探测引擎（`server/internal/release/checker.go`）**：控制端后台主动对接 GitHub Releases API，依据用户统一设置 `system.join_beta_program` 自动选择通道（开启测试计划时拉取首项 Release，包括 pre-release；关闭时拉取 `/releases/latest` 正式稳定版）；内置 5 分钟内存自愈缓存防止触发 GitHub API 频控，支持强制刷新 `force=true`；
+    - **在线 Release 探测引擎（`server/internal/release/checker.go`）**：控制端后台主动对接 GitHub Releases API，依据用户统一设置 `system.join_beta_program` 自动选择通道（开启测试计划时拉取前 20 个 Release，用 `CompareVersions` 取最大版本，包括 pre-release——GitHub 列表不保证按时间排序，禁止取首项；关闭时拉取 `/releases/latest` 正式稳定版）；内置 5 分钟内存自愈缓存防止触发 GitHub API 频控，支持强制刷新 `force=true`；
     - **Semver 规范多段语义比对（`CompareVersions`）**：严格兼容标准 Release 与 Pre-release 优先级，支持 `v0.1.0-beta.6` < `v0.1.0-beta.7` 等带点的先行版本比对、数值段比对及生产版优先于预发布版判定；
     - **全自动防篡改原子升级管线（`server/internal/release/updater.go`）**：
       1. 流式下载对应架构的官方发布包 `watchman-dist-${tag}-${os}-${arch}.tar.gz` 与 `CHECKSUMS.txt`；

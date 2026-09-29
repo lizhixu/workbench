@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NInput, NIcon, NEmpty } from 'naive-ui'
+import { NInput, NIcon, NEmpty, NBadge } from 'naive-ui'
 import { SearchOutline } from '@vicons/ionicons5'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { useAuthStore } from '../../stores/auth'
+import { useSystemUpdateStore } from '../../stores/systemUpdate'
 import {
   settingsSections,
   resolveSectionKey,
@@ -21,6 +22,7 @@ const route = useRoute()
 const router = useRouter()
 const workspace = useWorkspaceStore()
 const auth = useAuthStore()
+const systemUpdate = useSystemUpdateStore()
 
 const keyword = ref('')
 // 安全入口：adminOnly 分区（证书签发/域名绑定）仅管理员可见。
@@ -121,7 +123,14 @@ onMounted(() => {
             @click="selectSection(s.key)"
           >
             <NIcon :component="s.icon" size="16" class="nav-item-icon" />
-            <span>{{ s.label }}</span>
+            <span class="nav-item-label">{{ s.label }}</span>
+            <NBadge
+              v-if="s.key === 'upgrade' && systemUpdate.hasUpdate"
+              value="NEW"
+              type="info"
+              size="small"
+              class="nav-update-badge"
+            />
           </div>
         </template>
         <NEmpty
@@ -229,6 +238,15 @@ onMounted(() => {
 
   .nav-item-icon {
     flex-shrink: 0;
+  }
+
+  .nav-item-label {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .nav-update-badge {
+    margin-left: auto;
   }
 }
 

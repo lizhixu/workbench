@@ -738,3 +738,10 @@ func (s *Store) PanelSecurity() PanelSecurityConfig {
 	s.decode(ScopeSystem, "", "security.panel_force_https", &p.ForceHTTPS)
 	return p
 }
+
+// JoinBetaProgram returns whether the user has opted into the pre-release beta program.
+func (s *Store) JoinBetaProgram() bool {
+	var v bool
+	s.decode(ScopeSystem, "", "system.join_beta_program", &v)
+	return v
+}

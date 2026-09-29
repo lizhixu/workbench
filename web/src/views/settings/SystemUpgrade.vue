@@ -7,22 +7,30 @@ import {
 } from 'naive-ui'
 import {
   RocketOutline, CloudUploadOutline, RefreshOutline, ArrowUpCircleOutline,
-  CheckmarkCircleOutline, SyncOutline,
+  CheckmarkCircleOutline, SyncOutline, ChevronDownOutline, ChevronUpOutline,
+  AlertCircleOutline,
 } from '@vicons/ionicons5'
 import { uploadServerBinary, restartServer, batchUpgradeAgents, type ServerUpgradeResult } from '../../api/upgrade'
 import { health, listHosts } from '../../api/hosts'
 import { SETTING_KEYS, getSystemSettings, saveSystemSettings } from '../../api/settings'
 import { useAuthStore } from '../../stores/auth'
+import { useSystemUpdateStore } from '../../stores/systemUpdate'
 import type { Host } from '../../api/types'
 import { formatUpgradeStage } from '../../utils/upgrade'
 
 const auth = useAuthStore()
 const isAdmin = computed(() => auth.role === 'admin')
 const message = useMessage()
+const systemUpdate = useSystemUpdateStore()
 
 const healthData = ref<any>(null)
 const hosts = ref<Host[]>([])
 const loading = ref(false)
+
+// 在线自升级与更新日志展开
+const showOnlineUpgradeModal = ref(false)
+const showChangelog = ref(false)
+const onlineUpgrading = ref(false)
 
 // 离线上传升级控制端弹窗
 const showUploadModal = ref(false)
@@ -212,8 +220,50 @@ async function confirmBatchUpgrade() {
   await doBatchUpgradeAgents(isForceUpgrade.value)
 }
 
-// 加入测试计划（仅管理员）：控制安装脚本升级时跟踪的版本通道。
-// 开启后，重跑 deploy/install.sh 会解析含 pre-release 的最新版本；
+function formatBytes(bytes?: number): string {
+  if (!bytes || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let i = 0
+  let b = bytes
+  while (b >= 1024 && i < units.length - 1) {
+    b /= 1024
+    i++
+  }
+  return `${b.toFixed(1)} ${units[i]}`
+}
+
+function formatDateTime(d?: string): string {
+  if (!d) return ''
+  try {
+    return new Date(d).toLocaleString('zh-CN', { hour12: false })
+  } catch {
+    return d
+  }
+}
+
+async function doOnlineUpgradeServer() {
+  onlineUpgrading.value = true
+  try {
+    const res = await systemUpdate.performUpgrade(systemUpdate.latestVersion)
+    message.success(res?.message || '控制端在线升级指令已下发，正在平滑重启服务...')
+    showOnlineUpgradeModal.value = false
+    const back = await waitForServerBack(60000)
+    if (back) {
+      message.success(`控制端已成功升级至 ${systemUpdate.latestVersion} 并重新上线！`)
+      await refreshData()
+      await systemUpdate.check(true, betaProgram.value)
+    } else {
+      message.warning('控制端在预期时间内未恢复，请检查服务状态')
+    }
+  } catch (e: any) {
+    message.error(e?.message || '在线升级失败')
+  } finally {
+    onlineUpgrading.value = false
+  }
+}
+
+// 加入测试计划（仅管理员）：控制控制台与安装脚本升级时跟踪的版本通道。
+// 开启后，检查更新与重跑脚本会解析含 pre-release 的最新版本；
 // 关闭则只跟踪正式版。后端键 system.join_beta_program（system 域）。
 const betaProgram = ref(false)
 const betaLoading = ref(false)
@@ -237,8 +287,10 @@ async function onBetaProgramChange(v: boolean) {
   try {
     await saveSystemSettings({ [SETTING_KEYS.joinBetaProgram]: v })
     message.success(v
-      ? '已加入测试计划：下次用安装脚本升级时会跟踪预发布版本'
-      : '已退出测试计划：升级时只跟踪正式版')
+      ? '已加入测试计划：将跟踪预发布测试版本'
+      : '已退出测试计划：升级时只跟踪稳定正式版')
+    // 立即以新通道重新检测版本更新
+    await systemUpdate.check(true, v)
   } catch (e: any) {
     message.error(e?.message || '保存失败')
     betaProgram.value = !v
@@ -247,9 +299,10 @@ async function onBetaProgramChange(v: boolean) {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   refreshData()
-  loadBetaProgram()
+  await loadBetaProgram()
+  systemUpdate.check(false, betaProgram.value)
 })
 </script>
 
@@ -270,93 +323,209 @@ onMounted(() => {
       </NSpace>
     </template>
 
-    <div class="upgrade-container">
-      <!-- 顶部基础指标 -->
-      <NDescriptions :columns="3" label-placement="left" class="version-desc-grid">
-        <NDescriptionsItem label="控制端当前版本">
-          <span class="mono-font highlight">{{ healthData?.version || '0.1.0-dev' }}</span>
-        </NDescriptionsItem>
-        <NDescriptionsItem label="内置 Agent 最新版">
-          <span class="mono-font">{{ currentAgentVersion }}</span>
-        </NDescriptionsItem>
-        <NDescriptionsItem label="控制端运行环境">
-          <span class="mono-font">{{ runtimeEnv }}</span>
-        </NDescriptionsItem>
-      </NDescriptions>
+      <div class="upgrade-container">
+        <!-- 顶部基础指标 -->
+        <NDescriptions :columns="3" label-placement="left" class="version-desc-grid">
+          <NDescriptionsItem label="控制端当前版本">
+            <span class="mono-font highlight">{{ healthData?.version || '0.1.0-dev' }}</span>
+          </NDescriptionsItem>
+          <NDescriptionsItem label="内置 Agent 最新版">
+            <span class="mono-font">{{ currentAgentVersion }}</span>
+          </NDescriptionsItem>
+          <NDescriptionsItem label="控制端运行环境">
+            <span class="mono-font">{{ runtimeEnv }}</span>
+          </NDescriptionsItem>
+        </NDescriptions>
 
-      <div class="upgrade-sections-row">
-        <!-- 模块 1：控制端服务自升级 (Server) -->
-        <div class="upgrade-col">
-          <div class="section-box">
-            <div class="section-header">
-              <div class="title-wrap">
-                <span class="sec-title">控制端服务 (Watchman Server)</span>
+        <!-- 新版本提示横幅 (若检测到官方 Release 新版本) -->
+        <NAlert
+          v-if="systemUpdate.hasUpdate"
+          type="info"
+          :bordered="false"
+          class="new-version-banner"
+        >
+          <template #icon>
+            <NIcon :component="RocketOutline" color="#6366f1" size="22" />
+          </template>
+          <div class="banner-content">
+            <div class="banner-title-row">
+              <div class="banner-title">
+                发现控制端新版本：
+                <span class="version-tag-highlight mono-font">{{ systemUpdate.latestVersion }}</span>
                 <NTag
                   size="small"
-                  :type="serverHealthy ? 'success' : 'warning'"
+                  :type="systemUpdate.isBeta ? 'warning' : 'success'"
                   :bordered="false"
                   round
+                  style="margin-left: 8px"
                 >
-                  {{ serverHealthy ? '运行正常' : '健康状态未知' }}
-                </NTag>
-                <NTag v-if="healthData" size="small" :bordered="false" round>
-                  {{ healthData.online_agents ?? 0 }} / {{ healthData.agents ?? 0 }} 台在线
+                  {{ systemUpdate.isBeta ? '预发布测试版' : '正式稳定版' }}
                 </NTag>
               </div>
-              <p class="sec-desc">
-                支持上传最新编译的 <code>watchman-server</code> 单二进制进行原子安全替换，替换后系统自动下发维护预告帧并支持一键平滑重启。
-              </p>
-            </div>
-
-            <div class="sec-actions">
-              <NSpace :size="10">
+              <div class="banner-actions">
                 <NButton
                   v-if="isAdmin"
                   type="primary"
-                  secondary
                   size="small"
-                  @click="showUploadModal = true"
+                  :loading="onlineUpgrading"
+                  @click="showOnlineUpgradeModal = true"
                 >
-                  <template #icon><NIcon :component="CloudUploadOutline" /></template>
-                  离线上传新二进制升级
+                  <template #icon><NIcon :component="ArrowUpCircleOutline" /></template>
+                  一键在线升级
                 </NButton>
-
-                <NPopconfirm v-if="isAdmin" @positive-click="doRestartServer">
-                  <template #trigger>
-                    <NButton size="small" :loading="restarting">
-                      <template #icon><NIcon :component="SyncOutline" /></template>
-                      平滑重启服务 (维护握手模式)
-                    </NButton>
-                  </template>
-                  <div style="max-width: 320px; line-height: 1.5">
-                    <div style="font-weight: 600; margin-bottom: 4px">确认平滑重启控制端服务？</div>
-                    <div style="font-size: 12px; color: var(--text-secondary)">
-                      系统将在关机前向全网在线 Agent 广播维护通知，并在重启后的维护窗口内自动消除误报。
-                    </div>
-                  </div>
-                </NPopconfirm>
-              </NSpace>
-            </div>
-
-            <!-- 测试计划：决定安装脚本升级时跟踪正式版还是预发布版（仅管理员） -->
-            <template v-if="isAdmin">
-              <NDivider style="margin: 12px 0" />
-              <div class="beta-row">
-                <div class="beta-text">
-                  <div class="beta-title">加入测试计划</div>
-                  <p class="sec-desc tip-hint" style="margin: 4px 0 0">
-                    开启后，通过安装脚本升级控制端时会跟踪预发布版本（含 pre-release），第一时间体验新功能；关闭则只跟踪正式版，更加稳定。立即生效，下次重跑安装脚本时起作用。
-                  </p>
-                </div>
-                <NSwitch
-                  v-model:value="betaProgram"
-                  :loading="betaLoading || betaSaving"
-                  @update:value="onBetaProgramChange"
-                />
+                <NButton
+                  size="small"
+                  quaternary
+                  :loading="systemUpdate.checking"
+                  @click="() => systemUpdate.check(true, betaProgram)"
+                >
+                  <template #icon><NIcon :component="RefreshOutline" /></template>
+                  检查更新
+                </NButton>
               </div>
-            </template>
+            </div>
+            <div class="banner-meta">
+              <span>当前运行版本：<span class="mono-font">{{ systemUpdate.currentVersion || healthData?.version || '0.1.0-dev' }}</span></span>
+              <span v-if="systemUpdate.updateInfo?.published_at" style="margin-left: 16px">
+                发布时间：{{ formatDateTime(systemUpdate.updateInfo.published_at) }}
+              </span>
+              <span v-if="systemUpdate.updateInfo?.asset_size" style="margin-left: 16px">
+                安装包体积：{{ formatBytes(systemUpdate.updateInfo.asset_size) }}
+              </span>
+            </div>
+            <!-- 更新日志折叠/展开 -->
+            <div v-if="systemUpdate.updateInfo?.release_notes" class="banner-changelog">
+              <div class="changelog-header" @click="showChangelog = !showChangelog">
+                <span class="changelog-title">版本更新说明 (Release Notes)</span>
+                <NButton text size="tiny" type="primary">
+                  <template #icon>
+                    <NIcon :component="showChangelog ? ChevronUpOutline : ChevronDownOutline" />
+                  </template>
+                  {{ showChangelog ? '收起' : '展开查看' }}
+                </NButton>
+              </div>
+              <div v-if="showChangelog" class="changelog-body">
+                <pre>{{ systemUpdate.updateInfo.release_notes }}</pre>
+              </div>
+            </div>
           </div>
-        </div>
+        </NAlert>
+
+        <div class="upgrade-sections-row">
+          <!-- 模块 1：控制端服务自升级 (Server) -->
+          <div class="upgrade-col">
+            <div class="section-box">
+              <div class="section-header">
+                <div class="title-wrap">
+                  <span class="sec-title">控制端服务 (Watchman Server)</span>
+                  <NTag
+                    size="small"
+                    :type="serverHealthy ? 'success' : 'warning'"
+                    :bordered="false"
+                    round
+                  >
+                    {{ serverHealthy ? '运行正常' : '健康状态未知' }}
+                  </NTag>
+                  <NTag
+                    v-if="systemUpdate.hasUpdate"
+                    size="small"
+                    type="info"
+                    :bordered="false"
+                    round
+                  >
+                    可升级至 {{ systemUpdate.latestVersion }}
+                  </NTag>
+                  <NTag
+                    v-else-if="systemUpdate.updateInfo && !systemUpdate.checking"
+                    size="small"
+                    type="success"
+                    :bordered="false"
+                    round
+                  >
+                    已是最新版
+                  </NTag>
+                  <NTag v-if="healthData" size="small" :bordered="false" round>
+                    {{ healthData.online_agents ?? 0 }} / {{ healthData.agents ?? 0 }} 台在线
+                  </NTag>
+                </div>
+                <p class="sec-desc">
+                  支持从官方 GitHub Releases 在线自动升级，或离线上传最新编译的 <code>watchman-server</code> 单二进制进行原子安全替换，替换后系统自动下发维护预告帧并支持一键平滑重启。
+                </p>
+                <p v-if="systemUpdate.checkError" class="sec-desc" style="color: #ef4444; margin: 4px 0 8px;">
+                  <NIcon :component="AlertCircleOutline" style="vertical-align: -2px; margin-right: 4px;" />
+                  检查更新异常: {{ systemUpdate.checkError }}
+                </p>
+              </div>
+
+              <div class="sec-actions">
+                <NSpace :size="10">
+                  <NButton
+                    v-if="isAdmin && systemUpdate.hasUpdate"
+                    type="primary"
+                    size="small"
+                    :loading="onlineUpgrading"
+                    @click="showOnlineUpgradeModal = true"
+                  >
+                    <template #icon><NIcon :component="ArrowUpCircleOutline" /></template>
+                    一键在线升级
+                  </NButton>
+
+                  <NButton
+                    v-if="isAdmin"
+                    secondary
+                    size="small"
+                    @click="showUploadModal = true"
+                  >
+                    <template #icon><NIcon :component="CloudUploadOutline" /></template>
+                    离线上传新二进制
+                  </NButton>
+
+                  <NPopconfirm v-if="isAdmin" @positive-click="doRestartServer">
+                    <template #trigger>
+                      <NButton size="small" :loading="restarting">
+                        <template #icon><NIcon :component="SyncOutline" /></template>
+                        平滑重启
+                      </NButton>
+                    </template>
+                    <div style="max-width: 320px; line-height: 1.5">
+                      <div style="font-weight: 600; margin-bottom: 4px">确认平滑重启控制端服务？</div>
+                      <div style="font-size: 12px; color: var(--text-secondary)">
+                        系统将在关机前向全网在线 Agent 广播维护通知，并在重启后的维护窗口内自动消除误报。
+                      </div>
+                    </div>
+                  </NPopconfirm>
+
+                  <NButton
+                    size="small"
+                    quaternary
+                    :loading="systemUpdate.checking"
+                    @click="() => systemUpdate.check(true, betaProgram)"
+                  >
+                    <template #icon><NIcon :component="RefreshOutline" /></template>
+                    检查新版本
+                  </NButton>
+                </NSpace>
+              </div>
+
+              <!-- 测试计划：决定升级时跟踪正式版还是预发布版（仅管理员） -->
+              <template v-if="isAdmin">
+                <NDivider style="margin: 12px 0" />
+                <div class="beta-row">
+                  <div class="beta-text">
+                    <div class="beta-title">加入测试计划</div>
+                    <p class="sec-desc tip-hint" style="margin: 4px 0 0">
+                      开启后，控制台与升级脚本将跟踪预发布测试版本（含 pre-release），第一时间体验新功能与测试修复；关闭则仅跟踪经过充分验证的稳定正式版。切换后控制台自动刷新版本检测。
+                    </p>
+                  </div>
+                  <NSwitch
+                    v-model:value="betaProgram"
+                    :loading="betaLoading || betaSaving"
+                    @update:value="onBetaProgramChange"
+                  />
+                </div>
+              </template>
+            </div>
+          </div>
 
         <!-- 模块 2：被管端 Agent 全网批量升级 (Agents) -->
         <div class="upgrade-col">
@@ -583,6 +752,55 @@ onMounted(() => {
         </NSpace>
       </template>
     </NModal>
+
+    <!-- 在线升级控制端确认 Modal -->
+    <NModal
+      v-model:show="showOnlineUpgradeModal"
+      preset="card"
+      title="一键在线自升级控制端 (Online Self-Upgrade)"
+      style="width: 540px; max-width: 92vw"
+    >
+      <div class="online-upgrade-dialog">
+        <NDescriptions :columns="1" label-placement="left" size="small" bordered>
+          <NDescriptionsItem label="当前版本">
+            <span class="mono-font">{{ systemUpdate.currentVersion || healthData?.version || '0.1.0-dev' }}</span>
+          </NDescriptionsItem>
+          <NDescriptionsItem label="目标升级版本">
+            <span class="mono-font" style="color: var(--primary-color, #6366f1); font-weight: 700;">
+              {{ systemUpdate.latestVersion }}
+            </span>
+            <NTag size="small" :type="systemUpdate.isBeta ? 'warning' : 'success'" :bordered="false" round style="margin-left: 8px">
+              {{ systemUpdate.isBeta ? '预发布测试版' : '正式稳定版' }}
+            </NTag>
+          </NDescriptionsItem>
+          <NDescriptionsItem label="官方发布包">
+            <span class="mono-font" style="font-size: 12px">{{ systemUpdate.updateInfo?.asset_name || 'watchman-dist.tar.gz' }}</span>
+          </NDescriptionsItem>
+          <NDescriptionsItem label="安全与完整性">
+            <span>下载后自动校验官方 SHA-256 防篡改指纹，原子替换运行程序。</span>
+          </NDescriptionsItem>
+        </NDescriptions>
+
+        <NAlert type="warning" :bordered="false" style="margin-top: 14px">
+          升级前系统将自动向全网在线 Agent 下发维护信令，开启 2 分钟维护免告警期。服务平滑重载约持续 3~5 秒，重载完成后页面将自动重连刷新。
+        </NAlert>
+      </div>
+
+      <template #footer>
+        <NSpace justify="end" :size="10">
+          <NButton :disabled="onlineUpgrading" @click="showOnlineUpgradeModal = false">
+            取消
+          </NButton>
+          <NButton
+            type="primary"
+            :loading="onlineUpgrading"
+            @click="doOnlineUpgradeServer"
+          >
+            确认开始在线升级
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
   </NCard>
 </template>
 
@@ -592,6 +810,87 @@ onMounted(() => {
     display: flex;
     flex-direction: column;
     gap: 14px;
+  }
+
+  .new-version-banner {
+    border-radius: 8px;
+    border: 1px solid rgba(99, 102, 241, 0.35);
+    background: rgba(99, 102, 241, 0.08);
+
+    .banner-content {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      width: 100%;
+    }
+
+    .banner-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+
+      .banner-title {
+        font-size: 15px;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .version-tag-highlight {
+        color: var(--primary-color, #6366f1);
+        font-size: 16px;
+      }
+    }
+
+    .banner-meta {
+      font-size: 12px;
+      color: var(--n-text-color-3);
+    }
+
+    .banner-changelog {
+      margin-top: 6px;
+      background: var(--n-color-modal);
+      border: 1px solid var(--n-border-color);
+      border-radius: 6px;
+      overflow: hidden;
+
+      .changelog-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 6px 12px;
+        cursor: pointer;
+        user-select: none;
+        background: rgba(0, 0, 0, 0.03);
+
+        .changelog-title {
+          font-size: 12px;
+          font-weight: 600;
+        }
+      }
+
+      .changelog-body {
+        padding: 10px 14px;
+        max-height: 220px;
+        overflow-y: auto;
+        font-size: 12px;
+        line-height: 1.6;
+
+        pre {
+          margin: 0;
+          white-space: pre-wrap;
+          font-family: inherit;
+        }
+      }
+    }
+  }
+
+  .online-upgrade-dialog {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
   }
 
   .version-desc-grid {

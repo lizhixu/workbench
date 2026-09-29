@@ -728,6 +728,12 @@ GET    /api/v1/ai/audit                       # AI 调用审计
 # 审计
 GET    /api/v1/audit?user=&action=&from=&to=
 
+# 系统升级与自维护（控制端在线自升级）
+GET    /api/v1/system/check-update?force=&beta=   # 查询官方 Release 最新版本、更新日志与升级包（带通道与缓存）
+POST   /api/v1/system/online-upgrade              # 控制端一键在线自升级（下载官方包、校验SHA-256、原子替换、维护握手平滑重启）
+POST   /api/v1/system/upgrade-server              # 离线上传 watchman-server 单二进制升级
+POST   /api/v1/system/restart                     # 控制端平滑重启（广播维护预告，保护全网 Agent 零误报）
+
 # WebSocket
 WS /api/v1/ws/terminal/:sid          # 终端 IO（浏览器 ↔ 控制端 ↔ Agent）
 WS /api/v1/ws/file/:op_id            # 文件上传/下载分片
@@ -810,6 +816,18 @@ Agent internal/shell
   - **版本来源唯一真相**：**版本完全由官方 Release 提供，严禁任何自行决定或拼凑版本的行为**。发布包与升级清单必须 100% 来源于 Git tag 触发 GitHub Actions 产出的官方 Release（如 `v1.2.3` / `v1.2.3-beta.1`）以及由 CI 生成的 `manifest.json`；
   - **正式版与测试版通道**：默认跟踪 GitHub `/releases/latest`（自动排除 pre-release）。测试版改由面板开关控制——在「系统设置 → 系统升级」中开启「加入测试计划」（`system.join_beta_program`），`install.sh` 升级时读取该开关，若开启则取 release 列表首项（含 pre-release）；
   - **安装升级幂等性**：重跑脚本即为平滑升级，同版本默认跳过，保留数据目录与密钥；升级时自动停旧服务、替换二进制、复用凭据并热启动。
+  - **控制端在线检查与一键在线自升级（Web 自升级，2026-09-29）**：
+    - **在线 Release 探测引擎（`server/internal/release/checker.go`）**：控制端后台主动对接 GitHub Releases API，依据用户统一设置 `system.join_beta_program` 自动选择通道（开启测试计划时拉取首项 Release，包括 pre-release；关闭时拉取 `/releases/latest` 正式稳定版）；内置 5 分钟内存自愈缓存防止触发 GitHub API 频控，支持强制刷新 `force=true`；
+    - **Semver 规范多段语义比对（`CompareVersions`）**：严格兼容标准 Release 与 Pre-release 优先级，支持 `v0.1.0-beta.6` < `v0.1.0-beta.7` 等带点的先行版本比对、数值段比对及生产版优先于预发布版判定；
+    - **全自动防篡改原子升级管线（`server/internal/release/updater.go`）**：
+      1. 流式下载对应架构的官方发布包 `watchman-dist-${tag}-${os}-${arch}.tar.gz` 与 `CHECKSUMS.txt`；
+      2. 校验 SHA-256 哈希值与官方指纹完全一致，确保传输未被篡改；
+      3. 解压并提取 `watchman-server`、`manifest.json` 与新版 Agent 二进制；
+      4. 备份当前二进制为 `.bak.<timestamp>` 并以 `0755` 权限原子替换运行文件；
+      5. 自动同步更新 `/opt/watchman/manifest.json` 与 `/opt/watchman/bin/` 目录，使随后的 Agent 批量升级权威基准即时对齐；
+      6. 向全网在线 Agent 广播下发 120 秒维护预告信令（`reg.BroadcastMaintenance("server_restart", 120)`），自动进入维护免告警期；
+      7. 后台延迟 1 秒触发平滑重载（`os.Interrupt`），由 systemd 自动拉起新版本，前端 3~5 秒后平滑重连刷新。
+    - **响应式前端通知流（`useSystemUpdateStore`）**：顶栏设置图标徽标红点、侧边栏导航「NEW」高亮角标与「系统升级」页签顶部醒目横幅全联动，支持折叠查看官方 Release Notes（变更说明），一键直达在线自升级。
   - **架构演进说明（2026-09-28）**：全面移除外置 Nginx 依赖（控制端内嵌前端 `server/web` 自提供），旧版静态目录与 `cmd/deploy/` SSH 部署工具已彻底下线；`install.sh` 在升级时自动检测并清理旧版残留的 nginx 站点配置，避免历史 `auth_request` 指向已下线端点引发静态页 404。
 
 ### B.6.3 被控端 Agent 一键绑定与自纳管

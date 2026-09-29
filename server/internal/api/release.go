@@ -22,6 +22,15 @@ var agentRelease *release.Manifest
 // at the agent-facing address.
 var publicURL string
 
+// manifestPath stores the configured release manifest file path.
+var manifestPath string
+
+// SetManifestPath records the path to manifest.json (e.g. /opt/watchman/manifest.json).
+func SetManifestPath(p string) { manifestPath = p }
+
+// ManifestPath returns the path to manifest.json.
+func ManifestPath() string { return manifestPath }
+
 // SetAgentRelease installs the release manifest (nil clears it).
 func SetAgentRelease(m *release.Manifest) { agentRelease = m }
 

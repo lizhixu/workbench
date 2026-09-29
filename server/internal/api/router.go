@@ -36,7 +36,8 @@ import (
 		"watchman/server/internal/network"
 		"watchman/server/internal/panelsec"
 		"watchman/server/internal/policy"
-	"watchman/server/internal/rpc"
+		"watchman/server/internal/release"
+		"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/secentry"
 	"watchman/server/internal/session"
@@ -280,19 +281,21 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// Health.
 	authed.GET("/system/health", h.health)
 
-	// Version info: server build + agent upgrade source of truth.
-	authed.GET("/version", h.versionInfo)
+		// Version info: server build + agent upgrade source of truth.
+		authed.GET("/version", h.versionInfo)
+		authed.GET("/system/check-update", h.checkUpdate)
 
-	// Panel certificate status & inspection.
-	adminOnly.GET("/system/panel-cert", h.getPanelCertStatus)
+		// Panel certificate status & inspection.
+		adminOnly.GET("/system/panel-cert", h.getPanelCertStatus)
 
-	// Agent upgrade.
-	adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
+		// Agent upgrade.
+		adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
 
-	// Control-server binary hot self-upgrade (upload file/base64 binary).
-	adminOnly.POST("/system/upgrade", h.systemUpgrade)
-	adminOnly.POST("/system/restart", h.systemRestart)
-	adminOnly.POST("/system/upgrade-agents", h.upgradeAgentsBatch)
+		// Control-server binary hot self-upgrade (upload file/base64 binary, online upgrade, restart).
+		adminOnly.POST("/system/upgrade", h.systemUpgrade)
+		adminOnly.POST("/system/online-upgrade", h.onlineUpgrade)
+		adminOnly.POST("/system/restart", h.systemRestart)
+		adminOnly.POST("/system/upgrade-agents", h.upgradeAgentsBatch)
 
 	// User management (admin-only for mutating routes). Deleting an account
 	// also drops its terminal preferences, so a recreated account starts fresh.
@@ -2302,6 +2305,80 @@ func (h *handlers) systemRestart(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ok":      true,
 		"message": "已广播停机维护预告，正在触发控制端平滑重载...",
+	})
+
+	go func() {
+		time.Sleep(1 * time.Second)
+		p, err := os.FindProcess(os.Getpid())
+		if err == nil {
+			_ = p.Signal(os.Interrupt)
+		}
+	}()
+}
+
+// checkUpdate queries GitHub Releases to determine whether an update is available.
+func (h *handlers) checkUpdate(c *gin.Context) {
+	force := c.Query("force") == "true" || c.Query("force") == "1"
+	joinBeta := false
+	if h.settings != nil {
+		joinBeta = h.settings.JoinBetaProgram()
+	}
+	if betaParam := c.Query("beta"); betaParam != "" {
+		joinBeta = betaParam == "true" || betaParam == "1"
+	}
+
+	info, err := release.CheckUpdate(c.Request.Context(), version.Get(), joinBeta, force)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "检查更新失败: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
+// onlineUpgrade downloads the official release package matching target_version or latest,
+// verifies SHA-256 against CHECKSUMS.txt, extracts and replaces watchman-server,
+// updates manifest.json and agent binaries, broadcasts maintenance, and restarts.
+func (h *handlers) onlineUpgrade(c *gin.Context) {
+	var body struct {
+		TargetVersion string `json:"target_version"`
+	}
+	_ = c.ShouldBindJSON(&body)
+
+	joinBeta := false
+	if h.settings != nil {
+		joinBeta = h.settings.JoinBetaProgram()
+	}
+
+	// Retrieve release info (force refresh to ensure latest download URL and checksums).
+	info, err := release.CheckUpdate(c.Request.Context(), version.Get(), joinBeta, true)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "获取最新版本信息失败: " + err.Error()})
+		return
+	}
+
+	if body.TargetVersion != "" && body.TargetVersion != info.LatestVersion {
+		info.LatestVersion = body.TargetVersion
+	}
+
+	if info.AssetURL == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("未找到适用于当前系统/架构 (%s/%s) 的官方安装包", runtime.GOOS, runtime.GOARCH)})
+		return
+	}
+
+	mPath := ManifestPath()
+	if err := release.PerformOnlineUpgrade(c.Request.Context(), info.AssetURL, info.ChecksumsURL, info.LatestVersion, h.reg, mPath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("在线升级失败: %v", err)})
+		return
+	}
+
+	h.recordAudit(c, "upgrade", "system", "watchman-server",
+		fmt.Sprintf("控制端一键在线升级至 %s (渠道: %s)", info.LatestVersion, info.Channel),
+		audit.RiskHigh, audit.ResultSuccess)
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":             true,
+		"message":        fmt.Sprintf("控制端已成功下载并升级至 %s，正在触发平滑重载...", info.LatestVersion),
+		"target_version": info.LatestVersion,
 	})
 
 	go func() {

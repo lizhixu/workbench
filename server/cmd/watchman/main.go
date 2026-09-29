@@ -145,6 +145,7 @@ func main() {
 	// Release manifest: the source of truth for agent upgrades (target
 	// version + per-arch sha256). Absent in dev; then the server falls
 	// back to its own build version.
+	api.SetManifestPath(*manifestPath)
 	if m, err := release.Load(*manifestPath); err != nil {
 		log.Warn("release manifest not loaded, agent upgrades fall back to server build version", "path", *manifestPath, "err", err)
 	} else {

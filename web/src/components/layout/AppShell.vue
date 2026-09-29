@@ -21,6 +21,7 @@ import { useAuthStore } from '../../stores/auth'
 import { useWorkspaceStore, type WorkspaceTab } from '../../stores/workspace'
 import { useSettingsStore } from '../../stores/settings'
 import { useNotificationStore } from '../../stores/notifications'
+import { useSystemUpdateStore } from '../../stores/systemUpdate'
 import { updatePassword } from '../../api/users'
 import {
   PersonOutline,
@@ -52,10 +53,14 @@ const auth = useAuthStore()
 const workspace = useWorkspaceStore()
 const settings = useSettingsStore()
 const notifications = useNotificationStore()
+const systemUpdate = useSystemUpdateStore()
 const message = useMessage()
 
 onMounted(() => {
   notifications.startPolling()
+  if (auth.token) {
+    systemUpdate.check()
+  }
 })
 
 onUnmounted(() => {
@@ -475,18 +480,20 @@ function handleUser(key: string) {
           <!-- 全局设置 -->
           <NTooltip trigger="hover">
             <template #trigger>
-              <NButton
-                quaternary
-                circle
-                size="small"
-                @click="openSettings"
-              >
-                <template #icon>
-                  <NIcon size="18"><SettingsOutline /></NIcon>
-                </template>
-              </NButton>
+              <NBadge :dot="systemUpdate.hasUpdate" :show="systemUpdate.hasUpdate">
+                <NButton
+                  quaternary
+                  circle
+                  size="small"
+                  @click="openSettings"
+                >
+                  <template #icon>
+                    <NIcon size="18"><SettingsOutline /></NIcon>
+                  </template>
+                </NButton>
+              </NBadge>
             </template>
-            <span>系统设置</span>
+            <span>系统设置{{ systemUpdate.hasUpdate ? '（有新版本可用）' : '' }}</span>
           </NTooltip>
 
           <!-- 亮/暗主题切换 -->
@@ -543,6 +550,14 @@ function handleUser(key: string) {
                   <component :is="entry.icon" />
                 </NIcon>
                 <span v-if="!navCollapsed" class="side-nav-label">{{ entry.title }}</span>
+                <NBadge
+                  v-if="entry.key === '/settings' && systemUpdate.hasUpdate"
+                  :dot="navCollapsed"
+                  :value="navCollapsed ? undefined : 'NEW'"
+                  type="info"
+                  size="small"
+                  class="side-nav-badge"
+                />
               </div>
             </template>
             {{ entry.title }}
@@ -852,6 +867,19 @@ function handleUser(key: string) {
     transition: all 0.15s ease;
 
     .side-nav-icon {
+      flex-shrink: 0;
+    }
+
+    .side-nav-label {
+      flex: 1;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .side-nav-badge {
+      margin-left: auto;
       flex-shrink: 0;
     }
 

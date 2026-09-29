@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onActivated, onMounted, reactive, ref } from 'vue'
+import { onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref } from 'vue'
 import {
   NAlert,
   NButton,
@@ -11,6 +11,9 @@ import {
   NFormItem,
   NIcon,
   NInput,
+  NPopconfirm,
+  NRadio,
+  NRadioGroup,
   NSpace,
   NSpin,
   NSwitch,
@@ -28,7 +31,11 @@ import {
 import {
   detectPublicIP,
   getPanelCertJob,
+  importCert,
   issuePanelCert,
+  confirmPanelCertIssue,
+  cancelPanelCertIssue,
+  type ChallengeMode,
   type PanelCertJob,
 } from '../../api/certs'
 import {
@@ -187,10 +194,16 @@ function pollJob(jobId: string) {
     try {
       const j = await getPanelCertJob(jobId)
       job.value = j
+      if (j.status === 'awaiting_dns') {
+        // 手动 DNS-01：停止轮询，等待管理员添加 TXT 解析后手动确认
+        stopJobPoll()
+        message.info('签发任务已创建，请按指引手动添加 TXT 解析记录后再确认验证')
+        return
+      }
       if (j.status !== 'running') {
         stopJobPoll()
         if (j.status === 'done') {
-          message.success('证书签发成功，已自动绑定并启用 HTTPS')
+          message.success('证书签发成功，已自动绑定并启用 HTTPS（证书已进入证书中心「已签发证书」列表）')
         } else {
           message.error(j.error || '证书签发失败')
         }
@@ -208,6 +221,52 @@ function pollJob(jobId: string) {
   }, 3000)
 }
 
+const panelChallenge = ref<ChallengeMode>('')
+
+const confirming = ref(false)
+const cancelling = ref(false)
+
+// 手动 DNS-01：管理员已添加 TXT 解析，确认后通知 CA 开始验证
+async function confirmJob() {
+  if (!job.value) return
+  confirming.value = true
+  try {
+    const r = await confirmPanelCertIssue(job.value.id)
+    job.value = r.data
+    message.info(r.message || '已通知 CA 开始验证')
+    pollJob(r.data.id)
+  } catch (e: any) {
+    message.error(e?.message || '确认验证失败')
+  } finally {
+    confirming.value = false
+  }
+}
+
+// 取消待处理的手动 DNS-01 面板签发任务（同时取消证书中心订单）
+async function cancelJob() {
+  if (!job.value) return
+  cancelling.value = true
+  try {
+    const r = await cancelPanelCertIssue(job.value.id)
+    message.success(r.message || '已取消签发任务')
+    stopJobPoll()
+    job.value = null
+  } catch (e: any) {
+    message.error(e?.message || '取消任务失败')
+  } finally {
+    cancelling.value = false
+  }
+}
+
+async function copyText(text: string, label: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success(`${label}已复制`)
+  } catch {
+    message.warning('自动复制失败，请手动选中复制')
+  }
+}
+
 async function startIssue(mode: 'domain' | 'ip') {
   if (job.value?.status === 'running') {
     message.warning('已有签发任务在进行中，请稍候')
@@ -219,13 +278,21 @@ async function startIssue(mode: 'domain' | 'ip') {
     return
   }
   try {
-    const r = await issuePanelCert(mode, ip)
+    const r = await issuePanelCert(mode, ip, mode === 'domain' ? panelChallenge.value || undefined : undefined)
     job.value = r.data
     message.info(r.message || '签发任务已启动')
     pollJob(r.data.id)
   } catch (e: any) {
     message.error(e?.message || '启动签发任务失败')
   }
+}
+
+function challengeLabel(j: PanelCertJob | null): string {
+  if (!j) return ''
+  if (j.challenge === 'dns-01') return 'DNS-01 验证'
+  if (j.challenge === 'dns-01-manual') return 'DNS-01 手动解析验证'
+  if (j.challenge === 'http-01') return 'HTTP-01 验证'
+  return j.mode === 'ip' ? 'HTTP-01 验证' : '自动选择（HTTP-01 优先）'
 }
 
 async function uploadCustomCert() {
@@ -235,18 +302,20 @@ async function uploadCustomCert() {
   }
   uploading.value = true
   try {
+    // 先导入证书中心（服务端校验 PEM、入库），证书进入已签发证书列表；
+    // 再把面板绑定到该证书（cert_center 模式），私钥不再重复存入 settings。
+    const crt = await importCert(customCert.cert_pem.trim(), customCert.key_pem.trim())
     await saveSystemSettings({
-      [SETTING_KEYS.panelSSLMode]: 'custom',
-      [SETTING_KEYS.panelSSLCertPEM]: customCert.cert_pem.trim(),
-      [SETTING_KEYS.panelSSLKeyPEM]: customCert.key_pem.trim(),
+      [SETTING_KEYS.panelSSLMode]: 'cert_center',
+      [SETTING_KEYS.panelSSLCertID]: crt.id,
       [SETTING_KEYS.panelSSLEnabled]: true,
     })
-    message.success('自定义证书已保存并启用 HTTPS')
+    message.success(`自定义证书已导入证书中心并启用 HTTPS（${crt.domains.join('、') || crt.id}）`)
     customCert.cert_pem = ''
     customCert.key_pem = ''
     await refreshStatus()
   } catch (e: any) {
-    message.error(e?.message || '保存证书失败')
+    message.error(e?.message || '上传证书失败')
   } finally {
     uploading.value = false
   }
@@ -254,6 +323,8 @@ async function uploadCustomCert() {
 
 onMounted(loadData)
 onActivated(loadData)
+onDeactivated(stopJobPoll)
+onUnmounted(stopJobPoll)
 </script>
 
 <template>
@@ -377,7 +448,7 @@ onActivated(loadData)
               如签发报错 invalidContact，请到「证书中心」检查账户邮箱是否为有效公网域名邮箱。
             </NAlert>
             <template v-if="certStatus?.panel_domain">
-              <NSpace align="center">
+              <NSpace align="center" style="width: 100%">
                 <NButton
                   type="primary"
                   :loading="job?.status === 'running'"
@@ -386,10 +457,19 @@ onActivated(loadData)
                   <template #icon><NIcon><ShieldCheckmarkOutline /></NIcon></template>
                   为绑定域名申请免费证书
                 </NButton>
+                <NRadioGroup v-model:value="panelChallenge" size="small">
+                  <NSpace :size="8">
+                    <NRadio value="">自动</NRadio>
+                    <NRadio value="http-01">HTTP-01</NRadio>
+                    <NRadio value="dns-01">DNS-01</NRadio>
+                    <NRadio value="dns-01-manual">手动解析</NRadio>
+                  </NSpace>
+                </NRadioGroup>
               </NSpace>
               <p class="muted tip-hint" style="margin: 8px 0 0">
-                通过证书中心 ACME（DNS 验证）为 {{ certStatus.panel_domain }} 签发证书，
-                成功后自动绑定并启用 HTTPS。需先在「证书中心」配置 ACME 账户与 DNS 服务。
+                通过证书中心 ACME 为 {{ certStatus.panel_domain }} 签发证书，成功后自动绑定并启用 HTTPS。
+                自动：优先 HTTP-01（需 80 端口可被 CA 访问），失败时回退 DNS-01；选择 DNS-01 需先在「证书中心」配置并启用 dns-mng；
+                选择「手动解析」则由您到 DNS 服务商手动添加 TXT 记录，无需 dns-mng。
               </p>
             </template>
             <template v-else>
@@ -418,15 +498,64 @@ onActivated(loadData)
             </template>
 
             <NAlert
+              v-if="job?.status === 'awaiting_dns'"
+              type="warning"
+              :show-icon="true"
+              size="small"
+              style="margin-top: 12px"
+            >
+              <template #header>请手动添加以下 TXT 解析记录</template>
+              <div
+                v-for="rec in job.dns_records || []"
+                :key="rec.host"
+                class="dns-rec-block"
+              >
+                <div class="dns-rec-line">
+                  <span class="label">标识符</span>
+                  <NTag size="small" bordered>{{ rec.domain }}</NTag>
+                </div>
+                <div class="dns-rec-line">
+                  <span class="label">记录类型</span>
+                  <NTag size="small" type="info" bordered>TXT</NTag>
+                </div>
+                <div class="dns-rec-line">
+                  <span class="label">主机记录</span>
+                  <code class="mono">{{ rec.host }}</code>
+                  <NButton size="tiny" @click="copyText(rec.host, '主机记录')">复制</NButton>
+                </div>
+                <div class="dns-rec-line">
+                  <span class="label">记录值</span>
+                  <code class="mono">{{ rec.value }}</code>
+                  <NButton size="tiny" @click="copyText(rec.value, '记录值')">复制</NButton>
+                </div>
+              </div>
+              <p class="muted tip-hint" style="margin: 8px 0">
+                请到您的 DNS 服务商添加以上记录，等待解析生效后再点击下方按钮通知 CA 验证。
+                任务保留 2 小时，超时需重新发起。
+              </p>
+              <NButton type="primary" size="small" :loading="confirming" @click="confirmJob">
+                <template #icon><NIcon><ShieldCheckmarkOutline /></NIcon></template>
+                我已完成解析，开始验证
+              </NButton>
+              <NPopconfirm @positive-click="cancelJob">
+                <template #trigger>
+                  <NButton size="small" :disabled="cancelling" style="margin-left: 8px">取消任务</NButton>
+                </template>
+                确定取消该面板证书签发任务？CA 侧订单将自然过期，已添加的 TXT 记录需自行到 DNS 服务商删除。
+              </NPopconfirm>
+            </NAlert>
+
+            <NAlert
               v-if="job?.status === 'running'"
               type="info"
               :show-icon="true"
               size="small"
               style="margin-top: 12px"
             >
-              正在为 {{ job.target }} 签发证书（{{ job.mode === 'domain' ? 'DNS 验证' : 'HTTP-01 验证' }}），
+              正在为 {{ job.target }} 签发证书（{{ challengeLabel(job) }}），
               通常需要几十秒，请稍候……
             </NAlert>
+
             <NAlert
               v-if="job?.status === 'error'"
               type="error"
@@ -435,6 +564,18 @@ onActivated(loadData)
               style="margin-top: 12px"
             >
               签发失败：{{ job.error }}
+              <template v-if="job.terminal">该订单已终态失败，不可重试，请重新发起签发。</template>
+              <NButton
+                v-if="job.challenge === 'dns-01-manual' && !job.terminal"
+                size="small"
+                type="primary"
+                ghost
+                :loading="confirming"
+                style="margin-left: 8px"
+                @click="confirmJob"
+              >
+                检查解析后重新验证
+              </NButton>
             </NAlert>
           </div>
 
@@ -469,7 +610,7 @@ onActivated(loadData)
 
           <!-- 上传已有证书 -->
           <NCollapse style="margin-top: 8px">
-            <NCollapseItem title="上传已有证书（其他渠道申请的证书）" name="upload">
+            <NCollapseItem title="上传已有证书（其他渠道申请的证书，自动进入证书中心）" name="upload">
               <NForm label-placement="top" :show-feedback="false">
                 <NFormItem label="证书内容 (PEM)">
                   <NInput
@@ -558,6 +699,39 @@ onActivated(loadData)
 
 .issue-block {
   margin-top: 12px;
+}
+
+.dns-rec-block {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.03);
+  border-radius: 6px;
+
+  .dns-rec-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+
+    &:last-child {
+      margin-bottom: 0;
+    }
+
+    .label {
+      flex-shrink: 0;
+      width: 56px;
+      font-size: 12px;
+      color: var(--text-color-3);
+    }
+
+    .mono {
+      flex: 1;
+      min-width: 0;
+      font-family: monospace;
+      font-size: 12px;
+      word-break: break-all;
+    }
+  }
 }
 
 .cert-info-grid {

@@ -1,6 +1,7 @@
 package cert
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -22,7 +23,7 @@ func NewHandlers(hub *Hub) *Handlers {
 }
 
 // Register mounts routes. Config reads are open to all roles (the UI shows
-// integration state); config writes, issue/renew and delete are gated to
+// integration state); config writes, issue/import/renew and delete are gated to
 // roles allowed to change system state by the caller (writeRG).
 func (h *Handlers) Register(readRG, writeRG *gin.RouterGroup) {
 	readRG.GET("/certs/config", h.getConfig)
@@ -30,12 +31,16 @@ func (h *Handlers) Register(readRG, writeRG *gin.RouterGroup) {
 	readRG.GET("/certs/accounts", h.listAccounts)
 	readRG.GET("/certs", h.listCerts)
 	readRG.GET("/certs/:id", h.getCert)
+	readRG.GET("/certs/manual/:id", h.getManualOrder)
 
 	writeRG.PUT("/certs/config", h.putConfig)
 	writeRG.POST("/certs/accounts", h.createAccount)
 	writeRG.PUT("/certs/accounts/:id", h.updateAccount)
 	writeRG.DELETE("/certs/accounts/:id", h.deleteAccount)
 	writeRG.POST("/certs/issue", h.issueCert)
+	writeRG.POST("/certs/manual/:id/confirm", h.confirmManualOrder)
+	writeRG.DELETE("/certs/manual/:id", h.cancelManualOrder)
+	writeRG.POST("/certs/import", h.importCert)
 	writeRG.POST("/certs/:id/renew", h.renewCert)
 	writeRG.DELETE("/certs/:id", h.deleteCert)
 }
@@ -166,6 +171,9 @@ func (h *Handlers) issueCert(c *gin.Context) {
 	var req struct {
 		Domains   []string `json:"domains"`
 		AccountID string   `json:"account_id"`
+		// Challenge pins the ACME challenge mechanism: "" (auto),
+		// "http-01", "dns-01" or "dns-01-manual".
+		Challenge string `json:"challenge"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -175,15 +183,101 @@ func (h *Handlers) issueCert(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "至少需要一个域名或 IP"})
 		return
 	}
+	ch := ChallengePreference(strings.TrimSpace(req.Challenge))
+	if !ch.Valid() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("未知的验证方式: %q", req.Challenge)})
+		return
+	}
+
+	// Manual DNS-01 is a two-phase flow: create the order now and return the
+	// TXT records for the administrator to provision; the UI then calls
+	// confirmManualOrder after the records are in place.
+	if ch == ChallengeDNS01Manual {
+		h.mu.Lock()
+		order, err := h.hub.StartManualDNSOrder(req.Domains, req.AccountID)
+		h.mu.Unlock()
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": order})
+		return
+	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	// DNS-01 + propagation takes tens of seconds; run async and let the UI
 	// poll the list.
 	go func() {
-		_, _ = h.hub.Issue(req.Domains, req.AccountID)
+		_, _ = h.hub.IssueWithChallenge(req.Domains, req.AccountID, ch)
 	}()
 	c.JSON(http.StatusAccepted, gin.H{"ok": true, "message": "签发请求已受理，请稍后刷新列表"})
+}
+
+// getManualOrder returns the status and DNS records of a pending manual
+// DNS-01 order.
+func (h *Handlers) getManualOrder(c *gin.Context) {
+	order, err := h.hub.GetPendingOrder(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": order})
+}
+
+// confirmManualOrder starts CA validation for a pending manual DNS-01 order.
+// The administrator must have provisioned the TXT records first; validation
+// runs async and the UI polls getManualOrder for progress.
+func (h *Handlers) confirmManualOrder(c *gin.Context) {
+	id := c.Param("id")
+	order, err := h.hub.GetPendingOrder(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	if order.Status != ManualOrderAwaitingDNS && order.Status != ManualOrderError {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "任务当前不可确认验证"})
+		return
+	}
+	if order.Status == ManualOrderError && order.Terminal {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "CA 已对该订单作出终态判定（验证不通过），请重新发起签发"})
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	go func() {
+		_, _ = h.hub.ConfirmManualDNSOrder(id)
+	}()
+	c.JSON(http.StatusAccepted, gin.H{"ok": true, "message": "已通知 CA 开始验证，请稍后查询任务状态"})
+}
+
+// cancelManualOrder discards a pending manual DNS-01 order (awaiting_dns or
+// error state). The CA-side order is simply left to expire; the administrator
+// removes the provisioned TXT records at their DNS provider if desired.
+func (h *Handlers) cancelManualOrder(c *gin.Context) {
+	if err := h.hub.CancelManualDNSOrder(c.Param("id")); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "已取消手动签发任务"})
+}
+
+func (h *Handlers) importCert(c *gin.Context) {
+	var req struct {
+		CertPEM string `json:"cert_pem"`
+		KeyPEM  string `json:"key_pem"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	crt, err := h.hub.Import([]byte(req.CertPEM), []byte(req.KeyPEM))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	crt.KeyPEM = "" // never expose the private key over REST
+	c.JSON(http.StatusOK, gin.H{"data": crt})
 }
 
 func (h *Handlers) renewCert(c *gin.Context) {

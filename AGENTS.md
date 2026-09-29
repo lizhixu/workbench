@@ -112,7 +112,7 @@
 - **创建时即可绑定域名**：创建页填写域名与网关节点后，提交依次执行 创建应用 → 自动签发证书 → 下发反代；绑定失败不回滚应用创建，可稍后在详情页重试。
 - **系统设置面板安全与应用反代职责彻底解耦**（2026-09-28）：
   - 应用中心独立负责业务容器的反向代理与域名绑定（在应用详情 `AppDetail.vue` 的「域名与反代」页签中配置，经 Nginx 容器路由流量到应用容器或网关节点）；
-  - 「系统设置 → 面板域名与证书」（`web/src/views/settings/CertDomain.vue`，`sections.ts` 注册 `key: 'cert-domain'`，`adminOnly` 仅管理员可见）**专用于 Watchman 控制台/面板自身的访问与安全配置**，与应用反向代理彻底解耦，采用宝塔式简化模型。**域名绑定**：`security.panel_domain` 为空表示通过 IP 访问；一旦绑定域名即**自动启用严格域名限制**（无独立开关），面板只能通过该域名访问，直接 IP/其他域名请求被 403 拦截（回环地址与 Agent 注册/数据接口等基础设施路径豁免）。**面板证书**：已绑定域名时「为绑定域名申请免费证书」（经证书中心 ACME DNS-01 签发，需预先在证书中心配置 ACME 账户与 dns-mng）；未绑定域名时「为 IP 申请免费证书」（为公网 IP 签发 Let's Encrypt 等免费 IP 证书，走 HTTP-01 验证，签发期间临时监听 80 端口，证书有效期短、自动续期阈值按有效期 1/3 自适应）；签发成功后自动写入证书中心并绑定为面板证书、开启 HTTPS。另支持手动上传已有证书（`custom` 模式）与「强制 HTTPS 访问」（`security.panel_force_https`，明文 HTTP 自动 301 重定向至 HTTPS）。
+  - 「系统设置 → 面板域名与证书」（`web/src/views/settings/CertDomain.vue`，`sections.ts` 注册 `key: 'cert-domain'`，`adminOnly` 仅管理员可见）**专用于 Watchman 控制台/面板自身的访问与安全配置**，与应用反向代理彻底解耦，采用宝塔式简化模型。**域名绑定**：`security.panel_domain` 为空表示通过 IP 访问；一旦绑定域名即**自动启用严格域名限制**（无独立开关），面板只能通过该域名访问，直接 IP/其他域名请求被 403 拦截（回环地址与 Agent 注册/数据接口等基础设施路径豁免）。**面板证书**：已绑定域名时「为绑定域名申请免费证书」（经证书中心 ACME 签发：普通域名优先 HTTP-01，需服务器 80 端口可被 CA 访问、签发时临时监听；80 端口不可用或 HTTP-01 验证失败时自动回退 DNS-01，需预先在证书中心配置 ACME 账户与 dns-mng；通配符域名仅支持 DNS-01；另支持「DNS-01（手动解析）」两阶段签发——服务端创建订单并展示 TXT 记录，管理员手动到 DNS 服务商添加解析后确认，CA 验证通过后自动绑定，不依赖 dns-mng）；未绑定域名时「为 IP 申请免费证书」（为公网 IP 签发 Let's Encrypt 等免费 IP 证书，走 HTTP-01 验证，签发期间临时监听 80 端口，证书有效期短、自动续期阈值按有效期 1/3 自适应）；签发成功后自动写入证书中心并绑定为面板证书、开启 HTTPS。另支持手动上传已有证书（先导入证书中心并校验、私钥不再直存 settings，再以 cert_center 模式绑定）与「强制 HTTPS 访问」（`security.panel_force_https`，明文 HTTP 自动 301 重定向至 HTTPS）。
   - 面板服务采用**端口级协议动态嗅探（Dynamic Listener）**技术，在控制台默认端口（18789）上原生自适应处理 HTTP 明文与 TLS 握手，热重载或开关 SSL 无需重启服务或更改端口。
   - **防失联与紧急恢复**：若配置错误域名或无效证书导致无法登录，提供控制机命令行救援开关：`watchman-server -reset-panel-domain -data <数据目录>`（解绑面板域名；绑定即严格，解绑后恢复 IP 访问）以及 `watchman-server -reset-panel-ssl -data <数据目录>`（关闭面板 SSL 与强制 HTTPS 重定向）。
   - 独立「证书中心」（`/certs`，`CertList.vue` + `CertManager.vue`）保持作为全局基础设施，管理 ACME 自动化证书与证书凭证，供面板及各业务应用按需选用。
@@ -1076,10 +1076,34 @@ POST   /api/v1/system/backup              # 导出 SQLite/配置/录像打包
 POST   /api/v1/system/restore             # 从备份恢复（离线运维操作）
 GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
 
+# 证书中心（admin 写操作；读操作所有登录角色可见）
+GET    /api/v1/certs                       # 已签发证书列表
+POST   /api/v1/certs/issue                 # ACME 签发 {domains[], account_id?, challenge?}（异步，202 受理；challenge: ""自动 | "http-01" | "dns-01" | "dns-01-manual"，显式指定后不再自动回退）
+POST   /api/v1/certs/import                # 上传已有证书 {cert_pem, key_pem}（服务端校验 PEM 与私钥匹配，入库后进入已签发列表，不自动续期）
+POST   /api/v1/certs/:id/renew             # 续期（ACME 重新签发）
+DELETE /api/v1/certs/:id                   # 删除证书
+GET    /api/v1/certs/config                # dns-mng 集成配置（自动 DNS-01 验证后端）
+PUT    /api/v1/certs/config                # 更新 dns-mng 集成配置
+# 手动 DNS-01（两阶段，管理员自行添加 TXT 解析，不依赖 dns-mng）：
+POST   /api/v1/certs/manual/:id/confirm    # challenge="dns-01-manual" 时 /certs/issue 同步创建 ACME 订单并返回待添加的 TXT 记录 {id, identifiers[], records[{domain,host,type,value}], status, expires_at}（200）；管理员在 DNS 服务商添加解析后调本接口通知 CA 开始验证（异步 202，轮询下条查询进度）
+GET    /api/v1/certs/manual/:id            # 手动订单状态与 TXT 记录 {status: awaiting_dns|verifying|done|error, cert_id?, error?}
+DELETE /api/v1/certs/manual/:id            # 取消待处理的手动订单（verifying 中不可取消；CA 侧订单自然过期）
+# 挑战验证兼容策略：普通域名优先 HTTP-01（签发时临时监听 80 端口，无需 dns-mng；面板不常驻占用 80），
+# 80 端口不可用或 HTTP-01 失败时回退 DNS-01（需配置并启用 dns-mng 自动添加解析）；通配符域名仅支持 DNS-01；
+# IP 标识（RFC 8738）仅支持 HTTP-01（DNS-01 对 IP 无效，手动 DNS-01 拒绝 IP）。
+# DNS-01 有两种形态：① 自动（dns-mng）：服务端调用 dns-mng 自动添加/清理 TXT 解析，全程无人值守；
+# ② 手动（dns-01-manual）：服务端只计算并展示 TXT 记录，由管理员手动到 DNS 服务商添加解析后再确认签发。
+# 手动订单状态机：awaiting_dns → verifying → done | error；本地先做 15s DNS TXT 预检查（未传播不通知 CA，避免浪费验证次数）；
+# error 分两种：预检查/网络/超时失败可直接重新确认（terminal=false，TXT 记录不变）；CA 终态判定（authorization invalid/expired）则 terminal=true，
+# 同一订单不可重试、必须新建订单。订单落盘 2 小时 TTL；verifying 中服务重启会转为可重试的 error（不会卡死），面板内存任务不持久化、重启后需重新发起。
+# 签发弹窗与面板一键签发均提供「验证方式」显式选择（自动 / HTTP-01 / DNS-01 / DNS-01 手动解析），显式指定后不再自动回退。
+
 # 面板证书（宝塔式一键签发，admin）
 GET    /api/v1/system/panel-cert          # 面板证书状态（ssl_enabled/panel_domain/strict_domain/active/source/subject/issuer/dns_names/days_left）
-POST   /api/v1/system/panel-cert/issue    # 启动异步签发 {mode: domain|ip, ip?}；domain 走 DNS-01（需证书中心 dns-mng），ip 走 HTTP-01（临时监听 80）；202 返回 job
-GET    /api/v1/system/panel-cert/issue/:job_id  # 签发任务进度 {status: running|done|error, cert_id?, error?}
+POST   /api/v1/system/panel-cert/issue    # 启动异步签发 {mode: domain|ip, ip?, challenge?}；domain 走 HTTP-01 优先（临时监听 80）、失败或无 80 时回退 DNS-01（需证书中心 dns-mng；通配符仅 DNS-01），ip 走 HTTP-01（临时监听 80）；challenge 显式指定验证方式（含 "dns-01-manual" 手动两阶段：202 返回 awaiting_dns job 并携带 dns_records）；202 返回 job
+GET    /api/v1/system/panel-cert/issue/:job_id  # 签发任务进度 {status: running|awaiting_dns|done|error, cert_id?, error?, pending_id?, dns_records?}
+POST   /api/v1/system/panel-cert/issue/:job_id/confirm  # 手动 DNS-01 任务：管理员添加 TXT 解析后通知 CA 开始验证（异步 202；成功自动绑定面板并启用 HTTPS）
+DELETE /api/v1/system/panel-cert/issue/:job_id  # 取消手动 DNS-01 签发任务（同时取消证书中心待处理订单）
 GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 ```
 

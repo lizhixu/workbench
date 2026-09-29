@@ -1,20 +1,22 @@
 <script setup lang="ts">
-import { computed, h, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, h, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
   NAlert, NButton, NCard, NDataTable, NForm, NFormItem, NIcon, NInput,
-  NModal, NPopconfirm, NSelect, NSpace, NSwitch,
+  NModal, NPopconfirm, NRadio, NRadioGroup, NSelect, NSpace, NSwitch,
   NTabPane, NTabs, NTag, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import {
-  AddCircleOutline, LockClosedOutline,
+  AddCircleOutline, CloudUploadOutline, LockClosedOutline,
   RefreshOutline, ShieldCheckmarkOutline, TrashOutline,
 } from '@vicons/ionicons5'
 import {
   createACMEAccount, deleteACMEAccount, deleteCert, getCertConfig,
-  issueCert, listACMEAccounts, listCerts, listPresets, renewCert,
-  updateACMEAccount, updateCertConfig, type ACMEAccount, type ACMEPreset,
-  type Certificate, type CertHubConfig,
+  importCert, issueCert, listACMEAccounts, listCerts, listPresets, renewCert,
+  updateACMEAccount, updateCertConfig, startManualDNSIssue, getManualDNSOrder,
+  confirmManualDNSOrder, cancelManualDNSOrder, type ACMEAccount, type ACMEPreset,
+  type Certificate, type CertHubConfig, type ChallengeMode,
+  type ManualDNSOrder,
 } from '../../api/certs'
 
 defineOptions({ name: 'CertManager' })
@@ -30,6 +32,20 @@ const showIssue = ref(false)
 const issuing = ref(false)
 const issueDomains = ref('')
 const selectedIssueAccountID = ref<string>('')
+const issueChallenge = ref<ChallengeMode>('')
+
+// ---- 手动 DNS-01（管理员手动添加 TXT 解析） ----
+const showManual = ref(false)
+const manualOrder = ref<ManualDNSOrder | null>(null)
+const confirming = ref(false)
+const cancelling = ref(false)
+let manualPollTimer: ReturnType<typeof setInterval> | null = null
+
+// ---- 上传已有证书 ----
+const showImport = ref(false)
+const importing = ref(false)
+const importCertPEM = ref('')
+const importKeyPEM = ref('')
 
 // ---- ACME 账户相关 ----
 const accounts = ref<ACMEAccount[]>([])
@@ -332,13 +348,35 @@ async function doDeleteAccount(acc: ACMEAccount) {
 }
 
 function openIssue() {
-  if (!configReady.value) {
-    message.warning('请先配置并启用 dns-mng 集成')
-    showConfig.value = true
+  // 不再强制要求 dns-mng：普通域名优先走 HTTP-01（临时监听 80 端口）即可签发；
+  // 未接入 80 端口或通配符域名才需要 dns-mng（DNS-01）。
+  issueDomains.value = ''
+  issueChallenge.value = ''
+  showIssue.value = true
+}
+
+function openImport() {
+  importCertPEM.value = ''
+  importKeyPEM.value = ''
+  showImport.value = true
+}
+
+async function doImport() {
+  if (!importCertPEM.value.trim() || !importKeyPEM.value.trim()) {
+    message.warning('请填写完整的证书内容与私钥内容')
     return
   }
-  issueDomains.value = ''
-  showIssue.value = true
+  importing.value = true
+  try {
+    const crt = await importCert(importCertPEM.value.trim(), importKeyPEM.value.trim())
+    message.success(`证书已导入（${crt.domains.join('、') || crt.id}）`)
+    showImport.value = false
+    await loadCerts()
+  } catch (e: any) {
+    message.error(e.message || '导入失败')
+  } finally {
+    importing.value = false
+  }
 }
 
 async function doIssue() {
@@ -350,17 +388,131 @@ async function doIssue() {
     message.warning('请填写至少一个域名')
     return
   }
+  if (issueChallenge.value === 'dns-01' && !configReady.value) {
+    message.warning('已选择 DNS-01 验证，请先配置并启用 dns-mng 集成')
+    showConfig.value = true
+    return
+  }
   issuing.value = true
   try {
-    const res = await issueCert(domains, selectedIssueAccountID.value || undefined)
+    // 手动 DNS-01：同步返回待添加的 TXT 记录，打开解析指引弹窗。
+    if (issueChallenge.value === 'dns-01-manual') {
+      const order = await startManualDNSIssue(domains, selectedIssueAccountID.value || undefined)
+      showIssue.value = false
+      openManualModal(order)
+      return
+    }
+    const res = await issueCert(domains, selectedIssueAccountID.value || undefined, issueChallenge.value || undefined)
     message.success(res.message || '签发请求已受理')
     showIssue.value = false
-    setTimeout(loadCerts, 3000)
+    // 签发是异步的（DNS-01 需等待 TXT 生效），签发后每 5 秒刷新一次、
+    // 最长 2 分钟，直到新证书出现在列表中。
+    const before = new Set(certs.value.map((c) => c.id))
+    let tries = 0
+    const timer = setInterval(async () => {
+      tries++
+      try {
+        await loadCerts()
+      } catch {
+        /* 忽略单次刷新失败 */
+      }
+      const arrived = certs.value.some((c) => !before.has(c.id))
+      if (arrived || tries >= 24) {
+        clearInterval(timer)
+        if (arrived) message.success('新证书已签发完成')
+      }
+    }, 5000)
   } catch (e: any) {
     message.error(e.message || '签发请求失败')
   } finally {
     issuing.value = false
   }
+}
+
+// ---- 手动 DNS-01：管理员按指引添加 TXT 解析后确认验证 ----
+function openManualModal(order: ManualDNSOrder) {
+  manualOrder.value = order
+  showManual.value = true
+}
+
+function stopManualPolling() {
+  if (manualPollTimer) {
+    clearInterval(manualPollTimer)
+    manualPollTimer = null
+  }
+}
+
+function closeManualModal() {
+  stopManualPolling()
+  showManual.value = false
+}
+
+// 弹窗被遮罩/ESC 关闭时也要停止轮询
+watch(showManual, (v) => {
+  if (!v) stopManualPolling()
+})
+
+async function copyText(text: string, label: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success(`${label}已复制`)
+  } catch {
+    message.warning('自动复制失败，请手动选中复制')
+  }
+}
+
+// 管理员确认已完成 DNS 解析：通知 CA 开始验证，随后轮询任务状态。
+async function confirmDNS() {
+  if (!manualOrder.value) return
+  confirming.value = true
+  try {
+    await confirmManualDNSOrder(manualOrder.value.id)
+    message.success('已通知 CA 开始验证，请稍候')
+    pollManualOrder()
+  } catch (e: any) {
+    message.error(e.message || '确认验证失败')
+  } finally {
+    confirming.value = false
+  }
+}
+
+// 取消待处理的手动签发任务：服务端删除订单，CA 侧订单自然过期。
+async function cancelManual() {
+  if (!manualOrder.value) return
+  cancelling.value = true
+  try {
+    const res = await cancelManualDNSOrder(manualOrder.value.id)
+    message.success(res.message || '已取消签发任务')
+    closeManualModal()
+    manualOrder.value = null
+  } catch (e: any) {
+    message.error(e.message || '取消任务失败')
+  } finally {
+    cancelling.value = false
+  }
+}
+
+function pollManualOrder() {
+  stopManualPolling()
+  manualPollTimer = setInterval(async () => {
+    if (!manualOrder.value) {
+      stopManualPolling()
+      return
+    }
+    try {
+      manualOrder.value = await getManualDNSOrder(manualOrder.value.id)
+    } catch {
+      return // 忽略单次刷新失败
+    }
+    if (manualOrder.value.status === 'done') {
+      stopManualPolling()
+      message.success('证书签发成功，已入库')
+      await loadCerts()
+    } else if (manualOrder.value.status === 'error') {
+      stopManualPolling()
+      message.error(manualOrder.value.error || 'CA 验证失败，请检查 DNS 解析后重试')
+    }
+  }, 5000)
 }
 
 async function doRenew(cert: Certificate) {
@@ -412,10 +564,12 @@ onActivated(() => {
 
 onDeactivated(() => {
   stopPolling()
+  stopManualPolling()
 })
 
 onUnmounted(() => {
   stopPolling()
+  stopManualPolling()
 })
 </script>
 
@@ -436,6 +590,12 @@ onUnmounted(() => {
           </template>
           刷新
         </NButton>
+        <NButton v-if="activeMainTab === 'certs'" @click="openImport">
+          <template #icon>
+            <NIcon><CloudUploadOutline /></NIcon>
+          </template>
+          上传证书
+        </NButton>
         <NButton v-if="activeMainTab === 'accounts'" type="primary" @click="openCreateAccount">
           <template #icon>
             <NIcon><AddCircleOutline /></NIcon>
@@ -452,7 +612,7 @@ onUnmounted(() => {
     </div>
 
     <NAlert v-if="!configReady" type="warning" :show-icon="true" style="flex-shrink: 0">
-      证书中心需依赖 dns-mng（同级项目）：ACME DNS-01 验证将通过 dns-mng 的接口在 11 家主流云厂商（Cloudflare、阿里云、腾讯云等）自动添加与清理 TXT 解析。请先配置 dns-mng。
+      未配置 dns-mng 时，普通域名仍可通过 HTTP-01（签发时临时监听 80 端口）签发，无需 DNS 解析托管；通配符域名或 80 端口不可用时才需要配置 dns-mng（DNS-01 自动添加与清理 TXT 解析，支持 11 家主流云厂商）。
     </NAlert>
 
     <!-- Tabs Container：Tab 与表格分层，完全对齐 AlertList 规范 -->
@@ -588,11 +748,11 @@ onUnmounted(() => {
     <NModal
       v-model:show="showIssue"
       preset="card"
-      title="申请 SSL 证书（ACME DNS-01）"
+      title="申请 SSL 证书（ACME）"
       style="width: 560px; max-width: 94vw"
     >
       <NAlert type="info" :show-icon="true" class="tip-hint" style="margin-bottom: 12px">
-        域名的 DNS 解析须已托管在 dns-mng 接入的云解析厂商中。通配符示例：*.example.com 与 example.com。
+        普通域名优先通过 HTTP-01 验证签发（需服务器 80 端口可被 CA 访问，签发时临时监听）；80 端口不可用时自动回退到 DNS-01（需配置 dns-mng）。通配符域名仅支持 DNS-01，需将 DNS 解析托管在 dns-mng 接入的云解析厂商，或选择「DNS-01（手动解析）」由管理员手动添加 TXT 记录。
       </NAlert>
 
       <NForm label-placement="top">
@@ -608,6 +768,24 @@ onUnmounted(() => {
             placeholder="*.example.com&#10;example.com"
           />
         </NFormItem>
+
+        <NFormItem label="验证方式">
+          <NRadioGroup v-model:value="issueChallenge">
+            <NSpace>
+              <NRadio value="">自动（推荐）</NRadio>
+              <NRadio value="http-01">HTTP-01</NRadio>
+              <NRadio value="dns-01">DNS-01（dns-mng）</NRadio>
+              <NRadio value="dns-01-manual">DNS-01（手动解析）</NRadio>
+            </NSpace>
+          </NRadioGroup>
+          <template #feedback>
+            <span class="muted tip-hint">
+              自动：普通域名优先 HTTP-01（需 80 端口可被 CA 访问），失败或 80 不可用时回退 DNS-01；
+              通配符固定 DNS-01，IP 固定 HTTP-01。显式指定后不再自动回退。
+              手动解析：服务端先生成 TXT 记录，您到 DNS 服务商手动添加解析后再确认验证，不依赖 dns-mng。
+            </span>
+          </template>
+        </NFormItem>
       </NForm>
 
       <template #footer>
@@ -618,6 +796,126 @@ onUnmounted(() => {
               <NIcon><ShieldCheckmarkOutline /></NIcon>
             </template>
             申请签发
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- 手动 DNS-01 解析指引弹窗 -->
+    <NModal
+      v-model:show="showManual"
+      preset="card"
+      title="手动添加 DNS 解析（DNS-01）"
+      style="width: 640px; max-width: 94vw"
+    >
+      <NAlert type="info" :show-icon="true" class="tip-hint" style="margin-bottom: 12px">
+        请到您的 DNS 服务商为以下每个域名添加一条 TXT 解析记录；添加后等待解析生效
+        （一般几分钟，视 DNS 厂商而定），再点击「我已完成解析，开始验证」。
+        CA 验证通过后证书自动签发并入库。任务保留 2 小时，超时需重新发起。
+      </NAlert>
+
+      <div v-if="manualOrder" style="display: flex; flex-direction: column; gap: 12px">
+        <NCard
+          v-for="rec in manualOrder.records"
+          :key="rec.host"
+          size="small"
+          :title="rec.domain"
+          embedded
+        >
+          <div class="dns-rec-row">
+            <span class="dns-rec-label">记录类型</span>
+            <NTag size="small" type="info" bordered>TXT</NTag>
+          </div>
+          <div class="dns-rec-row">
+            <span class="dns-rec-label">主机记录</span>
+            <code class="dns-rec-value">{{ rec.host }}</code>
+            <NButton size="small" @click="copyText(rec.host, '主机记录')">复制</NButton>
+          </div>
+          <div class="dns-rec-row">
+            <span class="dns-rec-label">记录值</span>
+            <code class="dns-rec-value">{{ rec.value }}</code>
+            <NButton size="small" @click="copyText(rec.value, '记录值')">复制</NButton>
+          </div>
+        </NCard>
+
+        <NAlert v-if="manualOrder.status === 'verifying'" type="warning" :show-icon="true">
+          CA 正在验证 DNS 解析，请稍候，页面会自动刷新状态……
+        </NAlert>
+        <NAlert v-if="manualOrder.status === 'done'" type="success" :show-icon="true">
+          证书签发成功，已入库，可在证书列表中查看。
+        </NAlert>
+        <NAlert v-if="manualOrder.status === 'error'" type="error" :show-icon="true">
+          {{ manualOrder.error || 'CA 验证失败' }}。
+          <template v-if="manualOrder.terminal">该订单已终态失败，不可重试，请关闭后重新发起签发。</template>
+          <template v-else>请检查 TXT 记录是否已正确添加并生效，然后重新验证。</template>
+        </NAlert>
+      </div>
+
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="closeManualModal">关闭</NButton>
+          <NPopconfirm
+            v-if="manualOrder && (manualOrder.status === 'awaiting_dns' || manualOrder.status === 'error')"
+            @positive-click="cancelManual"
+          >
+            <template #trigger>
+              <NButton :disabled="cancelling">取消任务</NButton>
+            </template>
+            确定取消该手动签发任务？CA 侧订单将自然过期，已添加的 TXT 记录需自行到 DNS 服务商删除。
+          </NPopconfirm>
+          <NButton
+            v-if="manualOrder && (manualOrder.status === 'awaiting_dns' || (manualOrder.status === 'error' && !manualOrder.terminal))"
+            type="primary"
+            :loading="confirming"
+            @click="confirmDNS"
+          >
+            <template #icon>
+              <NIcon><ShieldCheckmarkOutline /></NIcon>
+            </template>
+            我已完成解析，开始验证
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- 上传已有证书弹窗 -->
+    <NModal
+      v-model:show="showImport"
+      preset="card"
+      title="上传已有证书"
+      style="width: 560px; max-width: 94vw"
+    >
+      <NAlert type="info" :show-icon="true" class="tip-hint" style="margin-bottom: 12px">
+        上传其他渠道申请的证书（PEM 格式），导入后进入已签发证书列表，可用于应用代理绑定或面板 HTTPS。私钥仅保存在服务器本地，不向外回显。
+      </NAlert>
+
+      <NForm label-placement="top">
+        <NFormItem label="证书内容（PEM，可含证书链）" required>
+          <NInput
+            v-model:value="importCertPEM"
+            type="textarea"
+            :rows="5"
+            placeholder="-----BEGIN CERTIFICATE-----"
+            spellcheck="false"
+          />
+        </NFormItem>
+
+        <NFormItem label="私钥内容（PEM）" required>
+          <NInput
+            v-model:value="importKeyPEM"
+            type="textarea"
+            :rows="5"
+            placeholder="-----BEGIN PRIVATE KEY-----"
+            spellcheck="false"
+          />
+        </NFormItem>
+      </NForm>
+
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showImport = false">取消</NButton>
+          <NButton type="primary" :loading="importing" @click="doImport">
+            导入证书
           </NButton>
         </NSpace>
       </template>
@@ -633,6 +931,36 @@ onUnmounted(() => {
   min-height: 0;
   gap: 14px;
   overflow: hidden;
+
+  // 手动 DNS-01 解析记录展示行（弹窗内）
+  :deep(.dns-rec-row) {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+
+    &:last-child {
+      margin-bottom: 0;
+    }
+  }
+
+  :deep(.dns-rec-label) {
+    flex-shrink: 0;
+    width: 64px;
+    font-size: 12px;
+    color: #999;
+  }
+
+  :deep(.dns-rec-value) {
+    flex: 1;
+    min-width: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    word-break: break-all;
+    background: rgba(0, 0, 0, 0.04);
+    border-radius: 4px;
+    padding: 4px 8px;
+  }
 
   .cert-toolbar {
     flex-shrink: 0;

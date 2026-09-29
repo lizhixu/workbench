@@ -26,6 +26,9 @@ func TestDeriveMutationActionCoverage(t *testing.T) {
 		{http.MethodDelete, "/api/v1/apps/:id/proxy", "app_proxy_unbind", "app", audit.RiskHigh},
 		// Cert hub.
 		{http.MethodPost, "/api/v1/certs/issue", "cert_issue", "cert", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/certs/manual/:id/confirm", "cert_manual_dns_confirm", "cert", audit.RiskHigh},
+		{http.MethodDelete, "/api/v1/certs/manual/:id", "cert_manual_dns_cancel", "cert", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/certs/import", "cert_import", "cert", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/certs/:id/renew", "cert_renew", "cert", audit.RiskHigh},
 		{http.MethodDelete, "/api/v1/certs/:id", "cert_delete", "cert", audit.RiskHigh},
 		// File ops.

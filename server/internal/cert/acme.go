@@ -6,16 +6,17 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -113,10 +114,14 @@ func (h *http01Challenge) start() error {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = io.WriteString(w, v)
 	})
-	h.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	// Capture the server in a local: the Serve goroutine must not read h.srv,
+	// which stop() may nil concurrently (e.g. when a pinned challenge
+	// preference fails fast right after the listener was probed).
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	h.srv = srv
 	h.ln = ln
 	go func() {
-		_ = h.srv.Serve(ln) // closed by stop()
+		_ = srv.Serve(ln) // closed by stop()
 	}()
 	return nil
 }
@@ -143,11 +148,12 @@ func (h *http01Challenge) stop() {
 
 // dnsMngChallenge implements the DNS-01 challenge by delegating TXT record
 // creation/removal to a dns-mng instance (sibling project) which already
-// knows which provider account owns each domain.
+// knows which provider account owns each domain. It satisfies challengeSolver.
 type dnsMngChallenge struct {
 	baseURL            string
 	username, password string
 	http               *http.Client
+	log                *slog.Logger
 }
 
 func (d *dnsMngChallenge) call(path string, body any) error {
@@ -173,8 +179,8 @@ func (d *dnsMngChallenge) call(path string, body any) error {
 	return nil
 }
 
-// Present creates the _acme-challenge TXT record for fqdn.
-func (d *dnsMngChallenge) Present(fqdn, value string) error {
+// presentTXT creates the _acme-challenge TXT record for fqdn.
+func (d *dnsMngChallenge) presentTXT(fqdn, value string) error {
 	return d.call("/api/acme/dns01/present", map[string]any{
 		"fqdn":  fqdn,
 		"value": value,
@@ -182,8 +188,8 @@ func (d *dnsMngChallenge) Present(fqdn, value string) error {
 	})
 }
 
-// CleanUp removes the TXT record after validation.
-func (d *dnsMngChallenge) CleanUp(fqdn, value string) error {
+// cleanupTXT removes the TXT record after validation.
+func (d *dnsMngChallenge) cleanupTXT(fqdn, value string) error {
 	return d.call("/api/acme/dns01/cleanup", map[string]any{
 		"fqdn":  fqdn,
 		"value": value,
@@ -295,13 +301,61 @@ func (a *acmeClient) ensureAccount(accountKey crypto.Signer) error {
 }
 
 // obtainCertificate runs order -> authorizations -> finalize -> cert.
-// identifiers may mix DNS names and IP literals; each authorization picks its
-// challenge from the identifier type ("dns" -> DNS-01 via dnsCh, "ip" ->
-// HTTP-01 on port 80). dnsCh may be nil when no DNS identifier is present.
-func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []string, dnsCh *dnsMngChallenge) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
+// identifiers may mix DNS names and IP literals. Each authorization is
+// validated with the usable challenge solvers in preference order (HTTP-01
+// first for plain DNS names, DNS-01 for wildcards, HTTP-01 only for IP
+// literals). When a solver fails at the CA, the order is retried once with
+// the remaining solvers, because a failed challenge poisons its authorization
+// and a fresh order is required to fall back.
+func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []string, solvers *solverSet) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
+	excluded := ""
+	for {
+		certPEM, keyPEM, notBefore, notAfter, issuer, err =
+			a.attemptOrder(accountKey, identifiers, solvers.excluding(excluded))
+		if err == nil {
+			return certPEM, keyPEM, notBefore, notAfter, issuer, nil
+		}
+		var cfe *challengeFailedError
+		if !errors.As(err, &cfe) || excluded != "" {
+			return nil, nil, time.Time{}, time.Time{}, "", err
+		}
+		excluded = cfe.solverType
+		a.log.Warn("order attempt failed, retrying with remaining challenge solvers",
+			"failed_solver", cfe.solverType, "identifier", cfe.identifier, "err", cfe.err)
+	}
+}
+
+// acmeOrder is the subset of an RFC 8555 order object the client uses.
+type acmeOrder struct {
+	Status         string          `json:"status"`
+	Authorizations []string        `json:"authorizations"`
+	Finalize       string          `json:"finalize"`
+	Certificate    string          `json:"certificate"`
+	Error          json.RawMessage `json:"error,omitempty"`
+}
+
+// authzChallenge is one challenge object offered by the CA for an authorization.
+type authzChallenge struct {
+	Type  string `json:"type"`
+	URL   string `json:"url"`
+	Token string `json:"token"`
+}
+
+// authorization is the subset of an RFC 8555 authorization object the client uses.
+type authorization struct {
+	Status     string `json:"status"`
+	Identifier struct {
+		Type  string `json:"type"`
+		Value string `json:"value"`
+	} `json:"identifier"`
+	Challenges []authzChallenge `json:"challenges"`
+}
+
+// createOrder submits a new order and returns its URL and object.
+func (a *acmeClient) createOrder(accountKey crypto.Signer, identifiers []string) (string, *acmeOrder, error) {
 	dir, err := a.directory()
 	if err != nil {
-		return nil, nil, time.Time{}, time.Time{}, "", err
+		return "", nil, err
 	}
 
 	// Identifiers for the order.
@@ -328,7 +382,7 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []s
 
 	body, orderURL, status, err := a.jwsRequest(dir["newOrder"], orderReq, a.kid, accountKey, false)
 	if err != nil {
-		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("newOrder: %w", err)
+		return "", nil, fmt.Errorf("newOrder: %w", err)
 	}
 	// If CA rejected the profile parameter (e.g. non-Let's Encrypt CA that doesn't support the profile draft),
 	// fall back to order without profile.
@@ -336,68 +390,74 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []s
 		delete(orderReq, "profile")
 		body, orderURL, status, err = a.jwsRequest(dir["newOrder"], orderReq, a.kid, accountKey, false)
 		if err != nil {
-			return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("newOrder: %w", err)
+			return "", nil, fmt.Errorf("newOrder: %w", err)
 		}
 	}
 	if status/100 != 2 {
-		return nil, nil, time.Time{}, time.Time{}, "", acmeError("newOrder", status, body)
+		return "", nil, acmeError("newOrder", status, body)
 	}
-	var order struct {
-		Status         string          `json:"status"`
-		Authorizations []string        `json:"authorizations"`
-		Finalize       string          `json:"finalize"`
-		Certificate    string          `json:"certificate"`
-		Error          json.RawMessage `json:"error,omitempty"`
-	}
+	var order acmeOrder
 	if err := json.Unmarshal(body, &order); err != nil {
-		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("newOrder parse: %w", err)
+		return "", nil, fmt.Errorf("newOrder parse: %w", err)
 	}
 	if order.Finalize == "" || orderURL == "" {
-		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("order missing finalize/location URL")
+		return "", nil, fmt.Errorf("order missing finalize/location URL")
 	}
+	return orderURL, &order, nil
+}
 
-	// 2. Satisfy each authorization. The HTTP-01 listener is only bound when
-	// an IP identifier is present.
-	var httpCh *http01Challenge
-	if needHTTP01 {
-		httpCh = &http01Challenge{}
-		if err := httpCh.start(); err != nil {
-			return nil, nil, time.Time{}, time.Time{}, "", err
-		}
-		defer httpCh.stop()
+// fetchAuthorization POST-as-GETs one authorization object.
+func (a *acmeClient) fetchAuthorization(authzURL string, accountKey crypto.Signer) (*authorization, error) {
+	body, err := a.postAsGet(authzURL, a.kid, accountKey)
+	if err != nil {
+		return nil, fmt.Errorf("authz fetch: %w", err)
 	}
-	for _, authzURL := range order.Authorizations {
-		if err := a.satisfyAuthorization(authzURL, accountKey, dnsCh, httpCh); err != nil {
-			return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("authorization: %w", err)
-		}
+	var authz authorization
+	if err := json.Unmarshal(body, &authz); err != nil {
+		return nil, fmt.Errorf("authz parse: %w", err)
 	}
+	return &authz, nil
+}
 
-	// 3. Poll order until ready.
+// triggerChallenge asks the CA to validate the challenge (RFC 8555 §7.5.1:
+// an empty JSON object acknowledges the challenge).
+func (a *acmeClient) triggerChallenge(challengeURL string, accountKey crypto.Signer) error {
+	_, _, _, err := a.jwsRequest(challengeURL, map[string]any{}, a.kid, accountKey, false)
+	return err
+}
+
+// waitOrderReady polls the order until its status becomes "ready".
+func (a *acmeClient) waitOrderReady(orderURL string, order *acmeOrder, accountKey crypto.Signer) error {
 	deadline := time.Now().Add(5 * time.Minute)
 	for order.Status != "ready" {
 		if time.Now().After(deadline) {
-			return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("order timeout: %s", order.Status)
+			return fmt.Errorf("order timeout: %s", order.Status)
 		}
 		time.Sleep(3 * time.Second)
 		body, _, status, err := a.jwsRequest(orderURL, nil, a.kid, accountKey, false)
 		if err != nil {
-			return nil, nil, time.Time{}, time.Time{}, "", err
+			return err
 		}
 		if status/100 != 2 {
-			return nil, nil, time.Time{}, time.Time{}, "", acmeError("poll order", status, body)
+			return acmeError("poll order", status, body)
 		}
-		if err := json.Unmarshal(body, &order); err != nil {
-			return nil, nil, time.Time{}, time.Time{}, "", err
+		if err := json.Unmarshal(body, order); err != nil {
+			return err
 		}
 		if order.Status == "invalid" {
 			if len(order.Error) > 0 {
-				return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("order invalid: %s", string(order.Error))
+				return fmt.Errorf("order invalid: %s", string(order.Error))
 			}
-			return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("order invalid")
+			return fmt.Errorf("order invalid")
 		}
 	}
+	return nil
+}
 
-	// 4. CSR with a fresh key.
+// finalizeOrder submits the CSR, waits for the order to become valid and
+// downloads the certificate chain.
+func (a *acmeClient) finalizeOrder(orderURL string, order *acmeOrder, accountKey crypto.Signer, identifiers []string) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
+	// CSR with a fresh key.
 	csrKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", err
@@ -408,7 +468,7 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []s
 	}
 	csrB64 := base64.RawURLEncoding.EncodeToString(csrDer)
 
-	body, _, status, err = a.jwsRequest(order.Finalize, map[string]any{"csr": csrB64}, a.kid, accountKey, false)
+	body, _, status, err := a.jwsRequest(order.Finalize, map[string]any{"csr": csrB64}, a.kid, accountKey, false)
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("finalize: %w", err)
 	}
@@ -422,8 +482,8 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []s
 	}
 	_ = json.Unmarshal(body, &finOrder)
 
-	// 5. Poll finalize until valid, then download.
-	deadline = time.Now().Add(3 * time.Minute)
+	// Poll finalize until valid, then download.
+	deadline := time.Now().Add(3 * time.Minute)
 	certURL := finOrder.Certificate
 	for {
 		if time.Now().After(deadline) {
@@ -481,28 +541,50 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []s
 	return pemBytes, keyPem, first.NotBefore, first.NotAfter, first.Issuer.CommonName, nil
 }
 
-// satisfyAuthorization completes one authorization, picking the challenge
-// from the identifier type: "ip" -> HTTP-01, anything else -> DNS-01.
-func (a *acmeClient) satisfyAuthorization(authzURL string, accountKey crypto.Signer, dnsCh *dnsMngChallenge, httpCh *http01Challenge) error {
-	// POST-as-GET the authorization.
-	body, err := a.postAsGet(authzURL, a.kid, accountKey)
+// attemptOrder runs a single order -> authorizations -> finalize -> cert
+// pass using the given solvers.
+func (a *acmeClient) attemptOrder(accountKey crypto.Signer, identifiers []string, solvers *solverSet) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
+	orderURL, order, err := a.createOrder(accountKey, identifiers)
 	if err != nil {
-		return fmt.Errorf("authz fetch: %w", err)
+		return nil, nil, time.Time{}, time.Time{}, "", err
 	}
-	var authz struct {
-		Status     string `json:"status"`
-		Identifier struct {
-			Type  string `json:"type"`
-			Value string `json:"value"`
-		} `json:"identifier"`
-		Challenges []struct {
-			Type  string `json:"type"`
-			URL   string `json:"url"`
-			Token string `json:"token"`
-		} `json:"challenges"`
+
+	// 2. Satisfy each authorization, picking (and falling back between) the
+	// usable challenge solvers. The solvers were probed when built and stay
+	// up for the whole order.
+	for _, authzURL := range order.Authorizations {
+		if err := a.satisfyAuthorization(authzURL, accountKey, solvers); err != nil {
+			return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("authorization: %w", err)
+		}
 	}
-	if err := json.Unmarshal(body, &authz); err != nil {
-		return fmt.Errorf("authz parse: %w", err)
+
+	// 3. Poll order until ready.
+	if err := a.waitOrderReady(orderURL, order, accountKey); err != nil {
+		return nil, nil, time.Time{}, time.Time{}, "", err
+	}
+
+	// 4-5. CSR, finalize, download.
+	return a.finalizeOrder(orderURL, order, accountKey, identifiers)
+}
+
+// challengeRef is one challenge object offered by the CA for an authorization.
+type challengeRef struct {
+	url   string
+	token string
+}
+
+// satisfyAuthorization completes one authorization, trying the usable
+// challenge solvers in preference order (see solverSet.pickSolvers). A solver
+// whose Present fails is skipped before the CA is contacted; the first
+// solver that presents successfully is submitted to the CA. A CA-side
+// validation failure is returned as *challengeFailedError so the caller can
+// retry the order with the remaining solvers (a failed challenge poisons its
+// authorization, so fallback requires a fresh order).
+func (a *acmeClient) satisfyAuthorization(authzURL string, accountKey crypto.Signer, solvers *solverSet) error {
+	// POST-as-GET the authorization.
+	authz, err := a.fetchAuthorization(authzURL, accountKey)
+	if err != nil {
+		return err
 	}
 	if authz.Status == "valid" {
 		return nil
@@ -513,15 +595,71 @@ func (a *acmeClient) satisfyAuthorization(authzURL string, accountKey crypto.Sig
 		return err
 	}
 
-	if authz.Identifier.Type == "ip" {
-		return a.satisfyHTTP01(authzURL, accountKey, thumbprint, authz.Challenges, httpCh)
+	offered := make(map[string]challengeRef, len(authz.Challenges))
+	offeredTypes := make(map[string]bool, len(authz.Challenges))
+	for _, ch := range authz.Challenges {
+		if _, ok := offered[ch.Type]; !ok {
+			offered[ch.Type] = challengeRef{url: ch.URL, token: ch.Token}
+			offeredTypes[ch.Type] = true
+		}
 	}
-	return a.satisfyDNS01(authzURL, accountKey, thumbprint, authz.Identifier.Value, authz.Challenges, dnsCh)
+	candidates := solvers.pickSolvers(authz.Identifier.Type, authz.Identifier.Value, offeredTypes)
+	if len(candidates) == 0 {
+		return fmt.Errorf("no usable challenge for %s %q (CA offered: %s; available here: %s)",
+			authz.Identifier.Type, authz.Identifier.Value,
+			strings.Join(sortedKeys(offeredTypes), ", "),
+			strings.Join(solvers.availableTypes(), ", "))
+	}
+
+	var presentErrs []string
+	for _, sv := range candidates {
+		ref := offered[sv.Type()]
+		if ref.token == "" {
+			continue
+		}
+		keyAuthz := ref.token + "." + thumbprint
+		cleanup, err := sv.Present(authz.Identifier.Value, ref.token, keyAuthz)
+		if err != nil {
+			// Present failed before the CA was involved: safe to try the next solver.
+			a.log.Warn("challenge present failed, trying next solver",
+				"solver", sv.Type(), "identifier", authz.Identifier.Value, "err", err)
+			presentErrs = append(presentErrs, fmt.Sprintf("%s: %v", sv.Type(), err))
+			continue
+		}
+		if err := a.triggerChallenge(ref.url, accountKey); err != nil {
+			cleanup()
+			return &challengeFailedError{solverType: sv.Type(), identifier: authz.Identifier.Value, err: fmt.Errorf("challenge notify: %w", err)}
+		}
+		err = a.pollAuthorization(authzURL, accountKey)
+		cleanup()
+		if err != nil {
+			return &challengeFailedError{solverType: sv.Type(), identifier: authz.Identifier.Value, err: err}
+		}
+		return nil
+	}
+	return fmt.Errorf("all challenge solvers failed to present for %q: %s",
+		authz.Identifier.Value, strings.Join(presentErrs, "; "))
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // pollAuthorization waits until the authorization becomes valid.
 func (a *acmeClient) pollAuthorization(authzURL string, accountKey crypto.Signer) error {
-	deadline := time.Now().Add(3 * time.Minute)
+	return a.pollAuthorizationWithTimeout(authzURL, accountKey, 3*time.Minute)
+}
+
+// pollAuthorizationWithTimeout is pollAuthorization with a custom deadline.
+// The manual DNS-01 flow uses a longer deadline because the administrator
+// adds the TXT records by hand and CA-side DNS propagation takes longer.
+func (a *acmeClient) pollAuthorizationWithTimeout(authzURL string, accountKey crypto.Signer, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
 	for {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("authorization timeout")
@@ -556,77 +694,3 @@ func (a *acmeClient) pollAuthorization(authzURL string, accountKey crypto.Signer
 	}
 }
 
-// satisfyHTTP01 completes one authorization using HTTP-01 on port 80.
-func (a *acmeClient) satisfyHTTP01(authzURL string, accountKey crypto.Signer, thumbprint string, challenges []struct {
-	Type  string `json:"type"`
-	URL   string `json:"url"`
-	Token string `json:"token"`
-}, httpCh *http01Challenge) error {
-	if httpCh == nil {
-		return fmt.Errorf("http-01 challenge unavailable")
-	}
-	var chURL, token string
-	for _, ch := range challenges {
-		if ch.Type == "http-01" {
-			chURL, token = ch.URL, ch.Token
-			break
-		}
-	}
-	if token == "" {
-		return fmt.Errorf("no http-01 challenge offered")
-	}
-
-	keyAuthz := token + "." + thumbprint
-	httpCh.present(token, keyAuthz)
-
-	if _, _, _, err := a.jwsRequest(chURL, map[string]any{}, a.kid, accountKey, false); err != nil {
-		return fmt.Errorf("challenge notify: %w", err)
-	}
-	return a.pollAuthorization(authzURL, accountKey)
-}
-
-// satisfyDNS01 completes one authorization using DNS-01 via dns-mng.
-func (a *acmeClient) satisfyDNS01(authzURL string, accountKey crypto.Signer, thumbprint, domain string, challenges []struct {
-	Type  string `json:"type"`
-	URL   string `json:"url"`
-	Token string `json:"token"`
-}, dnsCh *dnsMngChallenge) error {
-	if dnsCh == nil {
-		return fmt.Errorf("dns-01 challenge unavailable: 证书中心未配置 dns-mng")
-	}
-	var chURL, token string
-	for _, ch := range challenges {
-		if ch.Type == "dns-01" {
-			chURL, token = ch.URL, ch.Token
-			break
-		}
-	}
-	if token == "" {
-		return fmt.Errorf("no dns-01 challenge offered")
-	}
-
-	// keyAuthz = token.thumbprint; TXT value = base64url(sha256(keyAuthz)).
-	keyAuthz := token + "." + thumbprint
-	sum := sha256.Sum256([]byte(keyAuthz))
-	txtValue := base64.RawURLEncoding.EncodeToString(sum[:])
-	fqdn := "_acme-challenge." + domain
-
-	// Create the TXT record and notify the ACME server.
-	if err := dnsCh.Present(fqdn, txtValue); err != nil {
-		return fmt.Errorf("present TXT: %w", err)
-	}
-	defer func() {
-		if err := dnsCh.CleanUp(fqdn, txtValue); err != nil {
-			a.log.Warn("dns-01 cleanup failed", "fqdn", fqdn, "err", err)
-		}
-	}()
-
-	// DNS propagation: dns-mng publishes synchronously to the provider, but
-	// authoritative resolvers need some time to catch up.
-	time.Sleep(20 * time.Second)
-
-	if _, _, _, err := a.jwsRequest(chURL, map[string]any{}, a.kid, accountKey, false); err != nil {
-		return fmt.Errorf("challenge notify: %w", err)
-	}
-	return a.pollAuthorization(authzURL, accountKey)
-}

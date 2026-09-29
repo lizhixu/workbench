@@ -242,8 +242,9 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		}
 	}
 
-	// SSL certificate hub (ACME DNS-01 via dns-mng). Certificate material is
-	// sensitive, so mutations (config, issue, renew, delete) stay admin-only
+	// SSL certificate hub (ACME with compatible DNS-01/HTTP-01 challenge
+	// solvers, plus manual certificate import). Certificate material is
+	// sensitive, so mutations (config, issue, import, renew, delete) stay admin-only
 	// and audited; reads are open to every authenticated role.
 	if certHub != nil {
 		cert.NewHandlers(certHub).Register(
@@ -294,6 +295,8 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// One-click panel certificate issuance (domain or public IP), async jobs.
 	adminOnly.POST("/system/panel-cert/issue", h.issuePanelCert)
 	adminOnly.GET("/system/panel-cert/issue/:job_id", h.getPanelCertJob)
+	adminOnly.POST("/system/panel-cert/issue/:job_id/confirm", h.confirmPanelCertIssue)
+	adminOnly.DELETE("/system/panel-cert/issue/:job_id", h.cancelPanelCertIssue)
 	adminOnly.GET("/system/panel-cert/public-ip", h.getPanelPublicIP)
 
 	// Agent upgrade.
@@ -568,13 +571,15 @@ func (h *handlers) getPanelCertStatus(c *gin.Context) {
 
 // issuePanelCert starts an async panel certificate issuance job.
 // Body: {"mode": "domain"|"ip", "ip": "1.2.3.4" (optional for ip mode)}.
-// mode=domain issues for the bound panel domain (DNS-01 via cert center);
-// mode=ip issues a free IP certificate for a public IP (HTTP-01 on port 80).
+// mode=domain issues for the bound panel domain (HTTP-01 preferred, DNS-01
+// via dns-mng as fallback); mode=ip issues a free IP certificate for a
+// public IP (HTTP-01 on port 80).
 // Returns 202 with the job; poll getPanelCertJob for progress.
 func (h *handlers) issuePanelCert(c *gin.Context) {
 	var req struct {
-		Mode string `json:"mode"`
-		IP   string `json:"ip"`
+		Mode      string `json:"mode"`
+		IP        string `json:"ip"`
+		Challenge string `json:"challenge"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -584,7 +589,7 @@ func (h *handlers) issuePanelCert(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "证书签发器不可用"})
 		return
 	}
-	job, err := h.panelCert.StartIssue(strings.TrimSpace(req.Mode), strings.TrimSpace(req.IP))
+	job, err := h.panelCert.StartIssue(strings.TrimSpace(req.Mode), strings.TrimSpace(req.IP), strings.TrimSpace(req.Challenge))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -606,6 +611,44 @@ func (h *handlers) getPanelCertJob(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": job})
+}
+
+// confirmPanelCertIssue starts CA validation for a manual DNS-01 panel job.
+// The administrator must have provisioned the TXT records first; the job
+// stays async, poll getPanelCertJob for progress.
+func (h *handlers) confirmPanelCertIssue(c *gin.Context) {
+	if h.panelCert == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "证书签发器不可用"})
+		return
+	}
+	job, err := h.panelCert.ConfirmIssue(c.Param("job_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	h.recordAudit(c, "panel_cert_issue_confirm", "system", "panel-cert",
+		fmt.Sprintf("确认面板证书手动 DNS-01 验证(%s): %s", job.Target, job.ID),
+		audit.RiskHigh, audit.ResultSuccess)
+	c.JSON(http.StatusAccepted, gin.H{"data": job, "message": "已通知 CA 开始验证，可通过任务 ID 查询进度"})
+}
+
+// cancelPanelCertIssue discards a manual DNS-01 panel job that is no longer
+// needed (e.g. the administrator gave up adding the TXT records). The
+// underlying ACME pending order is cancelled as well.
+func (h *handlers) cancelPanelCertIssue(c *gin.Context) {
+	if h.panelCert == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "证书签发器不可用"})
+		return
+	}
+	jobID := c.Param("job_id")
+	if err := h.panelCert.CancelIssue(jobID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	h.recordAudit(c, "panel_cert_issue_cancel", "system", "panel-cert",
+		fmt.Sprintf("取消面板证书手动 DNS-01 签发任务: %s", jobID),
+		audit.RiskHigh, audit.ResultSuccess)
+	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "已取消签发任务"})
 }
 
 // getPanelPublicIP detects the server's public egress IP (for IP certs).
@@ -1918,6 +1961,9 @@ func deriveMutationAction(method, pattern string) (mutationRule, bool) {
 		{http.MethodPut, "/api/v1/certs/accounts/:id", "cert_account_update", "cert", "id", ""},
 		{http.MethodDelete, "/api/v1/certs/accounts/:id", "cert_account_delete", "cert", "id", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/certs/issue", "cert_issue", "cert", "", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/certs/manual/:id/confirm", "cert_manual_dns_confirm", "cert", "id", audit.RiskHigh},
+		{http.MethodDelete, "/api/v1/certs/manual/:id", "cert_manual_dns_cancel", "cert", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/certs/import", "cert_import", "cert", "", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/certs/:id/renew", "cert_renew", "cert", "id", audit.RiskHigh},
 		{http.MethodDelete, "/api/v1/certs/:id", "cert_delete", "cert", "id", audit.RiskHigh},
 		// File management on hosts: removal is destructive.

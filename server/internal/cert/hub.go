@@ -5,16 +5,16 @@
 package cert
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -52,9 +52,6 @@ type Certificate struct {
 // DefaultDirectoryURL is the Let's Encrypt production ACME directory.
 const DefaultDirectoryURL = "https://acme-v02.api.letsencrypt.org/directory"
 
-// ErrDisabled is returned when the hub is not configured yet.
-var ErrDisabled = errors.New("certificate hub disabled: dns-mng not configured")
-
 // Hub manages dns-mng settings, multiple ACME accounts, certificates and renewals.
 type Hub struct {
 	mu       sync.RWMutex
@@ -88,6 +85,10 @@ func NewHub(dataDir string, log *slog.Logger) (*Hub, error) {
 	if err := h.loadCerts(); err != nil {
 		return nil, err
 	}
+	// A restart must not leave manual DNS-01 orders stuck in "verifying":
+	// flip them back to a retryable error so the administrator can confirm
+	// again (or cancel) instead of staring at a dead task.
+	h.recoverInterruptedPending()
 	return h, nil
 }
 
@@ -423,24 +424,28 @@ func (h *Hub) markError(id, msg string) {
 	}
 }
 
-// issueACME runs the ACME flow using the specified account. DNS identifiers
-// are validated with DNS-01 (requires dns-mng); IP identifiers (RFC 8738)
-// are validated with HTTP-01 on port 80 and need no dns-mng.
-func (h *Hub) issueACME(acc *ACMEAccount, identifiers []string) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
-	needDNS := false
-	for _, id := range identifiers {
-		if net.ParseIP(strings.TrimSpace(id)) == nil {
-			needDNS = true
-			break
-		}
+// issueACME runs the ACME flow using the specified account. Challenge
+// validation is compatible across mechanisms: plain DNS names prefer HTTP-01
+// (temporary :80 listener, no external dependency) and fall back to DNS-01
+// via dns-mng when HTTP-01 is unavailable or fails; wildcards require
+// DNS-01; IP identifiers (RFC 8738) require HTTP-01. An explicit non-auto
+// challenge preference restricts the flow to that mechanism.
+func (h *Hub) issueACME(acc *ACMEAccount, identifiers []string, ch ChallengePreference) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
+	if !ch.Valid() {
+		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("未知的验证方式: %q", string(ch))
 	}
-	var dnsCh *dnsMngChallenge
-	if needDNS {
-		cfg := h.GetConfig()
-		if !cfg.Enabled || cfg.BaseURL == "" {
-			return nil, nil, time.Time{}, time.Time{}, "", ErrDisabled
-		}
-		dnsCh = &dnsMngChallenge{baseURL: cfg.BaseURL, username: cfg.Username, password: cfg.Password, http: &http.Client{Timeout: 30 * time.Second}}
+	if ch == ChallengeDNS01Manual {
+		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("DNS-01 手动验证需分两步完成（先获取解析记录，管理员添加解析后再确认），请使用 StartManualDNSOrder/ConfirmManualDNSOrder")
+	}
+	solvers := h.buildSolvers()
+	defer solvers.stop()
+	solvers, err = solvers.applyPreference(ch)
+	if err != nil {
+		return nil, nil, time.Time{}, time.Time{}, "", err
+	}
+	if !solvers.hasAny() {
+		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf(
+			"无法完成域名验证：HTTP-01 需要临时监听 80 端口（当前不可用），DNS-01 需要在证书中心配置并启用 dns-mng")
 	}
 	dirURL := acc.DirectoryURL
 	if dirURL == "" {
@@ -464,7 +469,7 @@ func (h *Hub) issueACME(acc *ACMEAccount, identifiers []string) (certPEM, keyPEM
 		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("acme account (%s): %w", acc.Name, err)
 	}
 
-	certPEM, keyPEM, notBefore, notAfter, issuer, err = acmeClient.obtainCertificate(accountKey, identifiers, dnsCh)
+	certPEM, keyPEM, notBefore, notAfter, issuer, err = acmeClient.obtainCertificate(accountKey, identifiers, solvers)
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", err
 	}
@@ -476,8 +481,15 @@ func (h *Hub) issueACME(acc *ACMEAccount, identifiers []string) (certPEM, keyPEM
 
 // Issue requests a new certificate using a specific or default ACME account.
 // identifiers accepts DNS names and/or IP literals (RFC 8738); the challenge
-// is picked per identifier type automatically.
+// is picked per identifier type automatically (HTTP-01 preferred, DNS-01
+// fallback). Use IssueWithChallenge to pin the challenge mechanism.
 func (h *Hub) Issue(identifiers []string, accountID string) (*Certificate, error) {
+	return h.IssueWithChallenge(identifiers, accountID, ChallengeAuto)
+}
+
+// IssueWithChallenge is Issue with an explicit challenge preference
+// (ChallengeAuto, ChallengeHTTP01 or ChallengeDNS01).
+func (h *Hub) IssueWithChallenge(identifiers []string, accountID string, ch ChallengePreference) (*Certificate, error) {
 	clean := make([]string, 0, len(identifiers))
 	for _, d := range identifiers {
 		d = strings.TrimSpace(strings.ToLower(d))
@@ -504,7 +516,7 @@ func (h *Hub) Issue(identifiers []string, accountID string) (*Certificate, error
 		acc = got
 	}
 
-	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, clean)
+	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, clean, ch)
 	if err != nil {
 		return nil, err
 	}
@@ -512,6 +524,57 @@ func (h *Hub) Issue(identifiers []string, accountID string) (*Certificate, error
 	if err := h.storeResult(id, acc.ID, clean, certPEM, keyPEM, notBefore, notAfter, issuer); err != nil {
 		return nil, err
 	}
+	c, _ := h.Get(id)
+	return c, nil
+}
+
+// Import stores a user-supplied certificate (issued through another channel,
+// e.g. manually uploaded PEM) in the hub so it shows up in the issued list
+// and can be selected wherever the panel or apps need a certificate. The PEM
+// pair is validated (parseable leaf, key matches the certificate) before
+// storing. Imported certificates do not auto-renew via ACME (AutoRenew is
+// false); an explicit Renew on one attempts a fresh ACME issuance for the
+// same identifiers.
+func (h *Hub) Import(certPEM, keyPEM []byte) (*Certificate, error) {
+	certPEM = bytes.TrimSpace(certPEM)
+	keyPEM = bytes.TrimSpace(keyPEM)
+	if len(certPEM) == 0 || len(keyPEM) == 0 {
+		return nil, fmt.Errorf("证书 PEM 与私钥 PEM 均不能为空")
+	}
+	keyPair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("证书与私钥不匹配或 PEM 格式错误: %w", err)
+	}
+	if len(keyPair.Certificate) == 0 {
+		return nil, fmt.Errorf("证书 PEM 中没有有效的证书")
+	}
+	leaf, err := x509.ParseCertificate(keyPair.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("解析证书失败: %w", err)
+	}
+	domains := make([]string, 0, len(leaf.DNSNames)+len(leaf.IPAddresses))
+	domains = append(domains, leaf.DNSNames...)
+	for _, ip := range leaf.IPAddresses {
+		domains = append(domains, ip.String())
+	}
+	if len(domains) == 0 && leaf.Subject.CommonName != "" {
+		domains = append(domains, leaf.Subject.CommonName)
+	}
+	issuer := leaf.Issuer.CommonName
+	if issuer == "" {
+		issuer = leaf.Issuer.String()
+	}
+	id := "crt_" + randomHex(8)
+	if err := h.storeResult(id, "", domains, certPEM, keyPEM, leaf.NotBefore, leaf.NotAfter, issuer); err != nil {
+		return nil, err
+	}
+	// Manually managed: never auto-renew an imported certificate via ACME.
+	h.mu.Lock()
+	if c, ok := h.certs[id]; ok {
+		c.AutoRenew = false
+		_ = h.saveCertsLocked()
+	}
+	h.mu.Unlock()
 	c, _ := h.Get(id)
 	return c, nil
 }
@@ -549,7 +612,7 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 		acc = got
 	}
 
-	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, c.Domains)
+	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, c.Domains, ChallengeAuto)
 	if err != nil {
 		h.markError(id, err.Error())
 		return nil, err

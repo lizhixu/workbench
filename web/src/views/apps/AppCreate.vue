@@ -876,6 +876,13 @@ onMounted(loadData)
   align-items: center;
   gap: 12px;
   margin-bottom: 12px;
+
+  .page-title {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
   flex-shrink: 0;
 }
 

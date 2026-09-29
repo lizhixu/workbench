@@ -740,8 +740,8 @@ onMounted(loadData)
 
       .page-title {
         margin: 0;
-        font-size: 20px;
-        font-weight: 700;
+        font-size: 18px;
+        font-weight: 600;
       }
     }
 

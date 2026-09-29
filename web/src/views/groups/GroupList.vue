@@ -491,6 +491,7 @@ onMounted(() => {
 .page-title {
   margin: 0;
   font-size: 18px;
+  font-weight: 600;
 }
 .group-name,
 :deep(.group-name) {

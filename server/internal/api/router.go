@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"watchman/internal/binval"
 	"watchman/internal/version"
 	"watchman/proto/agentpb"
 	"watchman/server/internal/ai"
@@ -32,12 +33,12 @@ import (
 	"watchman/server/internal/gitprovider"
 	"watchman/server/internal/groups"
 	"watchman/server/internal/install"
-		"watchman/server/internal/metrics"
-		"watchman/server/internal/network"
-		"watchman/server/internal/panelsec"
-		"watchman/server/internal/policy"
-		"watchman/server/internal/release"
-		"watchman/server/internal/rpc"
+	"watchman/server/internal/metrics"
+	"watchman/server/internal/network"
+	"watchman/server/internal/panelsec"
+	"watchman/server/internal/policy"
+	"watchman/server/internal/release"
+	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/secentry"
 	"watchman/server/internal/session"
@@ -130,16 +131,16 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	if authStore != nil {
 		jwtKey = authStore.SigningKey()
 	}
-		entryGuard := secentry.NewGuard(settingsStore, authStore, jwtKey, log)
-		r.Use(entryGuard.Middleware())
+	entryGuard := secentry.NewGuard(settingsStore, authStore, jwtKey, log)
+	r.Use(entryGuard.Middleware())
 
-		// Panel security: strict domain access check and force HTTPS redirection.
-		panelGuard := panelsec.NewGuard(settingsStore, log)
-		r.Use(panelGuard.HTTPSMiddleware(), panelGuard.DomainMiddleware())
+	// Panel security: strict domain access check and force HTTPS redirection.
+	panelGuard := panelsec.NewGuard(settingsStore, log)
+	r.Use(panelGuard.HTTPSMiddleware(), panelGuard.DomainMiddleware())
 
-		v1 := r.Group("/api/v1")
-		entryGuard.RegisterRoutes(v1)
-		h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, settings: settingsStore, certHub: certHub, alertMon: alertMon}
+	v1 := r.Group("/api/v1")
+	entryGuard.RegisterRoutes(v1)
+	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, settings: settingsStore, certHub: certHub, alertMon: alertMon}
 
 	// ---- Public routes (no auth) ----
 	// Auth login.
@@ -281,21 +282,21 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// Health.
 	authed.GET("/system/health", h.health)
 
-		// Version info: server build + agent upgrade source of truth.
-		authed.GET("/version", h.versionInfo)
-		authed.GET("/system/check-update", h.checkUpdate)
+	// Version info: server build + agent upgrade source of truth.
+	authed.GET("/version", h.versionInfo)
+	authed.GET("/system/check-update", h.checkUpdate)
 
-		// Panel certificate status & inspection.
-		adminOnly.GET("/system/panel-cert", h.getPanelCertStatus)
+	// Panel certificate status & inspection.
+	adminOnly.GET("/system/panel-cert", h.getPanelCertStatus)
 
-		// Agent upgrade.
-		adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
+	// Agent upgrade.
+	adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
 
-		// Control-server binary hot self-upgrade (upload file/base64 binary, online upgrade, restart).
-		adminOnly.POST("/system/upgrade", h.systemUpgrade)
-		adminOnly.POST("/system/online-upgrade", h.onlineUpgrade)
-		adminOnly.POST("/system/restart", h.systemRestart)
-		adminOnly.POST("/system/upgrade-agents", h.upgradeAgentsBatch)
+	// Control-server binary hot self-upgrade (upload file/base64 binary, online upgrade, restart).
+	adminOnly.POST("/system/upgrade", h.systemUpgrade)
+	adminOnly.POST("/system/online-upgrade", h.onlineUpgrade)
+	adminOnly.POST("/system/restart", h.systemRestart)
+	adminOnly.POST("/system/upgrade-agents", h.upgradeAgentsBatch)
 
 	// User management (admin-only for mutating routes). Deleting an account
 	// also drops its terminal preferences, so a recreated account starts fresh.
@@ -2197,12 +2198,13 @@ var _ = fmt.Sprintf
 
 // UpgradePayload defines the JSON body for uploading a new server binary.
 type UpgradePayload struct {
-	Data string `json:"data"` // Base64 encoded binary
+	Data   string `json:"data"`   // Base64 encoded binary
+	Sha256 string `json:"sha256"` // Optional expected SHA-256
 }
 
 // systemUpgrade accepts either a multipart/form-data upload or a base64-encoded binary,
-// replaces the running watchman-server binary atomically, announces maintenance to all agents,
-// and instructs the operator or system to restart the process.
+// validates size, SHA-256 (if provided), ELF/PE format, and host architecture, executes
+// a dry-run smoke test, and replaces the running watchman-server binary atomically.
 func (h *handlers) systemUpgrade(c *gin.Context) {
 	self, err := os.Executable()
 	if err != nil {
@@ -2218,9 +2220,11 @@ func (h *handlers) systemUpgrade(c *gin.Context) {
 	tmp := filepath.Join(dir, fmt.Sprintf("watchman-server.upgrade.%d", time.Now().UnixNano()))
 
 	var fileSize int64
+	var expectedSha string
 	contentType := c.GetHeader("Content-Type")
 
 	if strings.Contains(contentType, "multipart/form-data") {
+		expectedSha = strings.TrimSpace(c.PostForm("sha256"))
 		fileHeader, err := c.FormFile("file")
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "请选择上传的文件: " + err.Error()})
@@ -2239,13 +2243,14 @@ func (h *handlers) systemUpgrade(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("创建临时文件失败: %v", err)})
 			return
 		}
-		defer dst.Close()
 
 		if _, err := io.Copy(dst, src); err != nil {
-			os.Remove(tmp)
+			_ = dst.Close()
+			_ = os.Remove(tmp)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("写入文件失败: %v", err)})
 			return
 		}
+		_ = dst.Close()
 	} else {
 		// Fallback: JSON base64
 		var body UpgradePayload
@@ -2253,6 +2258,7 @@ func (h *handlers) systemUpgrade(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的上传参数"})
 			return
 		}
+		expectedSha = strings.TrimSpace(body.Sha256)
 		raw, err := base64.StdEncoding.DecodeString(body.Data)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid base64 data"})
@@ -2265,6 +2271,34 @@ func (h *handlers) systemUpgrade(c *gin.Context) {
 		}
 	}
 
+	// 1. Calculate actual SHA-256 and verify against expected SHA-256 if provided
+	actualSha, err := binval.FileSha256(tmp)
+	if err != nil {
+		_ = os.Remove(tmp)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("计算二进制 SHA-256 失败: %v", err)})
+		return
+	}
+	if expectedSha != "" && !strings.EqualFold(actualSha, expectedSha) {
+		_ = os.Remove(tmp)
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("SHA-256 校验失败 (期望: %s, 实际: %s)，上传二进制可能已被篡改或不完整", expectedSha, actualSha)})
+		return
+	}
+
+	// 2. Validate binary format and architecture compatibility
+	if err := binval.ValidateFormat(tmp, runtime.GOOS, runtime.GOARCH, binval.MinServerBinarySize); err != nil {
+		_ = os.Remove(tmp)
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("二进制格式/架构安全校验失败: %v", err)})
+		return
+	}
+
+	// 3. Smoke-test dry run (-version) to verify runnability
+	smokeOut, err := binval.SmokeTest(c.Request.Context(), tmp, runtime.GOOS, runtime.GOARCH, "watchman-server")
+	if err != nil {
+		_ = os.Remove(tmp)
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("二进制可执行性自检失败: %v", err)})
+		return
+	}
+
 	// Safety backup of existing binary
 	bakPath := filepath.Join(dir, fmt.Sprintf("watchman-server.bak.%d", time.Now().Unix()))
 	_ = os.Rename(target, bakPath)
@@ -2273,7 +2307,7 @@ func (h *handlers) systemUpgrade(c *gin.Context) {
 	if err := os.Rename(tmp, target); err != nil {
 		// Rollback if possible
 		_ = os.Rename(bakPath, target)
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("原子替换二进制失败: %v", err)})
 		return
 	}
@@ -2283,14 +2317,15 @@ func (h *handlers) systemUpgrade(c *gin.Context) {
 	h.reg.BroadcastMaintenance("server_upgrade", 180)
 
 	h.recordAudit(c, "update", "system", "server_binary",
-		fmt.Sprintf("上传新版本控制端二进制并原子替换 (大小: %d 字节)", fileSize),
+		fmt.Sprintf("上传新版本控制端二进制并验证通过 (大小: %d 字节, SHA-256: %s, 自检: %s)", fileSize, actualSha, smokeOut),
 		audit.RiskHigh, audit.ResultSuccess)
 
 	c.JSON(http.StatusOK, gin.H{
 		"ok":       true,
-		"message":  "控制端二进制已成功替换并备份旧版！系统已向全网 Agent 下发维护预告，请点击平滑重启生效。",
+		"message":  "控制端二进制已通过格式、架构与运行自检，并成功安全替换！系统已向全网 Agent 下发维护预告，请点击平滑重启生效。",
 		"path":     target,
 		"size":     fileSize,
+		"sha256":   actualSha,
 		"bak_path": bakPath,
 	})
 }

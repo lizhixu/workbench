@@ -262,3 +262,66 @@ func TestUpgradeHostDTOStateOnError(t *testing.T) {
 		t.Errorf("expected upgrade_error to match, got %v", data2["upgrade_error"])
 	}
 }
+
+func TestSystemUpgrade_RejectsCorruptBinary(t *testing.T) {
+	log := slog.Default()
+	reg := rpc.NewRegistry("", log)
+
+	authStore, err := auth.NewStore(t.TempDir(), "test-jwt-key")
+	if err != nil {
+		t.Fatalf("auth store: %v", err)
+	}
+	adminToken, _, err := authStore.Authenticate("admin", "admin")
+	if err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+
+	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	// Send base64 corrupt data
+	body := `{"data":"bm90IGFuIGV4ZWN1dGFibGU="}` // "not an executable"
+	httpReq := httptest.NewRequest("POST", "/api/v1/system/upgrade", strings.NewReader(body))
+	httpReq.Header.Set("Authorization", "Bearer "+adminToken)
+	httpReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, httpReq)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 for corrupt binary, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "安全校验失败") && !strings.Contains(w.Body.String(), "低于安全下限") {
+		t.Errorf("expected security validation failure in response, got %s", w.Body.String())
+	}
+}
+
+func TestSystemUpgrade_RejectsShaMismatch(t *testing.T) {
+	log := slog.Default()
+	reg := rpc.NewRegistry("", log)
+
+	authStore, err := auth.NewStore(t.TempDir(), "test-jwt-key")
+	if err != nil {
+		t.Fatalf("auth store: %v", err)
+	}
+	adminToken, _, err := authStore.Authenticate("admin", "admin")
+	if err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+
+	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	body := `{"data":"bm90IGFuIGV4ZWN1dGFibGU=","sha256":"1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"}`
+	httpReq := httptest.NewRequest("POST", "/api/v1/system/upgrade", strings.NewReader(body))
+	httpReq.Header.Set("Authorization", "Bearer "+adminToken)
+	httpReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, httpReq)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 for sha mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "SHA-256 校验失败") {
+		t.Errorf("expected SHA-256 mismatch in response, got %s", w.Body.String())
+	}
+}

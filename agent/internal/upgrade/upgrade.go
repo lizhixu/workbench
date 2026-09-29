@@ -7,6 +7,7 @@
 package upgrade
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"watchman/internal/binval"
 	"watchman/proto/agentpb"
 )
 
@@ -133,11 +135,30 @@ func (m *Manager) doUpgrade(req *agentpb.UpgradeRequest) {
 			m.progress("error", 0, "upgrade rejected: invalid signature")
 			return
 		}
-		m.log.Info("upgrade signature verified", "version", req.GetVersion())
-	}
+			m.log.Info("upgrade signature verified", "version", req.GetVersion())
+		}
 
-	// 3. Replace self
-	m.progress("replacing", 0, "")
+		// 4. Validate binary format and architecture compatibility before touching current executable
+		m.progress("verifying", 0, "verifying format and architecture")
+		if err := binval.ValidateFormat(tmpPath, runtime.GOOS, runtime.GOARCH, binval.MinAgentBinarySize); err != nil {
+			_ = os.Remove(tmpPath)
+			m.progress("error", 0, "binary validation rejected: "+err.Error())
+			return
+		}
+
+		// 5. Smoke-test dry run (-version) to ensure the new binary executes properly without dynamic link or runtime crash
+		m.progress("verifying", 0, "running smoke test")
+		smokeCtx, smokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer smokeCancel()
+		if _, err := binval.SmokeTest(smokeCtx, tmpPath, runtime.GOOS, runtime.GOARCH, "watchman-agent"); err != nil {
+			_ = os.Remove(tmpPath)
+			m.progress("error", 0, "binary smoke test failed: "+err.Error())
+			return
+		}
+		m.progress("verifying", 1, "")
+
+		// 6. Replace self
+		m.progress("replacing", 0, "")
 	if err := m.replaceSelf(tmpPath); err != nil {
 		m.progress("error", 0, "replace: "+err.Error())
 		return

@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -22,6 +23,7 @@ import (
 	"watchman/agent/internal/tunnel"
 	"watchman/agent/internal/uninstall"
 	"watchman/agent/internal/upgrade"
+	"watchman/internal/version"
 )
 
 func main() {
@@ -32,7 +34,13 @@ func main() {
 	tlsName := flag.String("tls-server-name", "", "override TLS server name check")
 	upPubKey := flag.String("upgrade-pubkey", "", "hex Ed25519 public key to verify self-upgrades")
 	trafficResetDay := flag.Int("traffic-reset-day", 1, "billing cycle reset day-of-month (1-28) for monthly traffic stats")
+	showVersion := flag.Bool("version", false, "print watchman-agent version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("watchman-agent %s (commit %s, built %s)\n", version.Get(), version.Commit, version.BuildTime)
+		os.Exit(0)
+	}
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(log)

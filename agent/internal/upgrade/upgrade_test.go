@@ -1,11 +1,27 @@
 package upgrade
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"watchman/proto/agentpb"
 )
+
+type mockSender struct {
+	messages []*agentpb.AgentMessage
+}
+
+func (s *mockSender) Send(msg *agentpb.AgentMessage) bool {
+	s.messages = append(s.messages, msg)
+	return true
+}
 
 func TestReplaceSelf(t *testing.T) {
 	dir := t.TempDir()
@@ -38,3 +54,44 @@ func TestReplaceSelf(t *testing.T) {
 	}
 	_ = m
 }
+
+func TestDoUpgrade_RejectsCorruptBinary(t *testing.T) {
+	// Dummy corrupt payload
+	corruptPayload := []byte("this is definitely not a compiled executable binary")
+	sum := sha256.Sum256(corruptPayload)
+	sumHex := hex.EncodeToString(sum[:])
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(corruptPayload)
+	}))
+	defer server.Close()
+
+	sender := &mockSender{}
+	m := NewManager(slog.Default())
+	m.SetSender(sender)
+
+	req := &agentpb.UpgradeRequest{
+		Version: "v1.2.3",
+		Url:     server.URL,
+		Sha256:  sumHex,
+	}
+
+	m.doUpgrade(req)
+
+	// Check that progress contains error from binary validation
+	foundError := false
+	for _, msg := range sender.messages {
+		if p := msg.GetUpgradeProgress(); p != nil {
+			if p.GetStage() == "error" && strings.Contains(p.GetError(), "binary validation rejected") {
+				foundError = true
+				break
+			}
+		}
+	}
+
+	if !foundError {
+		t.Fatalf("expected binary validation error in progress messages, got: %+v", sender.messages)
+	}
+}
+

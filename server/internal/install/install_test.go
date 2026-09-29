@@ -1,9 +1,13 @@
 package install
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestFindAgentBinary(t *testing.T) {
@@ -57,3 +61,28 @@ func TestFindAgentBinary(t *testing.T) {
 		t.Errorf("expected 64 hex characters, got %s", sha)
 	}
 }
+
+func TestAgentBinary_RejectsCorruptFile(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tmpDir := t.TempDir()
+
+	// Place a corrupt 100-byte agent file
+	corruptAgent := filepath.Join(tmpDir, "watchman-agent-linux-arm64")
+	if err := os.WriteFile(corruptAgent, []byte("this is corrupted text data"), 0755); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	h := NewHandler(nil, tmpDir)
+	engine := gin.New()
+	h.RegisterRoutes(engine)
+
+	req := httptest.NewRequest("GET", "/api/v1/agent/binary?os=linux&arch=arm64", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	// Since the file is corrupt, ValidateFormat should fail and reject serving it
+	if w.Code == http.StatusOK {
+		t.Fatalf("expected error for corrupted agent binary, got HTTP 200")
+	}
+}
+

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"watchman/internal/version"
 	"watchman/proto/agentpb"
 	"watchman/server/internal/ai"
 	"watchman/server/internal/alert"
@@ -69,7 +71,13 @@ func main() {
 	resetSecureEntry := flag.Bool("reset-secure-entry", false, "lockout recovery: disable the secure entry (安全入口) by flipping security.secure_entry_enabled to false in -data, then exit")
 	resetPanelSSL := flag.Bool("reset-panel-ssl", false, "lockout recovery: disable panel SSL/HTTPS by flipping security.panel_ssl_enabled and security.panel_force_https to false in -data, then exit")
 	resetPanelDomain := flag.Bool("reset-panel-domain", false, "lockout recovery: disable strict domain check and clear panel domain by flipping security.panel_domain_strict to false and security.panel_domain to empty in -data, then exit")
+	showVersion := flag.Bool("version", false, "print watchman-server version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("watchman-server %s (commit %s, built %s)\n", version.Get(), version.Commit, version.BuildTime)
+		os.Exit(0)
+	}
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(log)
@@ -413,6 +421,7 @@ func main() {
 	// Install endpoints (one-line agent install + binary download).
 	installHandler := install.NewHandler(reg, "bin")
 	installHandler.UpgradePubKey = api.UpgradePubKeyHex
+	installHandler.ManifestPath = *manifestPath
 	installHandler.RegisterRoutes(hr)
 	hs := &http.Server{
 		Addr: *httpAddr,

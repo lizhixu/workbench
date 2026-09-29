@@ -8,6 +8,7 @@
 package install
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,11 +19,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"watchman/internal/binval"
 	"watchman/internal/version"
+	"watchman/server/internal/release"
 	"watchman/server/internal/rpc"
 
 	"github.com/gin-gonic/gin"
@@ -30,9 +34,10 @@ import (
 
 // Handler returns an http.HandlerFunc group for install endpoints.
 type Handler struct {
-	reg    *rpc.Registry
-	binDir string // directory containing pre-built agent binaries
-	log    interface{ Printf(string, ...any) }
+	reg          *rpc.Registry
+	binDir       string // directory containing pre-built agent binaries
+	log          interface{ Printf(string, ...any) }
+	ManifestPath string // path to manifest.json (source of truth for agent version & checksums)
 
 	// UpgradePubKey is the hex Ed25519 public key agents should pin
 	// (-upgrade-pubkey) to verify self-upgrade signatures. Empty disables.
@@ -297,6 +302,52 @@ func (h *Handler) downloadAndCacheAgent(goos, goarch string) (string, error) {
 		downloadURL = mirror + "/" + downloadURL
 	}
 
+	// 1. Resolve expected SHA-256 from local manifest or remote CHECKSUMS.txt
+	expectedSha := ""
+	mPaths := []string{h.ManifestPath, "/opt/watchman/manifest.json", "data/manifest.json", "manifest.json"}
+	for _, mp := range mPaths {
+		if mp != "" {
+			if m, err := release.Load(mp); err == nil && m != nil {
+				if sha, ok := m.AgentSha256(goos, goarch); ok && sha != "" {
+					expectedSha = sha
+					break
+				}
+			}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+
+	// Fallback: fetch CHECKSUMS.txt from release if expectedSha is not in local manifest
+	if expectedSha == "" {
+		checksumURL := fmt.Sprintf("https://github.com/%s/releases/download/%s/CHECKSUMS.txt", repo, targetVersion)
+		if mirror != "" && strings.HasPrefix(checksumURL, "https://github.com/") {
+			checksumURL = mirror + "/" + checksumURL
+		}
+		cReq, cErr := http.NewRequestWithContext(ctx, "GET", checksumURL, nil)
+		if cErr == nil {
+			cReq.Header.Set("User-Agent", "Watchman-Server")
+			if cResp, cErr := client.Do(cReq); cErr == nil && cResp.StatusCode == http.StatusOK {
+				scanner := bufio.NewScanner(cResp.Body)
+				for scanner.Scan() {
+					line := strings.TrimSpace(scanner.Text())
+					parts := strings.Fields(line)
+					if len(parts) >= 2 {
+						base := filepath.Base(parts[1])
+						if base == filename || strings.Contains(parts[1], filename) {
+							expectedSha = strings.ToLower(parts[0])
+							break
+						}
+					}
+				}
+				cResp.Body.Close()
+			}
+		}
+	}
+
 	// Choose appropriate local cache directory
 	var cacheDir string
 	if h.binDir != "" {
@@ -315,16 +366,12 @@ func (h *Handler) downloadAndCacheAgent(goos, goarch string) (string, error) {
 	targetPath := filepath.Join(cacheDir, filename)
 	tmpPath := targetPath + ".downloading"
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
 	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("创建下载请求失败: %w", err)
 	}
 	req.Header.Set("User-Agent", "Watchman-Server")
 
-	client := &http.Client{Timeout: 5 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("下载 Agent 二进制失败: %w", err)
@@ -346,9 +393,34 @@ func (h *Handler) downloadAndCacheAgent(goos, goarch string) (string, error) {
 		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("保存 Agent 二进制失败: %w", err)
 	}
-	if written < 1024 {
+	if written < binval.MinAgentBinarySize {
 		_ = os.Remove(tmpPath)
-		return "", fmt.Errorf("下载的 Agent 二进制大小异常 (%d bytes)", written)
+		return "", fmt.Errorf("下载的 Agent 二进制大小异常 (%d 字节)，低于安全下限 (%d 字节)", written, binval.MinAgentBinarySize)
+	}
+
+	// 2. Compute SHA-256 and verify if expected SHA-256 is available
+	actualSha, err := binval.FileSha256(tmpPath)
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("计算下载 Agent SHA-256 失败: %w", err)
+	}
+	if expectedSha != "" && !strings.EqualFold(actualSha, expectedSha) {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("Agent 二进制 SHA-256 校验失败 (期望: %s, 实际: %s)，二进制可能损坏或被篡改", expectedSha, actualSha)
+	}
+
+	// 3. Validate binary format and architecture compatibility
+	if err := binval.ValidateFormat(tmpPath, goos, goarch, binval.MinAgentBinarySize); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("Agent 二进制格式/架构安全校验失败: %w", err)
+	}
+
+	// 4. Smoke-test dry run (-version) if running on same host OS/arch
+	if goos == runtime.GOOS && goarch == runtime.GOARCH {
+		if _, err := binval.SmokeTest(ctx, tmpPath, goos, goarch, "watchman-agent"); err != nil {
+			_ = os.Remove(tmpPath)
+			return "", fmt.Errorf("Agent 二进制运行自检失败: %w", err)
+		}
 	}
 
 	if err := os.Rename(tmpPath, targetPath); err != nil {
@@ -377,6 +449,18 @@ func (h *Handler) agentBinary(c *gin.Context) {
 			}
 			c.String(http.StatusNotFound, "binary not found: %s (auto-download error: %v; build it with: GOOS=%s GOARCH=%s go build -o %s ./agent/cmd/watchman-agent)", filename, dlErr, goos, goarch, filepath.Join(h.binDir, filename))
 			return
+		}
+	} else {
+		// Verify local binary integrity before serving
+		if err := binval.ValidateFormat(foundPath, goos, goarch, binval.MinAgentBinarySize); err != nil {
+			// Local file is damaged or corrupted; try re-downloading
+			_ = os.Remove(foundPath)
+			if downloaded, dlErr := h.downloadAndCacheAgent(goos, goarch); dlErr == nil {
+				foundPath = downloaded
+			} else {
+				c.String(http.StatusInternalServerError, "local agent binary validation failed: %v", err)
+				return
+			}
 		}
 	}
 

@@ -12,9 +12,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
+	"watchman/internal/binval"
 	"watchman/server/internal/rpc"
 )
 
@@ -75,38 +77,47 @@ func PerformOnlineUpgrade(
 
 	calcSha := hex.EncodeToString(hasher.Sum(nil))
 
-	// 2. If CHECKSUMS.txt is available, verify checksum.
+	// 2. Strict SHA-256 verification against CHECKSUMS.txt
 	if checksumsURL != "" {
 		cReq, err := http.NewRequestWithContext(ctx, "GET", checksumsURL, nil)
-		if err == nil {
-			cReq.Header.Set("User-Agent", "Watchman-Server-Upgrader")
-			cResp, err := client.Do(cReq)
-			if err == nil && cResp.StatusCode == http.StatusOK {
-				defer cResp.Body.Close()
-				expectedSha := ""
-				assetFileName := filepath.Base(assetURL)
-				// If assetURL has query params or redirects, strip them for clean filename comparison:
-				if idx := strings.IndexByte(assetFileName, '?'); idx >= 0 {
-					assetFileName = assetFileName[:idx]
-				}
+		if err != nil {
+			return fmt.Errorf("创建校验清单下载请求失败: %w", err)
+		}
+		cReq.Header.Set("User-Agent", "Watchman-Server-Upgrader")
+		cResp, err := client.Do(cReq)
+		if err != nil {
+			return fmt.Errorf("下载校验清单 CHECKSUMS.txt 失败: %w", err)
+		}
+		defer cResp.Body.Close()
+		if cResp.StatusCode != http.StatusOK {
+			return fmt.Errorf("下载校验清单 CHECKSUMS.txt HTTP 状态码异常 (%d)", cResp.StatusCode)
+		}
 
-				scanner := bufio.NewScanner(cResp.Body)
-				for scanner.Scan() {
-					line := strings.TrimSpace(scanner.Text())
-					parts := strings.Fields(line)
-					if len(parts) >= 2 {
-						filename := filepath.Base(parts[1])
-						if filename == assetFileName || strings.Contains(parts[1], assetFileName) {
-							expectedSha = strings.ToLower(parts[0])
-							break
-						}
-					}
-				}
+		expectedSha := ""
+		assetFileName := filepath.Base(assetURL)
+		// If assetURL has query params or redirects, strip them for clean filename comparison:
+		if idx := strings.IndexByte(assetFileName, '?'); idx >= 0 {
+			assetFileName = assetFileName[:idx]
+		}
 
-				if expectedSha != "" && !strings.EqualFold(calcSha, expectedSha) {
-					return fmt.Errorf("SHA-256 校验失败 (期望: %s, 实际: %s)，安装包可能已被篡改或下载不完整", expectedSha, calcSha)
+		scanner := bufio.NewScanner(cResp.Body)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				filename := filepath.Base(parts[1])
+				if filename == assetFileName || strings.Contains(parts[1], assetFileName) {
+					expectedSha = strings.ToLower(parts[0])
+					break
 				}
 			}
+		}
+
+		if expectedSha == "" {
+			return fmt.Errorf("CHECKSUMS.txt 中未包含目标发布包 %q 的校验记录，拒绝安装未经校验的发布包", assetFileName)
+		}
+		if !strings.EqualFold(calcSha, expectedSha) {
+			return fmt.Errorf("SHA-256 校验失败 (期望: %s, 实际: %s)，安装包可能已被篡改或下载不完整", expectedSha, calcSha)
 		}
 	}
 
@@ -174,6 +185,37 @@ func PerformOnlineUpgrade(
 
 	if !foundServer {
 		return fmt.Errorf("安装包内未找到 watchman-server 可执行程序")
+	}
+
+	// 3.1 Validate extracted server binary format and architecture
+	if err := binval.ValidateFormat(extractedServer, runtime.GOOS, runtime.GOARCH, binval.MinServerBinarySize); err != nil {
+		return fmt.Errorf("解压的 watchman-server 格式/架构校验失败: %w", err)
+	}
+
+	// 3.2 Smoke-test dry run (-version)
+	if _, err := binval.SmokeTest(ctx, extractedServer, runtime.GOOS, runtime.GOARCH, "watchman-server"); err != nil {
+		return fmt.Errorf("解压的 watchman-server 可执行性自检失败: %w", err)
+	}
+
+	// 3.3 Validate extracted agent binaries format and SHA-256 against manifest if present
+	if _, err := os.Stat(extractedManifest); err == nil {
+		if newM, err := Load(extractedManifest); err == nil {
+			for key, entry := range newM.Agents {
+				parts := strings.Split(key, "/")
+				if len(parts) == 2 {
+					p := filepath.Join(extractedBinDir, entry.File)
+					if _, err := os.Stat(p); err == nil {
+						if err := binval.ValidateFormat(p, parts[0], parts[1], binval.MinAgentBinarySize); err != nil {
+							return fmt.Errorf("解压的 Agent 二进制 (%s) 格式校验失败: %w", entry.File, err)
+						}
+						sum, err := binval.FileSha256(p)
+						if err != nil || !strings.EqualFold(sum, entry.Sha256) {
+							return fmt.Errorf("解压的 Agent 二进制 (%s) SHA-256 校验失败 (期望: %s, 实际: %s)", entry.File, entry.Sha256, sum)
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// 4. Locate current running binary.

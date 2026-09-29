@@ -29,6 +29,9 @@ type Config struct {
 	APIKey   string `json:"api_key"`  // for OpenAI/DeepSeek/vLLM servers; empty for Ollama
 	Enabled  bool   `json:"enabled"`
 	Provider string `json:"provider,omitempty"` // "deepseek", "openai", "ollama", "custom"
+	// Headers are user-defined HTTP headers sent with every LLM request
+	// (e.g. for gateways/proxies that require extra auth headers).
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // Assistant wraps the LLM endpoint and provides host diagnostic helpers.
@@ -905,6 +908,21 @@ func callLLMWithConfig(ctx context.Context, cfg Config, prompt string) (string, 
 	return callOpenAI(ctx, cfg, rawURL, prompt)
 }
 
+// applyCustomHeaders sets user-defined HTTP headers on the outgoing LLM
+// request. It runs after the built-in Authorization header so a custom
+// Authorization value can override the default "Bearer <api_key>" scheme
+// when a gateway or proxy requires a different auth format.
+func applyCustomHeaders(req *http.Request, cfg Config) {
+	for k, v := range cfg.Headers {
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if k == "" || v == "" {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+}
+
 func callOllama(ctx context.Context, cfg Config, baseURL string, prompt string) (string, error) {
 	targetURL := baseURL
 	if !strings.HasSuffix(targetURL, "/api/generate") {
@@ -925,6 +943,7 @@ func callOllama(ctx context.Context, cfg Config, baseURL string, prompt string) 
 	if cfg.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	}
+	applyCustomHeaders(req, cfg)
 
 	return doRequest(req, func(data []byte) (string, error) {
 		var resp struct {
@@ -968,6 +987,7 @@ func callOpenAI(ctx context.Context, cfg Config, baseURL string, prompt string) 
 	if cfg.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	}
+	applyCustomHeaders(req, cfg)
 
 	return doRequest(req, func(data []byte) (string, error) {
 		var resp struct {

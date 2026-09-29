@@ -6,6 +6,7 @@ export interface AIConfig {
   api_key: string
   enabled: boolean
   provider?: string
+  headers?: Record<string, string>
 }
 
 export interface DiagnoseResponse {

@@ -11,6 +11,7 @@ import {
   NAlert,
   NIcon,
   NTag,
+  NDynamicInput,
   useMessage,
 } from 'naive-ui'
 import { CheckmarkCircleOutline, SparklesOutline } from '@vicons/ionicons5'
@@ -32,6 +33,22 @@ const selectedProvider = ref('deepseek')
 const savingAI = ref(false)
 const testingAI = ref(false)
 const testResult = ref<{ ok: boolean; message: string } | null>(null)
+// 自定义请求头（键值对编辑器用，保存/测试前同步回 aiConfig.headers）
+const headerPairs = ref<{ key: string; value: string }[]>([])
+
+function syncHeadersToConfig() {
+  const headers: Record<string, string> = {}
+  for (const p of headerPairs.value) {
+    const k = (p.key || '').trim()
+    const v = (p.value || '').trim()
+    if (k && v) headers[k] = v
+  }
+  if (Object.keys(headers).length > 0) {
+    aiConfig.value.headers = headers
+  } else {
+    delete aiConfig.value.headers
+  }
+}
 
 const providerPresets: Record<string, { label: string; base_url: string; model: string; key_tip: string }> = {
   deepseek: {
@@ -92,6 +109,7 @@ async function loadAIConfig() {
     const data = await getAIConfig()
     if (data) {
       aiConfig.value = data
+      headerPairs.value = Object.entries(data.headers || {}).map(([key, value]) => ({ key, value }))
       if (data.provider) {
         selectedProvider.value = data.provider
       } else if (data.base_url?.includes('deepseek')) {
@@ -112,6 +130,7 @@ async function loadAIConfig() {
 async function saveAIConfig() {
   savingAI.value = true
   try {
+    syncHeadersToConfig()
     aiConfig.value.provider = selectedProvider.value
     await setAIConfig(aiConfig.value)
     message.success('AI 大模型配置已成功保存并持久化！')
@@ -131,6 +150,7 @@ async function handleTestAI() {
   testingAI.value = true
   testResult.value = null
   try {
+    syncHeadersToConfig()
     const res = await testAIConfig(aiConfig.value)
     testResult.value = { ok: true, message: res.message }
     message.success('AI 接口连通性测试通过！')
@@ -195,6 +215,21 @@ onMounted(() => {
           show-password-on="click"
           :placeholder="providerPresets[selectedProvider]?.key_tip || '输入 API Key'"
         />
+      </NFormItem>
+
+      <NFormItem label="自定义请求头 (Headers)">
+        <NDynamicInput
+          v-model:value="headerPairs"
+          preset="pair"
+          key-placeholder="Header 名称，例如 X-Custom-Key"
+          value-placeholder="Header 值"
+        />
+        <template #feedback>
+          <span class="muted tip-hint">
+            随每次 LLM 请求发送的额外 HTTP 头（如网关/代理要求的鉴权头）。留空则不发送；
+            如填写 Authorization 将覆盖默认的 Bearer 鉴权。
+          </span>
+        </template>
       </NFormItem>
 
       <NFormItem label="启用 AI 助手与诊断功能">

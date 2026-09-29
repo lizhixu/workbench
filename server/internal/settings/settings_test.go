@@ -254,11 +254,22 @@ func TestSchemaAndEffective(t *testing.T) {
 			t.Errorf("effective missing key %s", d.Key)
 		}
 	}
-	sysSchema := s.Schema(ScopeSystem)
-	if len(sysSchema) != 3 {
-		t.Fatalf("system schema has %d entries, want 3 (secure_entry keys + join_beta_program)", len(sysSchema))
+	wantSys := 0
+	for _, d := range Definitions {
+		if d.Scope == ScopeSystem {
+			wantSys++
+		}
 	}
-	for _, k := range []string{"security.secure_entry_enabled", "security.secure_entry_path", "system.join_beta_program"} {
+	sysSchema := s.Schema(ScopeSystem)
+	if len(sysSchema) != wantSys {
+		t.Fatalf("system schema has %d entries, want %d", len(sysSchema), wantSys)
+	}
+	for _, k := range []string{
+		"security.secure_entry_enabled", "security.secure_entry_path", "system.join_beta_program",
+		"server.public_url", "security.panel_domain", "security.panel_domain_strict",
+		"security.panel_ssl_enabled", "security.panel_ssl_mode", "security.panel_ssl_cert_id",
+		"security.panel_ssl_cert_pem", "security.panel_ssl_key_pem", "security.panel_force_https",
+	} {
 		found := false
 		for _, e := range sysSchema {
 			if e.Key == k {
@@ -438,6 +449,61 @@ func TestSnapshotConsistentUnderConcurrency(t *testing.T) {
 			}
 		}
 	}
-	close(stop)
-	wg.Wait()
-}
+		close(stop)
+		wg.Wait()
+	}
+
+	func TestPanelSecuritySettings(t *testing.T) {
+		s := newTestStore(t)
+		// Check defaults
+		sec := s.PanelSecurity()
+		if sec.PublicURL != "" || sec.PanelDomain != "" || sec.StrictDomain || sec.SSLEnabled || sec.ForceHTTPS {
+			t.Fatalf("unexpected defaults: %+v", sec)
+		}
+		if sec.SSLMode != "cert_center" {
+			t.Fatalf("unexpected default ssl_mode: %q", sec.SSLMode)
+		}
+
+		// Validation errors
+		badDomain := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+			"security.panel_domain": raw(t, "http://invalid-domain.com:18789"),
+		})
+		if badDomain == nil {
+			t.Fatal("expected error on invalid panel domain containing scheme/port")
+		}
+
+		badURL := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+			"server.public_url": raw(t, "ftp://bad-url"),
+		})
+		if badURL == nil {
+			t.Fatal("expected error on invalid public URL")
+		}
+
+		// Valid update
+		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+			"server.public_url":            raw(t, "https://panel.example.com:18789"),
+			"security.panel_domain":        raw(t, "panel.example.com"),
+			"security.panel_domain_strict": raw(t, true),
+			"security.panel_ssl_enabled":   raw(t, true),
+			"security.panel_ssl_mode":      raw(t, "custom"),
+			"security.panel_ssl_cert_pem":  raw(t, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"),
+			"security.panel_ssl_key_pem":   raw(t, "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"),
+			"security.panel_force_https":   raw(t, true),
+		}); err != nil {
+			t.Fatalf("SetMany valid panel security: %v", err)
+		}
+
+		updated := s.PanelSecurity()
+		if updated.PublicURL != "https://panel.example.com:18789" {
+			t.Errorf("public_url = %q, want https://panel.example.com:18789", updated.PublicURL)
+		}
+		if updated.PanelDomain != "panel.example.com" {
+			t.Errorf("panel_domain = %q, want panel.example.com", updated.PanelDomain)
+		}
+		if !updated.StrictDomain || !updated.SSLEnabled || !updated.ForceHTTPS {
+			t.Errorf("expected bool flags to be true, got %+v", updated)
+		}
+		if updated.SSLMode != "custom" {
+			t.Errorf("ssl_mode = %q, want custom", updated.SSLMode)
+		}
+	}

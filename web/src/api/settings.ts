@@ -35,6 +35,17 @@ export const SETTING_KEYS = {
   secureEntryEnabled: 'security.secure_entry_enabled',
   secureEntryPath: 'security.secure_entry_path',
   joinBetaProgram: 'system.join_beta_program',
+  // Panel domain and public access (system scope)
+  publicURL: 'server.public_url',
+  panelDomain: 'security.panel_domain',
+  panelDomainStrict: 'security.panel_domain_strict',
+  // Panel SSL / HTTPS (system scope)
+  panelSSLEnabled: 'security.panel_ssl_enabled',
+  panelSSLMode: 'security.panel_ssl_mode',
+  panelSSLCertID: 'security.panel_ssl_cert_id',
+  panelSSLCertPEM: 'security.panel_ssl_cert_pem',
+  panelSSLKeyPEM: 'security.panel_ssl_key_pem',
+  panelForceHTTPS: 'security.panel_force_https',
 } as const
 
 export interface SettingSchemaEntry {
@@ -109,3 +120,22 @@ export function getSystemSettings() {
 export function saveSystemSettings(data: SettingsData) {
   return unwrap<SettingsResponse>(http.put('/settings', { data }))
 }
+
+export interface PanelCertStatus {
+  enabled: boolean
+  mode: string
+  active: boolean
+  source: string
+  subject: string
+  issuer: string
+  dns_names: string[]
+  not_before?: string
+  not_after?: string
+  days_left: number
+  error?: string
+}
+
+export function getPanelCertStatus() {
+  return unwrap<PanelCertStatus>(http.get('/system/panel-cert'))
+}
+

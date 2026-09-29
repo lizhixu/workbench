@@ -35,11 +35,14 @@ export interface Host {
   arch: string
   distro: string
   agent_version: string
+  agent_latest_version?: string
+  agent_outdated?: boolean
   status: 'online' | 'offline' | 'maintenance'
   // In-progress agent upgrade state tracking
   upgrading?: boolean
   upgrade_stage?: string
   upgrade_target?: string
+  upgrade_error?: string
   last_seen: string
   registered: string
   group: string

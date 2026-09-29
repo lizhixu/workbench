@@ -110,7 +110,12 @@
   - 证书自动化：绑定域名时若证书中心无覆盖证书，自动用默认 ACME 账户签发后写入 Nginx 并热加载。
   - 网关主机 ID 持久化在 `Application.proxy_gateway_host_id`，解绑时同时清理应用主机与网关主机两侧配置。
 - **创建时即可绑定域名**：创建页填写域名与网关节点后，提交依次执行 创建应用 → 自动签发证书 → 下发反代；绑定失败不回滚应用创建，可稍后在详情页重试。
-- **系统设置安全入口**（2026-09-27）：「系统设置 → 证书与域名」分区（`web/src/views/settings/CertDomain.vue`，`sections.ts` 注册 `key: 'cert-domain'`）把证书签发/续期/ACME 账户管理与应用域名绑定收拢到一处；分区标记 `adminOnly`，SettingsLayout 按 `auth.role` 过滤，深链 `?s=cert-domain` 对非管理员回退到默认分区。后端对应写接口本就 admin/operator + 审计（`cert/handlers.go` 的 writeRG、`apps/proxy.go` 的 appWrite），前端隐藏是纵深防御。证书管理 UI 抽为可复用组件 `web/src/components/cert/CertManager.vue`（原 CertList 页面内容），独立「证书中心」路由保留做深链。
+- **系统设置面板安全与应用反代职责彻底解耦**（2026-09-28）：
+  - 应用中心独立负责业务容器的反向代理与域名绑定（在应用详情 `AppDetail.vue` 的「域名与反代」页签中配置，经 Nginx 容器路由流量到应用容器或网关节点）；
+  - 「系统设置 → 面板域名与证书」（`web/src/views/settings/CertDomain.vue`，`sections.ts` 注册 `key: 'cert-domain'`，`adminOnly` 仅管理员可见）**专用于 Watchman 控制台/面板自身的访问与安全配置**，与应用反向代理彻底解耦。配置项包括：面板公网访问地址（`server.public_url`，用于 Agent 一键安装脚本、更新包下载与终端分享链接）、面板绑定域名（`security.panel_domain`）、禁止未绑定域名/直接 IP 访问（`security.panel_domain_strict`，阻断全网自动化扫描发现控制台）、面板 SSL/HTTPS（`security.panel_ssl_enabled`，支持证书中心 ACME 证书选取或自定义 PEM 证书与私钥上传）、强制 HTTPS 访问（`security.panel_force_https`，明文 HTTP 自动 301 重定向至 HTTPS）。
+  - 面板服务采用**端口级协议动态嗅探（Dynamic Listener）**技术，在控制台默认端口（18789）上原生自适应处理 HTTP 明文与 TLS 握手，热重载或开关 SSL 无需重启服务或更改端口。
+  - **防失联与紧急恢复**：若配置错误域名或无效证书导致无法登录，提供控制机命令行救援开关：`watchman-server -reset-panel-domain -data <数据目录>`（关闭严格域名检查并清空绑定域名）以及 `watchman-server -reset-panel-ssl -data <数据目录>`（关闭面板 SSL 与强制 HTTPS 重定向）。
+  - 独立「证书中心」（`/certs`，`CertList.vue` + `CertManager.vue`）保持作为全局基础设施，管理 ACME 自动化证书与证书凭证，供面板及各业务应用按需选用。
 - **全生命周期管理**：部署历史、构建日志、健康检查探活失败自动保留旧版本（`-next`/`-prev` 滚动替换）、回滚、启停、AI 排障诊断，对所有来源的应用一致生效。
   - 实现备注（2026-09-28）：`deploySingleContainer` 的起新容器命令只清理残留的 `-next` 容器（`docker rm -f <name>-next`），旧版本容器在 swap 前全程运行、失败时原样保留——此前曾误删旧容器（`rm -f` 目标写成了正式容器名），与"探活失败自动保留旧版本"的设计相悖，已修复。
   - 实现备注（2026-09-28，发布流程 review）：git 拉取脚本必须 `set -e`——此前 `fetch` 失败会落到 `checkout --force` 用本地旧代码继续部署并上报成功；Git token 只持久化在 server 端 vault，下发时经 `git -c http.extraHeader="Authorization: Basic <base64(git:token)>"` 随单次 clone/fetch 使用，不再 `remote set-url` 写进 agent 的 `.git/config`（自动发布每次从 vault 现取，不受影响）；下发到 agent 的命令里所有用户输入变量必须 shell 转义（环境变量值曾因空格打散 `docker run` 参数）；swap 脚本 `set -e`，`docker rename` 失败不得被末尾 `docker inspect` 的退出码掩盖；镜像清理只针对 `watchman-app-*` 自建镜像、按创建时间保留最新 5 个（此前 `docker images repo:tag` 只匹配单个 tag 导致从不清，且 `head -n 6 | tail -n +6` 语义错误）；store 的 `GetApp/ListApps/FindAppByWebhookToken` 返回深拷贝——部署协程 `ResolveTemplate` 原地写 EnvVars map 时 HTTP 层正 marshal 同一对象，曾有 crash 风险；反代域名做严格 hostname 校验并检查跨应用重复绑定；网关模式拿不到 Mesh IP 时直接报错（此前回退 `127.0.0.1` 会指向网关自身造成流量黑洞）；`raw_compose` 每次部署快照 compose 内容到部署记录，回滚时恢复快照（此前"回滚"实际重部署了当前内容）；healer 跳过有部署在途的应用。
@@ -849,6 +854,8 @@ Agent internal/shell
 | `-tls-key` | 空 | — | gRPC 与 HTTPS 服务端 TLS 私钥路径 |
 | `-http-tls` | `false` | — | 是否在 `-http` 端口上直接启用 HTTPS（须与 `-tls-cert`/`-tls-key` 成对配置） |
 | `-reset-secure-entry` | `false` | — | 应急工具开关：关闭安全入口（置 `security.secure_entry_enabled=false`）后退出 |
+| `-reset-panel-ssl` | `false` | — | 应急工具开关：关闭面板 SSL 与强制 HTTPS 重定向（置 `security.panel_ssl_enabled=false` 与 `security.panel_force_https=false`）后退出 |
+| `-reset-panel-domain` | `false` | — | 应急工具开关：关闭严格域名检查并清空面板绑定域名（置 `security.panel_domain_strict=false` 与 `security.panel_domain=""`）后退出 |
 
 #### 2. 系统与用户统一设置（`settings.json`）
 
@@ -856,6 +863,15 @@ Agent internal/shell
 
 | 配置键 (Key) | 作用域 | 默认值 | 校验与说明 |
 | --- | --- | --- | --- |
+| `server.public_url` | `system` | `""` | 面板公网根访问地址（URL 格式，如 `https://panel.example.com:18789`，用于 Agent 一键安装与分享链接） |
+| `security.panel_domain` | `system` | `""` | 面板绑定域名（主机名格式，如 `panel.example.com`） |
+| `security.panel_domain_strict` | `system` | `false` | 禁止未绑定域名/直接 IP 访问（开启后仅允许绑定域名与回环地址访问，阻断全网自动化探测扫描） |
+| `security.panel_ssl_enabled` | `system` | `false` | 面板 SSL / HTTPS 总开关（通过端口级协议动态嗅探实现零停机热重载） |
+| `security.panel_ssl_mode` | `system` | `"cert_center"` | 证书来源模式（`cert_center` 从证书中心选取 / `custom` 自定义 PEM 证书与私钥） |
+| `security.panel_ssl_cert_id` | `system` | `""` | 证书中心证书 ID（`cert_center` 模式下选取） |
+| `security.panel_ssl_cert_pem` | `system` | `""` | 自定义证书 PEM 内容（含完整证书链） |
+| `security.panel_ssl_key_pem` | `system` | `""` | 自定义私钥 PEM 内容 |
+| `security.panel_force_https` | `system` | `false` | 强制 HTTPS 访问（未加密 HTTP 自动 301 重定向至 HTTPS） |
 | `system.join_beta_program` | `system` | `false` | 加入测试计划：开启后 `install.sh` 与批量升级将跟踪预发布版本（pre-release） |
 | `security.secure_entry_enabled` | `system` | `false` | 宝塔式安全入口总开关：开启后非秘密路径一律返回 404 |
 | `security.secure_entry_path` | `system` | `"entry"` | 安全入口秘密路径（6~64 位 URL 安全字符） |
@@ -872,7 +888,21 @@ Agent internal/shell
 
 版本唯一真相源是 git tag，**版本完全由官方 Release 提供，严禁任何自行决定或拼接版本的行为**。`internal/version` 的 `Version`/`Commit`/`BuildTime` 由构建时 ldflags 注入（见 `Makefile` 的 `LDFLAGS`）；`Get()` 取值优先级：ldflags 注入 > `debug.ReadBuildInfo()`（`go install` 装 tagged commit 时工具链自带）> `0.1.0-dev` 占位。任何本地部署、发布脚本或测试工具严禁擅自使用 commit hash 等拼接伪版本（如 `0.1.0-<hash>`）；未打 tag 的工作区一律视为开发态，升级管线权威基准必须来自官方 GitHub Releases 发布的 tarball 与 CI 生成的 `manifest.json`。
 
-- 打 tag 即发版：`git tag v1.2.3 && git push --tags` 触发 `.github/workflows/release.yml`。
+- **打 tag 即发版（严格附注变更说明，严禁裸 tag）**：
+  每次发布严禁创建和推送未包含说明信息的裸 tag（如仅 `git tag vX.Y.Z`）。必须使用带附注的 tag 并详细记录本次版本的变更描述（分为 Added / Changed / Fixed / Security 等清晰条目）：
+  ```bash
+  git tag -a v1.2.3 -m "release: v1.2.3
+
+  ### Changed
+  - 主机详情页与主机列表清晰区分「已是最新」与「可升级」状态，最新版操作按钮平滑切换为「重装」
+  - 优化系统升级页面状态机，去除多余加载动画并即时捕获展示各主机升级失败详情
+
+  ### Fixed
+  - 修复 Agent 升级遇到错误（如二进制占位）时状态机未即时释放的问题
+  "
+  git push origin v1.2.3
+  ```
+  GitHub Release notes 也必须同步保留上述详细变更清单，确保版本迭代历史 100% 透明可溯。
 - tag 规范：`v1.2.3` 为正式版；`v1.3.0-rc.1` / `v1.3.0-beta.1`（带 `-` 后缀）由 CI 自动标记为 pre-release。
 - 构建矩阵：server（linux amd64/arm64）+ agent（linux amd64/arm64、windows amd64），全部 `CGO_ENABLED=0` 静态编译。
 - 产物：`watchman-dist-v1.2.3-linux-{amd64,arm64}.tar.gz`（内含 `bin/` 二进制——agent 文件名遵循 `watchman-agent-{goos}-{goarch}` 以便 `install.FindAgentBinary` 直接找到、`manifest.json`；Web 控制台已通过 `go:embed` 打进 `watchman-server`，无需单独的前端包）+ `CHECKSUMS.txt`（sha256）。
@@ -1064,6 +1094,7 @@ GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
 4. **版本权威性与唯一来源准则 (Release-Driven Authority)**：
    - **版本完全由官方 Release 提供，严禁任何自行决定或拼接行为**：系统所有组件（控制端 Server、被管端 Agent、升级清单 Manifest 等）的版本号唯一来源必须是 Git tag 触发的官方 GitHub Release（形如 `v1.2.3` 或 `v1.2.3-beta.1`）。
    - **绝对禁止私自捏造/拼接版本**：禁止在开发、部署或测试脚本中自行生成伪版本号（例如取本地 git commit hash 拼凑 `0.1.0-<hash>` 或任意自定义后缀）；未经 tag 发布的代码版本一律为开发环境占位（`0.1.0-dev`），线上与测试环境的升级验证必须且只能来源于官方 Release 产物与由 CI 生成的 `manifest.json`，确保版本链路 100% 可追溯。
+   - **严禁裸 tag，必须完整编写变更说明 (Changelog)**：创建 Git tag 时严禁使用无任何说明的裸 tag（如仅 `git tag v1.2.3`）。每次打 tag 发版必须使用附注 tag（`git tag -a vX.Y.Z -m "..."`），并在 tag message 与 GitHub Release notes 中详细枚举 Changed（行为变更/优化）、Fixed（缺陷修复）、Added（新增功能）、Security（安全修复）等内容，确保版本演进清晰透明、便于追踪定位。
 
 ---
 

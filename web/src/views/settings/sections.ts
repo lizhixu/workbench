@@ -51,7 +51,7 @@ export const settingsSections: SettingsSection[] = [
   { key: 'backup', label: '备份恢复', icon: ArchiveOutline, component: BackupRestore, keywords: '备份 恢复 迁移', group: '系统管理' },
   { key: 'upgrade', label: '系统升级', icon: ArrowUpCircleOutline, component: SystemUpgrade, keywords: '升级 版本 agent 更新 重启 测试计划 beta 预发布', group: '系统管理' },
   { key: 'install', label: '安装部署', icon: DownloadOutline, component: InstallDeploy, keywords: '安装 部署 一键安装 二进制 注册令牌', group: '系统管理' },
-  { key: 'cert-domain', label: '证书与域名', icon: LockClosedOutline, component: CertDomain, keywords: '证书 域名 SSL ACME 签发 续期 反代 绑定', group: '系统管理', adminOnly: true },
+  { key: 'cert-domain', label: '面板域名与证书', icon: LockClosedOutline, component: CertDomain, keywords: '面板 域名 证书 SSL HTTPS 公网地址 强制HTTPS 安全', group: '系统管理', adminOnly: true },
   { key: 'secure-entry', label: '安全入口', icon: KeyOutline, component: SecureEntry, keywords: '安全入口 登录入口 隐藏面板 秘密地址 安全', group: '系统管理', adminOnly: true },
 ]
 

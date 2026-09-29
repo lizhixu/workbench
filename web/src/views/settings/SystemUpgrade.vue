@@ -54,7 +54,8 @@ const onlineHosts = computed(() => hosts.value.filter((h) => h.status === 'onlin
 const targetUpgradeHosts = computed(() => isForceUpgrade.value ? onlineHosts.value : outdatedHosts.value)
 
 // 追踪当前正在执行升级的主机与轮询器
-const upgradingHosts = computed(() => hosts.value.filter((h) => h.upgrading))
+const upgradingHosts = computed(() => hosts.value.filter((h) => h.upgrading && h.upgrade_stage !== 'error'))
+const failedHosts = computed(() => hosts.value.filter((h) => h.upgrade_stage === 'error'))
 const isAnyUpgrading = computed(() => upgradingHosts.value.length > 0)
 let pollTimer: any = null
 
@@ -364,8 +365,10 @@ onMounted(() => {
               <div class="title-wrap">
                 <span class="sec-title">被管端 Agent (全网批量维护)</span>
                 <NTag v-if="isAnyUpgrading" size="small" type="info" :bordered="false" round>
-                  <template #icon><NSpin :size="12" style="margin-right: 4px;" /></template>
                   {{ upgradingHosts.length }} 台正在升级中
+                </NTag>
+                <NTag v-else-if="failedHosts.length > 0" size="small" type="error" :bordered="false" round>
+                  {{ failedHosts.length }} 台升级失败
                 </NTag>
                 <NTag v-else-if="outdatedHosts.length > 0" size="small" type="warning" :bordered="false" round>
                   {{ outdatedHosts.length }} 台需升级
@@ -383,6 +386,12 @@ onMounted(() => {
                 </template>
                 正在执行后台升级中（{{ upgradingHosts.map(h => `${h.hostname}${h.upgrade_stage ? ` [${formatUpgradeStage(h.upgrade_stage)}]` : ''}`).join('、') }}），已开启 3 分钟维护静默期，请稍候...
               </NAlert>
+              <NAlert v-if="failedHosts.length > 0" type="error" :bordered="false" style="margin-top: 10px" closable>
+                部分主机升级遇到异常：
+                <span v-for="(h, idx) in failedHosts" :key="h.id">
+                  {{ idx > 0 ? '；' : '' }}<strong>{{ h.hostname }}</strong>: {{ h.upgrade_error || '升级失败' }}
+                </span>
+              </NAlert>
             </div>
 
             <div class="sec-actions">
@@ -391,7 +400,7 @@ onMounted(() => {
                   v-if="isAdmin && outdatedHosts.length > 0"
                   type="primary"
                   size="small"
-                  :loading="batchUpgrading || isAnyUpgrading"
+                  :loading="batchUpgrading"
                   :disabled="isAnyUpgrading"
                   @click="openBatchUpgrade(false)"
                 >
@@ -402,7 +411,7 @@ onMounted(() => {
                 <NButton
                   v-if="isAdmin && outdatedHosts.length === 0 && onlineHosts.length > 0"
                   size="small"
-                  :loading="batchUpgrading || isAnyUpgrading"
+                  :loading="batchUpgrading"
                   :disabled="isAnyUpgrading"
                   @click="openBatchUpgrade(true)"
                 >

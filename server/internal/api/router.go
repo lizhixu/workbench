@@ -32,9 +32,10 @@ import (
 	"watchman/server/internal/gitprovider"
 	"watchman/server/internal/groups"
 	"watchman/server/internal/install"
-	"watchman/server/internal/metrics"
-	"watchman/server/internal/network"
-	"watchman/server/internal/policy"
+		"watchman/server/internal/metrics"
+		"watchman/server/internal/network"
+		"watchman/server/internal/panelsec"
+		"watchman/server/internal/policy"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/secentry"
@@ -93,9 +94,12 @@ type HostDTO struct {
 	MonthRx   int64   `json:"month_rx"`
 	MonthTx   int64   `json:"month_tx"`
 	// In-progress upgrade tracking (survives page refreshes until reconnected or timeout).
-	Upgrading     bool   `json:"upgrading"`
-	UpgradeStage  string `json:"upgrade_stage,omitempty"`
-	UpgradeTarget string `json:"upgrade_target,omitempty"`
+	Upgrading          bool   `json:"upgrading"`
+	UpgradeStage       string `json:"upgrade_stage,omitempty"`
+	UpgradeTarget      string `json:"upgrade_target,omitempty"`
+	UpgradeError       string `json:"upgrade_error,omitempty"`
+	AgentLatestVersion string `json:"agent_latest_version,omitempty"`
+	AgentOutdated      bool   `json:"agent_outdated"`
 }
 
 // Router builds the gin engine with all routes mounted under /api/v1.
@@ -125,12 +129,16 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	if authStore != nil {
 		jwtKey = authStore.SigningKey()
 	}
-	entryGuard := secentry.NewGuard(settingsStore, authStore, jwtKey, log)
-	r.Use(entryGuard.Middleware())
+		entryGuard := secentry.NewGuard(settingsStore, authStore, jwtKey, log)
+		r.Use(entryGuard.Middleware())
 
-	v1 := r.Group("/api/v1")
-	entryGuard.RegisterRoutes(v1)
-	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, settings: settingsStore, alertMon: alertMon}
+		// Panel security: strict domain access check and force HTTPS redirection.
+		panelGuard := panelsec.NewGuard(settingsStore, log)
+		r.Use(panelGuard.HTTPSMiddleware(), panelGuard.DomainMiddleware())
+
+		v1 := r.Group("/api/v1")
+		entryGuard.RegisterRoutes(v1)
+		h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, settings: settingsStore, certHub: certHub, alertMon: alertMon}
 
 	// ---- Public routes (no auth) ----
 	// Auth login.
@@ -275,6 +283,9 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// Version info: server build + agent upgrade source of truth.
 	authed.GET("/version", h.versionInfo)
 
+	// Panel certificate status & inspection.
+	adminOnly.GET("/system/panel-cert", h.getPanelCertStatus)
+
 	// Agent upgrade.
 	adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
 
@@ -410,6 +421,7 @@ type handlers struct {
 	audit    *audit.Store
 	groups   *groups.Store
 	settings *settings.Store
+	certHub  *cert.Hub
 	alertMon *alert.Monitor
 }
 
@@ -481,17 +493,50 @@ func (h *handlers) loginWithAudit(login gin.HandlerFunc) gin.HandlerFunc {
 
 func (h *handlers) enroll(c *gin.Context) {
 	token := h.reg.IssueEnrollToken()
-	scheme := "http"
-	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-		scheme = "https"
+	serverURL := ""
+	if h.settings != nil {
+		serverURL = h.settings.PanelSecurity().PublicURL
 	}
-	serverURL := fmt.Sprintf("%s://%s", scheme, c.Request.Host)
+	if serverURL == "" {
+		scheme := "http"
+		if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
+			scheme = "https"
+		}
+		serverURL = fmt.Sprintf("%s://%s", scheme, c.Request.Host)
+	}
+	serverURL = strings.TrimRight(serverURL, "/")
 	c.JSON(http.StatusOK, gin.H{
 		"enroll_token": token,
 		"expires_in":   86400,
 		"install":      fmt.Sprintf("curl -kfsSL '%s/install?token=%s' | sudo bash", serverURL, token),
 		"install_win":  fmt.Sprintf("irm '%s/install?os_type=windows^&token=%s' | iex", serverURL, token),
 	})
+}
+
+func (h *handlers) getPanelCertStatus(c *gin.Context) {
+	if h.settings == nil {
+		c.JSON(http.StatusOK, gin.H{"ssl_enabled": false})
+		return
+	}
+	sec := h.settings.PanelSecurity()
+	res := gin.H{
+		"ssl_enabled":   sec.SSLEnabled,
+		"ssl_mode":      sec.SSLMode,
+		"ssl_cert_id":   sec.SSLCertID,
+		"panel_domain":  sec.PanelDomain,
+		"strict_domain": sec.StrictDomain,
+		"force_https":   sec.ForceHTTPS,
+		"public_url":    sec.PublicURL,
+	}
+	if h.certHub != nil || sec.SSLMode == "custom" {
+		cp := panelsec.NewCertProvider(h.settings, h.certHub, nil, h.log)
+		if summary, err := cp.InspectActiveCert(); err == nil && summary != nil {
+			res["cert_info"] = summary
+		} else if err != nil {
+			res["cert_error"] = err.Error()
+		}
+	}
+	c.JSON(http.StatusOK, res)
 }
 
 // ---- Hosts -----------------------------------------------------------
@@ -2037,34 +2082,37 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 	if tags == nil {
 		tags = []string{}
 	}
+	targetVer := agentTargetVersion()
 	dto := HostDTO{
-		ID:              a.ID,
-		Hostname:        a.Hostname,
-		OS:              a.OS,
-		Arch:            a.Arch,
-		Distro:          a.Distro,
-		Version:         a.Version,
-		Status:          a.Status,
-		LastSeen:        a.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
-		Registered:      a.Registered.Format("2006-01-02T15:04:05Z07:00"),
-		Group:           a.Group,
-		Tags:            tags,
-		Uptime:          a.Uptime,
-		CPUCores:        a.CPUCores,
-		MemTotal:        a.MemTotal,
-		InternalIP:      a.InternalIP,
-		PublicIP:        a.PublicIP,
-		Location:        a.Location,
-		Price:           a.Price,
-		Currency:        a.Currency,
-		BillingCycle:    a.BillingCycle,
-		ExpiresAt:       a.ExpiresAt,
-		AutoRenewal:     a.AutoRenewal,
-		TrafficLimitGB:  a.TrafficLimitGB,
-		TrafficCalcType: a.TrafficCalcType,
-		TrafficResetDay: a.TrafficResetDay,
-		RenewalURL:      a.RenewalURL,
-		Notes:           a.Notes,
+		ID:                 a.ID,
+		Hostname:           a.Hostname,
+		OS:                 a.OS,
+		Arch:               a.Arch,
+		Distro:             a.Distro,
+		Version:            a.Version,
+		AgentLatestVersion: targetVer,
+		AgentOutdated:      a.Status == "online" && a.Version != "" && a.Version != targetVer,
+		Status:             a.Status,
+		LastSeen:           a.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
+		Registered:         a.Registered.Format("2006-01-02T15:04:05Z07:00"),
+		Group:              a.Group,
+		Tags:               tags,
+		Uptime:             a.Uptime,
+		CPUCores:           a.CPUCores,
+		MemTotal:           a.MemTotal,
+		InternalIP:         a.InternalIP,
+		PublicIP:           a.PublicIP,
+		Location:           a.Location,
+		Price:              a.Price,
+		Currency:           a.Currency,
+		BillingCycle:       a.BillingCycle,
+		ExpiresAt:          a.ExpiresAt,
+		AutoRenewal:        a.AutoRenewal,
+		TrafficLimitGB:     a.TrafficLimitGB,
+		TrafficCalcType:    a.TrafficCalcType,
+		TrafficResetDay:    a.TrafficResetDay,
+		RenewalURL:         a.RenewalURL,
+		Notes:              a.Notes,
 	}
 	// Surface the real OS uptime and latest metrics
 	if hub := h.reg.Hub(a.ID); hub != nil {
@@ -2085,9 +2133,12 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 		}
 	}
 	if upg := h.reg.GetAgentUpgrade(a.ID); upg != nil {
-		dto.Upgrading = true
+		if upg.Stage != "error" {
+			dto.Upgrading = true
+		}
 		dto.UpgradeStage = upg.Stage
 		dto.UpgradeTarget = upg.TargetVersion
+		dto.UpgradeError = upg.Error
 	}
 	return dto
 }
@@ -2097,24 +2148,27 @@ func toDTO(a *rpc.Agent) HostDTO {
 	if tags == nil {
 		tags = []string{}
 	}
+	targetVer := agentTargetVersion()
 	return HostDTO{
-		ID:         a.ID,
-		Hostname:   a.Hostname,
-		OS:         a.OS,
-		Arch:       a.Arch,
-		Distro:     a.Distro,
-		Version:    a.Version,
-		Status:     a.Status,
-		LastSeen:   a.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
-		Registered: a.Registered.Format("2006-01-02T15:04:05Z07:00"),
-		Group:      a.Group,
-		Tags:       tags,
-		Uptime:     a.Uptime,
-		CPUCores:   a.CPUCores,
-		MemTotal:   a.MemTotal,
-		InternalIP: a.InternalIP,
-		PublicIP:   a.PublicIP,
-		Location:   a.Location,
+		ID:                 a.ID,
+		Hostname:           a.Hostname,
+		OS:                 a.OS,
+		Arch:               a.Arch,
+		Distro:             a.Distro,
+		Version:            a.Version,
+		AgentLatestVersion: targetVer,
+		AgentOutdated:      a.Status == "online" && a.Version != "" && a.Version != targetVer,
+		Status:             a.Status,
+		LastSeen:           a.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
+		Registered:         a.Registered.Format("2006-01-02T15:04:05Z07:00"),
+		Group:              a.Group,
+		Tags:               tags,
+		Uptime:             a.Uptime,
+		CPUCores:           a.CPUCores,
+		MemTotal:           a.MemTotal,
+		InternalIP:         a.InternalIP,
+		PublicIP:           a.PublicIP,
+		Location:           a.Location,
 	}
 }
 

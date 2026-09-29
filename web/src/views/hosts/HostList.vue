@@ -35,6 +35,7 @@ import {
   CheckmarkCircleOutline,
   LayersOutline,
   ArrowUpCircleOutline,
+  AlertCircleOutline,
   GitNetworkOutline,
   CardOutline,
   LinkOutline,
@@ -330,10 +331,13 @@ function handleMenuSelect(key: string, host: Host) {
       message.warning('主机已离线，无法下发在线升级指令')
       return
     }
+    const isOutdated = host.agent_outdated
     dialog.info({
-      title: '升级 Agent 确认',
-      content: `确定将主机 "${host.hostname}" 的 Agent 升级至控制端最新版本吗？\n升级过程中 Agent 将下载最新对应平台二进制，校验并平滑重启服务。`,
-      positiveText: '开始升级',
+      title: isOutdated ? '升级 Agent 确认' : '重装 Agent 确认',
+      content: isOutdated
+        ? `确定将主机 "${host.hostname}" 的 Agent 升级至控制端最新版本 (${host.agent_latest_version || '最新版'}) 吗？\n升级过程中 Agent 将下载最新对应平台二进制，校验并平滑重启服务。`
+        : `当前主机 "${host.hostname}" 的 Agent 已是最新版本 (${host.agent_version || '最新版'})。确定重新下发安装包执行覆盖安装吗？`,
+      positiveText: isOutdated ? '开始升级' : '确认重装',
       negativeText: '取消',
       onPositiveClick: async () => {
         message.loading('正在下发升级指令并等待 Agent 替换重启…', { duration: 6000 })
@@ -395,62 +399,65 @@ function handleMenuSelect(key: string, host: Host) {
   }
 }
 
-const menuOptions = [
-  {
-    label: '运维监控',
-    key: 'detail',
-    icon: () => h(NIcon, null, { default: () => h(PulseOutline) }),
-  },
-  {
-    label: '异地组网 (Tailscale)',
-    key: 'network',
-    icon: () => h(NIcon, { color: '#10b981' }, { default: () => h(GitNetworkOutline) }),
-  },
-  {
-    label: '在线终端',
-    key: 'terminal',
-    icon: () => h(NIcon, null, { default: () => h(TerminalOutline) }),
-  },
-  {
-    label: '文件管理',
-    key: 'files',
-    icon: () => h(NIcon, null, { default: () => h(FolderOutline) }),
-  },
-  {
-    label: 'Docker 管理',
-    key: 'docker',
-    icon: () => h(NIcon, null, { default: () => h(CubeOutline) }),
-  },
-  {
-    label: '推送命令',
-    key: 'exec',
-    icon: () => h(NIcon, null, { default: () => h(PaperPlaneOutline) }),
-  },
-  {
-    label: '财务与规格',
-    key: 'billing',
-    icon: () => h(NIcon, { color: '#6366f1' }, { default: () => h(CardOutline) }),
-  },
-  {
-    type: 'divider',
-    key: 'd1',
-  },
-  {
-    label: '设置分组',
-    key: 'group',
-    icon: () => h(NIcon, null, { default: () => h(LayersOutline) }),
-  },
-  {
-    label: '升级 Agent',
-    key: 'upgrade',
-    icon: () => h(NIcon, { color: '#6366f1' }, { default: () => h(ArrowUpCircleOutline) }),
-  },
-  {
-    label: '解绑主机',
-    key: 'unbind',
-    icon: () => h(NIcon, { color: '#ef4444' }, { default: () => h(TrashOutline) }),
-  },
-]
+function getHostMenuOptions(host: Host) {
+  const isOutdated = host.agent_outdated
+  return [
+    {
+      label: '运维监控',
+      key: 'detail',
+      icon: () => h(NIcon, null, { default: () => h(PulseOutline) }),
+    },
+    {
+      label: '异地组网 (Tailscale)',
+      key: 'network',
+      icon: () => h(NIcon, { color: '#10b981' }, { default: () => h(GitNetworkOutline) }),
+    },
+    {
+      label: '在线终端',
+      key: 'terminal',
+      icon: () => h(NIcon, null, { default: () => h(TerminalOutline) }),
+    },
+    {
+      label: '文件管理',
+      key: 'files',
+      icon: () => h(NIcon, null, { default: () => h(FolderOutline) }),
+    },
+    {
+      label: 'Docker 管理',
+      key: 'docker',
+      icon: () => h(NIcon, null, { default: () => h(CubeOutline) }),
+    },
+    {
+      label: '推送命令',
+      key: 'exec',
+      icon: () => h(NIcon, null, { default: () => h(PaperPlaneOutline) }),
+    },
+    {
+      label: '财务与规格',
+      key: 'billing',
+      icon: () => h(NIcon, { color: '#6366f1' }, { default: () => h(CardOutline) }),
+    },
+    {
+      type: 'divider',
+      key: 'd1',
+    },
+    {
+      label: '设置分组',
+      key: 'group',
+      icon: () => h(NIcon, null, { default: () => h(LayersOutline) }),
+    },
+    {
+      label: isOutdated ? '升级 Agent (可升级)' : '重装 Agent',
+      key: 'upgrade',
+      icon: () => h(NIcon, { color: isOutdated ? '#6366f1' : '#64748b' }, { default: () => h(isOutdated ? ArrowUpCircleOutline : RefreshOutline) }),
+    },
+    {
+      label: '解绑主机',
+      key: 'unbind',
+      icon: () => h(NIcon, { color: '#ef4444' }, { default: () => h(TrashOutline) }),
+    },
+  ]
+}
 
 const copied = ref(false)
 const copiedWin = ref(false)
@@ -517,7 +524,7 @@ async function copyIp(ip?: string) {
   }
 }
 
-const isAnyUpgrading = computed(() => store.hosts.some((h) => h.upgrading))
+const isAnyUpgrading = computed(() => store.hosts.some((h) => h.upgrading && h.upgrade_stage !== 'error'))
 let pollTimer: any = null
 
 function checkPolling() {
@@ -664,12 +671,20 @@ onUnmounted(() => {
             <!-- 3. 开机状态 Pill 标签 -->
             <div class="col-status">
               <div
-                v-if="host.upgrading"
+                v-if="host.upgrading && host.upgrade_stage !== 'error'"
                 class="uptime-pill is-upgrading"
                 :title="`Agent 正在升级至 ${host.upgrade_target || '最新版'}${host.upgrade_stage ? ` (${formatUpgradeStage(host.upgrade_stage)})` : ''}`"
               >
                 <NSpin :size="12" style="margin-right: 4px;" />
                 升级中{{ host.upgrade_stage ? ` (${formatUpgradeStage(host.upgrade_stage)})` : '' }}
+              </div>
+              <div
+                v-else-if="host.upgrade_stage === 'error'"
+                class="uptime-pill is-error"
+                :title="`Agent 升级失败: ${host.upgrade_error || '未知错误'}`"
+              >
+                <NIcon :component="AlertCircleOutline" style="margin-right: 4px;" />
+                升级失败
               </div>
               <div
                 v-else
@@ -766,7 +781,7 @@ onUnmounted(() => {
               <NDropdown
                 trigger="click"
                 placement="bottom-end"
-                :options="menuOptions"
+                :options="getHostMenuOptions(host)"
                 @select="(key: string) => handleMenuSelect(key, host)"
               >
                 <button class="more-action-btn" title="更多操作">
@@ -993,6 +1008,11 @@ onUnmounted(() => {
               &.is-upgrading {
                 background-color: rgba(99, 102, 241, 0.12);
                 color: #6366f1;
+              }
+
+              &.is-error {
+                background-color: rgba(239, 68, 68, 0.12);
+                color: #ef4444;
               }
             }
           }

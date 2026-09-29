@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -155,11 +156,28 @@ var Definitions = []Definition{
 	{Key: "security.secure_entry_enabled", Scope: ScopeSystem, Kind: KindBool, Title: "安全入口", Default: false},
 	{Key: "security.secure_entry_path", Scope: ScopeSystem, Kind: KindString, Title: "安全入口路径", Default: "",
 		MaxLen: 64, Validate: validateSecureEntryPath},
-	// 测试计划：开启后，控制端升级（重跑 deploy/install.sh）会跟踪预发布版本
-	// （含 pre-release 的 GitHub Release）；关闭则只跟踪正式版。system 域，
-	// 管理员专属。install.sh 在升级时从 <data>/settings.json 的 system 域读取。
-	{Key: "system.join_beta_program", Scope: ScopeSystem, Kind: KindBool, Title: "加入测试计划", Default: false},
-}
+		// 测试计划：开启后，控制端升级（重跑 deploy/install.sh）会跟踪预发布版本
+		// （含 pre-release 的 GitHub Release）；关闭则只跟踪正式版。system 域，
+		// 管理员专属。install.sh 在升级时从 <data>/settings.json 的 system 域读取。
+		{Key: "system.join_beta_program", Scope: ScopeSystem, Kind: KindBool, Title: "加入测试计划", Default: false},
+
+		// 面板域名与公网访问地址（system 域，管理员专属）：
+		// 绑定域名、未绑定域名限制（禁止直接 IP 访问）、公网访问地址
+		{Key: "server.public_url", Scope: ScopeSystem, Kind: KindString, Title: "面板公网访问地址", Default: "",
+			MaxLen: 256, Validate: validatePublicURL},
+		{Key: "security.panel_domain", Scope: ScopeSystem, Kind: KindString, Title: "面板绑定域名", Default: "",
+			MaxLen: 253, Validate: validateDomainName},
+		{Key: "security.panel_domain_strict", Scope: ScopeSystem, Kind: KindBool, Title: "禁止未绑定域名/直接IP访问", Default: false},
+
+		// 面板 SSL / HTTPS（system 域，管理员专属）：
+		{Key: "security.panel_ssl_enabled", Scope: ScopeSystem, Kind: KindBool, Title: "面板 SSL / HTTPS", Default: false},
+		{Key: "security.panel_ssl_mode", Scope: ScopeSystem, Kind: KindEnum, Title: "证书来源", Default: "cert_center",
+			Enum: []string{"cert_center", "custom"}},
+		{Key: "security.panel_ssl_cert_id", Scope: ScopeSystem, Kind: KindString, Title: "证书中心证书 ID", Default: "", MaxLen: 64},
+		{Key: "security.panel_ssl_cert_pem", Scope: ScopeSystem, Kind: KindString, Title: "自定义证书 (PEM)", Default: "", MaxLen: 65536},
+		{Key: "security.panel_ssl_key_pem", Scope: ScopeSystem, Kind: KindString, Title: "自定义私钥 (PEM)", Default: "", MaxLen: 65536},
+		{Key: "security.panel_force_https", Scope: ScopeSystem, Kind: KindBool, Title: "强制 HTTPS 访问", Default: false},
+	}
 
 // validateAbsPath accepts an empty value (OS default applies) or an absolute
 // path: Unix-style or a Windows drive path.
@@ -192,6 +210,50 @@ func validateSecureEntryPath(v any) error {
 	}
 	if !secureEntryPathRe.MatchString(s) {
 		return errors.New("安全入口路径必须为 6~64 位字母、数字、_、-，且首字符为字母或数字")
+	}
+	return nil
+}
+
+// validateDomainName 校验面板绑定域名（RFC-1035，小写规范）。
+func validateDomainName(v any) error {
+	s, _ := v.(string)
+	if s == "" {
+		return nil
+	}
+	s = strings.TrimSpace(strings.ToLower(s))
+	if strings.Contains(s, "://") || strings.Contains(s, ":") {
+		return errors.New("面板域名必须是纯域名（如 panel.example.com），无需包含 http(s):// 或端口")
+	}
+	if len(s) > 253 {
+		return errors.New("域名长度不能超过 253 个字符")
+	}
+	for _, label := range strings.Split(s, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return errors.New("域名段长度必须在 1~63 个字符之间")
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return errors.New("域名段不能以连字符 '-' 开头或结尾")
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return errors.New("域名只允许包含字母、数字与连字符 '-'")
+			}
+		}
+	}
+	return nil
+}
+
+// validatePublicURL 校验面板公网访问基准地址。
+func validatePublicURL(v any) error {
+	s, _ := v.(string)
+	if s == "" {
+		return nil
+	}
+	s = strings.TrimSpace(s)
+	u, err := url.Parse(s)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return errors.New("公网访问地址必须是有效的 http:// 或 https:// URL，例如 https://panel.example.com:18789")
 	}
 	return nil
 }
@@ -293,6 +355,19 @@ type TerminalPrefs struct {
 // AppearancePrefs is the typed view of the appearance.* keys for one user.
 type AppearancePrefs struct {
 	ThemeMode string `json:"theme_mode"`
+}
+
+// PanelSecurityConfig is the typed view of panel domain and SSL security settings.
+type PanelSecurityConfig struct {
+	PublicURL    string `json:"public_url"`
+	PanelDomain  string `json:"panel_domain"`
+	StrictDomain bool   `json:"strict_domain"`
+	SSLEnabled   bool   `json:"ssl_enabled"`
+	SSLMode      string `json:"ssl_mode"`
+	SSLCertID    string `json:"ssl_cert_id"`
+	SSLCertPEM   string `json:"ssl_cert_pem"`
+	SSLKeyPEM    string `json:"ssl_key_pem"`
+	ForceHTTPS   bool   `json:"force_https"`
 }
 
 // document is the on-disk shape of settings.json.
@@ -646,5 +721,20 @@ func (s *Store) Terminal(username string) TerminalPrefs {
 func (s *Store) Appearance(username string) AppearancePrefs {
 	var p AppearancePrefs
 	s.decode(ScopeUser, username, "appearance.theme_mode", &p.ThemeMode)
+	return p
+}
+
+// PanelSecurity returns the typed panel domain and SSL security settings.
+func (s *Store) PanelSecurity() PanelSecurityConfig {
+	var p PanelSecurityConfig
+	s.decode(ScopeSystem, "", "server.public_url", &p.PublicURL)
+	s.decode(ScopeSystem, "", "security.panel_domain", &p.PanelDomain)
+	s.decode(ScopeSystem, "", "security.panel_domain_strict", &p.StrictDomain)
+	s.decode(ScopeSystem, "", "security.panel_ssl_enabled", &p.SSLEnabled)
+	s.decode(ScopeSystem, "", "security.panel_ssl_mode", &p.SSLMode)
+	s.decode(ScopeSystem, "", "security.panel_ssl_cert_id", &p.SSLCertID)
+	s.decode(ScopeSystem, "", "security.panel_ssl_cert_pem", &p.SSLCertPEM)
+	s.decode(ScopeSystem, "", "security.panel_ssl_key_pem", &p.SSLKeyPEM)
+	s.decode(ScopeSystem, "", "security.panel_force_https", &p.ForceHTTPS)
 	return p
 }

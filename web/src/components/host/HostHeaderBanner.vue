@@ -6,6 +6,9 @@ import {
   ChevronUpOutline,
   ChevronDownOutline,
   ArrowUpCircleOutline,
+  AlertCircleOutline,
+  CheckmarkCircleOutline,
+  RefreshOutline,
   CardOutline,
 } from '@vicons/ionicons5'
 import OsLogo from '../common/OsLogo.vue'
@@ -33,6 +36,38 @@ const powering = ref(false)
 const upgrading = ref(false)
 const showBillingModal = ref(false)
 const tailscaleIp = ref<string>('')
+
+// 升级状态与版本比对
+const isUpgrading = computed(() => props.host.upgrading && props.host.upgrade_stage !== 'error')
+const isUpgradeError = computed(() => props.host.upgrade_stage === 'error')
+const isAgentOutdated = computed(() => {
+  if (props.host.agent_outdated !== undefined) {
+    return props.host.agent_outdated
+  }
+  const target = props.host.agent_latest_version
+  return !!(props.host.status === 'online' && props.host.agent_version && target && props.host.agent_version !== target)
+})
+const isAgentLatest = computed(() => {
+  return props.host.status === 'online' && !isAgentOutdated.value && !isUpgrading.value && !isUpgradeError.value && !!props.host.agent_version
+})
+
+const upgradeBtnText = computed(() => {
+  if (upgrading.value) return '执行中'
+  if (isUpgradeError.value) return '重试'
+  if (isAgentOutdated.value) return '升级'
+  return '重装'
+})
+
+const upgradeBtnIcon = computed(() => {
+  if (isAgentOutdated.value) return ArrowUpCircleOutline
+  return RefreshOutline
+})
+
+const upgradeBtnTooltip = computed(() => {
+  if (isUpgradeError.value) return '重试 Agent 升级'
+  if (isAgentOutdated.value) return `一键热升级 Agent 到控制端最新版本 (${props.host.agent_latest_version || '最新版'})`
+  return '当前已是最新版，点击可重新下发覆盖安装'
+})
 
 async function fetchTailscaleIp() {
   try {
@@ -287,27 +322,71 @@ const expiryTooltip = computed(() => {
             <div class="agent-version-wrap">
               <span class="spec-value mono-font">{{ host.agent_version || '-' }}</span>
               <span
-                v-if="host.upgrading"
+                v-if="isUpgrading"
                 class="upgrading-badge"
-                :title="`Agent 正在升级至 ${host.upgrade_target || '最新版'}${host.upgrade_stage ? ` (${formatUpgradeStage(host.upgrade_stage)})` : ''}`"
+                :title="`Agent 正在升级至 ${host.upgrade_target || host.agent_latest_version || '最新版'}${host.upgrade_stage ? ` (${formatUpgradeStage(host.upgrade_stage)})` : ''}`"
               >
                 <NSpin :size="12" style="margin-right: 4px;" />
                 <span>{{ host.upgrade_stage ? formatUpgradeStage(host.upgrade_stage) : '升级中' }}</span>
               </span>
-              <NPopconfirm v-else-if="isAdmin && host.status === 'online'" @positive-click="handleUpgradeAgent">
+              <span
+                v-else-if="isUpgradeError"
+                class="upgrading-badge is-error"
+                :title="`升级失败: ${host.upgrade_error || '未知错误'}`"
+              >
+                <NIcon size="12" :component="AlertCircleOutline" style="margin-right: 4px;" />
+                <span>升级失败</span>
+              </span>
+              <span
+                v-else-if="isAgentOutdated"
+                class="upgrading-badge is-outdated"
+                :title="`检测到新版本，可升级至 ${host.agent_latest_version || '最新版'}`"
+              >
+                <NIcon size="12" :component="ArrowUpCircleOutline" style="margin-right: 4px;" />
+                <span>可升级</span>
+              </span>
+              <span
+                v-else-if="isAgentLatest"
+                class="upgrading-badge is-latest"
+                title="当前 Agent 已是控制端最新版本"
+              >
+                <NIcon size="12" :component="CheckmarkCircleOutline" style="margin-right: 4px;" />
+                <span>已是最新</span>
+              </span>
+              <NPopconfirm
+                v-if="isAdmin && host.status === 'online' && !isUpgrading"
+                @positive-click="handleUpgradeAgent"
+              >
                 <template #trigger>
                   <button
                     class="upgrade-agent-btn"
-                    :class="{ 'is-loading': upgrading }"
+                    :class="{
+                      'is-loading': upgrading,
+                      'is-error': isUpgradeError,
+                      'is-outdated': isAgentOutdated,
+                      'is-latest': isAgentLatest,
+                    }"
                     :disabled="upgrading"
-                    title="一键热升级 Agent 到控制端最新版本"
+                    :title="upgradeBtnTooltip"
                   >
-                    <NIcon size="13" :component="ArrowUpCircleOutline" />
-                    <span>{{ upgrading ? '升级中' : '升级' }}</span>
+                    <NIcon size="13" :component="upgradeBtnIcon" />
+                    <span>{{ upgradeBtnText }}</span>
                   </button>
                 </template>
-                确认将主机 {{ host.hostname }} 的 Agent 升级至控制端最新版本？<br/>
-                升级过程将下载适配该系统架构的二进制，校验并平滑重启服务。
+                <div style="line-height: 1.6;">
+                  <template v-if="isUpgradeError">
+                    确认重新尝试为主机 <strong>{{ host.hostname }}</strong> 升级 Agent？<br />
+                    <span class="muted" style="font-size: 12px;">将重新下发最新安装包并平滑替换重启。</span>
+                  </template>
+                  <template v-else-if="isAgentOutdated">
+                    确认将主机 <strong>{{ host.hostname }}</strong> 的 Agent 升级至控制端最新版本（{{ host.agent_latest_version || '最新版' }}）？<br />
+                    <span class="muted" style="font-size: 12px;">升级过程将平滑重启 Agent 服务，无假掉线告警。</span>
+                  </template>
+                  <template v-else>
+                    当前主机 Agent 已是最新版本（{{ host.agent_version }}），确认重新下发覆盖安装？<br />
+                    <span class="muted" style="font-size: 12px;">此操作将强制重新下载最新二进制并热重启。</span>
+                  </template>
+                </div>
               </NPopconfirm>
             </div>
           </div>
@@ -532,6 +611,21 @@ const expiryTooltip = computed(() => {
           color: #6366f1;
           font-size: 11px;
           font-weight: 500;
+
+          &.is-error {
+            background: rgba(239, 68, 68, 0.12);
+            color: #ef4444;
+          }
+
+          &.is-outdated {
+            background: rgba(245, 158, 11, 0.14);
+            color: #d97706;
+          }
+
+          &.is-latest {
+            background: rgba(16, 185, 129, 0.12);
+            color: #10b981;
+          }
         }
 
         .upgrade-agent-btn {
@@ -552,6 +646,29 @@ const expiryTooltip = computed(() => {
           &:hover:not(:disabled) {
             background: #6366f1;
             color: #ffffff;
+          }
+
+          &.is-error {
+            border-color: rgba(239, 68, 68, 0.35);
+            background: rgba(239, 68, 68, 0.1);
+            color: #ef4444;
+
+            &:hover:not(:disabled) {
+              background: #ef4444;
+              color: #ffffff;
+            }
+          }
+
+          &.is-latest {
+            border-color: rgba(148, 163, 184, 0.28);
+            background: transparent;
+            color: #64748b;
+
+            &:hover:not(:disabled) {
+              background: rgba(148, 163, 184, 0.12);
+              color: #334155;
+              border-color: rgba(148, 163, 184, 0.45);
+            }
           }
 
           &.is-loading,

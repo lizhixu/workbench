@@ -183,3 +183,82 @@ func TestUpgradeAgentAttachesSignature(t *testing.T) {
 		t.Errorf("expected signature %s, got %s", expectedSig, string(receivedSig))
 	}
 }
+
+func TestUpgradeHostDTOStateOnError(t *testing.T) {
+	log := slog.Default()
+	reg := rpc.NewRegistry("", log)
+
+	req := &agentpb.RegisterRequest{
+		EnrollToken:  "test-enroll",
+		Hostname:     "error-box",
+		Os:           "linux",
+		Arch:         "amd64",
+		AgentVersion: "0.0.1",
+	}
+	token := reg.IssueEnrollToken()
+	req.EnrollToken = token
+	_, resp, err := reg.Register(context.Background(), req, "")
+	if err != nil || !resp.GetOk() {
+		t.Fatalf("register failed: %v", err)
+	}
+
+	authStore, err := auth.NewStore(t.TempDir(), "test-jwt-key")
+	if err != nil {
+		t.Fatalf("auth store: %v", err)
+	}
+	adminToken, _, err := authStore.Authenticate("admin", "admin")
+	if err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+
+	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	// 1. Mark in-progress
+	reg.SetAgentUpgrading(resp.GetAgentId(), "v1.0.0")
+	reg.SetAgentUpgradeProgress(resp.GetAgentId(), "downloading", "")
+
+	httpReq := httptest.NewRequest("GET", "/api/v1/hosts/"+resp.GetAgentId(), nil)
+	httpReq.Header.Set("Authorization", "Bearer "+adminToken)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httpReq)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var res map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+	data := res["data"].(map[string]any)
+	if data["upgrading"] != true {
+		t.Errorf("expected upgrading=true while downloading, got %v", data["upgrading"])
+	}
+	if data["upgrade_stage"] != "downloading" {
+		t.Errorf("expected stage=downloading, got %v", data["upgrade_stage"])
+	}
+	if data["agent_outdated"] != true {
+		t.Errorf("expected agent_outdated=true for version 0.0.1, got %v", data["agent_outdated"])
+	}
+	if data["agent_latest_version"] != CurrentAgentVersion {
+		t.Errorf("expected agent_latest_version=%s, got %v", CurrentAgentVersion, data["agent_latest_version"])
+	}
+
+	// 2. Mark error
+	reg.SetAgentUpgradeProgress(resp.GetAgentId(), "error", "open binary: text file busy")
+	w2 := httptest.NewRecorder()
+	httpReq2 := httptest.NewRequest("GET", "/api/v1/hosts/"+resp.GetAgentId(), nil)
+	httpReq2.Header.Set("Authorization", "Bearer "+adminToken)
+	router.ServeHTTP(w2, httpReq2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w2.Code)
+	}
+	var res2 map[string]any
+	_ = json.Unmarshal(w2.Body.Bytes(), &res2)
+	data2 := res2["data"].(map[string]any)
+	if data2["upgrading"] == true {
+		t.Errorf("expected upgrading=false when stage is error, got %v", data2["upgrading"])
+	}
+	if data2["upgrade_stage"] != "error" {
+		t.Errorf("expected stage=error, got %v", data2["upgrade_stage"])
+	}
+	if data2["upgrade_error"] != "open binary: text file busy" {
+		t.Errorf("expected upgrade_error to match, got %v", data2["upgrade_error"])
+	}
+}

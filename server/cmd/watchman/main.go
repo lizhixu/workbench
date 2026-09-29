@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -34,6 +35,7 @@ import (
 	"watchman/server/internal/install"
 	"watchman/server/internal/metrics"
 	"watchman/server/internal/network"
+	"watchman/server/internal/panelsec"
 	"watchman/server/internal/policy"
 	"watchman/server/internal/release"
 	"watchman/server/internal/rpc"
@@ -65,6 +67,8 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "TLS private key for gRPC")
 	httpTLS := flag.Bool("http-tls", false, "serve HTTPS on -http using -tls-cert/-tls-key")
 	resetSecureEntry := flag.Bool("reset-secure-entry", false, "lockout recovery: disable the secure entry (安全入口) by flipping security.secure_entry_enabled to false in -data, then exit")
+	resetPanelSSL := flag.Bool("reset-panel-ssl", false, "lockout recovery: disable panel SSL/HTTPS by flipping security.panel_ssl_enabled and security.panel_force_https to false in -data, then exit")
+	resetPanelDomain := flag.Bool("reset-panel-domain", false, "lockout recovery: disable strict domain check and clear panel domain by flipping security.panel_domain_strict to false and security.panel_domain to empty in -data, then exit")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -84,6 +88,42 @@ func main() {
 			os.Exit(1)
 		}
 		log.Info("secure entry disabled; panel login is open again")
+		os.Exit(0)
+	}
+
+	// Panel SSL lockout recovery: runs before any other init and exits.
+	if *resetPanelSSL {
+		st, err := settings.NewStore(*dataDir, log)
+		if err != nil {
+			log.Error("settings store init", "err", err)
+			os.Exit(1)
+		}
+		if err := st.SetMany(settings.ScopeSystem, "", map[string]json.RawMessage{
+			"security.panel_ssl_enabled": json.RawMessage("false"),
+			"security.panel_force_https": json.RawMessage("false"),
+		}); err != nil {
+			log.Error("reset panel ssl", "err", err)
+			os.Exit(1)
+		}
+		log.Info("panel SSL disabled and force HTTPS turned off; HTTP login is restored")
+		os.Exit(0)
+	}
+
+	// Panel domain lockout recovery: runs before any other init and exits.
+	if *resetPanelDomain {
+		st, err := settings.NewStore(*dataDir, log)
+		if err != nil {
+			log.Error("settings store init", "err", err)
+			os.Exit(1)
+		}
+		if err := st.SetMany(settings.ScopeSystem, "", map[string]json.RawMessage{
+			"security.panel_domain_strict": json.RawMessage("false"),
+			"security.panel_domain":        json.RawMessage(`""`),
+		}); err != nil {
+			log.Error("reset panel domain", "err", err)
+			os.Exit(1)
+		}
+		log.Info("strict panel domain check disabled and panel domain cleared; direct IP access is restored")
 		os.Exit(0)
 	}
 
@@ -381,21 +421,38 @@ func main() {
 		Handler:           http.MaxBytesHandler(hr, 512<<20),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	go func() {
-		if *httpTLS {
-			if !tlsEnabled {
-				log.Error("-http-tls requires -tls-cert and -tls-key")
-				os.Exit(1)
-			}
-			log.Info("https server listening", "addr", *httpAddr)
-			if err := hs.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Error("https serve", "err", err)
-				cancel()
-			}
-			return
+
+	// HTTP/HTTPS dynamic listener with TLS connection sniffing.
+	// When panel SSL is enabled in Settings, incoming TLS connections are served
+	// via HTTPS using the dynamic certificate provider, while plaintext requests
+	// can be automatically 301 redirected to HTTPS on the same port without restart.
+	httpLis, err := net.Listen("tcp", *httpAddr)
+	if err != nil {
+		log.Error("http listen", "err", err)
+		os.Exit(1)
+	}
+
+	var fallbackCert *tls.Certificate
+	if tlsEnabled {
+		c, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err == nil {
+			fallbackCert = &c
+		} else {
+			log.Warn("load gRPC tls cert pair for panel fallback failed", "err", err)
 		}
-		log.Info("http server listening", "addr", *httpAddr)
-		if err := hs.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	}
+	certProvider := panelsec.NewCertProvider(settingsStore, certHub, fallbackCert, log)
+	panelTLSConfig := &tls.Config{
+		GetCertificate: certProvider.GetCertificate,
+	}
+	if *httpTLS && fallbackCert != nil {
+		panelTLSConfig.Certificates = []tls.Certificate{*fallbackCert}
+	}
+	dynamicHTTPListener := panelsec.NewDynamicListener(httpLis, panelTLSConfig, settingsStore, log)
+
+	go func() {
+		log.Info("http/https server listening", "addr", *httpAddr)
+		if err := hs.Serve(dynamicHTTPListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http serve", "err", err)
 			cancel()
 		}

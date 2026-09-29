@@ -122,7 +122,7 @@ const severityOptions = [
 ]
 
 const filteredEvents = computed(() => {
-  return notifStore.events.filter((e) => {
+  const list = notifStore.events.filter((e) => {
     // Status filter
     if (statusFilter.value === 'unread' && e.resolved) return false
     if (statusFilter.value === 'resolved' && !e.resolved) return false
@@ -141,6 +141,10 @@ const filteredEvents = computed(() => {
 
     return true
   })
+  // Newest first.
+  const ts = (v?: string) => Date.parse(v || '') || 0
+  list.sort((a, b) => ts(b.fired_at) - ts(a.fired_at))
+  return list
 })
 
 // Changing a filter shrinks the result set; staying on a now-empty page would

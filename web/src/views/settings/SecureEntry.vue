@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, onActivated, onMounted, reactive, ref } from 'vue'
 import {
-  NAlert, NButton, NForm, NFormItem, NIcon, NInput, NInputGroup,
-  NPopconfirm, NSpace, NSwitch, useMessage,
+  NAlert, NButton, NCard, NForm, NFormItem, NIcon, NInput, NInputGroup,
+  NPopconfirm, NSpace, NSpin, NSwitch, useMessage,
 } from 'naive-ui'
 import { KeyOutline, RefreshOutline, CopyOutline, DiceOutline } from '@vicons/ionicons5'
 import {
@@ -95,83 +95,117 @@ onActivated(load)
 </script>
 
 <template>
-  <div class="secure-entry page-flex-column">
-    <NAlert type="info" :show-icon="true" class="tip-hint" style="flex-shrink: 0; margin-bottom: 12px">
-      开启安全入口后，面板只能通过下方唯一的秘密入口地址访问：访问该地址会签发通行凭证，之后才能看到登录页并发起登录。
-      直接访问面板首页或直接调用登录接口将一律返回 404，扫描器无法发现面板存在。Agent 安装/注册、应用 webhook 等基础设施接口不受影响。
-    </NAlert>
+  <NCard :bordered="false" size="small">
+    <template #header>
+      <span style="font-size: 16px; font-weight: 700">
+        <NIcon style="vertical-align: middle; margin-right: 6px"><KeyOutline /></NIcon>
+        安全入口
+      </span>
+    </template>
+    <template #header-extra>
+      <NButton size="small" quaternary :loading="loading" @click="load">
+        <template #icon><NIcon><RefreshOutline /></NIcon></template>
+        重新加载
+      </NButton>
+    </template>
 
-    <NAlert
-      v-if="form.enabled"
-      type="warning" :show-icon="true" style="flex-shrink: 0; margin-bottom: 12px"
-    >
-      安全入口已启用。请务必收藏好入口地址——<b>忘记入口路径将无法登录面板</b>。
-      恢复方法：在控制机上执行
-      <code>watchman-server -reset-secure-entry -data &lt;数据目录&gt;</code>
-     （默认数据目录 /opt/watchman/data），或直接编辑数据目录下的 settings.json
-      将 security.secure_entry_enabled 改为 false 后重启。
-      注意：启用后你当前浏览器也需要访问一次入口地址签发凭证，否则刷新页面将看到 404（你的登录会话本身不受影响）。
-    </NAlert>
+    <NSpin :show="loading">
+      <NSpace vertical :size="14">
+        <p class="muted tip-hint">
+          开启安全入口后，面板只能通过下方唯一的秘密入口地址访问：访问该地址会签发通行凭证，之后才能看到登录页并发起登录。
+          直接访问面板首页或直接调用登录接口将一律返回 404，扫描器无法发现面板存在。Agent 安装/注册、应用 webhook 等基础设施接口不受影响。
+        </p>
 
-    <NForm :disabled="loading" label-placement="left" label-width="120px" style="max-width: 640px; flex-shrink: 0">
-      <NFormItem label="启用安全入口">
-        <NSwitch v-model:value="form.enabled" />
-      </NFormItem>
-      <NFormItem label="入口路径" :feedback="validate() || undefined" :validation-status="validate() ? 'error' : undefined">
-        <NInputGroup>
-          <NInput
-            v-model:value="form.path"
-            placeholder="6~64 位字母/数字/_/-，如 k9xQ2mZ7aB4cD8eF"
-            :maxlength="64"
-            clearable
-          />
-          <NButton @click="genPath">
-            <template #icon><NIcon><DiceOutline /></NIcon></template>
-            随机生成
-          </NButton>
-        </NInputGroup>
-      </NFormItem>
-      <NFormItem label=" ">
-        <NSpace>
-          <NPopconfirm @positive-click="doSave">
-            <template #trigger>
-              <NButton type="primary" :loading="saving || loading">
-                <template #icon><NIcon><KeyOutline /></NIcon></template>
-                保存
+        <NAlert v-if="form.enabled" type="warning" :show-icon="true">
+          安全入口已启用。请务必收藏好入口地址——<b>忘记入口路径将无法登录面板</b>。
+          恢复方法：在控制机上执行
+          <code>watchman-server -reset-secure-entry -data &lt;数据目录&gt;</code>
+          （默认数据目录 /opt/watchman/data），或直接编辑数据目录下的 settings.json
+          将 security.secure_entry_enabled 改为 false 后重启。
+          注意：启用后你当前浏览器也需要访问一次入口地址签发凭证，否则刷新页面将看到 404（你的登录会话本身不受影响）。
+        </NAlert>
+
+        <NForm :disabled="loading" label-placement="left" label-width="140px" style="max-width: 640px">
+          <NFormItem label="启用安全入口">
+            <NSwitch v-model:value="form.enabled" />
+          </NFormItem>
+          <NFormItem label="入口路径" :feedback="validate() || undefined" :validation-status="validate() ? 'error' : undefined">
+            <NInputGroup>
+              <NInput
+                v-model:value="form.path"
+                placeholder="6~64 位字母/数字/_/-，如 k9xQ2mZ7aB4cD8eF"
+                :maxlength="64"
+                clearable
+              />
+              <NButton @click="genPath">
+                <template #icon><NIcon><DiceOutline /></NIcon></template>
+                随机生成
               </NButton>
-            </template>
-            <template v-if="form.enabled">
-              开启后只能通过秘密入口地址登录面板，直接访问首页将返回 404。确认已记下入口路径吗？
-            </template>
-            <template v-else>确认保存安全入口配置？</template>
-          </NPopconfirm>
-          <NButton :loading="loading" @click="load">
-            <template #icon><NIcon><RefreshOutline /></NIcon></template>
-            重新加载
-          </NButton>
-        </NSpace>
-      </NFormItem>
-    </NForm>
+            </NInputGroup>
+          </NFormItem>
+          <NFormItem label=" ">
+            <NPopconfirm @positive-click="doSave">
+              <template #trigger>
+                <NButton type="primary" :loading="saving || loading">
+                  <template #icon><NIcon><KeyOutline /></NIcon></template>
+                  保存
+                </NButton>
+              </template>
+              <template v-if="form.enabled">
+                开启后只能通过秘密入口地址登录面板，直接访问首页将返回 404。确认已记下入口路径吗？
+              </template>
+              <template v-else>确认保存安全入口配置？</template>
+            </NPopconfirm>
+          </NFormItem>
+        </NForm>
 
-    <NAlert
-      v-if="form.enabled && entryUrl"
-      type="success" :show-icon="true" style="flex-shrink: 0; margin-top: 4px; max-width: 640px"
-    >
-      <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
-        <span>秘密入口地址：</span>
-        <code style="word-break: break-all">{{ entryUrl }}</code>
-        <NButton size="small" secondary @click="copyUrl" :disabled="!entryUrl">
-          <template #icon><NIcon><CopyOutline /></NIcon></template>
-          复制
-        </NButton>
-      </div>
-    </NAlert>
-  </div>
+        <NAlert
+          v-if="form.enabled && entryUrl"
+          type="success" :show-icon="true" style="max-width: 640px"
+        >
+          <div class="entry-url-row">
+            <span>秘密入口地址：</span>
+            <code>{{ entryUrl }}</code>
+            <NButton size="small" secondary @click="copyUrl" :disabled="!entryUrl">
+              <template #icon><NIcon><CopyOutline /></NIcon></template>
+              复制
+            </NButton>
+          </div>
+        </NAlert>
+      </NSpace>
+    </NSpin>
+  </NCard>
 </template>
 
 <style scoped lang="scss">
-.secure-entry {
-  height: 100%;
-  overflow-y: auto;
+.muted {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.entry-url-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+
+  code {
+    word-break: break-all;
+    padding: 2px 6px;
+    background: rgba(0, 0, 0, 0.06);
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 12px;
+    color: var(--primary-color, #18a058);
+  }
+}
+
+.n-alert code {
+  padding: 2px 6px;
+  margin: 2px 4px;
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 12px;
 }
 </style>

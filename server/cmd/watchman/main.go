@@ -70,7 +70,7 @@ func main() {
 	httpTLS := flag.Bool("http-tls", false, "serve HTTPS on -http using -tls-cert/-tls-key")
 	resetSecureEntry := flag.Bool("reset-secure-entry", false, "lockout recovery: disable the secure entry (安全入口) by flipping security.secure_entry_enabled to false in -data, then exit")
 	resetPanelSSL := flag.Bool("reset-panel-ssl", false, "lockout recovery: disable panel SSL/HTTPS by flipping security.panel_ssl_enabled and security.panel_force_https to false in -data, then exit")
-	resetPanelDomain := flag.Bool("reset-panel-domain", false, "lockout recovery: disable strict domain check and clear panel domain by flipping security.panel_domain_strict to false and security.panel_domain to empty in -data, then exit")
+	resetPanelDomain := flag.Bool("reset-panel-domain", false, "lockout recovery: unbind the panel domain (binding a domain auto-enables strict domain check) by clearing security.panel_domain in -data, then exit")
 	showVersion := flag.Bool("version", false, "print watchman-server version and exit")
 	flag.Parse()
 
@@ -125,13 +125,12 @@ func main() {
 			os.Exit(1)
 		}
 		if err := st.SetMany(settings.ScopeSystem, "", map[string]json.RawMessage{
-			"security.panel_domain_strict": json.RawMessage("false"),
-			"security.panel_domain":        json.RawMessage(`""`),
+			"security.panel_domain": json.RawMessage(`""`),
 		}); err != nil {
 			log.Error("reset panel domain", "err", err)
 			os.Exit(1)
 		}
-		log.Info("strict panel domain check disabled and panel domain cleared; direct IP access is restored")
+		log.Info("panel domain unbound (strict domain check is automatic when bound); direct IP access is restored")
 		os.Exit(0)
 	}
 

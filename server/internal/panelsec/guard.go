@@ -62,8 +62,11 @@ func isLoopback(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// DomainMiddleware checks the Host header when strict domain check is enabled.
-// If direct IP or unauthorized domain access is detected, it blocks with 403 Forbidden.
+// DomainMiddleware checks the Host header when a panel domain is bound.
+// Binding a domain automatically enables strict domain checking: the panel
+// can then only be reached through that domain (loopback is always allowed
+// for local maintenance; infrastructure paths such as agent enrollments are
+// exempt). With no domain bound the panel stays reachable by IP.
 func (g *Guard) DomainMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if g.settings == nil {
@@ -71,7 +74,7 @@ func (g *Guard) DomainMiddleware() gin.HandlerFunc {
 			return
 		}
 		sec := g.settings.PanelSecurity()
-		if !sec.StrictDomain || sec.PanelDomain == "" {
+		if sec.PanelDomain == "" {
 			c.Next()
 			return
 		}

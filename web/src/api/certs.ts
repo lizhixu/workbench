@@ -105,3 +105,36 @@ export function bindProxy(appId: string, req: ProxyBindRequest) {
 export function unbindProxy(appId: string) {
   return unwrap<{ ok: boolean }>(http.delete(`/apps/${appId}/proxy`))
 }
+
+// ---- 面板一键证书签发 ----
+
+export interface PanelCertJob {
+  id: string
+  mode: 'domain' | 'ip'
+  target: string
+  status: 'running' | 'done' | 'error'
+  cert_id?: string
+  error?: string
+  created_at: string
+}
+
+// 启动面板证书签发任务（异步）：mode=domain 为绑定域名签发（DNS-01），
+// mode=ip 为公网 IP 签发免费证书（HTTP-01，需临时开放 80 端口）。
+export function issuePanelCert(mode: 'domain' | 'ip', ip?: string) {
+  return unwrap<{ data: PanelCertJob; message?: string }>(
+    http.post('/system/panel-cert/issue', { mode, ip }),
+  )
+}
+
+export function getPanelCertJob(jobId: string) {
+  return unwrap<{ data: PanelCertJob }>(http.get(`/system/panel-cert/issue/${jobId}`)).then(
+    (r) => r.data,
+  )
+}
+
+// 检测服务器公网出口 IP（用于 IP 证书签发）。
+export function detectPublicIP() {
+  return unwrap<{ data: { ip: string } }>(http.get('/system/panel-cert/public-ip')).then(
+    (r) => r.data.ip,
+  )
+}

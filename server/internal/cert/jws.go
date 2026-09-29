@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -152,10 +153,25 @@ func keyThumbprint(key crypto.Signer) (string, error) {
 }
 
 // makeCSR builds a DER CSR covering all domains (CN = first domain).
-func makeCSR(key *ecdsa.PrivateKey, domains []string) ([]byte, error) {
+func makeCSR(key *ecdsa.PrivateKey, identifiers []string) ([]byte, error) {
+	var dnsNames []string
+	var ips []net.IP
+	for _, id := range identifiers {
+		id = strings.TrimSpace(id)
+		if ip := net.ParseIP(id); ip != nil {
+			ips = append(ips, ip)
+		} else if id != "" {
+			dnsNames = append(dnsNames, id)
+		}
+	}
+	cn := ""
+	if len(identifiers) > 0 {
+		cn = strings.TrimSpace(identifiers[0])
+	}
 	tmpl := &x509.CertificateRequest{
-		Subject:            pkix.Name{CommonName: domains[0]},
-		DNSNames:           domains,
+		Subject:            pkix.Name{CommonName: cn},
+		DNSNames:           dnsNames,
+		IPAddresses:        ips,
 		SignatureAlgorithm: x509.ECDSAWithSHA256,
 	}
 	return x509.CreateCertificateRequest(rand.Reader, tmpl, key)

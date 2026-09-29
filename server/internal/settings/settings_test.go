@@ -266,7 +266,7 @@ func TestSchemaAndEffective(t *testing.T) {
 	}
 	for _, k := range []string{
 		"security.secure_entry_enabled", "security.secure_entry_path", "system.join_beta_program",
-		"server.public_url", "security.panel_domain", "security.panel_domain_strict",
+		"server.public_url", "security.panel_domain",
 		"security.panel_ssl_enabled", "security.panel_ssl_mode", "security.panel_ssl_cert_id",
 		"security.panel_ssl_cert_pem", "security.panel_ssl_key_pem", "security.panel_force_https",
 	} {
@@ -457,7 +457,7 @@ func TestSnapshotConsistentUnderConcurrency(t *testing.T) {
 		s := newTestStore(t)
 		// Check defaults
 		sec := s.PanelSecurity()
-		if sec.PublicURL != "" || sec.PanelDomain != "" || sec.StrictDomain || sec.SSLEnabled || sec.ForceHTTPS {
+		if sec.PublicURL != "" || sec.PanelDomain != "" || sec.SSLEnabled || sec.ForceHTTPS {
 			t.Fatalf("unexpected defaults: %+v", sec)
 		}
 		if sec.SSLMode != "cert_center" {
@@ -483,7 +483,6 @@ func TestSnapshotConsistentUnderConcurrency(t *testing.T) {
 		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
 			"server.public_url":            raw(t, "https://panel.example.com:18789"),
 			"security.panel_domain":        raw(t, "panel.example.com"),
-			"security.panel_domain_strict": raw(t, true),
 			"security.panel_ssl_enabled":   raw(t, true),
 			"security.panel_ssl_mode":      raw(t, "custom"),
 			"security.panel_ssl_cert_pem":  raw(t, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"),
@@ -500,7 +499,7 @@ func TestSnapshotConsistentUnderConcurrency(t *testing.T) {
 		if updated.PanelDomain != "panel.example.com" {
 			t.Errorf("panel_domain = %q, want panel.example.com", updated.PanelDomain)
 		}
-		if !updated.StrictDomain || !updated.SSLEnabled || !updated.ForceHTTPS {
+		if !updated.SSLEnabled || !updated.ForceHTTPS {
 			t.Errorf("expected bool flags to be true, got %+v", updated)
 		}
 		if updated.SSLMode != "custom" {

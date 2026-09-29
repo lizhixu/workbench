@@ -162,12 +162,12 @@ var Definitions = []Definition{
 		{Key: "system.join_beta_program", Scope: ScopeSystem, Kind: KindBool, Title: "加入测试计划", Default: false},
 
 		// 面板域名与公网访问地址（system 域，管理员专属）：
-		// 绑定域名、未绑定域名限制（禁止直接 IP 访问）、公网访问地址
+		// 绑定域名后面板只能通过该域名访问（自动启用严格域名限制，
+		// 直接 IP 访问将被拦截），解绑后恢复 IP 访问。
 		{Key: "server.public_url", Scope: ScopeSystem, Kind: KindString, Title: "面板公网访问地址", Default: "",
 			MaxLen: 256, Validate: validatePublicURL},
 		{Key: "security.panel_domain", Scope: ScopeSystem, Kind: KindString, Title: "面板绑定域名", Default: "",
 			MaxLen: 253, Validate: validateDomainName},
-		{Key: "security.panel_domain_strict", Scope: ScopeSystem, Kind: KindBool, Title: "禁止未绑定域名/直接IP访问", Default: false},
 
 		// 面板 SSL / HTTPS（system 域，管理员专属）：
 		{Key: "security.panel_ssl_enabled", Scope: ScopeSystem, Kind: KindBool, Title: "面板 SSL / HTTPS", Default: false},
@@ -358,16 +358,17 @@ type AppearancePrefs struct {
 }
 
 // PanelSecurityConfig is the typed view of panel domain and SSL security settings.
+// Strict domain checking is derived: a non-empty PanelDomain means the panel
+// is only reachable through that domain.
 type PanelSecurityConfig struct {
-	PublicURL    string `json:"public_url"`
-	PanelDomain  string `json:"panel_domain"`
-	StrictDomain bool   `json:"strict_domain"`
-	SSLEnabled   bool   `json:"ssl_enabled"`
-	SSLMode      string `json:"ssl_mode"`
-	SSLCertID    string `json:"ssl_cert_id"`
-	SSLCertPEM   string `json:"ssl_cert_pem"`
-	SSLKeyPEM    string `json:"ssl_key_pem"`
-	ForceHTTPS   bool   `json:"force_https"`
+	PublicURL   string `json:"public_url"`
+	PanelDomain string `json:"panel_domain"`
+	SSLEnabled  bool   `json:"ssl_enabled"`
+	SSLMode     string `json:"ssl_mode"`
+	SSLCertID   string `json:"ssl_cert_id"`
+	SSLCertPEM  string `json:"ssl_cert_pem"`
+	SSLKeyPEM   string `json:"ssl_key_pem"`
+	ForceHTTPS  bool   `json:"force_https"`
 }
 
 // document is the on-disk shape of settings.json.
@@ -729,7 +730,6 @@ func (s *Store) PanelSecurity() PanelSecurityConfig {
 	var p PanelSecurityConfig
 	s.decode(ScopeSystem, "", "server.public_url", &p.PublicURL)
 	s.decode(ScopeSystem, "", "security.panel_domain", &p.PanelDomain)
-	s.decode(ScopeSystem, "", "security.panel_domain_strict", &p.StrictDomain)
 	s.decode(ScopeSystem, "", "security.panel_ssl_enabled", &p.SSLEnabled)
 	s.decode(ScopeSystem, "", "security.panel_ssl_mode", &p.SSLMode)
 	s.decode(ScopeSystem, "", "security.panel_ssl_cert_id", &p.SSLCertID)

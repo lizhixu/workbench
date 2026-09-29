@@ -140,7 +140,7 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 
 	v1 := r.Group("/api/v1")
 	entryGuard.RegisterRoutes(v1)
-	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, settings: settingsStore, certHub: certHub, alertMon: alertMon}
+	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, settings: settingsStore, certHub: certHub, panelCert: panelsec.NewPanelCertIssuer(settingsStore, certHub, log), alertMon: alertMon}
 
 	// ---- Public routes (no auth) ----
 	// Auth login.
@@ -288,6 +288,10 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 
 	// Panel certificate status & inspection.
 	adminOnly.GET("/system/panel-cert", h.getPanelCertStatus)
+	// One-click panel certificate issuance (domain or public IP), async jobs.
+	adminOnly.POST("/system/panel-cert/issue", h.issuePanelCert)
+	adminOnly.GET("/system/panel-cert/issue/:job_id", h.getPanelCertJob)
+	adminOnly.GET("/system/panel-cert/public-ip", h.getPanelPublicIP)
 
 	// Agent upgrade.
 	adminOnly.POST("/hosts/:id/upgrade", h.upgradeAgent)
@@ -416,17 +420,18 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 }
 
 type handlers struct {
-	reg      *rpc.Registry
-	log      *slog.Logger
-	sess     *session.Store
-	auth     *auth.Store
-	metrics  *metrics.Store
-	policy   *policy.Store
-	audit    *audit.Store
-	groups   *groups.Store
-	settings *settings.Store
-	certHub  *cert.Hub
-	alertMon *alert.Monitor
+	reg       *rpc.Registry
+	log       *slog.Logger
+	sess      *session.Store
+	auth      *auth.Store
+	metrics   *metrics.Store
+	policy    *policy.Store
+	audit     *audit.Store
+	groups    *groups.Store
+	settings  *settings.Store
+	certHub   *cert.Hub
+	panelCert *panelsec.PanelCertIssuer
+	alertMon  *alert.Monitor
 }
 
 // canSeeHost reports whether the caller is allowed to reach the given host,
@@ -524,23 +529,86 @@ func (h *handlers) getPanelCertStatus(c *gin.Context) {
 	}
 	sec := h.settings.PanelSecurity()
 	res := gin.H{
-		"ssl_enabled":   sec.SSLEnabled,
-		"ssl_mode":      sec.SSLMode,
-		"ssl_cert_id":   sec.SSLCertID,
-		"panel_domain":  sec.PanelDomain,
-		"strict_domain": sec.StrictDomain,
+		"ssl_enabled":  sec.SSLEnabled,
+		"ssl_mode":     sec.SSLMode,
+		"ssl_cert_id":  sec.SSLCertID,
+		"panel_domain": sec.PanelDomain,
+		// 绑定域名即自动启用严格域名限制（仅允许该域名与回环地址访问）。
+		"strict_domain": sec.PanelDomain != "",
 		"force_https":   sec.ForceHTTPS,
 		"public_url":    sec.PublicURL,
+		"active":        false,
 	}
 	if h.certHub != nil || sec.SSLMode == "custom" {
 		cp := panelsec.NewCertProvider(h.settings, h.certHub, nil, h.log)
 		if summary, err := cp.InspectActiveCert(); err == nil && summary != nil {
-			res["cert_info"] = summary
+			res["active"] = summary.Valid
+			if sec.SSLMode == "custom" {
+				res["source"] = "自定义上传"
+			} else {
+				res["source"] = "证书中心"
+			}
+			res["subject"] = summary.Subject
+			res["issuer"] = summary.Issuer
+			res["dns_names"] = summary.Domains
+			res["not_after"] = summary.NotAfter.Format(time.RFC3339)
+			res["days_left"] = summary.DaysRemaining
 		} else if err != nil {
-			res["cert_error"] = err.Error()
+			res["error"] = err.Error()
 		}
 	}
 	c.JSON(http.StatusOK, res)
+}
+
+// ---- Panel one-click certificate issuance ----
+
+// issuePanelCert starts an async panel certificate issuance job.
+// Body: {"mode": "domain"|"ip", "ip": "1.2.3.4" (optional for ip mode)}.
+// mode=domain issues for the bound panel domain (DNS-01 via cert center);
+// mode=ip issues a free IP certificate for a public IP (HTTP-01 on port 80).
+// Returns 202 with the job; poll getPanelCertJob for progress.
+func (h *handlers) issuePanelCert(c *gin.Context) {
+	var req struct {
+		Mode string `json:"mode"`
+		IP   string `json:"ip"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if h.panelCert == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "证书签发器不可用"})
+		return
+	}
+	job, err := h.panelCert.StartIssue(strings.TrimSpace(req.Mode), strings.TrimSpace(req.IP))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"data": job, "message": "签发任务已启动，可通过任务 ID 查询进度"})
+}
+
+func (h *handlers) getPanelCertJob(c *gin.Context) {
+	if h.panelCert == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "证书签发器不可用"})
+		return
+	}
+	job, ok := h.panelCert.GetJob(c.Param("job_id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "签发任务不存在或已过期"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": job})
+}
+
+// getPanelPublicIP detects the server's public egress IP (for IP certs).
+func (h *handlers) getPanelPublicIP(c *gin.Context) {
+	ip, err := cert.DetectPublicIP()
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"ip": ip}})
 }
 
 // ---- Hosts -----------------------------------------------------------

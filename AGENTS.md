@@ -112,9 +112,9 @@
 - **创建时即可绑定域名**：创建页填写域名与网关节点后，提交依次执行 创建应用 → 自动签发证书 → 下发反代；绑定失败不回滚应用创建，可稍后在详情页重试。
 - **系统设置面板安全与应用反代职责彻底解耦**（2026-09-28）：
   - 应用中心独立负责业务容器的反向代理与域名绑定（在应用详情 `AppDetail.vue` 的「域名与反代」页签中配置，经 Nginx 容器路由流量到应用容器或网关节点）；
-  - 「系统设置 → 面板域名与证书」（`web/src/views/settings/CertDomain.vue`，`sections.ts` 注册 `key: 'cert-domain'`，`adminOnly` 仅管理员可见）**专用于 Watchman 控制台/面板自身的访问与安全配置**，与应用反向代理彻底解耦。配置项包括：面板公网访问地址（`server.public_url`，用于 Agent 一键安装脚本、更新包下载与终端分享链接）、面板绑定域名（`security.panel_domain`）、禁止未绑定域名/直接 IP 访问（`security.panel_domain_strict`，阻断全网自动化扫描发现控制台）、面板 SSL/HTTPS（`security.panel_ssl_enabled`，支持证书中心 ACME 证书选取或自定义 PEM 证书与私钥上传）、强制 HTTPS 访问（`security.panel_force_https`，明文 HTTP 自动 301 重定向至 HTTPS）。
+  - 「系统设置 → 面板域名与证书」（`web/src/views/settings/CertDomain.vue`，`sections.ts` 注册 `key: 'cert-domain'`，`adminOnly` 仅管理员可见）**专用于 Watchman 控制台/面板自身的访问与安全配置**，与应用反向代理彻底解耦，采用宝塔式简化模型。**域名绑定**：`security.panel_domain` 为空表示通过 IP 访问；一旦绑定域名即**自动启用严格域名限制**（无独立开关），面板只能通过该域名访问，直接 IP/其他域名请求被 403 拦截（回环地址与 Agent 注册/数据接口等基础设施路径豁免）。**面板证书**：已绑定域名时「为绑定域名申请免费证书」（经证书中心 ACME DNS-01 签发，需预先在证书中心配置 ACME 账户与 dns-mng）；未绑定域名时「为 IP 申请免费证书」（为公网 IP 签发 Let's Encrypt 等免费 IP 证书，走 HTTP-01 验证，签发期间临时监听 80 端口，证书有效期短、自动续期阈值按有效期 1/3 自适应）；签发成功后自动写入证书中心并绑定为面板证书、开启 HTTPS。另支持手动上传已有证书（`custom` 模式）与「强制 HTTPS 访问」（`security.panel_force_https`，明文 HTTP 自动 301 重定向至 HTTPS）。
   - 面板服务采用**端口级协议动态嗅探（Dynamic Listener）**技术，在控制台默认端口（18789）上原生自适应处理 HTTP 明文与 TLS 握手，热重载或开关 SSL 无需重启服务或更改端口。
-  - **防失联与紧急恢复**：若配置错误域名或无效证书导致无法登录，提供控制机命令行救援开关：`watchman-server -reset-panel-domain -data <数据目录>`（关闭严格域名检查并清空绑定域名）以及 `watchman-server -reset-panel-ssl -data <数据目录>`（关闭面板 SSL 与强制 HTTPS 重定向）。
+  - **防失联与紧急恢复**：若配置错误域名或无效证书导致无法登录，提供控制机命令行救援开关：`watchman-server -reset-panel-domain -data <数据目录>`（解绑面板域名；绑定即严格，解绑后恢复 IP 访问）以及 `watchman-server -reset-panel-ssl -data <数据目录>`（关闭面板 SSL 与强制 HTTPS 重定向）。
   - 独立「证书中心」（`/certs`，`CertList.vue` + `CertManager.vue`）保持作为全局基础设施，管理 ACME 自动化证书与证书凭证，供面板及各业务应用按需选用。
 - **全生命周期管理**：部署历史、构建日志、健康检查探活失败自动保留旧版本（`-next`/`-prev` 滚动替换）、回滚、启停、AI 排障诊断，对所有来源的应用一致生效。
   - 实现备注（2026-09-28）：`deploySingleContainer` 的起新容器命令只清理残留的 `-next` 容器（`docker rm -f <name>-next`），旧版本容器在 swap 前全程运行、失败时原样保留——此前曾误删旧容器（`rm -f` 目标写成了正式容器名），与"探活失败自动保留旧版本"的设计相悖，已修复。
@@ -873,7 +873,7 @@ Agent internal/shell
 | `-http-tls` | `false` | — | 是否在 `-http` 端口上直接启用 HTTPS（须与 `-tls-cert`/`-tls-key` 成对配置） |
 | `-reset-secure-entry` | `false` | — | 应急工具开关：关闭安全入口（置 `security.secure_entry_enabled=false`）后退出 |
 | `-reset-panel-ssl` | `false` | — | 应急工具开关：关闭面板 SSL 与强制 HTTPS 重定向（置 `security.panel_ssl_enabled=false` 与 `security.panel_force_https=false`）后退出 |
-| `-reset-panel-domain` | `false` | — | 应急工具开关：关闭严格域名检查并清空面板绑定域名（置 `security.panel_domain_strict=false` 与 `security.panel_domain=""`）后退出 |
+| `-reset-panel-domain` | `false` | — | 应急工具开关：解绑面板绑定域名（置 `security.panel_domain=""`；绑定即自动严格，解绑后恢复 IP 访问）后退出 |
 
 #### 2. 系统与用户统一设置（`settings.json`）
 
@@ -882,8 +882,7 @@ Agent internal/shell
 | 配置键 (Key) | 作用域 | 默认值 | 校验与说明 |
 | --- | --- | --- | --- |
 | `server.public_url` | `system` | `""` | 面板公网根访问地址（URL 格式，如 `https://panel.example.com:18789`，用于 Agent 一键安装与分享链接） |
-| `security.panel_domain` | `system` | `""` | 面板绑定域名（主机名格式，如 `panel.example.com`） |
-| `security.panel_domain_strict` | `system` | `false` | 禁止未绑定域名/直接 IP 访问（开启后仅允许绑定域名与回环地址访问，阻断全网自动化探测扫描） |
+| `security.panel_domain` | `system` | `""` | 面板绑定域名（主机名格式，如 `panel.example.com`）；绑定后自动启用严格域名限制，面板只能通过该域名访问 |
 | `security.panel_ssl_enabled` | `system` | `false` | 面板 SSL / HTTPS 总开关（通过端口级协议动态嗅探实现零停机热重载） |
 | `security.panel_ssl_mode` | `system` | `"cert_center"` | 证书来源模式（`cert_center` 从证书中心选取 / `custom` 自定义 PEM 证书与私钥） |
 | `security.panel_ssl_cert_id` | `system` | `""` | 证书中心证书 ID（`cert_center` 模式下选取） |
@@ -1076,6 +1075,12 @@ DELETE /api/v1/networks/:id/hosts/:hid
 POST   /api/v1/system/backup              # 导出 SQLite/配置/录像打包
 POST   /api/v1/system/restore             # 从备份恢复（离线运维操作）
 GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
+
+# 面板证书（宝塔式一键签发，admin）
+GET    /api/v1/system/panel-cert          # 面板证书状态（ssl_enabled/panel_domain/strict_domain/active/source/subject/issuer/dns_names/days_left）
+POST   /api/v1/system/panel-cert/issue    # 启动异步签发 {mode: domain|ip, ip?}；domain 走 DNS-01（需证书中心 dns-mng），ip 走 HTTP-01（临时监听 80）；202 返回 job
+GET    /api/v1/system/panel-cert/issue/:job_id  # 签发任务进度 {status: running|done|error, cert_id?, error?}
+GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 ```
 
 ### B.8.3 协议补充

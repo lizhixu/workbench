@@ -90,10 +90,9 @@ func TestDomainMiddleware(t *testing.T) {
 		t.Fatalf("disabled: got status %d, want 200", w.Code)
 	}
 
-	// Enable strict domain check for panel.example.com
+	// Bind a domain: strict domain check is now automatic (no separate switch)
 	if err := st.SetMany(settings.ScopeSystem, "", map[string]json.RawMessage{
-		"security.panel_domain":        rawJSON(t, "panel.example.com"),
-		"security.panel_domain_strict": rawJSON(t, true),
+		"security.panel_domain": rawJSON(t, "panel.example.com"),
 	}); err != nil {
 		t.Fatalf("SetMany: %v", err)
 	}

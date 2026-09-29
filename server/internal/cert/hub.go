@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -408,11 +409,24 @@ func (h *Hub) markError(id, msg string) {
 	}
 }
 
-// issueDNS01 runs the ACME DNS-01 flow using the specified account.
-func (h *Hub) issueDNS01(acc *ACMEAccount, domains []string) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
-	cfg := h.GetConfig()
-	if !cfg.Enabled || cfg.BaseURL == "" {
-		return nil, nil, time.Time{}, time.Time{}, "", ErrDisabled
+// issueACME runs the ACME flow using the specified account. DNS identifiers
+// are validated with DNS-01 (requires dns-mng); IP identifiers (RFC 8738)
+// are validated with HTTP-01 on port 80 and need no dns-mng.
+func (h *Hub) issueACME(acc *ACMEAccount, identifiers []string) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
+	needDNS := false
+	for _, id := range identifiers {
+		if net.ParseIP(strings.TrimSpace(id)) == nil {
+			needDNS = true
+			break
+		}
+	}
+	var dnsCh *dnsMngChallenge
+	if needDNS {
+		cfg := h.GetConfig()
+		if !cfg.Enabled || cfg.BaseURL == "" {
+			return nil, nil, time.Time{}, time.Time{}, "", ErrDisabled
+		}
+		dnsCh = &dnsMngChallenge{baseURL: cfg.BaseURL, username: cfg.Username, password: cfg.Password, http: &http.Client{Timeout: 30 * time.Second}}
 	}
 	dirURL := acc.DirectoryURL
 	if dirURL == "" {
@@ -436,8 +450,7 @@ func (h *Hub) issueDNS01(acc *ACMEAccount, domains []string) (certPEM, keyPEM []
 		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("acme account (%s): %w", acc.Name, err)
 	}
 
-	challenger := &dnsMngChallenge{baseURL: cfg.BaseURL, username: cfg.Username, password: cfg.Password, http: acmeClient.http}
-	certPEM, keyPEM, notBefore, notAfter, issuer, err = acmeClient.obtainCertificate(accountKey, domains, challenger)
+	certPEM, keyPEM, notBefore, notAfter, issuer, err = acmeClient.obtainCertificate(accountKey, identifiers, dnsCh)
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", err
 	}
@@ -448,16 +461,18 @@ func (h *Hub) issueDNS01(acc *ACMEAccount, domains []string) (certPEM, keyPEM []
 }
 
 // Issue requests a new certificate using a specific or default ACME account.
-func (h *Hub) Issue(domains []string, accountID string) (*Certificate, error) {
-	clean := make([]string, 0, len(domains))
-	for _, d := range domains {
+// identifiers accepts DNS names and/or IP literals (RFC 8738); the challenge
+// is picked per identifier type automatically.
+func (h *Hub) Issue(identifiers []string, accountID string) (*Certificate, error) {
+	clean := make([]string, 0, len(identifiers))
+	for _, d := range identifiers {
 		d = strings.TrimSpace(strings.ToLower(d))
 		if d != "" {
 			clean = append(clean, d)
 		}
 	}
 	if len(clean) == 0 {
-		return nil, fmt.Errorf("至少需要一个域名")
+		return nil, fmt.Errorf("至少需要一个域名或 IP")
 	}
 
 	var acc *ACMEAccount
@@ -475,7 +490,7 @@ func (h *Hub) Issue(domains []string, accountID string) (*Certificate, error) {
 		acc = got
 	}
 
-	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueDNS01(acc, clean)
+	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, clean)
 	if err != nil {
 		return nil, err
 	}
@@ -520,7 +535,7 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 		acc = got
 	}
 
-	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueDNS01(acc, c.Domains)
+	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, c.Domains)
 	if err != nil {
 		h.markError(id, err.Error())
 		return nil, err
@@ -556,7 +571,16 @@ func (h *Hub) renewExpiring() {
 		if !c.AutoRenew || c.Renewing {
 			continue
 		}
-		if time.Until(c.NotAfter) > renewBefore {
+		// Renewal threshold scales with validity: 30 days for classic
+		// 90-day certificates, but short-lived certificates (e.g. Let's
+		// Encrypt IP certificates, ~6 days) renew at 1/3 of validity.
+		threshold := renewBefore
+		if validity := c.NotAfter.Sub(c.NotBefore); validity > 0 {
+			if third := validity / 3; third < threshold {
+				threshold = third
+			}
+		}
+		if time.Until(c.NotAfter) > threshold {
 			continue
 		}
 		h.log.Info("renewing certificate", "id", c.ID, "domains", c.Domains, "not_after", c.NotAfter)

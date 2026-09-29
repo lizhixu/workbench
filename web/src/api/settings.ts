@@ -35,10 +35,10 @@ export const SETTING_KEYS = {
   secureEntryEnabled: 'security.secure_entry_enabled',
   secureEntryPath: 'security.secure_entry_path',
   joinBetaProgram: 'system.join_beta_program',
-  // Panel domain and public access (system scope)
+  // Panel domain and public access (system scope).
+  // 绑定域名即自动启用严格域名限制（只能通过该域名访问面板），无独立开关。
   publicURL: 'server.public_url',
   panelDomain: 'security.panel_domain',
-  panelDomainStrict: 'security.panel_domain_strict',
   // Panel SSL / HTTPS (system scope)
   panelSSLEnabled: 'security.panel_ssl_enabled',
   panelSSLMode: 'security.panel_ssl_mode',
@@ -122,14 +122,18 @@ export function saveSystemSettings(data: SettingsData) {
 }
 
 export interface PanelCertStatus {
-  enabled: boolean
-  mode: string
+  ssl_enabled: boolean
+  ssl_mode: string
+  ssl_cert_id: string
+  panel_domain: string
+  strict_domain: boolean
+  force_https: boolean
+  public_url: string
   active: boolean
   source: string
   subject: string
   issuer: string
   dns_names: string[]
-  not_before?: string
   not_after?: string
   days_left: number
   error?: string

@@ -14,8 +14,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,6 +35,88 @@ func randomHex(n int) string {
 		out = append(out, hexDigits[v>>4], hexDigits[v&0x0f])
 	}
 	return string(out)
+}
+
+// identifierType classifies an ACME identifier per RFC 8738: IP literals use
+// the "ip" type, everything else is a "dns" name.
+func identifierType(v string) string {
+	if net.ParseIP(strings.TrimSpace(v)) != nil {
+		return "ip"
+	}
+	return "dns"
+}
+
+// http01Challenge serves ACME HTTP-01 responses for the duration of an
+// issuance. Public CAs only validate http-01 on port 80, so the listener is
+// bound briefly (challenge lifetime) and released afterwards; it is only
+// needed for "ip" identifiers (e.g. Let's Encrypt IP certificates), which
+// cannot use DNS-01 without control of reverse DNS.
+type http01Challenge struct {
+	mu     sync.Mutex
+	values map[string]string // token -> keyAuthorization
+
+	// addr is the listen address; defaults to ":80" (the only port public
+	// CAs validate http-01 on). Tests may override it.
+	addr string
+
+	ln  net.Listener
+	srv *http.Server
+}
+
+func (h *http01Challenge) start() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.ln != nil {
+		return nil
+	}
+	addr := h.addr
+	if addr == "" {
+		addr = ":80"
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("http-01 验证需要临时监听 80 端口: %w", err)
+	}
+	h.values = make(map[string]string)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/acme-challenge/", func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.URL.Path, "/.well-known/acme-challenge/")
+		h.mu.Lock()
+		v, ok := h.values[token]
+		h.mu.Unlock()
+		if !ok || token == "" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, v)
+	})
+	h.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	h.ln = ln
+	go func() {
+		_ = h.srv.Serve(ln) // closed by stop()
+	}()
+	return nil
+}
+
+func (h *http01Challenge) present(token, keyAuthz string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.values == nil {
+		h.values = make(map[string]string)
+	}
+	h.values[token] = keyAuthz
+}
+
+func (h *http01Challenge) stop() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.srv != nil {
+		_ = h.srv.Close()
+		h.srv = nil
+	}
+	h.ln = nil
+	h.values = nil
 }
 
 // dnsMngChallenge implements the DNS-01 challenge by delegating TXT record
@@ -84,8 +168,10 @@ func (d *dnsMngChallenge) CleanUp(fqdn, value string) error {
 	})
 }
 
-// acmeClient is a minimal RFC 8555 client supporting the DNS-01 flow:
-// account creation, new-order, authorization challenges, finalize, download.
+// acmeClient is a minimal RFC 8555 client supporting the DNS-01 and HTTP-01
+// flows: account creation, new-order, authorization challenges, finalize,
+// download. DNS identifiers use DNS-01 (delegated to dns-mng); IP
+// identifiers (RFC 8738) use HTTP-01 served on port 80.
 type acmeClient struct {
 	directoryURL string
 	email        string
@@ -167,23 +253,31 @@ func (a *acmeClient) ensureAccount(accountKey crypto.Signer) error {
 	return nil
 }
 
-// obtainCertificate runs order -> authorizations (DNS-01) -> finalize -> cert.
-func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, domains []string, challenger *dnsMngChallenge) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
+// obtainCertificate runs order -> authorizations -> finalize -> cert.
+// identifiers may mix DNS names and IP literals; each authorization picks its
+// challenge from the identifier type ("dns" -> DNS-01 via dnsCh, "ip" ->
+// HTTP-01 on port 80). dnsCh may be nil when no DNS identifier is present.
+func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []string, dnsCh *dnsMngChallenge) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
 	dir, err := a.directory()
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", err
 	}
 
 	// Identifiers for the order.
-	identifiers := make([]map[string]string, 0, len(domains))
-	for _, d := range domains {
-		identifiers = append(identifiers, map[string]string{"type": "dns", "value": d})
+	idents := make([]map[string]string, 0, len(identifiers))
+	needHTTP01 := false
+	for _, d := range identifiers {
+		t := identifierType(d)
+		if t == "ip" {
+			needHTTP01 = true
+		}
+		idents = append(idents, map[string]string{"type": t, "value": d})
 	}
 
 	// 1. New order. The order URL is the Location response header, used to
 	// poll status below.
 	body, orderURL, status, err := a.jwsRequest(dir["newOrder"], map[string]any{
-		"identifiers": identifiers,
+		"identifiers": idents,
 	}, a.kid, accountKey, false)
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("newOrder: %w", err)
@@ -204,9 +298,18 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, domains []strin
 		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("order missing finalize/location URL")
 	}
 
-	// 2. Satisfy each authorization via DNS-01.
+	// 2. Satisfy each authorization. The HTTP-01 listener is only bound when
+	// an IP identifier is present.
+	var httpCh *http01Challenge
+	if needHTTP01 {
+		httpCh = &http01Challenge{}
+		if err := httpCh.start(); err != nil {
+			return nil, nil, time.Time{}, time.Time{}, "", err
+		}
+		defer httpCh.stop()
+	}
 	for _, authzURL := range order.Authorizations {
-		if err := a.satisfyAuthorization(authzURL, accountKey, challenger); err != nil {
+		if err := a.satisfyAuthorization(authzURL, accountKey, dnsCh, httpCh); err != nil {
 			return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("authorization: %w", err)
 		}
 	}
@@ -238,7 +341,7 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, domains []strin
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", err
 	}
-	csrDer, err := makeCSR(csrKey, domains)
+	csrDer, err := makeCSR(csrKey, identifiers)
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", err
 	}
@@ -307,8 +410,9 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, domains []strin
 	return pemBytes, keyPem, first.NotBefore, first.NotAfter, first.Issuer.CommonName, nil
 }
 
-// satisfyAuthorization completes one authorization using DNS-01.
-func (a *acmeClient) satisfyAuthorization(authzURL string, accountKey crypto.Signer, challenger *dnsMngChallenge) error {
+// satisfyAuthorization completes one authorization, picking the challenge
+// from the identifier type: "ip" -> HTTP-01, anything else -> DNS-01.
+func (a *acmeClient) satisfyAuthorization(authzURL string, accountKey crypto.Signer, dnsCh *dnsMngChallenge, httpCh *http01Challenge) error {
 	// POST-as-GET the authorization.
 	body, err := a.postAsGet(authzURL, a.kid, accountKey)
 	if err != nil {
@@ -317,6 +421,7 @@ func (a *acmeClient) satisfyAuthorization(authzURL string, accountKey crypto.Sig
 	var authz struct {
 		Status     string `json:"status"`
 		Identifier struct {
+			Type  string `json:"type"`
 			Value string `json:"value"`
 		} `json:"identifier"`
 		Challenges []struct {
@@ -331,50 +436,20 @@ func (a *acmeClient) satisfyAuthorization(authzURL string, accountKey crypto.Sig
 	if authz.Status == "valid" {
 		return nil
 	}
-	var ch *struct {
-		Type  string `json:"type"`
-		URL   string `json:"url"`
-		Token string `json:"token"`
-	}
-	for i := range authz.Challenges {
-		if authz.Challenges[i].Type == "dns-01" {
-			ch = &authz.Challenges[i]
-			break
-		}
-	}
-	if ch == nil {
-		return fmt.Errorf("no dns-01 challenge offered")
-	}
 
-	// keyAuthz = token.thumbprint; TXT value = base64url(sha256(keyAuthz)).
 	thumbprint, err := keyThumbprint(accountKey)
 	if err != nil {
 		return err
 	}
-	keyAuthz := ch.Token + "." + thumbprint
-	sum := sha256.Sum256([]byte(keyAuthz))
-	txtValue := base64.RawURLEncoding.EncodeToString(sum[:])
-	fqdn := "_acme-challenge." + authz.Identifier.Value
 
-	// Create the TXT record and notify the ACME server.
-	if err := challenger.Present(fqdn, txtValue); err != nil {
-		return fmt.Errorf("present TXT: %w", err)
+	if authz.Identifier.Type == "ip" {
+		return a.satisfyHTTP01(authzURL, accountKey, thumbprint, authz.Challenges, httpCh)
 	}
-	defer func() {
-		if err := challenger.CleanUp(fqdn, txtValue); err != nil {
-			a.log.Warn("dns-01 cleanup failed", "fqdn", fqdn, "err", err)
-		}
-	}()
+	return a.satisfyDNS01(authzURL, accountKey, thumbprint, authz.Identifier.Value, authz.Challenges, dnsCh)
+}
 
-	// DNS propagation: dns-mng publishes synchronously to the provider, but
-	// authoritative resolvers need some time to catch up.
-	time.Sleep(20 * time.Second)
-
-	if _, _, _, err := a.jwsRequest(ch.URL, map[string]any{}, a.kid, accountKey, false); err != nil {
-		return fmt.Errorf("challenge notify: %w", err)
-	}
-
-	// Poll the authorization until valid.
+// pollAuthorization waits until the authorization becomes valid.
+func (a *acmeClient) pollAuthorization(authzURL string, accountKey crypto.Signer) error {
 	deadline := time.Now().Add(3 * time.Minute)
 	for {
 		if time.Now().After(deadline) {
@@ -397,4 +472,79 @@ func (a *acmeClient) satisfyAuthorization(authzURL string, accountKey crypto.Sig
 			}
 		}
 	}
+}
+
+// satisfyHTTP01 completes one authorization using HTTP-01 on port 80.
+func (a *acmeClient) satisfyHTTP01(authzURL string, accountKey crypto.Signer, thumbprint string, challenges []struct {
+	Type  string `json:"type"`
+	URL   string `json:"url"`
+	Token string `json:"token"`
+}, httpCh *http01Challenge) error {
+	if httpCh == nil {
+		return fmt.Errorf("http-01 challenge unavailable")
+	}
+	var chURL, token string
+	for _, ch := range challenges {
+		if ch.Type == "http-01" {
+			chURL, token = ch.URL, ch.Token
+			break
+		}
+	}
+	if token == "" {
+		return fmt.Errorf("no http-01 challenge offered")
+	}
+
+	keyAuthz := token + "." + thumbprint
+	httpCh.present(token, keyAuthz)
+
+	if _, _, _, err := a.jwsRequest(chURL, map[string]any{}, a.kid, accountKey, false); err != nil {
+		return fmt.Errorf("challenge notify: %w", err)
+	}
+	return a.pollAuthorization(authzURL, accountKey)
+}
+
+// satisfyDNS01 completes one authorization using DNS-01 via dns-mng.
+func (a *acmeClient) satisfyDNS01(authzURL string, accountKey crypto.Signer, thumbprint, domain string, challenges []struct {
+	Type  string `json:"type"`
+	URL   string `json:"url"`
+	Token string `json:"token"`
+}, dnsCh *dnsMngChallenge) error {
+	if dnsCh == nil {
+		return fmt.Errorf("dns-01 challenge unavailable: 证书中心未配置 dns-mng")
+	}
+	var chURL, token string
+	for _, ch := range challenges {
+		if ch.Type == "dns-01" {
+			chURL, token = ch.URL, ch.Token
+			break
+		}
+	}
+	if token == "" {
+		return fmt.Errorf("no dns-01 challenge offered")
+	}
+
+	// keyAuthz = token.thumbprint; TXT value = base64url(sha256(keyAuthz)).
+	keyAuthz := token + "." + thumbprint
+	sum := sha256.Sum256([]byte(keyAuthz))
+	txtValue := base64.RawURLEncoding.EncodeToString(sum[:])
+	fqdn := "_acme-challenge." + domain
+
+	// Create the TXT record and notify the ACME server.
+	if err := dnsCh.Present(fqdn, txtValue); err != nil {
+		return fmt.Errorf("present TXT: %w", err)
+	}
+	defer func() {
+		if err := dnsCh.CleanUp(fqdn, txtValue); err != nil {
+			a.log.Warn("dns-01 cleanup failed", "fqdn", fqdn, "err", err)
+		}
+	}()
+
+	// DNS propagation: dns-mng publishes synchronously to the provider, but
+	// authoritative resolvers need some time to catch up.
+	time.Sleep(20 * time.Second)
+
+	if _, _, _, err := a.jwsRequest(chURL, map[string]any{}, a.kid, accountKey, false); err != nil {
+		return fmt.Errorf("challenge notify: %w", err)
+	}
+	return a.pollAuthorization(authzURL, accountKey)
 }

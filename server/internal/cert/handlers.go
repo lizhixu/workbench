@@ -172,7 +172,7 @@ func (h *Handlers) issueCert(c *gin.Context) {
 		return
 	}
 	if len(req.Domains) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "至少需要一个域名"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "至少需要一个域名或 IP"})
 		return
 	}
 

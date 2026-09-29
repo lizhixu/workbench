@@ -181,11 +181,13 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	authed.GET("/hosts/:id/files", h.fileList)
 	authed.GET("/hosts/:id/files/stat", h.fileStat)
 	authed.GET("/hosts/:id/files/download", h.fileDownload)
-	hostWrite.POST("/hosts/:id/files/mkdir", h.fileMkdir)
-	hostWrite.POST("/hosts/:id/files/move", h.fileMove)
-	hostWrite.POST("/hosts/:id/files/copy", h.fileCopy)
-	hostWrite.DELETE("/hosts/:id/files", h.fileRemove)
-	hostWrite.POST("/hosts/:id/files/upload", h.fileUpload)
+	// File operations on hosts are audited via the mutation middleware.
+	fileWrite := hostWrite.Group("", h.auditMutation())
+	fileWrite.POST("/hosts/:id/files/mkdir", h.fileMkdir)
+	fileWrite.POST("/hosts/:id/files/move", h.fileMove)
+	fileWrite.POST("/hosts/:id/files/copy", h.fileCopy)
+	fileWrite.DELETE("/hosts/:id/files", h.fileRemove)
+	fileWrite.POST("/hosts/:id/files/upload", h.fileUpload)
 
 	// Exec (push command).
 	hostWrite.POST("/hosts/:id/exec", h.execCommand)
@@ -270,7 +272,7 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 
 	// Security scanning.
 	if scanStore != nil {
-		scan.NewHandlers(reg, scanStore, log).Register(authed, hostWrite)
+		scan.NewHandlers(reg, scanStore, log).Register(authed, hostWrite.Group("", h.auditMutation()))
 	}
 
 	// Sessions (audit / recordings). Removing a recording destroys audit
@@ -313,9 +315,9 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		uh.Register(authed.Group("", h.auditMutation()))
 	}
 
-	// Alerts (rules + events + webhook).
+	// Alerts (rules + events + webhook). Mutations are audited.
 	if alertStore != nil {
-		alert.NewHandlers(alertStore).Register(authed.Group(""))
+		alert.NewHandlers(alertStore).Register(authed.Group("", h.auditMutation()))
 	}
 
 	// Credential vault (admin-only).
@@ -323,9 +325,10 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		vault.NewHandlers(vaultStore).Register(authed.Group("", h.auditMutation()))
 	}
 
-	// AI diagnostics.
+	// AI diagnostics. Only config changes are audited (the middleware skips
+	// the diagnostic POSTs, which have no mutation rules).
 	if aiAssistant != nil {
-		ai.NewHandlers(aiAssistant).Register(authed.Group(""))
+		ai.NewHandlers(aiAssistant).Register(authed.Group("", h.auditMutation()))
 	}
 
 	// High-risk command control (policy + audit).
@@ -586,6 +589,9 @@ func (h *handlers) issuePanelCert(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	h.recordAudit(c, "panel_cert_issue", "system", "panel-cert",
+		fmt.Sprintf("启动面板证书签发任务(%s %s): %s", req.Mode, job.Target, job.ID),
+		audit.RiskHigh, audit.ResultSuccess)
 	c.JSON(http.StatusAccepted, gin.H{"data": job, "message": "签发任务已启动，可通过任务 ID 查询进度"})
 }
 
@@ -1833,63 +1839,142 @@ func (h *handlers) auditMutation() gin.HandlerFunc {
 		if h.audit == nil || c.Request.Method == http.MethodGet || c.Writer.Status() >= 400 {
 			return
 		}
-		action, ok := deriveMutationAction(c.Request.Method, c.FullPath())
+		rule, ok := deriveMutationAction(c.Request.Method, c.FullPath())
 		if !ok {
 			return
 		}
-		risk := audit.RiskMedium
-		switch action {
-		case "user_delete", "policy_update", "docker_install",
-			"system_restore", "system_backup_delete":
-			risk = audit.RiskHigh
+		targetType, targetID := rule.targetType, ""
+		if targetType == "" {
+			// Legacy heuristic for the earliest rules: user routes carry
+			// :username, host routes carry :id, the rest fall back to :name.
+			targetType, targetID = "system", c.Param("username")
+			if id := c.Param("id"); id != "" {
+				targetType, targetID = "host", id
+			}
+			if targetID == "" {
+				targetID = c.Param("name")
+			}
+		} else if rule.targetParam != "" {
+			targetID = c.Param(rule.targetParam)
 		}
-		// Host-scoped routes carry :id; user routes carry :username; the rest
-		// (backups, groups, commands) name their target with :name or :id.
-		targetType, targetID := "system", c.Param("username")
-		if id := c.Param("id"); id != "" {
-			targetType, targetID = "host", id
+		risk := rule.risk
+		if risk == "" {
+			risk = audit.RiskMedium
 		}
-		if targetID == "" {
-			targetID = c.Param("name")
-		}
-		h.recordAudit(c, action, targetType, targetID,
+		h.recordAudit(c, rule.action, targetType, targetID,
 			c.Request.Method+" "+c.FullPath(), risk, audit.ResultSuccess)
 	}
 }
 
+// mutationRule maps one mutating route to its audit action. targetType pins
+// the audited target type (empty = legacy param heuristic); targetParam names
+// the gin param holding the target ID (empty = heuristic, or none when
+// targetType is set); risk overrides the default medium level (empty = medium).
+type mutationRule struct {
+	method, pattern, action string
+	targetType, targetParam  string
+	risk                    string
+}
+
 // deriveMutationAction maps an HTTP method + gin route pattern to a concrete
 // audit action name.
-func deriveMutationAction(method, pattern string) (string, bool) {
-	type rule struct{ method, pattern, action string }
-	rules := []rule{
-		{http.MethodPost, "/api/v1/users", "user_create"},
-		{http.MethodPut, "/api/v1/users/:username/password", "user_password"},
-		{http.MethodPut, "/api/v1/users/:username/role", "user_role"},
-		{http.MethodPost, "/api/v1/users/:username/reset-password", "user_reset_password"},
-		{http.MethodDelete, "/api/v1/users/:username", "user_delete"},
-		{http.MethodPut, "/api/v1/policy/command", "policy_update"},
-		{http.MethodPost, "/api/v1/hosts/:id/apps/install", "app_install"},
-		{http.MethodDelete, "/api/v1/hosts/:id/apps/:name", "app_uninstall"},
-		{http.MethodPost, "/api/v1/hosts/:id/docker/install-script", "docker_install"},
-		{http.MethodPut, "/api/v1/me/settings", "user_settings_update"},
-		{http.MethodPut, "/api/v1/settings", "system_settings_update"},
+func deriveMutationAction(method, pattern string) (mutationRule, bool) {
+	rules := []mutationRule{
+		{http.MethodPost, "/api/v1/auth/logout", "logout", "system", "", audit.RiskLow},
+		{http.MethodPost, "/api/v1/users", "user_create", "", "", ""},
+		{http.MethodPut, "/api/v1/users/:username/password", "user_password", "", "", ""},
+		{http.MethodPut, "/api/v1/users/:username/role", "user_role", "", "", ""},
+		{http.MethodPost, "/api/v1/users/:username/reset-password", "user_reset_password", "", "", ""},
+		{http.MethodDelete, "/api/v1/users/:username", "user_delete", "", "", audit.RiskHigh},
+		{http.MethodPut, "/api/v1/policy/command", "policy_update", "", "", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/hosts/:id/apps/install", "app_install", "", "", ""},
+		{http.MethodDelete, "/api/v1/hosts/:id/apps/:name", "app_uninstall", "", "", ""},
+		{http.MethodPost, "/api/v1/hosts/:id/docker/install-script", "docker_install", "", "", audit.RiskHigh},
+		{http.MethodPut, "/api/v1/me/settings", "user_settings_update", "", "", ""},
+		{http.MethodPut, "/api/v1/settings", "system_settings_update", "", "", ""},
 		// Control-plane backup / restore: a restore rewrites the whole dataset,
 		// so it is recorded as a high-risk action.
-		{http.MethodPost, "/api/v1/system/backup", "system_backup"},
-		{http.MethodDelete, "/api/v1/system/backups/:name", "system_backup_delete"},
-		{http.MethodPost, "/api/v1/system/backups/:name/restore", "system_restore"},
-		{http.MethodPost, "/api/v1/system/restore", "system_restore"},
+		{http.MethodPost, "/api/v1/system/backup", "system_backup", "", "", ""},
+		{http.MethodDelete, "/api/v1/system/backups/:name", "system_backup_delete", "", "", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/system/backups/:name/restore", "system_restore", "", "", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/system/restore", "system_restore", "", "", audit.RiskHigh},
+		// App lifecycle (Dokploy-style): deploy/rollback/start/stop/restart
+		// change the running state, so they are high-risk.
+		{http.MethodPost, "/api/v1/apps", "app_create", "app", "", ""},
+		{http.MethodPut, "/api/v1/apps/:id", "app_update", "app", "id", ""},
+		{http.MethodDelete, "/api/v1/apps/:id", "app_delete", "app", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/apps/:id/deploy", "app_deploy", "app", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/apps/:id/rollback", "app_rollback", "app", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/apps/:id/stop", "app_stop", "app", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/apps/:id/start", "app_start", "app", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/apps/:id/restart", "app_restart", "app", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/apps/:id/webhook/sync", "app_webhook_sync", "app", "id", audit.RiskHigh},
+		// Reverse-proxy domain binding: traffic-affecting, high-risk.
+		{http.MethodPut, "/api/v1/apps/:id/proxy", "app_proxy_bind", "app", "id", audit.RiskHigh},
+		{http.MethodDelete, "/api/v1/apps/:id/proxy", "app_proxy_unbind", "app", "id", audit.RiskHigh},
+		// Certificate hub: key material is sensitive.
+		{http.MethodPut, "/api/v1/certs/config", "cert_config_update", "cert", "", ""},
+		{http.MethodPost, "/api/v1/certs/accounts", "cert_account_create", "cert", "", ""},
+		{http.MethodPut, "/api/v1/certs/accounts/:id", "cert_account_update", "cert", "id", ""},
+		{http.MethodDelete, "/api/v1/certs/accounts/:id", "cert_account_delete", "cert", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/certs/issue", "cert_issue", "cert", "", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/certs/:id/renew", "cert_renew", "cert", "id", audit.RiskHigh},
+		{http.MethodDelete, "/api/v1/certs/:id", "cert_delete", "cert", "id", audit.RiskHigh},
+		// File management on hosts: removal is destructive.
+		{http.MethodPost, "/api/v1/hosts/:id/files/mkdir", "file_mkdir", "host", "id", ""},
+		{http.MethodPost, "/api/v1/hosts/:id/files/move", "file_move", "host", "id", ""},
+		{http.MethodPost, "/api/v1/hosts/:id/files/copy", "file_copy", "host", "id", ""},
+		{http.MethodDelete, "/api/v1/hosts/:id/files", "file_remove", "host", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/hosts/:id/files/upload", "file_upload", "host", "id", ""},
+		// Security scan trigger: active probing on the host.
+		{http.MethodPost, "/api/v1/hosts/:id/scans", "scan_trigger", "host", "id", ""},
+		// Snapshot / backup jobs: a restore overwrites live data.
+		{http.MethodPost, "/api/v1/backups/jobs", "backup_job_create", "backup", "", ""},
+		{http.MethodPut, "/api/v1/backups/jobs/:id", "backup_job_update", "backup", "id", ""},
+		{http.MethodDelete, "/api/v1/backups/jobs/:id", "backup_job_delete", "backup", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/backups/jobs/:id/run", "backup_job_run", "backup", "id", ""},
+		{http.MethodPost, "/api/v1/backups/jobs/:id/archives/:archiveID/restore", "backup_archive_restore", "backup", "archiveID", audit.RiskHigh},
+		{http.MethodDelete, "/api/v1/backups/jobs/:id/archives/:archiveID", "backup_archive_delete", "backup", "archiveID", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/backups/s3-targets", "backup_s3_create", "backup", "", ""},
+		{http.MethodPut, "/api/v1/backups/s3-targets/:id", "backup_s3_update", "backup", "id", ""},
+		{http.MethodDelete, "/api/v1/backups/s3-targets/:id", "backup_s3_delete", "backup", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/backups/s3-targets/:id/test", "backup_s3_test", "backup", "id", audit.RiskLow},
+		// Git provider credentials: token material is sensitive.
+		{http.MethodPost, "/api/v1/git/github/token", "git_token_set", "system", "", audit.RiskHigh},
+		{http.MethodDelete, "/api/v1/git/github", "git_account_delete", "system", "", audit.RiskHigh},
+		// Host groups + per-group grants: authorization changes are high-risk.
+		{http.MethodPost, "/api/v1/groups", "group_create", "group", "", ""},
+		{http.MethodPatch, "/api/v1/groups/:id", "group_update", "group", "id", ""},
+		{http.MethodDelete, "/api/v1/groups/:id", "group_delete", "group", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/groups/:id/users", "group_grant", "group", "id", audit.RiskHigh},
+		{http.MethodDelete, "/api/v1/groups/:id/users/:username", "group_revoke", "group", "id", audit.RiskHigh},
+		// Saved-command library.
+		{http.MethodPost, "/api/v1/commands", "command_create", "command", "", ""},
+		{http.MethodPatch, "/api/v1/commands/:id", "command_update", "command", "id", ""},
+		{http.MethodDelete, "/api/v1/commands/:id", "command_delete", "command", "id", audit.RiskHigh},
+		// Alerts: rules/webhook changes and event evidence destruction.
+		{http.MethodPost, "/api/v1/alerts/rules", "alert_rule_create", "alert", "", ""},
+		{http.MethodPut, "/api/v1/alerts/rules/:id", "alert_rule_update", "alert", "id", ""},
+		{http.MethodDelete, "/api/v1/alerts/rules/:id", "alert_rule_delete", "alert", "id", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/alerts/events/ack-all", "alert_events_ack_all", "alert", "", audit.RiskLow},
+		{http.MethodPost, "/api/v1/alerts/events/:id/ack", "alert_event_ack", "alert", "id", audit.RiskLow},
+		{http.MethodDelete, "/api/v1/alerts/events/:id", "alert_event_delete", "alert", "id", audit.RiskHigh},
+		{http.MethodDelete, "/api/v1/alerts/events", "alert_events_clear", "alert", "", audit.RiskHigh},
+		{http.MethodPut, "/api/v1/alerts/webhook", "alert_webhook_update", "alert", "", ""},
+		{http.MethodPost, "/api/v1/alerts/webhook/test", "alert_webhook_test", "alert", "", audit.RiskLow},
+		// AI assistant config: model/endpoint credentials.
+		{http.MethodPut, "/api/v1/ai/config", "ai_config_update", "system", "", ""},
 	}
 	for _, r := range rules {
 		if method == r.method && pattern == r.pattern {
-			return r.action, true
+			return r, true
 		}
 	}
 	// Vault credential mutations share one pattern family.
 	if strings.HasPrefix(pattern, "/api/v1/vault") {
-		return "vault_op", true
+		return mutationRule{method: method, pattern: pattern, action: "vault_op", risk: audit.RiskHigh}, true
 	}
-	return "", false
+	return mutationRule{}, false
 }
 
 // ---- Sessions / Audit ------------------------------------------------
@@ -2115,6 +2200,8 @@ func (h *handlers) deleteSession(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// Deleting a recording destroys audit evidence: always log it.
+	h.recordAudit(c, "session_delete", "session", sid, "删除会话/录像", audit.RiskHigh, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

@@ -1133,6 +1133,13 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
    - **绝对禁止私自捏造/拼接版本**：禁止在开发、部署或测试脚本中自行生成伪版本号（例如取本地 git commit hash 拼凑 `0.1.0-<hash>` 或任意自定义后缀）；未经 tag 发布的代码版本一律为开发环境占位（`0.1.0-dev`），线上与测试环境的升级验证必须且只能来源于官方 Release 产物与由 CI 生成的 `manifest.json`，确保版本链路 100% 可追溯。
    - **严禁裸 tag，必须完整编写变更说明 (Changelog)**：创建 Git tag 时严禁使用无任何说明的裸 tag（如仅 `git tag v1.2.3`）。每次打 tag 发版必须使用附注 tag（`git tag -a vX.Y.Z -m "..."`），并在 tag message 与 GitHub Release notes 中详细枚举 Changed（行为变更/优化）、Fixed（缺陷修复）、Added（新增功能）、Security（安全修复）等内容，确保版本演进清晰透明、便于追踪定位。
 
+5. **操作审计全覆盖 (Audit Coverage)**：
+   - **所有改变系统/主机状态的写操作必须记审计**：凡是 `POST/PUT/PATCH/DELETE` 且会产生状态变更的 API（创建/更新/删除配置、启停/部署/回滚应用、签发/续期证书、文件增删改、执行命令、绑定解绑域名、授权变更、删除会话录像等），必须有一条审计记录（谁、何时、做了什么、目标对象、结果、风险等级）。
+   - **实现方式**：优先走 `server/internal/api/router.go` 的 `auditMutation()` 中间件——在 `deriveMutationAction` 里为新路由添加规则（action 名、targetType、targetParam、risk）；中间件覆盖不到的单个 handler（如异步任务启动、证据删除）用 `h.recordAudit(...)` 显式记录。
+   - **新增写路由必须同步加规则**：`deriveMutationAction` 的规则表是审计覆盖的唯一事实来源；新增任何写操作路由时，必须同时在规则表里加一条，并在 `server/internal/api/audit_coverage_test.go` 的 `TestDeriveMutationActionCoverage` 里加一条用例锁住它。Review 时发现写路由无规则 = 缺陷。
+   - **豁免**：纯读（GET）、诊断/分析类（AI diagnose、部署诊断）、机器对机器回调（Agent enroll、应用 webhook 回调）不记审计；失败请求（HTTP >= 400）由中间件自动跳过，显式埋点自行决定。
+   - **风险分级**：删除/恢复/签发/授权变更/流量切换类记 `high`；常规增改记 `medium`；登出、连通性测试、告警确认等记 `low`。
+
 ---
 
 ## 8. 前端布局规范

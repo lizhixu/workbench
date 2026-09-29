@@ -46,6 +46,28 @@ func identifierType(v string) string {
 	return "dns"
 }
 
+// acmeError extracts the error detail from an RFC 8555 problem JSON response.
+func acmeError(action string, status int, body []byte) error {
+	var prob struct {
+		Type   string `json:"type"`
+		Detail string `json:"detail"`
+	}
+	if json.Unmarshal(body, &prob) == nil && prob.Detail != "" {
+		if prob.Type != "" {
+			return fmt.Errorf("%s: status %d (%s): %s", action, status, prob.Type, prob.Detail)
+		}
+		return fmt.Errorf("%s: status %d: %s", action, status, prob.Detail)
+	}
+	snippet := strings.TrimSpace(string(body))
+	if len(snippet) > 300 {
+		snippet = snippet[:300]
+	}
+	if snippet != "" {
+		return fmt.Errorf("%s: status %d %s", action, status, snippet)
+	}
+	return fmt.Errorf("%s: status %d", action, status)
+}
+
 // http01Challenge serves ACME HTTP-01 responses for the duration of an
 // issuance. Public CAs only validate http-01 on port 80, so the listener is
 // bound briefly (challenge lifetime) and released afterwards; it is only
@@ -262,11 +284,7 @@ func (a *acmeClient) ensureAccount(accountKey crypto.Signer) error {
 		return err
 	}
 	if status/100 != 2 {
-		snippet := string(body)
-		if len(snippet) > 300 {
-			snippet = snippet[:300]
-		}
-		return fmt.Errorf("newAccount: status %d %s", status, snippet)
+		return acmeError("newAccount", status, body)
 	}
 	if location == "" {
 		return fmt.Errorf("newAccount: missing Location")
@@ -299,20 +317,37 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []s
 
 	// 1. New order. The order URL is the Location response header, used to
 	// poll status below.
-	body, orderURL, status, err := a.jwsRequest(dir["newOrder"], map[string]any{
+	orderReq := map[string]any{
 		"identifiers": idents,
-	}, a.kid, accountKey, false)
+	}
+	if needHTTP01 {
+		// RFC 8738 / ACME profile draft: Let's Encrypt (and CAs supporting short-lived IP certs)
+		// require "profile": "shortlived" for IP address identifiers (see https://letsencrypt.org/docs/profiles/).
+		orderReq["profile"] = "shortlived"
+	}
+
+	body, orderURL, status, err := a.jwsRequest(dir["newOrder"], orderReq, a.kid, accountKey, false)
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("newOrder: %w", err)
 	}
+	// If CA rejected the profile parameter (e.g. non-Let's Encrypt CA that doesn't support the profile draft),
+	// fall back to order without profile.
+	if status/100 != 2 && needHTTP01 && strings.Contains(strings.ToLower(string(body)), "unrecognized") && strings.Contains(strings.ToLower(string(body)), "profile") {
+		delete(orderReq, "profile")
+		body, orderURL, status, err = a.jwsRequest(dir["newOrder"], orderReq, a.kid, accountKey, false)
+		if err != nil {
+			return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("newOrder: %w", err)
+		}
+	}
 	if status/100 != 2 {
-		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("newOrder: status %d", status)
+		return nil, nil, time.Time{}, time.Time{}, "", acmeError("newOrder", status, body)
 	}
 	var order struct {
-		Status         string   `json:"status"`
-		Authorizations []string `json:"authorizations"`
-		Finalize       string   `json:"finalize"`
-		Certificate    string   `json:"certificate"`
+		Status         string          `json:"status"`
+		Authorizations []string        `json:"authorizations"`
+		Finalize       string          `json:"finalize"`
+		Certificate    string          `json:"certificate"`
+		Error          json.RawMessage `json:"error,omitempty"`
 	}
 	if err := json.Unmarshal(body, &order); err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("newOrder parse: %w", err)
@@ -349,12 +384,15 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []s
 			return nil, nil, time.Time{}, time.Time{}, "", err
 		}
 		if status/100 != 2 {
-			return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("poll order: status %d", status)
+			return nil, nil, time.Time{}, time.Time{}, "", acmeError("poll order", status, body)
 		}
 		if err := json.Unmarshal(body, &order); err != nil {
 			return nil, nil, time.Time{}, time.Time{}, "", err
 		}
 		if order.Status == "invalid" {
+			if len(order.Error) > 0 {
+				return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("order invalid: %s", string(order.Error))
+			}
 			return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("order invalid")
 		}
 	}
@@ -370,13 +408,17 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []s
 	}
 	csrB64 := base64.RawURLEncoding.EncodeToString(csrDer)
 
-	body, _, _, err = a.jwsRequest(order.Finalize, map[string]any{"csr": csrB64}, a.kid, accountKey, false)
+	body, _, status, err = a.jwsRequest(order.Finalize, map[string]any{"csr": csrB64}, a.kid, accountKey, false)
 	if err != nil {
 		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("finalize: %w", err)
 	}
+	if status/100 != 2 {
+		return nil, nil, time.Time{}, time.Time{}, "", acmeError("finalize", status, body)
+	}
 	var finOrder struct {
-		Status      string `json:"status"`
-		Certificate string `json:"certificate"`
+		Status      string          `json:"status"`
+		Certificate string          `json:"certificate"`
+		Error       json.RawMessage `json:"error,omitempty"`
 	}
 	_ = json.Unmarshal(body, &finOrder)
 
@@ -388,9 +430,12 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []s
 			return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("finalize timeout: %s", finOrder.Status)
 		}
 		if certURL == "" {
-			body, _, _, err := a.jwsRequest(orderURL, nil, a.kid, accountKey, false)
+			body, _, status, err := a.jwsRequest(orderURL, nil, a.kid, accountKey, false)
 			if err != nil {
 				return nil, nil, time.Time{}, time.Time{}, "", err
+			}
+			if status/100 != 2 {
+				return nil, nil, time.Time{}, time.Time{}, "", acmeError("poll finalize", status, body)
 			}
 			_ = json.Unmarshal(body, &finOrder)
 			certURL = finOrder.Certificate
@@ -399,6 +444,9 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []s
 			break
 		}
 		if finOrder.Status == "invalid" {
+			if len(finOrder.Error) > 0 {
+				return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("finalize invalid: %s", string(finOrder.Error))
+			}
 			return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("finalize invalid")
 		}
 		time.Sleep(3 * time.Second)
@@ -483,17 +531,28 @@ func (a *acmeClient) pollAuthorization(authzURL string, accountKey crypto.Signer
 		if err != nil {
 			continue
 		}
-		var st struct {
-			Status string `json:"status"`
-		}
-		if json.Unmarshal(body, &st) == nil {
-			switch st.Status {
-			case "valid":
-				return nil
-			case "invalid", "expired":
-				return fmt.Errorf("authorization %s", st.Status)
+			var st struct {
+				Status     string `json:"status"`
+				Challenges []struct {
+					Type  string          `json:"type"`
+					Error json.RawMessage `json:"error,omitempty"`
+				} `json:"challenges"`
 			}
-		}
+			if json.Unmarshal(body, &st) == nil {
+				switch st.Status {
+				case "valid":
+					return nil
+				case "invalid", "expired":
+					var chalErr string
+					for _, ch := range st.Challenges {
+						if len(ch.Error) > 0 {
+							chalErr = fmt.Sprintf(" (%s: %s)", ch.Type, string(ch.Error))
+							break
+						}
+					}
+					return fmt.Errorf("authorization %s%s", st.Status, chalErr)
+				}
+			}
 	}
 }
 

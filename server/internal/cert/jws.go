@@ -186,11 +186,15 @@ func makeCSR(key *ecdsa.PrivateKey, identifiers []string) ([]byte, error) {
 		}
 	}
 	cn := ""
-	if len(identifiers) > 0 {
-		cn = strings.TrimSpace(identifiers[0])
+	if len(dnsNames) > 0 {
+		cn = dnsNames[0]
+	}
+	var subject pkix.Name
+	if cn != "" {
+		subject.CommonName = cn
 	}
 	tmpl := &x509.CertificateRequest{
-		Subject:            pkix.Name{CommonName: cn},
+		Subject:            subject,
 		DNSNames:           dnsNames,
 		IPAddresses:        ips,
 		SignatureAlgorithm: x509.ECDSAWithSHA256,

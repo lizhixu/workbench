@@ -65,6 +65,9 @@ func TestMakeCSRWithIP(t *testing.T) {
 	if len(req.DNSNames) != 0 {
 		t.Errorf("DNSNames = %v, want empty", req.DNSNames)
 	}
+	if req.Subject.CommonName != "" {
+		t.Errorf("CommonName = %q, want empty for IP-only CSR", req.Subject.CommonName)
+	}
 	if err := req.CheckSignature(); err != nil {
 		t.Errorf("CSR signature invalid: %v", err)
 	}
@@ -88,6 +91,9 @@ func TestMakeCSRMixed(t *testing.T) {
 	}
 	if len(req.IPAddresses) != 1 || req.IPAddresses[0].String() != "203.0.113.10" {
 		t.Errorf("IPAddresses = %v, want [203.0.113.10]", req.IPAddresses)
+	}
+	if req.Subject.CommonName != "panel.example.com" {
+		t.Errorf("CommonName = %q, want panel.example.com", req.Subject.CommonName)
 	}
 }
 
@@ -143,5 +149,45 @@ func TestDirectoryParseSkipsMetaObject(t *testing.T) {
 	}
 	if _, ok := dir["meta"]; ok {
 		t.Fatalf("meta should be skipped, got %q", dir["meta"])
+	}
+}
+
+func TestACMEError(t *testing.T) {
+	cases := []struct {
+		action string
+		status int
+		body   string
+		want   string
+	}{
+		{
+			action: "newOrder",
+			status: 400,
+			body:   `{"type":"urn:ietf:params:acme:error:rejectedIdentifier","detail":"Default profile does not permit IP address identifiers."}`,
+			want:   "newOrder: status 400 (urn:ietf:params:acme:error:rejectedIdentifier): Default profile does not permit IP address identifiers.",
+		},
+		{
+			action: "finalize",
+			status: 403,
+			body:   `{"detail":"Order not ready"}`,
+			want:   "finalize: status 403: Order not ready",
+		},
+		{
+			action: "poll order",
+			status: 500,
+			body:   `internal server error`,
+			want:   "poll order: status 500 internal server error",
+		},
+		{
+			action: "newAccount",
+			status: 400,
+			body:   "",
+			want:   "newAccount: status 400",
+		},
+	}
+	for _, c := range cases {
+		err := acmeError(c.action, c.status, []byte(c.body))
+		if err == nil || err.Error() != c.want {
+			t.Errorf("acmeError(%q, %d, %q) = %v, want %q", c.action, c.status, c.body, err, c.want)
+		}
 	}
 }

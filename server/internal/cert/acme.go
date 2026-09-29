@@ -255,9 +255,12 @@ func (a *acmeClient) ensureAccount(accountKey crypto.Signer) error {
 	if err != nil {
 		return err
 	}
-	_ = body
 	if status/100 != 2 {
-		return fmt.Errorf("newAccount: status %d", status)
+		snippet := string(body)
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		return fmt.Errorf("newAccount: status %d %s", status, snippet)
 	}
 	if location == "" {
 		return fmt.Errorf("newAccount: missing Location")

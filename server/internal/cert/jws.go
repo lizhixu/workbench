@@ -46,6 +46,7 @@ func (a *acmeClient) jwsRequest(url string, payload any, kid string, key crypto.
 	}
 
 	protected := map[string]any{
+		"alg":   "ES256", // account keys are always ECDSA P-256 (see loadOrCreateAccountKey)
 		"nonce": nonce,
 		"url":   url,
 	}
@@ -75,8 +76,7 @@ func (a *acmeClient) jwsRequest(url string, payload any, kid string, key crypto.
 	protectedB64 := base64.RawURLEncoding.EncodeToString(protectedB)
 
 	signingInput := protectedB64 + "." + payloadB64
-	sum := sha256.Sum256([]byte(signingInput))
-	sig, err := key.Sign(rand.Reader, sum[:], crypto.SHA256)
+	sig, err := es256Sign(key, signingInput)
 	if err != nil {
 		return nil, "", 0, err
 	}
@@ -123,6 +123,27 @@ func (a *acmeClient) postAsGet(url, kid string, key crypto.Signer) ([]byte, erro
 		return nil, fmt.Errorf("post-as-get %s: status %d %s", url, status, snippet)
 	}
 	return body, nil
+}
+
+// es256Sign signs the JWS signing input per RFC 7518 §3.4 (ES256):
+// the signature is the raw concatenation R || S, each left-padded to 32
+// bytes. Note crypto.Signer.Sign on an ECDSA key returns ASN.1 DER, which
+// ACME servers reject, so we encode R and S manually.
+func es256Sign(key crypto.Signer, signingInput string) ([]byte, error) {
+	ecKey, ok := key.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("jws: unsupported key type %T (ES256 needs *ecdsa.PrivateKey)", key)
+	}
+	sum := sha256.Sum256([]byte(signingInput))
+	r, s, err := ecdsa.Sign(rand.Reader, ecKey, sum[:])
+	if err != nil {
+		return nil, err
+	}
+	sig := make([]byte, 64)
+	rb, sb := r.Bytes(), s.Bytes()
+	copy(sig[32-len(rb):32], rb)
+	copy(sig[64-len(sb):], sb)
+	return sig, nil
 }
 
 // jwkJSON renders the JWK for an ECDSA public key (ES256).

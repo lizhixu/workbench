@@ -329,16 +329,37 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 
 func (h *AppHandlers) deleteApp(c *gin.Context) {
 	id := c.Param("id")
-	if app, ok := h.store.GetApp(id); ok {
-		if app.WebhookAutoManaged && app.GitHubHookID > 0 && h.gitProvider != nil {
-			_ = h.gitProvider.DeleteRepoWebhook(context.Background(), app.RepoURL, app.GitHubHookID)
+	purge := c.Query("purge") == "true" || c.Query("purge") == "1"
+	app, ok := h.store.GetApp(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
+		return
+	}
+	var warnings []string
+	if purge {
+		var err error
+		warnings, err = h.purgeAppResources(app)
+		if err != nil {
+			// Agent offline etc: refuse so resources are not silently orphaned.
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
 		}
+	}
+	if app.WebhookAutoManaged && app.GitHubHookID > 0 && h.gitProvider != nil {
+		_ = h.gitProvider.DeleteRepoWebhook(context.Background(), app.RepoURL, app.GitHubHookID)
 	}
 	if err := h.store.DeleteApp(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	resp := gin.H{"ok": true}
+	if purge {
+		resp["purged"] = true
+		if len(warnings) > 0 {
+			resp["warnings"] = warnings
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (h *AppHandlers) syncAppWebhook(c *gin.Context) {

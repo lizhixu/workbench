@@ -2,8 +2,8 @@
 import { computed, h, onActivated, onDeactivated, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  NButton, NDataTable, NEmpty, NIcon, NInput, NPopconfirm,
-  NSpace, NTag, useMessage,
+  NButton, NDataTable, NEmpty, NIcon, NInput, NModal,
+  NSpace, NTag, NCheckbox, NAlert, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import {
@@ -120,13 +120,9 @@ const columns = computed<DataTableColumns<AppEntity>>(() => [
           if (canWrite.value) {
             buttons.push(
               h(
-                NPopconfirm,
-                { onPositiveClick: () => doDelete(row) },
-                {
-                  trigger: () =>
-                    h(NButton, { size: 'tiny', secondary: true, type: 'error' }, { default: () => h(NIcon, null, { default: () => h(TrashOutline) }) }),
-                  default: () => `确定删除应用「${row.name}」？容器不会被销毁。`,
-                },
+                NButton,
+                { size: 'tiny', secondary: true, type: 'error', onClick: () => openDeleteModal(row) },
+                { default: () => h(NIcon, null, { default: () => h(TrashOutline) }) },
               ),
             )
           }
@@ -184,13 +180,38 @@ function openCreate() {
   router.push('/apps/create')
 }
 
-async function doDelete(app: AppEntity) {
+// 删除确认（含"是否删除内容"选项）
+const showDeleteModal = ref(false)
+const deleteTarget = ref<AppEntity | null>(null)
+const purgeContent = ref(false)
+const deleting = ref(false)
+
+function openDeleteModal(app: AppEntity) {
+  deleteTarget.value = app
+  purgeContent.value = false
+  showDeleteModal.value = true
+}
+
+async function confirmDelete() {
+  const app = deleteTarget.value
+  if (!app) return
+  deleting.value = true
   try {
-    await deleteApp(app.id)
-    message.success(`已删除应用「${app.name}」`)
+    const res = await deleteApp(app.id, purgeContent.value)
+    if (res.purged) {
+      message.success(`已删除应用「${app.name}」及其部署内容`)
+    } else {
+      message.success(`已删除应用「${app.name}」（容器等内容未动）`)
+    }
+    if (res.warnings?.length) {
+      message.warning('部分内容清理失败：' + res.warnings.join('；'))
+    }
+    showDeleteModal.value = false
     await loadData()
   } catch (e: any) {
     message.error(e.message || '删除失败')
+  } finally {
+    deleting.value = false
   }
 }
 
@@ -263,6 +284,31 @@ onDeactivated(() => {
         </NButton>
       </NEmpty>
     </div>
+
+    <NModal
+      v-model:show="showDeleteModal"
+      preset="dialog"
+      title="删除应用"
+      :loading="deleting"
+      positive-text="删除"
+      negative-text="取消"
+      type="error"
+      @positive-click="confirmDelete"
+    >
+      <NSpace vertical :size="12">
+        <div>确定删除应用「{{ deleteTarget?.name }}」？</div>
+        <NCheckbox v-model:checked="purgeContent">
+          同时删除应用内容（容器、数据卷、镜像、代理配置等）
+        </NCheckbox>
+        <NAlert v-if="purgeContent" type="warning" :show-icon="false" style="font-size: 12px">
+          将在主机上销毁该应用的容器/Compose 栈、命名数据卷、构建镜像及域名代理配置，数据不可恢复。
+          若主机离线，删除会被拒绝（避免内容被静默遗留）。
+        </NAlert>
+        <div v-else style="font-size: 12px; color: var(--n-text-color-disabled, #999)">
+          仅删除面板中的应用记录，主机上的容器、数据卷等内容不会被销毁。
+        </div>
+      </NSpace>
+    </NModal>
   </div>
 </template>
 

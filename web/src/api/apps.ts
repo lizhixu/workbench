@@ -135,8 +135,10 @@ export function updateApp(id: string, req: Partial<AppCreateRequest>) {
   return unwrap<{ data: AppEntity }>(http.put(`/apps/${id}`, req)).then((r) => r.data)
 }
 
-export function deleteApp(id: string) {
-  return unwrap<{ ok: boolean }>(http.delete(`/apps/${id}`))
+export function deleteApp(id: string, purge = false) {
+  return unwrap<{ ok: boolean; purged?: boolean; warnings?: string[] }>(
+    http.delete(`/apps/${id}`, { params: { purge } }),
+  )
 }
 
 export function deployApp(id: string) {

@@ -57,6 +57,31 @@ sudo bash install.sh --help    # 查看全部选项（--version、--port、--mir
 
 > 版本通道：默认只跟踪正式版。想尝鲜预发布版时，在面板「系统设置 → 系统升级」中打开「加入测试计划」，之后重跑安装脚本升级即可（不再用 `--channel` 这类命令参数区分）。
 
+### 独立单二进制直接运行（免解压）
+
+除了一键脚本自动托管 systemd 外，也可以从 [GitHub Releases](https://github.com/lizhixu/workbench/releases) 直接下载单二进制独立运行：
+
+- **控制端（内置 Web 控制台，开箱即用）**：
+  ```bash
+  # Linux x86_64
+  curl -LO https://github.com/lizhixu/workbench/releases/download/<TAG>/watchman-server-linux-amd64
+  chmod +x watchman-server-linux-amd64
+  ./watchman-server-linux-amd64 -http :18789 -grpc :9090 -data ./data
+  ```
+  控制端启动后直接在浏览器打开 `http://<IP>:18789`，默认管理员账号密码均为 `admin`。若本地未预置各系统 agent 二进制，首次生成纳管命令并下载时控制端会自动按需从官方 Release 缓存。
+
+- **被管端 Agent（独立运行）**：
+  - **Linux**：
+    ```bash
+    curl -LO https://github.com/lizhixu/workbench/releases/download/<TAG>/watchman-agent-linux-amd64
+    chmod +x watchman-agent-linux-amd64
+    ./watchman-agent-linux-amd64 -server <SERVER_IP>:9090 -token <ENROLL_TOKEN>
+    ```
+  - **Windows**：直接下载 `watchman-agent-windows-amd64.exe`，在 PowerShell 或命令提示符中执行：
+    ```powershell
+    .\watchman-agent-windows-amd64.exe -server <SERVER_IP>:9090 -token <ENROLL_TOKEN>
+    ```
+
 ### 源码构建
 
 ```bash
@@ -83,10 +108,20 @@ npm run build         # 生产构建
 
 ## 发版
 
-推送 `v*` tag 触发 GitHub Actions：构建 server（linux amd64/arm64）+ agent（linux amd64/arm64、windows amd64），注入版本号/commit/构建时间，打包 `watchman-dist-<tag>-linux-<arch>.tar.gz`（bin + manifest.json，前端已 embed 进 server）+ `CHECKSUMS.txt`，发布 GitHub Release（`-rc`/`-beta` 后缀自动标 pre-release）。
+推送带附注的 `v*` tag 触发 GitHub Actions 官方 Release 流水线：
+- 编译 Server（Linux amd64/arm64）与 Agent（Linux amd64/arm64、Windows amd64），通过 ldflags 注入版本号、Commit 与构建时间；
+- 发布独立单二进制：`watchman-server-linux-amd64`、`watchman-server-linux-arm64`、`watchman-agent-linux-amd64`、`watchman-agent-linux-arm64`、`watchman-agent-windows-amd64.exe`；
+- 发布完整套件包：`watchman-dist-<tag>-linux-<arch>.tar.gz`（内含完整二进制、manifest.json 与 install.sh，前端已 embed 进 server）；
+- 发布官方校验与清单：`manifest.json` 与 `CHECKSUMS.txt`。
 
+严禁使用裸 tag，必须编写包含详细变更的附注 tag：
 ```bash
-git tag v1.0.0 && git push origin v1.0.0
+git tag -a v0.1.0-beta.9 -m "release: v0.1.0-beta.9
+
+### Added
+- Release 页面直出免解压独立单二进制
+"
+git push origin v0.1.0-beta.9
 ```
 
 ## 目录结构

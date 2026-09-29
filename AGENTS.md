@@ -923,8 +923,22 @@ Agent internal/shell
   GitHub Release notes 也必须同步保留上述详细变更清单，确保版本迭代历史 100% 透明可溯。
 - tag 规范：`v1.2.3` 为正式版；`v1.3.0-rc.1` / `v1.3.0-beta.1`（带 `-` 后缀）由 CI 自动标记为 pre-release。
 - 构建矩阵：server（linux amd64/arm64）+ agent（linux amd64/arm64、windows amd64），全部 `CGO_ENABLED=0` 静态编译。
-- 产物：`watchman-dist-v1.2.3-linux-{amd64,arm64}.tar.gz`（内含 `bin/` 二进制——agent 文件名遵循 `watchman-agent-{goos}-{goarch}` 以便 `install.FindAgentBinary` 直接找到、`manifest.json`；Web 控制台已通过 `go:embed` 打进 `watchman-server`，无需单独的前端包）+ `CHECKSUMS.txt`（sha256）。
+- **发布产物规范（双轨发布体系：独立单二进制 + 完整安装包）**：
+  每次发布直出以下完整资产列表，满足直接运行与自动化安装双重需求：
+  1. **直接可执行的独立二进制（无须解压，下载即用）**：
+     - `watchman-server-linux-amd64`：Linux x86_64 控制端独立程序（内嵌 Web 控制台）
+     - `watchman-server-linux-arm64`：Linux ARM64 控制端独立程序（内嵌 Web 控制台）
+     - `watchman-agent-linux-amd64`：Linux x86_64 被管端 Agent 独立程序
+     - `watchman-agent-linux-arm64`：Linux ARM64 被管端 Agent 独立程序
+     - `watchman-agent-windows-amd64.exe`：Windows x86_64 被管端可执行程序
+  2. **完整套件安装包（供 install.sh 脚本与系统化一键部署）**：
+     - `watchman-dist-${TAG}-linux-amd64.tar.gz`（内含控制端、各平台 agent 二进制、`install.sh` 与 `manifest.json`）
+     - `watchman-dist-${TAG}-linux-arm64.tar.gz`
+  3. **权威元数据与安全校验**：
+     - `manifest.json`：官方发布清单，记录版本号、Commit 与各平台 Agent 二进制权威 SHA-256
+     - `CHECKSUMS.txt`：包含上述所有独立单二进制、归档包与清单文件的全局 SHA-256 校验和
 - `manifest.json`：`{version, commit, build_time, agents: {"linux/amd64": {file, sha256}, ...}}`。已落地（2026-09-27）：控制端启动时读 `-manifest`（默认 `/opt/watchman/manifest.json`，由 install.sh 部署），作为 agent 升级的版本/sha256 基准，替代 server 自身构建版本，解除"最新 = 控制端自己"的闭环；无 manifest 时（dev）回退到 `CurrentAgentVersion`。单台/批量升级的版本判定、sha256（优先 manifest，其次 `install.AgentBinarySha256`）、签名、下载 URL 全部走这套基准。`GET /api/v1/version`（authed）返回 server 构建信息 + `agent_target_version` + `agent_manifest` + `upgrade_pubkey` + `public_url`。
+- 控制端单二进制按需自动拉取 Agent 机制：若控制端脱离 `/opt/watchman` 作为独立二进制运行（本地缺少 agent 二进制），在被纳管主机请求下载 Agent 时，控制端自适应依据当前 Release 版本自动从 GitHub Releases 官方下载对应 Agent 并缓存至 `data/bin/`，确保跨机器一键安装命令平滑打通。
 - 版本通道：`stable`（默认，GitHub `/releases/latest`，自动排除 pre-release）、`beta`（releases API 列表第一条，含 pre-release）、`--version` 精确锁定（优先级最高）。
 - 手动触发：workflow_dispatch 只构建打包、上传 artifacts，不创建 Release（正式打 tag 前验证管线用）。
 

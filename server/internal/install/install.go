@@ -8,8 +8,10 @@
 package install
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -17,7 +19,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
+	"watchman/internal/version"
 	"watchman/server/internal/rpc"
 
 	"github.com/gin-gonic/gin"
@@ -132,27 +137,72 @@ func FindAgentBinary(binDir, goos, goarch string) (string, error) {
 	if binDir != "" {
 		candidates = append(candidates, filepath.Join(binDir, filename))
 	}
+
+	// 1. Search relative to the currently running server executable
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(exeDir, filename),
+			filepath.Join(exeDir, "bin", filename),
+			filepath.Join(exeDir, "data", "bin", filename),
+		)
+	}
+
+	// 2. Search common installation and project directories
 	candidates = append(candidates,
 		filepath.Join("/opt/watchman/bin", filename),
+		filepath.Join("/opt/watchman/data/bin", filename),
 		filepath.Join("bin", filename),
+		filepath.Join("data", "bin", filename),
+		filepath.Join("dist", filename),
+		filepath.Join("dist", "bin", filename),
 		filepath.Join("bin/linux_amd64", filename),
 	)
+
+	// Canonical bare names for linux/amd64 (matches install.FindAgentBinary dev fallback)
 	if goos == "linux" && goarch == "amd64" {
 		if binDir != "" {
 			candidates = append(candidates, filepath.Join(binDir, "watchman-agent"))
 		}
+		if exe, err := os.Executable(); err == nil {
+			exeDir := filepath.Dir(exe)
+			candidates = append(candidates,
+				filepath.Join(exeDir, "watchman-agent"),
+				filepath.Join(exeDir, "bin", "watchman-agent"),
+				filepath.Join(exeDir, "data", "bin", "watchman-agent"),
+			)
+		}
 		candidates = append(candidates,
 			filepath.Join("/opt/watchman/bin", "watchman-agent"),
+			filepath.Join("/opt/watchman/data/bin", "watchman-agent"),
 			filepath.Join("bin/linux_amd64", "watchman-agent"),
 			filepath.Join("bin", "watchman-agent"),
+			filepath.Join("data", "bin", "watchman-agent"),
+			filepath.Join("dist", "watchman-agent"),
+			filepath.Join("dist", "bin", "watchman-agent"),
 		)
 	}
+
+	// Canonical bare names for windows/amd64
 	if goos == "windows" && goarch == "amd64" {
 		if binDir != "" {
 			candidates = append(candidates, filepath.Join(binDir, "watchman-agent.exe"))
 		}
+		if exe, err := os.Executable(); err == nil {
+			exeDir := filepath.Dir(exe)
+			candidates = append(candidates,
+				filepath.Join(exeDir, "watchman-agent.exe"),
+				filepath.Join(exeDir, "bin", "watchman-agent.exe"),
+				filepath.Join(exeDir, "data", "bin", "watchman-agent.exe"),
+			)
+		}
 		candidates = append(candidates,
+			filepath.Join("/opt/watchman/bin", "watchman-agent.exe"),
+			filepath.Join("/opt/watchman/data/bin", "watchman-agent.exe"),
 			filepath.Join("bin", "watchman-agent.exe"),
+			filepath.Join("data", "bin", "watchman-agent.exe"),
+			filepath.Join("dist", "watchman-agent.exe"),
+			filepath.Join("dist", "bin", "watchman-agent.exe"),
 		)
 	}
 
@@ -183,6 +233,133 @@ func AgentBinarySha256(binDir, goos, goarch string) (string, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
+var agentDownloadMu sync.Mutex
+
+// downloadAndCacheAgent downloads the agent binary for goos/goarch on demand from
+// official GitHub Releases when running as a standalone binary without local agent files.
+func (h *Handler) downloadAndCacheAgent(goos, goarch string) (string, error) {
+	agentDownloadMu.Lock()
+	defer agentDownloadMu.Unlock()
+
+	// Double-check if another request just downloaded it
+	if p, err := FindAgentBinary(h.binDir, goos, goarch); err == nil {
+		return p, nil
+	}
+
+	filename := fmt.Sprintf("watchman-agent-%s-%s", goos, goarch)
+	if goos == "windows" {
+		filename += ".exe"
+	}
+
+	targetVersion := version.Get()
+	repo := os.Getenv("WATCHMAN_REPO")
+	if repo == "" {
+		repo = "lizhixu/workbench"
+	}
+
+	if !strings.HasPrefix(targetVersion, "v") {
+		if envV := os.Getenv("WATCHMAN_TARGET_VERSION"); envV != "" {
+			targetVersion = envV
+		} else {
+			// Query latest release tag from GitHub API
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo), nil)
+			if err == nil {
+				req.Header.Set("User-Agent", "Watchman-Server")
+				client := &http.Client{Timeout: 10 * time.Second}
+				if resp, err := client.Do(req); err == nil {
+					defer resp.Body.Close()
+					if resp.StatusCode == http.StatusOK {
+						var rel struct {
+							TagName string `json:"tag_name"`
+						}
+						if err := json.NewDecoder(resp.Body).Decode(&rel); err == nil && rel.TagName != "" {
+							targetVersion = rel.TagName
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if !strings.HasPrefix(targetVersion, "v") {
+		return "", fmt.Errorf("无法确定目标 Release 版本 (当前版本: %s)", targetVersion)
+	}
+
+	downloadURL := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", repo, targetVersion, filename)
+	mirror := os.Getenv("GITHUB_MIRROR")
+	if mirror == "" {
+		mirror = os.Getenv("WATCHMAN_GITHUB_MIRROR")
+	}
+	mirror = strings.TrimSuffix(strings.TrimSpace(mirror), "/")
+	if mirror != "" && strings.HasPrefix(downloadURL, "https://github.com/") {
+		downloadURL = mirror + "/" + downloadURL
+	}
+
+	// Choose appropriate local cache directory
+	var cacheDir string
+	if h.binDir != "" {
+		cacheDir = h.binDir
+	} else if exe, err := os.Executable(); err == nil && filepath.Dir(exe) != "" {
+		cacheDir = filepath.Join(filepath.Dir(exe), "data", "bin")
+	} else {
+		cacheDir = filepath.Join("data", "bin")
+	}
+
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		cacheDir = filepath.Join(os.TempDir(), "watchman-bin")
+		_ = os.MkdirAll(cacheDir, 0755)
+	}
+
+	targetPath := filepath.Join(cacheDir, filename)
+	tmpPath := targetPath + ".downloading"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("创建下载请求失败: %w", err)
+	}
+	req.Header.Set("User-Agent", "Watchman-Server")
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("下载 Agent 二进制失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("下载 Agent 二进制 HTTP 状态码 %d", resp.StatusCode)
+	}
+
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return "", fmt.Errorf("创建临时缓存文件失败: %w", err)
+	}
+
+	written, err := io.Copy(f, resp.Body)
+	f.Close()
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("保存 Agent 二进制失败: %w", err)
+	}
+	if written < 1024 {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("下载的 Agent 二进制大小异常 (%d bytes)", written)
+	}
+
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("重命名缓存文件失败: %w", err)
+	}
+	_ = os.Chmod(targetPath, 0755)
+
+	return targetPath, nil
+}
+
 // agentBinary serves the pre-built agent binary for the requested OS/arch.
 func (h *Handler) agentBinary(c *gin.Context) {
 	goos := c.DefaultQuery("os", "linux")
@@ -190,12 +367,17 @@ func (h *Handler) agentBinary(c *gin.Context) {
 
 	foundPath, err := FindAgentBinary(h.binDir, goos, goarch)
 	if err != nil {
-		filename := fmt.Sprintf("watchman-agent-%s-%s", goos, goarch)
-		if goos == "windows" {
-			filename += ".exe"
+		// Attempt on-demand download from GitHub Releases
+		if downloaded, dlErr := h.downloadAndCacheAgent(goos, goarch); dlErr == nil {
+			foundPath = downloaded
+		} else {
+			filename := fmt.Sprintf("watchman-agent-%s-%s", goos, goarch)
+			if goos == "windows" {
+				filename += ".exe"
+			}
+			c.String(http.StatusNotFound, "binary not found: %s (auto-download error: %v; build it with: GOOS=%s GOARCH=%s go build -o %s ./agent/cmd/watchman-agent)", filename, dlErr, goos, goarch, filepath.Join(h.binDir, filename))
+			return
 		}
-		c.String(http.StatusNotFound, "binary not found: %s (build it with: GOOS=%s GOARCH=%s go build -o %s ./agent/cmd/watchman-agent)", filename, goos, goarch, filepath.Join(h.binDir, filename))
-		return
 	}
 
 	filename := filepath.Base(foundPath)

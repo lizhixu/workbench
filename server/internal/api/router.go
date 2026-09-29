@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -2398,6 +2399,38 @@ func (h *handlers) systemUpgrade(c *gin.Context) {
 	})
 }
 
+// restartService restarts the control-plane process.
+//
+// Preferred path: `systemctl restart watchman-server`. The unit file written
+// by install.sh carries Restart=always, but more importantly systemd enforces
+// the stop with SIGKILL after TimeoutStopSec — so the restart is guaranteed
+// even if the in-process graceful shutdown wedges (e.g. an old binary whose
+// gRPC GracefulStop blocks forever on persistent agent streams; the process
+// then never exits and a self-sent SIGINT alone would leave the panel dead).
+//
+// Fallback: when systemctl is unavailable or fails (non-systemd deployments,
+// renamed units), send SIGINT to ourselves as before and rely on whatever
+// supervisor is in place.
+func restartService(log *slog.Logger) {
+	go func() {
+		time.Sleep(1 * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := exec.CommandContext(ctx, "systemctl", "--no-block", "restart", "watchman-server").Run(); err != nil {
+			if log != nil {
+				log.Warn("systemctl restart failed, falling back to self SIGINT", "err", err)
+			}
+			if p, perr := os.FindProcess(os.Getpid()); perr == nil {
+				_ = p.Signal(os.Interrupt)
+			}
+			return
+		}
+		if log != nil {
+			log.Info("systemctl restart watchman-server issued")
+		}
+	}()
+}
+
 // systemRestart initiates graceful server restart under systemd / supervisor.
 func (h *handlers) systemRestart(c *gin.Context) {
 	h.reg.BroadcastMaintenance("server_restart", 120)
@@ -2410,13 +2443,7 @@ func (h *handlers) systemRestart(c *gin.Context) {
 		"message": "已广播停机维护预告，正在触发控制端平滑重载...",
 	})
 
-	go func() {
-		time.Sleep(1 * time.Second)
-		p, err := os.FindProcess(os.Getpid())
-		if err == nil {
-			_ = p.Signal(os.Interrupt)
-		}
-	}()
+	restartService(h.log)
 }
 
 // checkUpdate queries GitHub Releases to determine whether an update is available.
@@ -2484,13 +2511,7 @@ func (h *handlers) onlineUpgrade(c *gin.Context) {
 		"target_version": info.LatestVersion,
 	})
 
-	go func() {
-		time.Sleep(1 * time.Second)
-		p, err := os.FindProcess(os.Getpid())
-		if err == nil {
-			_ = p.Signal(os.Interrupt)
-		}
-	}()
+	restartService(h.log)
 }
 
 // upgradeAgentsBatch pushes an upgrade to several hosts at once. Every target

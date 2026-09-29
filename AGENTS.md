@@ -826,7 +826,7 @@ Agent internal/shell
       4. 备份当前二进制为 `.bak.<timestamp>` 并以 `0755` 权限原子替换运行文件；
       5. 自动同步更新 `/opt/watchman/manifest.json` 与 `/opt/watchman/bin/` 目录，使随后的 Agent 批量升级权威基准即时对齐；
       6. 向全网在线 Agent 广播下发 120 秒维护预告信令（`reg.BroadcastMaintenance("server_restart", 120)`），自动进入维护免告警期；
-      7. 后台延迟 1 秒触发平滑重载（`os.Interrupt`），由 systemd 自动拉起新版本，前端 3~5 秒后平滑重连刷新。
+      7. 后台延迟 1 秒触发平滑重载：优先执行 `systemctl --no-block restart watchman-server`（systemd 在 TimeoutStopSec 后会 SIGKILL 兜底，重启一定能发生；非 systemd 部署或 unit 改名时回退为自发 `os.Interrupt`），前端 3~5 秒后平滑重连刷新。注意：2026-09-29 曾用纯自发 SIGINT 方案，因旧二进制关闭路径里 `gs.GracefulStop()` 被 agent 长连接永久阻塞（sync.Cond.Wait），进程不退出、systemd 不重启，面板直接挂掉——自此重启/升级一律走 systemctl 优先路径。
     - **响应式前端通知流（`useSystemUpdateStore`）**：顶栏设置图标徽标红点、侧边栏导航「NEW」高亮角标与「系统升级」页签顶部醒目横幅全联动，支持折叠查看官方 Release Notes（变更说明），一键直达在线自升级。
   - **架构演进说明（2026-09-28）**：全面移除外置 Nginx 依赖（控制端内嵌前端 `server/web` 自提供），旧版静态目录与 `cmd/deploy/` SSH 部署工具已彻底下线；`install.sh` 在升级时自动检测并清理旧版残留的 nginx 站点配置，避免历史 `auth_request` 指向已下线端点引发静态页 404。
 

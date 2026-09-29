@@ -148,7 +148,13 @@ onMounted(() => {
 </script>
 
 <template>
-  <NCard title="AI 大模型配置与助手" :bordered="false" size="small">
+  <NCard :bordered="false" size="small">
+    <template #header>
+      <span style="font-size: 16px; font-weight: 700">
+        <NIcon style="vertical-align: middle; margin-right: 6px"><SparklesOutline /></NIcon>
+        AI 大模型配置与助手
+      </span>
+    </template>
     <template #header-extra>
       <NTag :type="aiConfig.enabled ? 'success' : 'default'" size="small" round>
         {{ aiConfig.enabled ? '已启用 AI 功能' : '未启用' }}

@@ -93,7 +93,13 @@ onMounted(() => {
 </script>
 
 <template>
-  <NCard title="代码源集成 (Git Providers)" :bordered="false" size="small">
+  <NCard :bordered="false" size="small">
+    <template #header>
+      <span style="font-size: 16px; font-weight: 700">
+        <NIcon style="vertical-align: middle; margin-right: 6px"><LogoGithub /></NIcon>
+        代码源集成 (Git Providers)
+      </span>
+    </template>
     <template #header-extra>
       <span class="muted" style="font-size: 13px">Connect your Git provider for authentication.</span>
     </template>

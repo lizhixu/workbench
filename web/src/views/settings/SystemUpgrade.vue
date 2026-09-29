@@ -310,7 +310,7 @@ onMounted(async () => {
   <NCard :bordered="false" size="small" class="system-upgrade-card">
     <template #header>
       <span style="font-size: 16px; font-weight: 700">
-        <NIcon style="vertical-align: middle; margin-right: 6px" color="#6366f1"><RocketOutline /></NIcon>
+        <NIcon style="vertical-align: middle; margin-right: 6px"><RocketOutline /></NIcon>
         版本与系统维护 / 在线与离线升级
       </span>
     </template>

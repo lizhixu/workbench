@@ -4,9 +4,11 @@ import {
   NCard,
   NSpace,
   NButton,
+  NIcon,
   NTag,
   useMessage,
 } from 'naive-ui'
+import { DownloadOutline, CubeOutline } from '@vicons/ionicons5'
 import { enroll } from '../../api/hosts'
 import { copyToClipboard } from '../../utils/clipboard'
 import OsLogo from '../../components/common/OsLogo.vue'
@@ -68,7 +70,10 @@ onMounted(() => {
   <NSpace vertical :size="16">
     <NCard :bordered="false">
       <template #header>
-        <span style="font-size: 16px; font-weight: 700">一键安装 Agent</span>
+        <span style="font-size: 16px; font-weight: 700">
+          <NIcon style="vertical-align: middle; margin-right: 6px"><DownloadOutline /></NIcon>
+          一键安装 Agent
+        </span>
       </template>
       <template #header-extra>
         <div class="os-selector-wrap">
@@ -145,7 +150,13 @@ onMounted(() => {
       </NSpace>
     </NCard>
 
-    <NCard title="已编译 Agent 二进制" :bordered="false" size="small">
+    <NCard :bordered="false" size="small">
+      <template #header>
+        <span style="font-size: 16px; font-weight: 700">
+          <NIcon style="vertical-align: middle; margin-right: 6px"><CubeOutline /></NIcon>
+          已编译 Agent 二进制
+        </span>
+      </template>
       <NSpace vertical :size="8">
         <div class="binary-row">
           <span class="binary-name">watchman-agent-linux-amd64</span>

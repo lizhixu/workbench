@@ -4,9 +4,11 @@ import {
   NCard,
   NDescriptions,
   NDescriptionsItem,
+  NIcon,
   NTag,
   useMessage,
 } from 'naive-ui'
+import { PulseOutline } from '@vicons/ionicons5'
 import { health } from '../../api/hosts'
 
 // 从旧 Settings.vue 抽取：系统状态卡片
@@ -29,7 +31,13 @@ onMounted(() => {
 </script>
 
 <template>
-  <NCard title="系统状态" :bordered="false">
+  <NCard :bordered="false" size="small">
+    <template #header>
+      <span style="font-size: 16px; font-weight: 700">
+        <NIcon style="vertical-align: middle; margin-right: 6px"><PulseOutline /></NIcon>
+        系统状态
+      </span>
+    </template>
     <NDescriptions :column="3" label-placement="left" bordered v-if="healthData">
       <NDescriptionsItem label="状态">
         <NTag type="success" size="small">运行中</NTag>

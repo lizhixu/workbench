@@ -372,6 +372,10 @@ onActivated(loadData)
 
           <!-- 一键签发 -->
           <div class="issue-block">
+            <NAlert type="info" :show-icon="true" size="small" style="margin-bottom: 12px">
+              签发使用「证书中心」的默认 ACME 账户；账户联系邮箱为选填，留空则不向 CA 提交。
+              如签发报错 invalidContact，请到「证书中心」检查账户邮箱是否为有效公网域名邮箱。
+            </NAlert>
             <template v-if="certStatus?.panel_domain">
               <NSpace align="center">
                 <NButton

@@ -274,6 +274,7 @@ onMounted(() => {
   margin: 0;
   font-size: 18px;
   font-weight: 600;
+  color: var(--text-primary);
 }
 :deep(.username-text) {
   font-weight: 600;

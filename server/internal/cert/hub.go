@@ -148,7 +148,7 @@ func (h *Hub) loadAccounts() error {
 				Name:         "Let's Encrypt (默认)",
 				ProviderID:   "letsencrypt",
 				DirectoryURL: DefaultDirectoryURL,
-				Email:        "admin@watchman.local",
+				Email:        "",
 				IsDefault:    true,
 				CreatedAt:    time.Now(),
 			}
@@ -172,11 +172,25 @@ func (h *Hub) loadAccounts() error {
 			Name:         "Let's Encrypt (默认)",
 			ProviderID:   "letsencrypt",
 			DirectoryURL: DefaultDirectoryURL,
-			Email:        "admin@watchman.local",
+			Email:        "",
 			IsDefault:    true,
 			CreatedAt:    time.Now(),
 		}
 		h.accounts[def.ID] = def
+		_ = h.saveAccountsLocked()
+	}
+	// Migrate legacy placeholder emails: earlier versions seeded
+	// admin@watchman.local (and the UI prefilled admin@example.com);
+	// neither has a valid public suffix, so Let's Encrypt rejects them
+	// with invalidContact. Empty means "omit contact", which RFC 8555 allows.
+	migrated := false
+	for _, acc := range h.accounts {
+		if acc.Email == "admin@watchman.local" || acc.Email == "admin@example.com" {
+			acc.Email = ""
+			migrated = true
+		}
+	}
+	if migrated {
 		_ = h.saveAccountsLocked()
 	}
 	return nil

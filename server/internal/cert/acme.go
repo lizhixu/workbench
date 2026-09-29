@@ -242,7 +242,13 @@ func (a *acmeClient) ensureAccount(accountKey crypto.Signer) error {
 	}
 	payload := map[string]any{
 		"termsOfServiceAgreed": true,
-		"contact":              []string{"mailto:" + a.email},
+	}
+	// RFC 8555: contact is optional. Let's Encrypt rejects addresses whose
+	// domain lacks a valid public suffix (e.g. the historically seeded
+	// admin@watchman.local), so omit the field entirely when no usable
+	// email is configured instead of sending a placeholder.
+	if email := strings.TrimSpace(a.email); email != "" {
+		payload["contact"] = []string{"mailto:" + email}
 	}
 	if a.eabKeyID != "" && a.eabHMACKey != "" {
 		eabJWS, err := computeEAB(dir["newAccount"], a.eabKeyID, a.eabHMACKey, accountKey.Public())

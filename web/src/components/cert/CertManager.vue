@@ -269,7 +269,7 @@ function openCreateAccount() {
   accountForm.name = "Google Trust Services"
   accountForm.provider_id = "google"
   accountForm.directory_url = "https://dv.acme.pki.goog/directory"
-  accountForm.email = "admin@example.com"
+  accountForm.email = ""
   accountForm.eab_key_id = ""
   accountForm.eab_hmac_key = ""
   accountForm.is_default = false
@@ -301,10 +301,6 @@ async function submitAccount() {
   }
   if (!accountForm.directory_url.trim()) {
     message.warning('请填写 ACME Directory URL')
-    return
-  }
-  if (!accountForm.email.trim()) {
-    message.warning('请填写联系邮箱')
     return
   }
   savingAccount.value = true
@@ -559,8 +555,8 @@ onUnmounted(() => {
           <NInput v-model:value="accountForm.directory_url" placeholder="https://..." />
         </NFormItem>
 
-        <NFormItem label="联系邮箱" required>
-          <NInput v-model:value="accountForm.email" placeholder="admin@yourdomain.com" />
+        <NFormItem label="联系邮箱">
+          <NInput v-model:value="accountForm.email" placeholder="可选；留空则不向 CA 提交联系邮箱" />
         </NFormItem>
 
         <NFormItem label="EAB Key ID (KID)（ZeroSSL/Google/SSL.com 需填写）">

@@ -119,3 +119,76 @@ func (fakeSigner) Public() crypto.PublicKey { return nil }
 func (fakeSigner) Sign(_ io.Reader, _ []byte, _ crypto.SignerOpts) ([]byte, error) {
 	return nil, nil
 }
+
+// Empty contact email must omit the contact field from newAccount (RFC 8555
+// makes it optional); Let's Encrypt rejects placeholder domains like
+// admin@watchman.local with invalidContact 400.
+func TestEnsureAccountContactOptional(t *testing.T) {
+	newServer := func(t *testing.T, payloadOut *map[string]any) *httptest.Server {
+		mux := http.NewServeMux()
+		srv := httptest.NewServer(mux)
+		mux.HandleFunc("/directory", func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"newNonce":   srv.URL + "/new-nonce",
+				"newAccount": srv.URL + "/new-account",
+				"newOrder":   srv.URL + "/new-order",
+			})
+		})
+		mux.HandleFunc("/new-nonce", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Replay-Nonce", "nonce-1")
+		})
+		mux.HandleFunc("/new-account", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Payload string `json:"payload"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode jws: %v", err)
+			}
+			raw, err := base64.RawURLEncoding.DecodeString(body.Payload)
+			if err != nil {
+				t.Errorf("decode payload: %v", err)
+			}
+			var p map[string]any
+			if err := json.Unmarshal(raw, &p); err != nil {
+				t.Errorf("unmarshal payload: %v", err)
+			}
+			*payloadOut = p
+			w.Header().Set("Location", srv.URL+"/acct/1")
+			w.WriteHeader(http.StatusCreated)
+		})
+		return srv
+	}
+
+	newKey := func(t *testing.T) *ecdsa.PrivateKey {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return key
+	}
+
+	// Case 1: empty email -> no contact field at all.
+	var p1 map[string]any
+	srv1 := newServer(t, &p1)
+	defer srv1.Close()
+	c1 := &acmeClient{directoryURL: srv1.URL + "/directory", http: srv1.Client()}
+	if err := c1.ensureAccount(newKey(t)); err != nil {
+		t.Fatalf("ensureAccount(empty email): %v", err)
+	}
+	if _, ok := p1["contact"]; ok {
+		t.Errorf("payload with empty email must not contain contact, got %v", p1["contact"])
+	}
+
+	// Case 2: email set -> contact carries the mailto: address.
+	var p2 map[string]any
+	srv2 := newServer(t, &p2)
+	defer srv2.Close()
+	c2 := &acmeClient{directoryURL: srv2.URL + "/directory", http: srv2.Client(), email: "ops@example.org"}
+	if err := c2.ensureAccount(newKey(t)); err != nil {
+		t.Fatalf("ensureAccount(with email): %v", err)
+	}
+	contacts, _ := p2["contact"].([]any)
+	if len(contacts) != 1 || contacts[0] != "mailto:ops@example.org" {
+		t.Errorf("contact = %v, want [mailto:ops@example.org]", p2["contact"])
+	}
+}

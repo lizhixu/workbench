@@ -52,7 +52,7 @@ type accountReq struct {
 	Name         string `json:"name" binding:"required"`
 	ProviderID   string `json:"provider_id"`
 	DirectoryURL string `json:"directory_url" binding:"required"`
-	Email        string `json:"email" binding:"required"`
+	Email        string `json:"email"` // optional; empty means the ACME newAccount request omits contact (RFC 8555 allows it)
 	EABKeyID     string `json:"eab_key_id"`
 	EABHMACKey   string `json:"eab_hmac_key"`
 	IsDefault    bool   `json:"is_default"`

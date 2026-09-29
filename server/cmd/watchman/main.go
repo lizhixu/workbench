@@ -476,6 +476,9 @@ func main() {
 	case <-ctx.Done():
 	}
 
+	// Cancel background worker tasks.
+	cancel()
+
 	shutdownCtx, sc := context.WithTimeout(context.Background(), 5*time.Second)
 	defer sc()
 
@@ -485,7 +488,24 @@ func main() {
 	time.Sleep(150 * time.Millisecond) // brief pause to flush outbound frame
 
 	_ = hs.Shutdown(shutdownCtx)
-	gs.GracefulStop()
+
+	// Gracefully stop gRPC with timeout protection. Persistent bidirectional
+	// agent streaming RPCs (AgentService.Connect) will block gs.GracefulStop()
+	// indefinitely unless forced; if agents do not disconnect within 2 seconds,
+	// force close via gs.Stop() to unblock main() and permit process exit.
+	grpcStopped := make(chan struct{})
+	go func() {
+		gs.GracefulStop()
+		close(grpcStopped)
+	}()
+	select {
+	case <-grpcStopped:
+		log.Info("gRPC server gracefully stopped")
+	case <-time.After(2 * time.Second):
+		log.Warn("gRPC graceful stop timed out, forcing stop")
+		gs.Stop()
+	}
+
 	log.Info("bye")
 }
 

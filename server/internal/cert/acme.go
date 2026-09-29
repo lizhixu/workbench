@@ -208,9 +208,23 @@ func (a *acmeClient) directory() (map[string]string, error) {
 	if resp.StatusCode/100 != 2 {
 		return nil, fmt.Errorf("acme directory: status %d", resp.StatusCode)
 	}
-	var dir map[string]string
-	if err := json.Unmarshal(body, &dir); err != nil {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("acme directory parse: %w", err)
+	}
+	// The directory may contain non-string values (e.g. the "meta" object);
+	// only the endpoint URLs (strings) are needed.
+	dir := make(map[string]string, len(raw))
+	for k, v := range raw {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil {
+			dir[k] = s
+		}
+	}
+	for _, key := range []string{"newNonce", "newAccount", "newOrder"} {
+		if dir[key] == "" {
+			return nil, fmt.Errorf("acme directory: missing %q endpoint", key)
+		}
 	}
 	a.dir = dir
 	return dir, nil

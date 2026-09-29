@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -109,5 +110,38 @@ func TestHTTP01ChallengeServe(t *testing.T) {
 	// Unknown token -> 404.
 	if _, err := httpGet("http://" + ch.ln.Addr().String() + "/.well-known/acme-challenge/nope"); err == nil {
 		t.Error("expected error for unknown token")
+	}
+}
+
+func TestDirectoryParseSkipsMetaObject(t *testing.T) {
+	// Realistic Let's Encrypt directory: "meta" is an object, not a string.
+	body := `{
+		"newNonce": "https://acme-v02.api.letsencrypt.org/acme/new-nonce",
+		"newAccount": "https://acme-v02.api.letsencrypt.org/acme/new-acct",
+		"newOrder": "https://acme-v02.api.letsencrypt.org/acme/new-order",
+		"revokeCert": "https://acme-v02.api.letsencrypt.org/acme/revoke-cert",
+		"keyChange": "https://acme-v02.api.letsencrypt.org/acme/key-change",
+		"meta": {
+			"termsOfService": "https://letsencrypt.org/documents/LE-SA-v1.4-April-3-2024.pdf",
+			"website": "https://letsencrypt.org",
+			"caaIdentities": ["letsencrypt.org"]
+		}
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := &acmeClient{directoryURL: srv.URL, email: "test@example.com", http: srv.Client()}
+	dir, err := c.directory()
+	if err != nil {
+		t.Fatalf("directory() = %v, want nil", err)
+	}
+	if dir["newOrder"] != "https://acme-v02.api.letsencrypt.org/acme/new-order" {
+		t.Fatalf("newOrder = %q, want LE URL", dir["newOrder"])
+	}
+	if _, ok := dir["meta"]; ok {
+		t.Fatalf("meta should be skipped, got %q", dir["meta"])
 	}
 }

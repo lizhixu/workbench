@@ -236,6 +236,12 @@ onDeactivated(() => {
 
 <template>
   <div class="apps-view page-flex-column">
+    <div class="page-header">
+      <div class="header-left">
+        <h2 class="page-title">应用中心</h2>
+      </div>
+    </div>
+
     <div class="table-toolbar">
       <NSpace align="center">
         <NInput
@@ -315,6 +321,25 @@ onDeactivated(() => {
 <style scoped lang="scss">
 .apps-view {
   gap: 12px;
+}
+
+.page-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+
+  .header-left {
+    display: flex;
+    align-items: center;
+
+    .page-title {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+  }
 }
 
 .table-toolbar {

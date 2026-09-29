@@ -132,6 +132,17 @@ func TestDomainMiddleware(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("exempt path on direct IP: got status %d, want 200", w.Code)
 	}
+
+	// 5. Bracketed IPv6 loopback without port -> 200 OK (maintenance exception)
+	for _, h := range []string{"[::1]", "[::1]:18789", "localhost", "localhost:18789"} {
+		req = httptest.NewRequest("GET", "/test", nil)
+		req.Host = h
+		w = httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("loopback host %q: got status %d, want 200", h, w.Code)
+		}
+	}
 }
 
 func TestHTTPSMiddleware(t *testing.T) {

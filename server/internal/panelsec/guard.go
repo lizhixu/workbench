@@ -89,7 +89,10 @@ func (g *Guard) DomainMiddleware() gin.HandlerFunc {
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
 		}
-		host = strings.TrimSpace(strings.ToLower(host))
+		// Bracketed IPv6 literals without a port (e.g. "[::1]") fail
+		// SplitHostPort above; strip the brackets so net.ParseIP works.
+		host = strings.Trim(strings.TrimSpace(host), "[]")
+		host = strings.ToLower(host)
 
 		// Loopback access (127.0.0.1 / localhost) is always allowed for local maintenance.
 		if isLoopback(host) {

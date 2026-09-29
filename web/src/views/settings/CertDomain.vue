@@ -285,7 +285,7 @@ onActivated(loadData)
               <template #icon><NIcon><CheckmarkCircleOutline /></NIcon></template>
               已绑定：{{ certStatus.panel_domain }}
             </NTag>
-            <span class="muted">面板只能通过该域名访问，直接使用 IP 访问将被拦截（回环地址除外）。</span>
+            <span class="muted">面板只能通过该域名访问，直接使用 IP 访问将被拦截（回环地址除外）。<br />注意：绑定后「系统升级」中批量升级 Agent 时，安装包下载地址将使用该域名，请确保 Agent 所在主机能解析该域名；纯内网环境可在服务端启动参数加 <code>-public-url http://&lt;内网IP&gt;:18789</code> 覆盖为 IP 地址。</span>
             <NButton size="small" type="error" ghost @click="unbindDomain">解绑</NButton>
           </div>
           <NForm v-else label-placement="top" :show-feedback="false">
@@ -302,7 +302,9 @@ onActivated(loadData)
               <template #feedback>
                 <span class="muted tip-hint">
                   绑定后自动启用严格域名限制：任何通过服务器 IP 或其他域名发起的面板请求将被 403 拦截；
-                  Agent 注册与数据接口不受影响。不绑定则保持通过 IP 访问。
+                  Agent 注册与数据接口不受影响。不绑定则保持通过 IP 访问。<br />
+                  注意：绑定后「系统升级」中批量升级 Agent 时，安装包下载地址将使用该域名，请确保 Agent 所在主机能解析该域名；
+                  纯内网环境可在服务端启动参数加 <code>-public-url http://&lt;内网IP&gt;:18789</code> 覆盖为 IP 地址。
                 </span>
               </template>
             </NFormItem>

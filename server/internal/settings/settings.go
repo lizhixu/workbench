@@ -132,6 +132,16 @@ const (
 	MaxScrollback = 100000
 )
 
+// Certificate timing bounds (days before expiry). Renewal too early wastes CA
+// quota; a reminder too late leaves no time to act. Short-lived certificates
+// are additionally scaled to 1/3 of validity by the callers, so the bounds
+// only constrain the configured base value.
+const (
+	MinCertDays          = 1
+	MaxCertDays          = 90
+	DefaultCertRenewDays = 30
+)
+
 // DefaultUIFontFamily is the default terminal font stack.
 const DefaultUIFontFamily = `Consolas, "Cascadia Code", "Courier New", monospace`
 
@@ -177,6 +187,12 @@ var Definitions = []Definition{
 		{Key: "security.panel_ssl_cert_pem", Scope: ScopeSystem, Kind: KindString, Title: "自定义证书 (PEM)", Default: "", MaxLen: 65536},
 		{Key: "security.panel_ssl_key_pem", Scope: ScopeSystem, Kind: KindString, Title: "自定义私钥 (PEM)", Default: "", MaxLen: 65536},
 		{Key: "security.panel_force_https", Scope: ScopeSystem, Kind: KindBool, Title: "强制 HTTPS 访问", Default: false},
+
+		// 证书中心（system 域，管理员专属）：
+		// 自动续期在「到期前 N 天」触发；手动签发/手动上传的证书不会自动续期，
+		// 到期前 N 天经告警中心提醒一次。短期证书两侧都按有效期 1/3 自适应收紧（取较小者）。
+		{Key: "certs.auto_renew_days", Scope: ScopeSystem, Kind: KindInt, Title: "证书自动续期提前天数", Default: DefaultCertRenewDays, Min: MinCertDays, Max: MaxCertDays, DefaultOnEmpty: true},
+		{Key: "certs.expiry_reminder_days", Scope: ScopeSystem, Kind: KindInt, Title: "手动证书到期提醒提前天数", Default: DefaultCertRenewDays, Min: MinCertDays, Max: MaxCertDays, DefaultOnEmpty: true},
 	}
 
 // validateAbsPath accepts an empty value (OS default applies) or an absolute
@@ -743,5 +759,32 @@ func (s *Store) PanelSecurity() PanelSecurityConfig {
 func (s *Store) JoinBetaProgram() bool {
 	var v bool
 	s.decode(ScopeSystem, "", "system.join_beta_program", &v)
+	return v
+}
+
+// CertAutoRenewDays returns how many days before expiry automatic renewal
+// triggers. Callers scale it down to 1/3 of validity for short-lived
+// certificates. Falls back to the registry default when the stored value is
+// out of range (e.g. hand-edited settings.json bypassing validation).
+func (s *Store) CertAutoRenewDays() int {
+	var v int
+	s.decode(ScopeSystem, "", "certs.auto_renew_days", &v)
+	if v < MinCertDays || v > MaxCertDays {
+		return DefaultCertRenewDays
+	}
+	return v
+}
+
+// CertExpiryReminderDays returns how many days before expiry the one-shot
+// reminder fires for certificates that never auto-renew (manual DNS-01
+// issuance, manual upload). Callers scale it down to 1/3 of validity for
+// short-lived certificates. Falls back to the registry default when the
+// stored value is out of range.
+func (s *Store) CertExpiryReminderDays() int {
+	var v int
+	s.decode(ScopeSystem, "", "certs.expiry_reminder_days", &v)
+	if v < MinCertDays || v > MaxCertDays {
+		return DefaultCertRenewDays
+	}
 	return v
 }

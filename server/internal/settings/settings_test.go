@@ -269,6 +269,7 @@ func TestSchemaAndEffective(t *testing.T) {
 		"server.public_url", "security.panel_domain",
 		"security.panel_ssl_enabled", "security.panel_ssl_mode", "security.panel_ssl_cert_id",
 		"security.panel_ssl_cert_pem", "security.panel_ssl_key_pem", "security.panel_force_https",
+		"certs.auto_renew_days", "certs.expiry_reminder_days",
 	} {
 		found := false
 		for _, e := range sysSchema {
@@ -506,3 +507,68 @@ func TestSnapshotConsistentUnderConcurrency(t *testing.T) {
 			t.Errorf("ssl_mode = %q, want custom", updated.SSLMode)
 		}
 	}
+
+func TestCertTimingKeys(t *testing.T) {
+	s := newTestStore(t)
+
+	// Defaults apply before anything is stored.
+	if got := s.CertAutoRenewDays(); got != 30 {
+		t.Errorf("default CertAutoRenewDays = %d, want 30", got)
+	}
+	if got := s.CertExpiryReminderDays(); got != 30 {
+		t.Errorf("default CertExpiryReminderDays = %d, want 30", got)
+	}
+
+	// Valid values round-trip through the registry.
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"certs.auto_renew_days":      raw(t, 45),
+		"certs.expiry_reminder_days": raw(t, 7),
+	}); err != nil {
+		t.Fatalf("SetMany valid cert timing keys: %v", err)
+	}
+	if got := s.CertAutoRenewDays(); got != 45 {
+		t.Errorf("CertAutoRenewDays = %d, want 45", got)
+	}
+	if got := s.CertExpiryReminderDays(); got != 7 {
+		t.Errorf("CertExpiryReminderDays = %d, want 7", got)
+	}
+
+	// Out-of-range values are rejected by validation. (0 is not rejected:
+	// DefaultOnEmpty normalizes it to the default, matching terminal.font_size.)
+	for _, tc := range []struct {
+		key string
+		val any
+	}{
+		{"certs.auto_renew_days", 91},
+		{"certs.auto_renew_days", -5},
+		{"certs.expiry_reminder_days", 91},
+		{"certs.expiry_reminder_days", "30"},
+	} {
+		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{tc.key: raw(t, tc.val)}); err == nil {
+			t.Errorf("key %s accepted invalid value %v", tc.key, tc.val)
+		}
+	}
+	// 0 normalizes to the default rather than erroring.
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{"certs.auto_renew_days": raw(t, 0)}); err != nil {
+		t.Fatalf("SetMany 0: %v", err)
+	}
+	if got := s.CertAutoRenewDays(); got != 30 {
+		t.Errorf("0 normalized to %d, want default 30", got)
+	}
+
+	// User scope is rejected: these are admin-only system keys.
+	if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{"certs.auto_renew_days": raw(t, 10)}); err == nil {
+		t.Error("certs.auto_renew_days accepted in user scope")
+	}
+
+	// A hand-edited settings.json bypassing validation must not produce a
+	// nonsensical threshold: accessors clamp back to the default.
+	s.system["certs.auto_renew_days"] = raw(t, 500)
+	s.system["certs.expiry_reminder_days"] = raw(t, -3)
+	if got := s.CertAutoRenewDays(); got != 30 {
+		t.Errorf("clamped CertAutoRenewDays = %d, want 30", got)
+	}
+	if got := s.CertExpiryReminderDays(); got != 30 {
+		t.Errorf("clamped CertExpiryReminderDays = %d, want 30", got)
+	}
+}

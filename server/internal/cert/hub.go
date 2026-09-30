@@ -60,6 +60,32 @@ type Hub struct {
 	cfg      Config
 	accounts map[string]*ACMEAccount
 	certs    map[string]*Certificate
+	// renewBeforeDays supplies the configured "days before expiry" for
+	// automatic renewal (settings: certs.auto_renew_days). Nil means the
+	// built-in default (30 days). Injected by the server entrypoint so the
+	// cert package stays decoupled from the settings store.
+	renewBeforeDays func() int
+}
+
+// SetRenewBeforeDaysProvider injects the auto-renew lead-time source.
+// A nil provider restores the built-in default.
+func (h *Hub) SetRenewBeforeDaysProvider(fn func() int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.renewBeforeDays = fn
+}
+
+func (h *Hub) renewBeforeDaysOrDefault() int {
+	h.mu.RLock()
+	fn := h.renewBeforeDays
+	h.mu.RUnlock()
+	if fn == nil {
+		return defaultRenewBeforeDays
+	}
+	if d := fn(); d >= 1 && d <= 90 {
+		return d
+	}
+	return defaultRenewBeforeDays
 }
 
 // NewHub loads or initializes the hub under dataDir.
@@ -635,14 +661,17 @@ func (h *Hub) RunRenewalLoop(stop <-chan struct{}) {
 	}()
 }
 
-const renewBefore = 30 * 24 * time.Hour
+// defaultRenewBeforeDays is the built-in auto-renew lead time (days) used
+// when no provider is injected. Mirrors settings.DefaultCertRenewDays.
+const defaultRenewBeforeDays = 30
 
 func (h *Hub) renewExpiring() {
+	renewBefore := time.Duration(h.renewBeforeDaysOrDefault()) * 24 * time.Hour
 	for _, c := range h.List() {
 		if !c.AutoRenew || c.Renewing {
 			continue
 		}
-		// Renewal threshold scales with validity: 30 days for classic
+		// Renewal threshold scales with validity: renewBefore days for classic
 		// 90-day certificates, but short-lived certificates (e.g. Let's
 		// Encrypt IP certificates, ~6 days) renew at 1/3 of validity.
 		threshold := renewBefore

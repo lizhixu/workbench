@@ -12,6 +12,7 @@ import {
   ArrowUpCircleOutline,
   DownloadOutline,
   KeyOutline,
+  TimeOutline,
 } from '@vicons/ionicons5'
 import GeneralPrefs from './GeneralPrefs.vue'
 import TerminalPrefs from './TerminalPrefs.vue'
@@ -24,6 +25,7 @@ import BackupRestore from './BackupRestore.vue'
 import SystemUpgrade from './SystemUpgrade.vue'
 import InstallDeploy from './InstallDeploy.vue'
 import CertDomain from './CertDomain.vue'
+import CertSettings from './CertSettings.vue'
 import SecureEntry from './SecureEntry.vue'
 
 export interface SettingsSection {
@@ -52,6 +54,7 @@ export const settingsSections: SettingsSection[] = [
   { key: 'upgrade', label: '系统升级', icon: ArrowUpCircleOutline, component: SystemUpgrade, keywords: '升级 版本 agent 更新 重启 测试计划 beta 预发布', group: '系统管理' },
   { key: 'install', label: '安装部署', icon: DownloadOutline, component: InstallDeploy, keywords: '安装 部署 一键安装 二进制 注册令牌', group: '系统管理' },
   { key: 'cert-domain', label: '面板域名与证书', icon: LockClosedOutline, component: CertDomain, keywords: '面板 域名 证书 SSL HTTPS 公网地址 强制HTTPS 安全', group: '系统管理', adminOnly: true },
+  { key: 'cert-settings', label: '证书时间设置', icon: TimeOutline, component: CertSettings, keywords: '证书 续期 到期 提醒 自动续期 提前天数', group: '系统管理', adminOnly: true },
   { key: 'secure-entry', label: '安全入口', icon: KeyOutline, component: SecureEntry, keywords: '安全入口 登录入口 隐藏面板 秘密地址 安全', group: '系统管理', adminOnly: true },
 ]
 

@@ -35,6 +35,9 @@ export const SETTING_KEYS = {
   secureEntryEnabled: 'security.secure_entry_enabled',
   secureEntryPath: 'security.secure_entry_path',
   joinBetaProgram: 'system.join_beta_program',
+  // Certificate center timing (system scope, admin only).
+  certAutoRenewDays: 'certs.auto_renew_days',
+  certExpiryReminderDays: 'certs.expiry_reminder_days',
   // Panel domain and public access (system scope).
   // 绑定域名即自动启用严格域名限制（只能通过该域名访问面板），无独立开关。
   publicURL: 'server.public_url',

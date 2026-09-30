@@ -408,10 +408,16 @@ func main() {
 		}
 		return out
 	}))
+	// Certificate timing settings (system scope, admin): auto-renew lead time
+	// (certs.auto_renew_days) and manual-certificate reminder lead time
+	// (certs.expiry_reminder_days). Read live on every evaluation so changes
+	// apply without a restart.
+	certHub.SetRenewBeforeDaysProvider(func() int { return settingsStore.CertAutoRenewDays() })
+	alertMonitor.SetCertExpiryReminderDays(func() int { return settingsStore.CertExpiryReminderDays() })
 	go alertMonitor.Start(ctx, 30*time.Second)
 
-	// Certificate renewal loop: auto-renews certificates expiring within 30
-	// days through the dns-mng DNS-01 delegation.
+	// Certificate renewal loop: auto-renews certificates expiring within the
+	// configured lead time (settings: certs.auto_renew_days) via ACME.
 	certHub.RunRenewalLoop(ctx.Done())
 
 	// Snapshot scheduler: evaluates cron expressions on backup jobs every minute.

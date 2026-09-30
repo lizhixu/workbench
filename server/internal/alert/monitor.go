@@ -61,6 +61,11 @@ type Monitor struct {
 	store        *Store
 	provider     HostProvider
 	certProvider CertProvider // optional: enables certificate expiry reminders
+	// certReminderDays supplies the configured "days before expiry" for the
+	// manual-certificate reminder (settings: certs.expiry_reminder_days).
+	// Nil means the built-in default (30 days). Injected by the server
+	// entrypoint so the alert package stays decoupled from the settings store.
+	certReminderDays func() int
 	metricsStore     *metrics.Store
 	aiAssistant      *ai.Assistant
 	log              *slog.Logger
@@ -159,6 +164,29 @@ func (m *Monitor) certProviderSnapshot() CertProvider {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.certProvider
+}
+
+// SetCertExpiryReminderDays injects the manual-certificate reminder lead-time
+// source. A nil provider restores the built-in default (30 days).
+func (m *Monitor) SetCertExpiryReminderDays(fn func() int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.certReminderDays = fn
+}
+
+// certReminderDaysOrDefault returns the configured reminder lead time in
+// days, clamped to the registry bounds, defaulting to 30.
+func (m *Monitor) certReminderDaysOrDefault() int {
+	m.mu.Lock()
+	fn := m.certReminderDays
+	m.mu.Unlock()
+	if fn == nil {
+		return defaultCertReminderDays
+	}
+	if d := fn(); d >= 1 && d <= 90 {
+		return d
+	}
+	return defaultCertReminderDays
 }
 
 // SetBootGraceForTest overrides the cold-start suppression window in tests.
@@ -477,11 +505,16 @@ func parseBillingDate(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unrecognized date format: %s", s)
 }
 
-// certExpiryThreshold mirrors the ACME auto-renew scaling: 30 days for
+// defaultCertReminderDays is the built-in reminder lead time (days) for
+// certificates that never auto-renew, used when no provider is injected.
+// Mirrors settings.DefaultCertRenewDays.
+const defaultCertReminderDays = 30
+
+// certExpiryThreshold mirrors the ACME auto-renew scaling: baseDays for
 // classic 90-day certificates, 1/3 of validity for short-lived ones (e.g.
 // Let's Encrypt IP certificates, ~6 days).
-func certExpiryThreshold(notBefore, notAfter time.Time) time.Duration {
-	threshold := 30 * 24 * time.Hour
+func certExpiryThreshold(notBefore, notAfter time.Time, baseDays int) time.Duration {
+	threshold := time.Duration(baseDays) * 24 * time.Hour
 	if validity := notAfter.Sub(notBefore); validity > 0 {
 		if third := validity / 3; third < threshold {
 			threshold = third
@@ -494,13 +527,14 @@ func certExpiryThreshold(notBefore, notAfter time.Time) time.Duration {
 // 到期阈值内只触发一次（告警中心 + webhook）；证书被续期/替换（到期时间推后）后自动解除，
 // 证书被删除后同步解除，避免 firing 状态泄漏。
 func (m *Monitor) checkCertExpiry(certs []CertInfo) {
+	reminderDays := m.certReminderDaysOrDefault()
 	alive := make(map[string]bool, len(certs))
 	for _, c := range certs {
 		alive[c.ID] = true
 		if c.AutoRenew {
 			continue
 		}
-		threshold := certExpiryThreshold(c.NotBefore, c.NotAfter)
+		threshold := certExpiryThreshold(c.NotBefore, c.NotAfter, reminderDays)
 		daysLeft := int(math.Ceil(time.Until(c.NotAfter).Hours() / 24))
 		key := firingKeyOf("builtin-cert-expiry", "", c.ID)
 		if time.Until(c.NotAfter) <= threshold {

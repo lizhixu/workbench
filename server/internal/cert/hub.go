@@ -390,7 +390,7 @@ func (h *Hub) Delete(id string) error {
 	return h.saveCertsLocked()
 }
 
-func (h *Hub) storeResult(id string, accountID string, domains []string, certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string) error {
+func (h *Hub) storeResult(id string, accountID string, domains []string, certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, autoRenew bool) error {
 	if err := os.WriteFile(h.certFile(id), certPEM, 0600); err != nil {
 		return err
 	}
@@ -408,7 +408,7 @@ func (h *Hub) storeResult(id string, accountID string, domains []string, certPEM
 		NotBefore: notBefore,
 		NotAfter:  notAfter,
 		Issuer:    issuer,
-		AutoRenew: true,
+		AutoRenew: autoRenew,
 		CreatedAt: time.Now(),
 	}
 	return h.saveCertsLocked()
@@ -521,7 +521,7 @@ func (h *Hub) IssueWithChallenge(identifiers []string, accountID string, ch Chal
 		return nil, err
 	}
 	id := "crt_" + randomHex(8)
-	if err := h.storeResult(id, acc.ID, clean, certPEM, keyPEM, notBefore, notAfter, issuer); err != nil {
+	if err := h.storeResult(id, acc.ID, clean, certPEM, keyPEM, notBefore, notAfter, issuer, true); err != nil {
 		return nil, err
 	}
 	c, _ := h.Get(id)
@@ -565,16 +565,10 @@ func (h *Hub) Import(certPEM, keyPEM []byte) (*Certificate, error) {
 		issuer = leaf.Issuer.String()
 	}
 	id := "crt_" + randomHex(8)
-	if err := h.storeResult(id, "", domains, certPEM, keyPEM, leaf.NotBefore, leaf.NotAfter, issuer); err != nil {
+	// Manually managed: never auto-renew an imported certificate via ACME.
+	if err := h.storeResult(id, "", domains, certPEM, keyPEM, leaf.NotBefore, leaf.NotAfter, issuer, false); err != nil {
 		return nil, err
 	}
-	// Manually managed: never auto-renew an imported certificate via ACME.
-	h.mu.Lock()
-	if c, ok := h.certs[id]; ok {
-		c.AutoRenew = false
-		_ = h.saveCertsLocked()
-	}
-	h.mu.Unlock()
 	c, _ := h.Get(id)
 	return c, nil
 }
@@ -617,7 +611,7 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 		h.markError(id, err.Error())
 		return nil, err
 	}
-	if err := h.storeResult(id, acc.ID, c.Domains, certPEM, keyPEM, notBefore, notAfter, issuer); err != nil {
+	if err := h.storeResult(id, acc.ID, c.Domains, certPEM, keyPEM, notBefore, notAfter, issuer, true); err != nil {
 		h.markError(id, err.Error())
 		return nil, err
 	}

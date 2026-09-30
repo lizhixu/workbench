@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,15 +36,36 @@ type HostProvider interface {
 	ClearReconnectReason(hostID string)
 }
 
+// CertInfo is a snapshot of a certificate used for expiry evaluation.
+type CertInfo struct {
+	ID        string
+	Domains   []string
+	NotBefore time.Time
+	NotAfter  time.Time
+	AutoRenew bool
+}
+
+// CertProvider supplies the current certificate list to the monitor.
+type CertProvider interface {
+	ListCerts() []CertInfo
+}
+
+// CertProviderFunc adapts a plain function to the CertProvider interface.
+type CertProviderFunc func() []CertInfo
+
+// ListCerts implements CertProvider.
+func (f CertProviderFunc) ListCerts() []CertInfo { return f() }
+
 // Monitor periodically evaluates alert rules against the live host state.
 type Monitor struct {
 	store        *Store
 	provider     HostProvider
-	metricsStore *metrics.Store
-	aiAssistant  *ai.Assistant
-	log          *slog.Logger
-	stop         chan struct{}
-	stopOnce     sync.Once
+	certProvider CertProvider // optional: enables certificate expiry reminders
+	metricsStore     *metrics.Store
+	aiAssistant      *ai.Assistant
+	log              *slog.Logger
+	stop             chan struct{}
+	stopOnce         sync.Once
 
 	mu        sync.Mutex
 	startTime time.Time
@@ -122,6 +144,21 @@ func (m *Monitor) sweepMaintenance() {
 			delete(m.maintenanceUntil, id)
 		}
 	}
+}
+
+// SetCertProvider attaches the certificate source used by the built-in
+// certificate expiry reminder. Nil (default) disables the check.
+func (m *Monitor) SetCertProvider(p CertProvider) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.certProvider = p
+}
+
+// certProviderSnapshot returns the attached provider under lock.
+func (m *Monitor) certProviderSnapshot() CertProvider {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.certProvider
 }
 
 // SetBootGraceForTest overrides the cold-start suppression window in tests.
@@ -231,6 +268,11 @@ func (m *Monitor) evaluate() {
 		m.checkHostTraffic(host)
 		// 到期时间前 30 天发起一次续费提醒
 		m.checkHostExpiry(host)
+	}
+
+	// 证书到期提醒：手动签发 / 手动上传的证书不会自动续期，到期阈值内提醒一次
+	if cp := m.certProviderSnapshot(); cp != nil {
+		m.checkCertExpiry(cp.ListCerts())
 	}
 
 	m.mu.Lock()
@@ -433,6 +475,77 @@ func parseBillingDate(s string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("unrecognized date format: %s", s)
+}
+
+// certExpiryThreshold mirrors the ACME auto-renew scaling: 30 days for
+// classic 90-day certificates, 1/3 of validity for short-lived ones (e.g.
+// Let's Encrypt IP certificates, ~6 days).
+func certExpiryThreshold(notBefore, notAfter time.Time) time.Duration {
+	threshold := 30 * 24 * time.Hour
+	if validity := notAfter.Sub(notBefore); validity > 0 {
+		if third := validity / 3; third < threshold {
+			threshold = third
+		}
+	}
+	return threshold
+}
+
+// checkCertExpiry 提醒不会自动续期的证书（手动 DNS-01 签发 / 手动上传）即将到期。
+// 到期阈值内只触发一次（告警中心 + webhook）；证书被续期/替换（到期时间推后）后自动解除，
+// 证书被删除后同步解除，避免 firing 状态泄漏。
+func (m *Monitor) checkCertExpiry(certs []CertInfo) {
+	alive := make(map[string]bool, len(certs))
+	for _, c := range certs {
+		alive[c.ID] = true
+		if c.AutoRenew {
+			continue
+		}
+		threshold := certExpiryThreshold(c.NotBefore, c.NotAfter)
+		daysLeft := int(math.Ceil(time.Until(c.NotAfter).Hours() / 24))
+		key := firingKeyOf("builtin-cert-expiry", "", c.ID)
+		if time.Until(c.NotAfter) <= threshold {
+			if !m.store.isFiring(key) {
+				m.store.setFiring(key, true)
+				domains := strings.Join(c.Domains, ", ")
+				var msg string
+				switch {
+				case daysLeft < 0:
+					msg = fmt.Sprintf("证书 %s 已于 %s 过期，该证书不会自动续期，请重新签发或上传",
+						domains, c.NotAfter.Format("2006-01-02"))
+				case daysLeft == 0:
+					msg = fmt.Sprintf("证书 %s 将于今天过期，该证书不会自动续期，请及时重新签发或上传", domains)
+				default:
+					msg = fmt.Sprintf("证书 %s 将于 %d 天后过期（%s），该证书不会自动续期，请提前重新签发或上传",
+						domains, daysLeft, c.NotAfter.Format("2006-01-02"))
+				}
+				event := &Event{
+					ID:       randomID(),
+					RuleID:   "builtin-cert-expiry",
+					RuleName: "证书到期提醒",
+					Severity: SeverityWarning,
+					Hostname: domains,
+					CertID:   c.ID,
+					Message:  msg,
+					FiredAt:  time.Now(),
+				}
+				m.store.addEvent(event)
+				_ = m.store.persist()
+				m.log.Info("certificate expiry reminder fired", "cert", c.ID, "domains", domains, "days_left", daysLeft)
+				m.notify(event)
+			}
+		} else if m.store.isFiring(key) {
+			// 证书已续期/替换（到期时间推后到阈值以外），解除提醒
+			m.store.setFiring(key, false)
+			m.resolveCertEvent("builtin-cert-expiry", c.ID)
+		}
+	}
+	// 证书被删除后，解除不再存在的提醒
+	for _, id := range m.store.firingCertIDs("builtin-cert-expiry") {
+		if !alive[id] {
+			m.store.setFiring(firingKeyOf("builtin-cert-expiry", "", id), false)
+			m.resolveCertEvent("builtin-cert-expiry", id)
+		}
+	}
 }
 
 func (m *Monitor) checkRule(rule *Rule, host HostInfo) {
@@ -722,6 +835,20 @@ func (m *Monitor) resolveEvent(ruleID, hostID string) {
 	m.store.mu.Lock()
 	for _, e := range m.store.events {
 		if e.RuleID == ruleID && e.HostID == hostID && !e.Resolved {
+			e.Resolved = true
+			e.ResolvedAt = time.Now()
+		}
+	}
+	m.store.mu.Unlock()
+	_ = m.store.persist()
+}
+
+// resolveCertEvent marks unresolved certificate alerts (matched by CertID)
+// as resolved.
+func (m *Monitor) resolveCertEvent(ruleID, certID string) {
+	m.store.mu.Lock()
+	for _, e := range m.store.events {
+		if e.RuleID == ruleID && e.CertID == certID && !e.Resolved {
 			e.Resolved = true
 			e.ResolvedAt = time.Now()
 		}

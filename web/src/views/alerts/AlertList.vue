@@ -258,6 +258,9 @@ const eventColumns = computed<DataTableColumns<AlertEvent>>(() => [
           e.host_id
             ? h(NButton, { size: 'tiny', quaternary: true, type: 'primary', onClick: () => goHostDetail(e.host_id, e.hostname) }, { default: () => '查看' })
             : null,
+          e.cert_id
+            ? h(NButton, { size: 'tiny', quaternary: true, type: 'primary', onClick: () => goCertCenter() }, { default: () => '查看证书' })
+            : null,
           h(NPopconfirm, { onPositiveClick: () => doDeleteEvent(e.id) }, {
             trigger: () => h(NButton, { size: 'tiny', quaternary: true, type: 'error' }, {
               icon: () => h(NIcon, { component: TrashOutline }),
@@ -313,6 +316,16 @@ function goHostDetail(hostId: string, hostname: string) {
     closable: true,
   })
   router.push(`/hosts/${hostId}`)
+}
+
+function goCertCenter() {
+  workspace.openTab({
+    key: '/certs',
+    title: '证书中心',
+    path: '/certs',
+    closable: true,
+  })
+  router.push('/certs')
 }
 
 async function loadRules() {

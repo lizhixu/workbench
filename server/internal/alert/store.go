@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -60,11 +61,22 @@ type Event struct {
 	Severity         Severity  `json:"severity"`
 	HostID           string    `json:"host_id"`
 	Hostname         string    `json:"hostname"`
+	CertID           string    `json:"cert_id,omitempty"` // set for certificate alerts (e.g. builtin-cert-expiry)
 	Message          string    `json:"message"`
 	FiredAt          time.Time `json:"fired_at"`
 	Resolved         bool      `json:"resolved"`
 	ResolvedAt       time.Time `json:"resolved_at,omitempty"`
 	AIInterpretation string    `json:"ai_interpretation,omitempty"` // AI-generated root-cause/suggestion
+}
+
+// firingKeyOf returns the dedup key for an event: ruleID:hostID for host
+// alerts, ruleID:cert:<certID> for certificate alerts. The ":cert:" segment
+// keeps certificate keys from colliding with host keys.
+func firingKeyOf(ruleID, hostID, certID string) string {
+	if certID != "" {
+		return ruleID + ":cert:" + certID
+	}
+	return ruleID + ":" + hostID
 }
 
 // WebhookConfig defines where notifications are sent.
@@ -177,10 +189,17 @@ func (s *Store) load() error {
 	s.events = p.Events
 	s.webhook = p.Webhook
 	// Restore active alerts into s.firing so a server restart does not re-fire
-	// existing un-resolved alerts (CPU/mem/disk high, offline, etc.).
+	// existing un-resolved alerts (CPU/mem/disk high, offline, cert expiry, etc.).
 	for _, e := range s.events {
-		if !e.Resolved && e.RuleID != "" && e.HostID != "" {
-			s.firing[e.RuleID+":"+e.HostID] = true
+		if e.Resolved || e.RuleID == "" {
+			continue
+		}
+		if e.CertID != "" {
+			s.firing[firingKeyOf(e.RuleID, "", e.CertID)] = true
+			continue
+		}
+		if e.HostID != "" {
+			s.firing[firingKeyOf(e.RuleID, e.HostID, "")] = true
 		}
 	}
 	// Deduplicate redundant historical "builtin-online" events for the same host:
@@ -437,6 +456,22 @@ func (s *Store) setFiring(key string, v bool) {
 	s.mu.Lock()
 	s.firing[key] = v
 	s.mu.Unlock()
+}
+
+// firingCertIDs returns the certificate IDs that currently hold an active
+// firing entry for ruleID. Used to sweep reminders whose certificate was
+// deleted while the alert was still firing.
+func (s *Store) firingCertIDs(ruleID string) []string {
+	prefix := ruleID + ":cert:"
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []string
+	for k, v := range s.firing {
+		if v && strings.HasPrefix(k, prefix) {
+			out = append(out, strings.TrimPrefix(k, prefix))
+		}
+	}
+	return out
 }
 
 // markPending records the first time a rule's condition was seen true for a

@@ -102,6 +102,9 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
       const type = days > 30 ? 'success' : days > 7 ? 'warning' : 'error'
       return h('span', null, [
         h(NTag, { size: 'small', type, bordered: false }, { default: () => `${days} 天后到期` }),
+        !row.auto_renew
+          ? h(NTag, { size: 'small', type: 'warning', bordered: false, style: 'margin-left: 6px', title: '该证书不会自动续期，到期前将经告警中心提醒，请手动重新签发或上传' }, { default: () => '手动维护' })
+          : null,
         h('span', { style: 'margin-left: 8px; font-size: 12px; color: #999' },
           formatDate(row.not_after)),
       ])

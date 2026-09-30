@@ -312,6 +312,9 @@ func TestManualDNSOrderEndToEnd(t *testing.T) {
 	if len(c.Domains) != 2 {
 		t.Fatalf("cert domains = %v, want 2", c.Domains)
 	}
+	if c.AutoRenew {
+		t.Error("manually issued certificate must not auto-renew; expiry is covered by the alert reminder")
+	}
 	if _, ok := h.Get(c.ID); !ok {
 		t.Fatal("issued certificate missing from hub")
 	}

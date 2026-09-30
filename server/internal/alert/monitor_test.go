@@ -375,3 +375,161 @@ func TestMonitorHostExpiryReminder(t *testing.T) {
 		t.Fatalf("expected no new events after renewal, got %d", len(events))
 	}
 }
+
+// ---- 证书到期提醒（builtin-cert-expiry）----
+
+type mockCertProvider struct {
+	certs []CertInfo
+}
+
+func (m *mockCertProvider) ListCerts() []CertInfo { return m.certs }
+
+func newCertTestMonitor(t *testing.T, certs []CertInfo) (*Monitor, *Store, *mockCertProvider) {
+	t.Helper()
+	store := newTestStore(t)
+	prov := &mockProvider{}
+	cprov := &mockCertProvider{certs: certs}
+	mon := NewMonitor(store, prov, nil, nil, slog.Default())
+	mon.SetBootGraceForTest(0)
+	mon.SetCertProvider(cprov)
+	return mon, store, cprov
+}
+
+func certExpiringIn(t *testing.T, id string, days int, autoRenew bool) CertInfo {
+	t.Helper()
+	now := time.Now()
+	return CertInfo{
+		ID:        id,
+		Domains:   []string{"example.com"},
+		NotBefore: now.Add(-80 * 24 * time.Hour),
+		NotAfter:  now.Add(time.Duration(days) * 24 * time.Hour),
+		AutoRenew: autoRenew,
+	}
+}
+
+// 不自动续期的证书在到期阈值内只提醒一次，自动续期的不提醒。
+func TestCheckCertExpiryFiresOnce(t *testing.T) {
+	mon, store, _ := newCertTestMonitor(t, []CertInfo{
+		certExpiringIn(t, "crt_manual", 10, false), // 手动签发/上传：应提醒
+		certExpiringIn(t, "crt_auto", 10, true),    // 自动续期：不提醒
+		certExpiringIn(t, "crt_far", 60, false),    // 还早：不提醒
+	})
+	mon.evaluate()
+	mon.evaluate() // 重复 tick 不重复提醒
+
+	events := store.ListEvents(100)
+	if len(events) != 1 {
+		t.Fatalf("expected exactly 1 cert expiry reminder, got %d", len(events))
+	}
+	e := events[0]
+	if e.RuleID != "builtin-cert-expiry" {
+		t.Errorf("expected rule builtin-cert-expiry, got %s", e.RuleID)
+	}
+	if e.CertID != "crt_manual" {
+		t.Errorf("expected reminder for crt_manual, got cert_id=%s host_id=%s", e.CertID, e.HostID)
+	}
+	if e.Severity != SeverityWarning {
+		t.Errorf("expected warning severity, got %s", e.Severity)
+	}
+	if e.Resolved {
+		t.Errorf("reminder should not be resolved")
+	}
+}
+
+// 证书续期/替换（到期时间推后）后提醒自动解除。
+func TestCheckCertExpiryResolvesOnRenewal(t *testing.T) {
+	mon, store, cprov := newCertTestMonitor(t, []CertInfo{
+		certExpiringIn(t, "crt_manual", 10, false),
+	})
+	mon.evaluate()
+	if events := store.ListEvents(100); len(events) != 1 {
+		t.Fatalf("expected 1 reminder, got %d", len(events))
+	}
+
+	// 模拟重新签发：到期时间推后到阈值以外
+	cprov.certs[0].NotAfter = time.Now().Add(80 * 24 * time.Hour)
+	mon.evaluate()
+
+	events := store.ListEvents(100)
+	if len(events) != 1 {
+		t.Fatalf("expected no new events after renewal, got %d", len(events))
+	}
+	if !events[0].Resolved {
+		t.Errorf("reminder should be resolved after renewal")
+	}
+	if mon.store.isFiring(firingKeyOf("builtin-cert-expiry", "", "crt_manual")) {
+		t.Errorf("firing state should be cleared after renewal")
+	}
+}
+
+// 证书被删除后，提醒同步解除，不泄漏 firing 状态。
+func TestCheckCertExpirySweepDeleted(t *testing.T) {
+	mon, store, cprov := newCertTestMonitor(t, []CertInfo{
+		certExpiringIn(t, "crt_manual", 10, false),
+	})
+	mon.evaluate()
+	if events := store.ListEvents(100); len(events) != 1 {
+		t.Fatalf("expected 1 reminder, got %d", len(events))
+	}
+
+	cprov.certs = nil // 证书被删除
+	mon.evaluate()
+
+	events := store.ListEvents(100)
+	if len(events) != 1 || !events[0].Resolved {
+		t.Fatalf("expected the reminder to be resolved after deletion, got %+v", events)
+	}
+	if mon.store.isFiring(firingKeyOf("builtin-cert-expiry", "", "crt_manual")) {
+		t.Errorf("firing state should be cleared after deletion")
+	}
+}
+
+// 短有效期证书的提醒阈值为有效期的 1/3（与自动续期缩放一致）。
+func TestCheckCertExpiryShortLivedThreshold(t *testing.T) {
+	now := time.Now()
+	short := CertInfo{
+		ID:        "crt_ip",
+		Domains:   []string{"192.0.2.1"},
+		NotBefore: now.Add(-4 * 24 * time.Hour), // 6 天有效期 → 阈值 2 天
+		NotAfter:  now.Add(3 * 24 * time.Hour),
+		AutoRenew: false,
+	}
+	mon, store, cprov := newCertTestMonitor(t, []CertInfo{short})
+	mon.evaluate()
+	if events := store.ListEvents(100); len(events) != 0 {
+		t.Fatalf("6-day cert expiring in 3 days should not remind yet, got %d events", len(events))
+	}
+
+	cprov.certs[0].NotAfter = now.Add(36 * time.Hour) // 剩余 1.5 天 < 2 天阈值
+	mon.evaluate()
+	if events := store.ListEvents(100); len(events) != 1 {
+		t.Fatalf("expected 1 reminder inside scaled threshold, got %d", len(events))
+	}
+}
+
+// 已过期的证书同样提醒（文案为“已过期”），且只提醒一次。
+func TestCheckCertExpiryAlreadyExpired(t *testing.T) {
+	mon, store, _ := newCertTestMonitor(t, []CertInfo{
+		certExpiringIn(t, "crt_old", -3, false),
+	})
+	mon.evaluate()
+	mon.evaluate()
+
+	events := store.ListEvents(100)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 reminder for expired cert, got %d", len(events))
+	}
+	if got := events[0].Message; len(got) == 0 {
+		t.Errorf("reminder message should not be empty")
+	}
+}
+
+// firingKeyOf：证书 key 与主机 key 不冲突。
+func TestFiringKeyOf(t *testing.T) {
+	if got := firingKeyOf("r", "h1", ""); got != "r:h1" {
+		t.Errorf("host key = %q, want %q", got, "r:h1")
+	}
+	if got := firingKeyOf("r", "", "c1"); got != "r:cert:c1" {
+		t.Errorf("cert key = %q, want %q", got, "r:cert:c1")
+	}
+}

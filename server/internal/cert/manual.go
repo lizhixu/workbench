@@ -518,7 +518,11 @@ func (h *Hub) ConfirmManualDNSOrder(id string) (*Certificate, error) {
 		issuer = acc.Name
 	}
 	certID := "crt_" + randomHex(8)
-	if err := h.storeResult(certID, acc.ID, p.Identifiers, certPEM, keyPEM, notBefore, notAfter, issuer); err != nil {
+	// Manually issued: the renewal loop uses automatic challenges (HTTP-01 /
+	// dns-mng DNS-01), which is exactly what the administrator bypassed by
+	// choosing the manual two-phase flow — auto-renew would only fail
+	// repeatedly. Leave AutoRenew off; the alert monitor reminds before expiry.
+	if err := h.storeResult(certID, acc.ID, p.Identifiers, certPEM, keyPEM, notBefore, notAfter, issuer, false); err != nil {
 		// The certificate was issued but could not be stored locally; the
 		// order is consumed, so a fresh order is required.
 		return fail("保存证书失败", err, true)

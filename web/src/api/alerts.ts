@@ -24,6 +24,7 @@ export interface AlertEvent {
   severity: Severity
   host_id: string
   hostname: string
+  cert_id?: string
   message: string
   fired_at: string
   resolved: boolean

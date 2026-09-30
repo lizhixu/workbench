@@ -392,6 +392,22 @@ func main() {
 	// Alert monitor: evaluates rules every 30s against the live registry.
 	// metricsStore enables anomaly detection; aiAssistant enables alert interpretation.
 	alertMonitor := alert.NewMonitor(alertStore, alert.NewHostProvider(reg), metricsStore, aiAssistant, log)
+	// Certificate expiry reminder: certificates that never auto-renew
+	// (manual DNS-01 issuance, manual upload) fire a one-shot builtin alert
+	// before expiry (alert center + webhook).
+	alertMonitor.SetCertProvider(alert.CertProviderFunc(func() []alert.CertInfo {
+		out := make([]alert.CertInfo, 0)
+		for _, c := range certHub.List() {
+			out = append(out, alert.CertInfo{
+				ID:        c.ID,
+				Domains:   c.Domains,
+				NotBefore: c.NotBefore,
+				NotAfter:  c.NotAfter,
+				AutoRenew: c.AutoRenew,
+			})
+		}
+		return out
+	}))
 	go alertMonitor.Start(ctx, 30*time.Second)
 
 	// Certificate renewal loop: auto-renews certificates expiring within 30

@@ -213,7 +213,7 @@ async function handleSave() {
             <NInputNumber
               v-model:value="form.traffic_reset_day"
               :min="1"
-              :max="31"
+              :max="28"
               placeholder="每月 1 日"
               style="width: 100%"
             />

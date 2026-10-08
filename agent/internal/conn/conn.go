@@ -225,6 +225,13 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 		return fmt.Errorf("%s", msg)
 	}
 
+	// The panel's per-host traffic reset day arrives on every (re)connect;
+	// applying it keeps the agent's billing cycle aligned with the panel
+	// setting (a 0 from an old server is ignored).
+	if d.metrics != nil {
+		d.metrics.SetResetDay(int(regResp.GetTrafficResetDay()))
+	}
+
 	if regResp.GetAuthToken() != "" {
 		newID := regResp.GetAgentId()
 		if err := d.cfg.Update(func(s *config.State) {

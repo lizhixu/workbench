@@ -236,7 +236,7 @@ const trafficDisplay = computed(() => {
     usedBytes = h.month_rx || 0
     calcLabel = '入向'
   }
-  const usedGB = usedBytes / (1024 * 1024 * 1024)
+  const usedGB = usedBytes / 1e9
   const pct = ((usedGB / h.traffic_limit_gb) * 100).toFixed(1)
   return `${usedGB.toFixed(1)} / ${h.traffic_limit_gb} GB (${pct}%, ${calcLabel})`
 })
@@ -244,8 +244,8 @@ const trafficDisplay = computed(() => {
 const trafficTooltip = computed(() => {
   const h = props.host
   if (!h.traffic_limit_gb) return ''
-  const rxGB = ((h.month_rx || 0) / (1024 * 1024 * 1024)).toFixed(2)
-  const txGB = ((h.month_tx || 0) / (1024 * 1024 * 1024)).toFixed(2)
+  const rxGB = ((h.month_rx || 0) / 1e9).toFixed(2)
+  const txGB = ((h.month_tx || 0) / 1e9).toFixed(2)
   return `本月入向: ${rxGB} GB | 本月出向: ${txGB} GB | 重置日: 每月 ${h.traffic_reset_day || 1} 号`
 })
 

@@ -32,6 +32,11 @@ type Manager struct {
 	log    *slog.Logger
 	cancel context.CancelFunc
 
+	// Host boot time (unix seconds), cached at startup. It only changes
+	// across a host reboot — which also restarts this process — so it is a
+	// stable reboot detector for the traffic tracker.
+	bootTime int64
+
 	// Previous cumulative counters for computing per-second rates.
 	prevNetRx     float64
 	prevNetTx     float64
@@ -51,13 +56,30 @@ func NewManager(log *slog.Logger) *Manager {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Manager{log: log}
+	m := &Manager{log: log}
+	if hi, err := host.Info(); err == nil {
+		m.bootTime = int64(hi.BootTime)
+	}
+	return m
 }
 
 // SetStateFile wires the monthly traffic tracker to persist alongside the
-// agent identity. resetDay is the billing-cycle reset day-of-month (1..28).
-func (m *Manager) SetStateFile(stateFile string, resetDay int) {
-	m.traffic = newTrafficTracker(stateFile, resetDay)
+// agent identity. resetDay is the billing-cycle reset day-of-month (1..28);
+// allowIfaces optionally restricts accounting to the named interfaces
+// (empty = all non-loopback interfaces).
+func (m *Manager) SetStateFile(stateFile string, resetDay int, allowIfaces []string) {
+	m.traffic = newTrafficTracker(stateFile, resetDay, allowIfaces)
+}
+
+// SetResetDay applies the panel-configured billing reset day delivered by
+// the server in RegisterResponse; values outside 1..28 are ignored so an
+// old server (or a transient 0) never clobbers the local setting.
+func (m *Manager) SetResetDay(day int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.traffic != nil {
+		m.traffic.setResetDay(day)
+	}
 }
 
 func (m *Manager) SetSender(s Sender) {
@@ -194,26 +216,41 @@ func (m *Manager) collect() *agentpb.MetricsSample {
 	// CPU model name (static, cached after first lookup).
 	sample.CpuModel = m.cpuModelString()
 
-	// Network: gopsutil returns cumulative counters; compute per-second rates.
-	if io, err := net.IOCounters(false); err == nil && len(io) > 0 {
-		curRx := float64(io[0].BytesRecv)
-		curTx := float64(io[0].BytesSent)
+	// Network: per-interface cumulative counters. Loopback is excluded
+	// (host-internal traffic no ISP bills); an optional allowlist can
+	// restrict accounting to chosen interfaces (e.g. the external NIC on
+	// docker hosts, where one packet is counted on veth + bridge + NIC).
+	if io, err := net.IOCounters(true); err == nil && len(io) > 0 {
+		samples := make(map[string]ifaceCounters, len(io))
+		var curRx, curTx uint64
+		for _, nic := range io {
+			if isLoopbackIface(nic.Name) {
+				continue
+			}
+			if m.traffic != nil && !m.traffic.ifaceAllowed(nic.Name) {
+				continue
+			}
+			curRx += nic.BytesRecv
+			curTx += nic.BytesSent
+			samples[nic.Name] = ifaceCounters{Rx: nic.BytesRecv, Tx: nic.BytesSent}
+		}
+		fRx, fTx := float64(curRx), float64(curTx)
 		m.mu.Lock()
 		if !m.prevTs.IsZero() {
 			elapsed := now.Sub(m.prevTs).Seconds()
 			if elapsed > 0 {
-				sample.NetRx = max64(curRx-m.prevNetRx, 0) / elapsed
-				sample.NetTx = max64(curTx-m.prevNetTx, 0) / elapsed
+				sample.NetRx = max64(fRx-m.prevNetRx, 0) / elapsed
+				sample.NetTx = max64(fTx-m.prevNetTx, 0) / elapsed
 			}
 		}
-		m.prevNetRx = curRx
-		m.prevNetTx = curTx
+		m.prevNetRx = fRx
+		m.prevNetTx = fTx
 		m.mu.Unlock()
 
-		// Monthly traffic accounting from the same cumulative counters.
+		// Monthly traffic accounting from the same per-interface counters.
 		if m.traffic != nil {
 			m.mu.Lock()
-			rx, tx := m.traffic.account(io[0].BytesRecv, io[0].BytesSent, now)
+			rx, tx := m.traffic.account(samples, m.bootTime, now)
 			m.mu.Unlock()
 			sample.MonthRx = int64(rx)
 			sample.MonthTx = int64(tx)

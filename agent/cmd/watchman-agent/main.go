@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"watchman/agent/internal/config"
@@ -34,6 +35,7 @@ func main() {
 	tlsName := flag.String("tls-server-name", "", "override TLS server name check")
 	upPubKey := flag.String("upgrade-pubkey", "", "hex Ed25519 public key to verify self-upgrades")
 	trafficResetDay := flag.Int("traffic-reset-day", 1, "billing cycle reset day-of-month (1-28) for monthly traffic stats")
+	trafficIfaces := flag.String("traffic-ifaces", "", "comma-separated NIC allowlist for traffic accounting (default: all non-loopback interfaces)")
 	showVersion := flag.Bool("version", false, "print watchman-agent version and exit")
 	flag.Parse()
 
@@ -79,7 +81,7 @@ func main() {
 	d.SetFileManager(files.NewManager(log))
 	d.SetExecManager(exec.NewManager(log))
 	mm := metrics.NewManager(log)
-	mm.SetStateFile(*state, *trafficResetDay)
+	mm.SetStateFile(*state, *trafficResetDay, strings.Split(*trafficIfaces, ","))
 	d.SetMetricsManager(mm)
 	d.SetSysInfoManager(sysinfo.NewManager(log))
 	d.SetDockerManager(docker.NewManager(log))

@@ -786,8 +786,12 @@ type RegisterResponse struct {
 	// session_keep_sec is how long the server keeps a PTY session alive after
 	// the agent disconnects, to allow seamless resume.
 	SessionKeepSec int32 `protobuf:"varint,6,opt,name=session_keep_sec,json=sessionKeepSec,proto3" json:"session_keep_sec,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// traffic_reset_day is the billing-cycle reset day-of-month (1-28)
+	// configured for this host in the panel ("财务与规格"); the agent
+	// applies it to its monthly traffic accounting on (re)connect.
+	TrafficResetDay int32 `protobuf:"varint,7,opt,name=traffic_reset_day,json=trafficResetDay,proto3" json:"traffic_reset_day,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RegisterResponse) Reset() {
@@ -858,6 +862,13 @@ func (x *RegisterResponse) GetHeartbeatIntervalSec() int32 {
 func (x *RegisterResponse) GetSessionKeepSec() int32 {
 	if x != nil {
 		return x.SessionKeepSec
+	}
+	return 0
+}
+
+func (x *RegisterResponse) GetTrafficResetDay() int32 {
+	if x != nil {
+		return x.TrafficResetDay
 	}
 	return 0
 }
@@ -2879,7 +2890,7 @@ const file_agent_proto_rawDesc = "" +
 	"internalIp\x12\x1b\n" +
 	"\tpublic_ip\x18\f \x01(\tR\bpublicIp\x12\x1a\n" +
 	"\blocation\x18\r \x01(\tR\blocation\x12)\n" +
-	"\x10reconnect_reason\x18\x0e \x01(\tR\x0freconnectReason\"\xd2\x01\n" +
+	"\x10reconnect_reason\x18\x0e \x01(\tR\x0freconnectReason\"\xfe\x01\n" +
 	"\x10RegisterResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12\x19\n" +
@@ -2887,7 +2898,8 @@ const file_agent_proto_rawDesc = "" +
 	"\n" +
 	"auth_token\x18\x04 \x01(\tR\tauthToken\x124\n" +
 	"\x16heartbeat_interval_sec\x18\x05 \x01(\x05R\x14heartbeatIntervalSec\x12(\n" +
-	"\x10session_keep_sec\x18\x06 \x01(\x05R\x0esessionKeepSec\"\x1b\n" +
+	"\x10session_keep_sec\x18\x06 \x01(\x05R\x0esessionKeepSec\x12*\n" +
+	"\x11traffic_reset_day\x18\a \x01(\x05R\x0ftrafficResetDay\"\x1b\n" +
 	"\tHeartbeat\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x03R\x02ts\"\x1e\n" +
 	"\fHeartbeatAck\x12\x0e\n" +

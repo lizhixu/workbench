@@ -98,6 +98,10 @@ message RegisterResponse {
   // session_keep_sec is how long the server keeps a PTY session alive after
   // the agent disconnects, to allow seamless resume.
   int32 session_keep_sec = 6;
+  // traffic_reset_day is the billing-cycle reset day-of-month (1-28)
+  // configured for this host in the panel ("财务与规格"); the agent
+  // applies it to its monthly traffic accounting on (re)connect.
+  int32 traffic_reset_day = 7;
 }
 
 message Heartbeat {

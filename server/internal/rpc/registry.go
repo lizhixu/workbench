@@ -396,6 +396,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 			AgentId:              agentID,
 			HeartbeatIntervalSec: heartbeatSec,
 			SessionKeepSec:       sessionKeep,
+			TrafficResetDay:      int32(normTrafficResetDay(a.TrafficResetDay)),
 		}, nil
 	}
 
@@ -448,6 +449,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 		AuthToken:            authTokenNew,
 		HeartbeatIntervalSec: heartbeatSec,
 		SessionKeepSec:       sessionKeep,
+		TrafficResetDay:      int32(normTrafficResetDay(a.TrafficResetDay)),
 	}, nil
 }
 
@@ -629,7 +631,19 @@ type HostBillingConfig struct {
 	Notes           string  `json:"notes"`
 }
 
+// normTrafficResetDay clamps the panel-configured billing reset day to the
+// range the agent supports (1..28); 0/unset means the 1st of the month.
+func normTrafficResetDay(d int) int {
+	if d < 1 || d > 28 {
+		return 1
+	}
+	return d
+}
+
 // SetAgentBilling updates optional billing, traffic limits and notes for a host.
+// NOTE: a changed TrafficResetDay reaches the agent on its next (re)connect
+// via RegisterResponse; already-connected agents keep their current cycle
+// until then.
 func (r *Registry) SetAgentBilling(id string, b HostBillingConfig) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -650,8 +664,10 @@ func (r *Registry) SetAgentBilling(id string, b HostBillingConfig) error {
 	}
 	if b.TrafficResetDay <= 0 {
 		a.TrafficResetDay = 1
-	} else if b.TrafficResetDay > 31 {
-		a.TrafficResetDay = 31
+	} else if b.TrafficResetDay > 28 {
+		// The agent only supports reset days 1..28 (every month has 28
+		// days); larger values would silently collapse to 1 there.
+		a.TrafficResetDay = 28
 	} else {
 		a.TrafficResetDay = b.TrafficResetDay
 	}

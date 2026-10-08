@@ -410,7 +410,7 @@ func (m *Monitor) checkHostTraffic(host HostInfo) {
 		calcDesc = "双向"
 	}
 
-	quotaBytes := quotaGB * (1 << 30) // GiB
+	quotaBytes := quotaGB * 1e9 // decimal GB, matching the panel label and ISP billing
 	pct := float64(used) / quotaBytes * 100
 
 	// We define two tiers: 100% (critical) and 80% (warning)
@@ -420,7 +420,7 @@ func (m *Monitor) checkHostTraffic(host HostInfo) {
 			if !m.store.isFiring(key) {
 				m.store.setFiring(key, true)
 				msg := fmt.Sprintf("主机 %s 本月流量(%s) %s 已达到配额 %s 的 %.1f%% (告警阈值 %.0f%%)",
-					host.Hostname, calcDesc, fmtGiB(float64(used)/(1<<30)), fmtGiB(quotaGB), pct, threshold)
+					host.Hostname, calcDesc, fmtGB(float64(used)/1e9), fmtGB(quotaGB), pct, threshold)
 				event := &Event{
 					ID:       randomID(),
 					RuleID:   "builtin-traffic-" + tierName,
@@ -810,15 +810,15 @@ func metricLabel(m string) string {
 	}
 }
 
-// fmtGiB renders a GiB value with precision adapted to its magnitude.
-func fmtGiB(v float64) string {
+// fmtGB renders a decimal-GB value with precision adapted to its magnitude.
+func fmtGB(v float64) string {
 	switch {
 	case v >= 100:
-		return fmt.Sprintf("%.0f GiB", v)
+		return fmt.Sprintf("%.0f GB", v)
 	case v >= 10:
-		return fmt.Sprintf("%.1f GiB", v)
+		return fmt.Sprintf("%.1f GB", v)
 	default:
-		return fmt.Sprintf("%.2f GiB", v)
+		return fmt.Sprintf("%.2f GB", v)
 	}
 }
 

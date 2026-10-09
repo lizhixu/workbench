@@ -102,11 +102,12 @@ message RegisterResponse {
   // configured for this host in the panel ("财务与规格"); the agent
   // applies it to its monthly traffic accounting on (re)connect.
   int32 traffic_reset_day = 7;
-  // probe_url is the effective HTTP(S) target for the agent's latency /
-  // packet-loss probe (per-host "测速目标" in the panel; the server
-  // resolves the built-in default when the host has none). Empty means
-  // probing disabled (old server).
-  string probe_url = 8;
+  // probe_targets carries the per-carrier network quality probe targets
+  // (三网监控), keyed by carrier code ("telecom" / "unicom" / "mobile").
+  // Values are "host[:port]" TCP endpoints (default port 80); only carriers
+  // with a non-empty target are included. Empty means probing disabled
+  // (old server or the host has the switch off).
+  map<string, string> probe_targets = 9;
 }
 
 message Heartbeat {
@@ -224,9 +225,17 @@ message MetricsSample {
   string cpu_model = 21;     // CPU model name (cached, static)
   int64 month_rx = 22; // bytes received this billing cycle
   int64 month_tx = 23; // bytes transmitted this billing cycle
-  // Network quality probe (panel-configured target, see RegisterResponse).
-  double net_latency_ms = 24; // mean HTTP probe latency in ms; 0 = no data
-  double net_loss_pct = 25;   // failed probe attempts, percent 0..100
+  // Network quality probe results, keyed by carrier code
+  // ("telecom" / "unicom" / "mobile"); see RegisterResponse.probe_targets.
+  // A carrier entry appears only once at least one probe round has
+  // completed for its target.
+  map<string, ProbeResult> probe_results = 26;
+}
+
+// ProbeResult is one carrier's latest probe round outcome.
+message ProbeResult {
+  double latency_ms = 1; // median RTT of successful attempts in ms; 0 = none succeeded
+  double loss_pct = 2;   // failed attempts share, percent 0..100
 }
 
 message Mount {

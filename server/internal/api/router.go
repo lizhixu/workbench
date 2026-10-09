@@ -80,18 +80,18 @@ type HostDTO struct {
 	PublicIP   string   `json:"public_ip"`
 	Location   string   `json:"location"`
 	// Optional billing & traffic quota configurations
-	Price           float64 `json:"price,omitempty"`
-	Currency        string  `json:"currency,omitempty"`
-	BillingCycle    string  `json:"billing_cycle,omitempty"`
-	ExpiresAt       string  `json:"expires_at,omitempty"`
-	AutoRenewal     bool    `json:"auto_renewal,omitempty"`
-	TrafficLimitGB  float64 `json:"traffic_limit_gb,omitempty"`
-	TrafficCalcType string  `json:"traffic_calc_type,omitempty"`
-	TrafficResetDay int     `json:"traffic_reset_day,omitempty"`
-	RenewalURL      string  `json:"renewal_url,omitempty"`
-	ProbeEnabled    bool    `json:"probe_enabled"`
-	ProbeURL        string  `json:"probe_url,omitempty"`
-	Notes           string  `json:"notes,omitempty"`
+	Price           float64           `json:"price,omitempty"`
+	Currency        string            `json:"currency,omitempty"`
+	BillingCycle    string            `json:"billing_cycle,omitempty"`
+	ExpiresAt       string            `json:"expires_at,omitempty"`
+	AutoRenewal     bool              `json:"auto_renewal,omitempty"`
+	TrafficLimitGB  float64           `json:"traffic_limit_gb,omitempty"`
+	TrafficCalcType string            `json:"traffic_calc_type,omitempty"`
+	TrafficResetDay int               `json:"traffic_reset_day,omitempty"`
+	RenewalURL      string            `json:"renewal_url,omitempty"`
+	ProbeEnabled    bool              `json:"probe_enabled"`
+	ProbeTargets    map[string]string `json:"probe_targets,omitempty"`
+	Notes           string            `json:"notes,omitempty"`
 	// Extended live metrics (from the agent's latest sample).
 	CpuModel  string  `json:"cpu_model,omitempty"`
 	Load1     float64 `json:"load1"`
@@ -1222,6 +1222,24 @@ func metricsToJSON(m *agentpb.MetricsSample) gin.H {
 			"used":  mt.GetUsed(),
 		})
 	}
+	// Per-carrier network quality probe readings (snake_case so the frontend
+	// gets latency_ms/loss_pct; proto map keys would marshal as Go field names).
+	var netProbe gin.H
+	if len(m.GetProbeResults()) > 0 {
+		netProbe = make(gin.H, len(m.GetProbeResults()))
+		for carrier, r := range m.GetProbeResults() {
+			if r == nil {
+				continue
+			}
+			netProbe[carrier] = gin.H{
+				"latency_ms": r.GetLatencyMs(),
+				"loss_pct":   r.GetLossPct(),
+			}
+		}
+		if len(netProbe) == 0 {
+			netProbe = nil
+		}
+	}
 	return gin.H{
 		"ts":              m.GetTs(),
 		"cpu_usage":       m.GetCpuUsage(),
@@ -1244,8 +1262,7 @@ func metricsToJSON(m *agentpb.MetricsSample) gin.H {
 		"cpu_model":       m.GetCpuModel(),
 		"month_rx":        m.GetMonthRx(),
 		"month_tx":        m.GetMonthTx(),
-		"net_latency_ms":  m.GetNetLatencyMs(),
-		"net_loss_pct":    m.GetNetLossPct(),
+		"net_probe":       netProbe,
 	}
 }
 
@@ -2334,7 +2351,7 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 		TrafficResetDay:    a.TrafficResetDay,
 		RenewalURL:         a.RenewalURL,
 		ProbeEnabled:       a.ProbeEnabled,
-		ProbeURL:           a.ProbeURL,
+		ProbeTargets:       panelProbeTargets(a),
 		Notes:              a.Notes,
 	}
 	// Surface the real OS uptime and latest metrics
@@ -2364,6 +2381,17 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 		dto.UpgradeError = upg.Error
 	}
 	return dto
+}
+
+// panelProbeTargets returns the per-carrier probe targets shown in the host
+// billing modal: the stored/effective targets when probing is on, otherwise
+// the Zstatic defaults resolved from the host location — so the admin can
+// see and edit what will be probed before switching the feature on.
+func panelProbeTargets(a *rpc.Agent) map[string]string {
+	if targets := rpc.EffectiveProbeTargets(a); targets != nil {
+		return targets
+	}
+	return rpc.DefaultProbeTargets(a.Location)
 }
 
 func toDTO(a *rpc.Agent) HostDTO {

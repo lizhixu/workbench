@@ -1,5 +1,5 @@
 import { http, unwrap } from './http'
-import type { EnrollResponse, HealthResponse, Host, HostBillingConfig, ListResponse, SessionRecord } from './types'
+import type { EnrollResponse, HealthResponse, Host, HostBillingConfig, ListResponse, ProbeReading, SessionRecord } from './types'
 
 export function listHosts() {
   return unwrap<ListResponse<Host>>(http.get('/hosts'))
@@ -188,8 +188,9 @@ export interface MetricPoint {
   process_count?: number
   month_rx?: number
   month_tx?: number
-  net_latency_ms?: number
-  net_loss_pct?: number
+  // Network quality probe readings per carrier ("telecom" / "unicom" /
+  // "mobile"); absent on records from older agents.
+  net_probe?: Record<string, ProbeReading>
 }
 
 export interface MetricsHistoryResponse {

@@ -20,7 +20,7 @@ import { CanvasRenderer } from 'echarts/renderers'
 
 echarts.use([LineChart, GridComponent, TooltipComponent, TitleComponent, CanvasRenderer])
 import { getMetrics, getMetricsHistory, type MetricPoint } from '../../api/hosts'
-import type { Metrics } from '../../api/types'
+import type { Metrics, ProbeReading } from '../../api/types'
 import { useSettingsStore } from '../../stores/settings'
 import { fmtDateTime, fmtTime as fmtTimeOfDay } from '../../utils/time'
 
@@ -79,6 +79,12 @@ function fmtBytes(n: number): string {
 
 function fmtRate(n: number): string {
   return fmtBytes(n) + '/s'
+}
+
+// #rrggbb -> rgba() for echarts gradient stops.
+function hexToRgba(hex: string, alpha: number): string {
+  const n = parseInt(hex.slice(1), 16)
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`
 }
 
 function fmtTime(ts: number, full = false): string {
@@ -323,82 +329,107 @@ function updateChartsWithPoints(points: MetricPoint[]) {
     diskChart.setOption(opt)
   }
 
-  // 5 & 6. Network latency / packet loss (panel-configured probe target).
-  // net_latency_ms <= 0 means "no probe data" (older agent, probing off, or
-  // a round where every attempt failed); gaps are rendered as nulls.
-  const hasProbeData =
-    points.some((p) => (p.net_latency_ms ?? 0) > 0) ||
-    points.some((p) => (p.net_loss_pct ?? 0) > 0)
-  const noProbeHint = '暂无数据（等待探测或未配置测速目标）'
-  const lastLatency = [...points].reverse().find((p) => (p.net_latency_ms ?? 0) > 0)
-  const lastLoss = points[points.length - 1]
+  // 5 & 6. Network latency / packet loss, one line per carrier (三网监控).
+  // A missing carrier entry or latency <= 0 means "no probe data" (older
+  // agent, probing off, or a round where every attempt failed); gaps are
+  // rendered as nulls.
+  const probeCarriers = [
+    { key: 'telecom', label: '电信', color: '#3b82f6' },
+    { key: 'unicom', label: '联通', color: '#f59e0b' },
+    { key: 'mobile', label: '移动', color: '#10b981' },
+  ]
+  const probeReading = (p: MetricPoint, carrier: string): ProbeReading | undefined =>
+    p.net_probe?.[carrier]
+  const hasProbeData = points.some((p) =>
+    probeCarriers.some((c) => {
+      const r = probeReading(p, c.key)
+      return !!r && (r.latency_ms > 0 || r.loss_pct > 0)
+    }),
+  )
+  const lastProbePoint = [...points].reverse().find((p) => p.net_probe && Object.keys(p.net_probe).length > 0)
+  const noProbeHint = '暂无数据（等待探测或未配置探测目标）'
+  const carrierSummary = (pick: (r: ProbeReading) => string) => {
+    if (!lastProbePoint) return noProbeHint
+    const latest = lastProbePoint
+    return probeCarriers
+      .map((c) => {
+        const r = probeReading(latest, c.key)
+        return `${c.label} ${r ? pick(r) : '--'}`
+      })
+      .join(' · ')
+  }
+
+  const probeLegend = () => ({
+    show: true,
+    top: 4,
+    right: 8,
+    itemWidth: 14,
+    itemHeight: 8,
+    textStyle: { color: settings.themeMode === 'dark' ? '#9ca3af' : '#64748b', fontSize: 10 },
+  })
+  // One series per carrier: latency breaks the line when the round had no
+  // successful attempt, loss only when the carrier entry is absent.
+  const probeSeries = (value: (r: ProbeReading) => number | null) =>
+    probeCarriers.map((c) => ({
+      name: c.label,
+      type: 'line',
+      smooth: true,
+      showSymbol: false,
+      connectNulls: false,
+      data: points.map((p) => {
+        const r = probeReading(p, c.key)
+        return r ? value(r) : null
+      }),
+      itemStyle: { color: c.color },
+      lineStyle: { width: 1.5, color: c.color },
+      areaStyle: {
+        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+          { offset: 0, color: hexToRgba(c.color, 0.35) },
+          { offset: 1, color: hexToRgba(c.color, 0.02) },
+        ]),
+      },
+    }))
 
   if (latencyChart) {
     const opt: any = getBaseChartOption(
       '网络延迟',
-      hasProbeData && lastLatency
-        ? `当前: ${(lastLatency.net_latency_ms as number).toFixed(1)} ms`
-        : noProbeHint,
+      hasProbeData ? carrierSummary((r) => (r.latency_ms > 0 ? `${r.latency_ms.toFixed(1)} ms` : '无数据')) : noProbeHint,
       (v) => `${v} ms`,
     )
+    opt.legend = probeLegend()
     opt.xAxis.data = times
     opt.tooltip.formatter = (params: any[]) => {
       const idx = params[0]?.dataIndex ?? 0
       const pt = points[idx]
-      const v = pt.net_latency_ms
-      return `${fmtTime(pt.ts, true)}<br/>延迟: ${v && v > 0 ? v.toFixed(1) + ' ms' : '无数据'}<br/>丢包率: ${(pt.net_loss_pct ?? 0).toFixed(1)}%`
+      const lines = probeCarriers.map((c) => {
+        const r = probeReading(pt, c.key)
+        return `${c.label}: ${r && r.latency_ms > 0 ? r.latency_ms.toFixed(1) + ' ms' : '无数据'}`
+      })
+      return `${fmtTime(pt.ts, true)}<br/>${lines.join('<br/>')}`
     }
-    opt.series = [
-      {
-        name: '网络延迟',
-        type: 'line',
-        smooth: true,
-        showSymbol: false,
-        connectNulls: false,
-        data: points.map((p) =>
-          p.net_latency_ms && p.net_latency_ms > 0 ? +p.net_latency_ms.toFixed(1) : null,
-        ),
-        itemStyle: { color: '#14b8a6' },
-        areaStyle: {
-          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-            { offset: 0, color: 'rgba(20, 184, 166, 0.40)' },
-            { offset: 1, color: 'rgba(20, 184, 166, 0.02)' },
-          ]),
-        },
-      },
-    ]
+    opt.series = probeSeries((r) => (r.latency_ms > 0 ? +r.latency_ms.toFixed(1) : null))
     latencyChart.setOption(opt)
   }
 
   if (lossChart) {
     const opt: any = getBaseChartOption(
       '丢包率',
-      hasProbeData ? `当前: ${(lastLoss.net_loss_pct ?? 0).toFixed(1)}%` : noProbeHint,
+      hasProbeData ? carrierSummary((r) => `${r.loss_pct.toFixed(1)}%`) : noProbeHint,
       (v) => `${v}%`,
       100,
     )
+    opt.legend = probeLegend()
     opt.xAxis.data = times
     opt.tooltip.formatter = (params: any[]) => {
       const idx = params[0]?.dataIndex ?? 0
       const pt = points[idx]
-      return `${fmtTime(pt.ts, true)}<br/>丢包率: ${(pt.net_loss_pct ?? 0).toFixed(1)}%`
+      const lines = probeCarriers.map((c) => {
+        const r = probeReading(pt, c.key)
+        return `${c.label}: ${r ? r.loss_pct.toFixed(1) + '%' : '无数据'}`
+      })
+      return `${fmtTime(pt.ts, true)}<br/>${lines.join('<br/>')}`
     }
-    opt.series = [
-      {
-        name: '丢包率',
-        type: 'line',
-        smooth: true,
-        showSymbol: false,
-        data: points.map((p) => (hasProbeData ? +(p.net_loss_pct ?? 0).toFixed(1) : null)),
-        itemStyle: { color: '#ef4444' },
-        areaStyle: {
-          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-            { offset: 0, color: 'rgba(239, 68, 68, 0.40)' },
-            { offset: 1, color: 'rgba(239, 68, 68, 0.02)' },
-          ]),
-        },
-      },
-    ]
+    opt.series = probeSeries((r) => +r.loss_pct.toFixed(1))
     lossChart.setOption(opt)
   }
 }
@@ -420,8 +451,7 @@ async function fetchRealtimeMetrics() {
       net_tx: data.net_tx || 0,
       disk_read: data.disk_read || 0,
       disk_write: data.disk_write || 0,
-      net_latency_ms: data.net_latency_ms ?? 0,
-      net_loss_pct: data.net_loss_pct ?? 0,
+      net_probe: data.net_probe,
     }
 
     realtimePoints.value.push(pt)
@@ -669,14 +699,14 @@ watch(() => settings.themeMode, () => {
           </div>
         </NGridItem>
 
-        <!-- 5. 网络延迟 监控（需在主机配置中开启延迟/丢包监控） -->
+        <!-- 5. 网络延迟 监控（三网，需在主机配置中开启延迟/丢包监控） -->
         <NGridItem v-if="probeEnabled">
           <div class="chart-card">
             <div ref="latencyChartEl" class="echarts-box"></div>
           </div>
         </NGridItem>
 
-        <!-- 6. 丢包率 监控（需在主机配置中开启延迟/丢包监控） -->
+        <!-- 6. 丢包率 监控（三网，需在主机配置中开启延迟/丢包监控） -->
         <NGridItem v-if="probeEnabled">
           <div class="chart-card">
             <div ref="lossChartEl" class="echarts-box"></div>

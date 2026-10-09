@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
+	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,18 +41,18 @@ type persistedAgent struct {
 	PublicIP   string    `json:"public_ip"`
 	Location   string    `json:"location"`
 	// Optional billing & traffic quota configurations
-	Price           float64 `json:"price,omitempty"`
-	Currency        string  `json:"currency,omitempty"`
-	BillingCycle    string  `json:"billing_cycle,omitempty"`
-	ExpiresAt       string  `json:"expires_at,omitempty"`
-	AutoRenewal     bool    `json:"auto_renewal,omitempty"`
-	TrafficLimitGB  float64 `json:"traffic_limit_gb,omitempty"`
-	TrafficCalcType string  `json:"traffic_calc_type,omitempty"`
-	TrafficResetDay int     `json:"traffic_reset_day,omitempty"`
-	RenewalURL      string  `json:"renewal_url,omitempty"`
-	ProbeEnabled    bool    `json:"probe_enabled,omitempty"`
-	ProbeURL        string  `json:"probe_url,omitempty"`
-	Notes           string  `json:"notes,omitempty"`
+	Price           float64           `json:"price,omitempty"`
+	Currency        string            `json:"currency,omitempty"`
+	BillingCycle    string            `json:"billing_cycle,omitempty"`
+	ExpiresAt       string            `json:"expires_at,omitempty"`
+	AutoRenewal     bool              `json:"auto_renewal,omitempty"`
+	TrafficLimitGB  float64           `json:"traffic_limit_gb,omitempty"`
+	TrafficCalcType string            `json:"traffic_calc_type,omitempty"`
+	TrafficResetDay int               `json:"traffic_reset_day,omitempty"`
+	RenewalURL      string            `json:"renewal_url,omitempty"`
+	ProbeEnabled    bool              `json:"probe_enabled,omitempty"`
+	ProbeTargets    map[string]string `json:"probe_targets,omitempty"`
+	Notes           string            `json:"notes,omitempty"`
 	// AuthToken is the long-lived token issued at registration; kept here
 	// (NOT in r.tokens) so a server restart doesn't invalidate it.
 	AuthToken string `json:"auth_token"`
@@ -116,7 +118,7 @@ type Agent struct {
 	TrafficResetDay int
 	RenewalURL      string
 	ProbeEnabled    bool
-	ProbeURL        string
+	ProbeTargets    map[string]string
 	Notes           string
 	// ReconnectReason is the reason sent by the agent on its most recent registration.
 	ReconnectReason string
@@ -238,7 +240,7 @@ func (r *Registry) loadAgents() error {
 			TrafficResetDay: p.TrafficResetDay,
 			RenewalURL:      p.RenewalURL,
 			ProbeEnabled:    p.ProbeEnabled,
-			ProbeURL:        p.ProbeURL,
+			ProbeTargets:    p.ProbeTargets,
 			Notes:           p.Notes,
 			AuthToken:       p.AuthToken,
 		}
@@ -286,7 +288,7 @@ func (r *Registry) persistAgentsLocked() error {
 			TrafficResetDay: a.TrafficResetDay,
 			RenewalURL:      a.RenewalURL,
 			ProbeEnabled:    a.ProbeEnabled,
-			ProbeURL:        a.ProbeURL,
+			ProbeTargets:    a.ProbeTargets,
 			Notes:           a.Notes,
 			AuthToken:       a.AuthToken,
 		}
@@ -407,7 +409,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 			HeartbeatIntervalSec: heartbeatSec,
 			SessionKeepSec:       sessionKeep,
 			TrafficResetDay:      int32(normTrafficResetDay(a.TrafficResetDay)),
-			ProbeUrl:             probePushURL(a),
+			ProbeTargets:         EffectiveProbeTargets(a),
 		}, nil
 	}
 
@@ -461,7 +463,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 		HeartbeatIntervalSec: heartbeatSec,
 		SessionKeepSec:       sessionKeep,
 		TrafficResetDay:      int32(normTrafficResetDay(a.TrafficResetDay)),
-		ProbeUrl:             probePushURL(a),
+		ProbeTargets:         EffectiveProbeTargets(a),
 	}, nil
 }
 
@@ -631,18 +633,18 @@ func (r *Registry) ClearAgentUpgrade(agentID string) {
 
 // HostBillingConfig carries optional user-managed finance, traffic quota and note configs for a host.
 type HostBillingConfig struct {
-	Price           float64 `json:"price"`
-	Currency        string  `json:"currency"`
-	BillingCycle    string  `json:"billing_cycle"`
-	ExpiresAt       string  `json:"expires_at"`
-	AutoRenewal     bool    `json:"auto_renewal"`
-	TrafficLimitGB  float64 `json:"traffic_limit_gb"`
-	TrafficCalcType string  `json:"traffic_calc_type"`
-	TrafficResetDay int     `json:"traffic_reset_day"`
-	RenewalURL      string  `json:"renewal_url"`
-	ProbeEnabled    bool    `json:"probe_enabled"`
-	ProbeURL        string  `json:"probe_url"`
-	Notes           string  `json:"notes"`
+	Price           float64           `json:"price"`
+	Currency        string            `json:"currency"`
+	BillingCycle    string            `json:"billing_cycle"`
+	ExpiresAt       string            `json:"expires_at"`
+	AutoRenewal     bool              `json:"auto_renewal"`
+	TrafficLimitGB  float64           `json:"traffic_limit_gb"`
+	TrafficCalcType string            `json:"traffic_calc_type"`
+	TrafficResetDay int               `json:"traffic_reset_day"`
+	RenewalURL      string            `json:"renewal_url"`
+	ProbeEnabled    bool              `json:"probe_enabled"`
+	ProbeTargets    map[string]string `json:"probe_targets"`
+	Notes           string            `json:"notes"`
 }
 
 // normTrafficResetDay clamps the panel-configured billing reset day to the
@@ -654,44 +656,182 @@ func normTrafficResetDay(d int) int {
 	return d
 }
 
-// DefaultProbeURL is the built-in latency/loss probe target used for hosts
-// without a per-host "测速目标" override (lightweight CDN endpoint).
-const DefaultProbeURL = "https://www.zstaticcdn.com/"
+// Carrier keys of the three-carrier network quality monitoring (三网监控).
+// They key Agent.ProbeTargets, RegisterResponse.probe_targets and
+// MetricsSample.probe_results. The map-based design leaves room for a fourth
+// carrier (e.g. "bytedance") later without touching the protocol.
+const (
+	carrierTelecom = "telecom" // 电信
+	carrierUnicom  = "unicom"  // 联通
+	carrierMobile  = "mobile"  // 移动
+)
 
-// effectiveProbeURL resolves the probe target pushed to an agent: the
-// per-host override when set, otherwise the built-in default.
-func effectiveProbeURL(stored string) string {
-	if s := strings.TrimSpace(stored); s != "" {
-		return s
-	}
-	return DefaultProbeURL
+// zstaticCarrierCodes maps carrier keys to the carrier code embedded in
+// Zstatic CDN node hostnames.
+var zstaticCarrierCodes = map[string]string{
+	carrierTelecom: "ct",
+	carrierUnicom:  "cu",
+	carrierMobile:  "cm",
 }
 
-// probePushURL resolves what RegisterResponse pushes for an agent: empty
-// when the host has latency/loss monitoring switched off (the agent treats
-// an empty probe_url as "probing disabled"), otherwise the effective URL.
-func probePushURL(a *Agent) string {
-	if a == nil || !a.ProbeEnabled {
-		return ""
-	}
-	return effectiveProbeURL(a.ProbeURL)
+// zstaticProvinceCodes maps Chinese province/municipality/autonomous-region
+// names (with the 省/市/自治区 suffixes already stripped) to Zstatic node
+// province codes.
+var zstaticProvinceCodes = map[string]string{
+	"北京": "bj", "天津": "tj", "上海": "sh", "重庆": "cq",
+	"河北": "he", "山西": "sx", "辽宁": "ln", "吉林": "jl", "黑龙江": "hl",
+	"江苏": "js", "浙江": "zj", "安徽": "ah", "福建": "fj", "江西": "jx",
+	"山东": "sd", "河南": "ha", "湖北": "hb", "湖南": "hn",
+	"广东": "gd", "海南": "hi", "四川": "sc", "贵州": "gz", "云南": "yn",
+	"陕西": "sn", "甘肃": "gs", "青海": "qh",
+	"内蒙古": "nm", "广西": "gx", "西藏": "xz", "宁夏": "nx", "新疆": "xj",
 }
 
-// normalizeProbeURL validates a user-supplied probe target: empty means
-// "use the default"; otherwise it must be an absolute http(s) URL.
-func normalizeProbeURL(raw string) (string, error) {
-	s := strings.TrimSpace(raw)
+// zstaticProvinceSuffixes are trimmed (longest first) from the leading
+// segment of a host location string.
+var zstaticProvinceSuffixes = []string{
+	"特别行政区", "壮族自治区", "回族自治区", "维吾尔自治区", "自治区", "省", "市",
+}
+
+// probeHostRe matches a DNS hostname label sequence (IPv6 literals are
+// accepted separately via net.ParseIP).
+var probeHostRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$`)
+
+// zstaticProvinceCode resolves the Zstatic province code from a host location
+// string such as "浙江省-杭州市", "浙江 杭州" or "黑龙江省". Unrecognized
+// (or empty) locations fall back to Beijing ("bj"), whose nodes are reachable
+// from every carrier.
+func zstaticProvinceCode(location string) string {
+	s := strings.TrimSpace(location)
 	if s == "" {
-		return "", nil
+		return "bj"
 	}
-	if len(s) > 512 {
-		return "", fmt.Errorf("测速目标 URL 过长（上限 512 字符）")
+	// Keep the leading province segment before any city separator.
+	for _, sep := range []string{"-", "–", " ", ",", "，", "/"} {
+		if i := strings.Index(s, sep); i > 0 {
+			s = s[:i]
+			break
+		}
 	}
-	u, err := url.Parse(s)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return "", fmt.Errorf("测速目标必须是 http/https URL：%q", s)
+	if code, ok := zstaticProvinceCodes[s]; ok {
+		return code
 	}
-	return s, nil
+	// Strip administrative suffixes ("内蒙古自治区" → "内蒙古"), re-checking
+	// after each strip ("广西壮族自治区" keeps "广西").
+	for {
+		trimmed := false
+		for _, suffix := range zstaticProvinceSuffixes {
+			if strings.HasSuffix(s, suffix) {
+				s = strings.TrimSuffix(s, suffix)
+				trimmed = true
+				break
+			}
+		}
+		if code, ok := zstaticProvinceCodes[s]; ok {
+			return code
+		}
+		if !trimmed {
+			break
+		}
+	}
+	// Concatenated forms ("广东深圳", "浙江杭州"): match the leading name.
+	for name, code := range zstaticProvinceCodes {
+		if strings.HasPrefix(s, name) {
+			return code
+		}
+	}
+	return "bj"
+}
+
+// DefaultProbeTargets builds the built-in three-carrier probe targets from
+// the host location: one Zstatic CDN node per carrier in the host's province
+// (bj fallback). These are TCP-ping endpoints, so the port is always 80.
+func DefaultProbeTargets(location string) map[string]string {
+	province := zstaticProvinceCode(location)
+	targets := make(map[string]string, len(zstaticCarrierCodes))
+	for carrier, code := range zstaticCarrierCodes {
+		targets[carrier] = fmt.Sprintf("%s-%s-v4.ip.zstaticcdn.com:80", province, code)
+	}
+	return targets
+}
+
+// EffectiveProbeTargets resolves the per-carrier probe targets of an agent:
+// nil when the host has network quality monitoring switched off; the stored
+// per-host targets when at least one carrier has one; otherwise the built-in
+// Zstatic CDN nodes for the host location. Carriers mapped to an empty value
+// are never probed.
+func EffectiveProbeTargets(a *Agent) map[string]string {
+	if a == nil || !a.ProbeEnabled {
+		return nil
+	}
+	targets := make(map[string]string, len(a.ProbeTargets))
+	for carrier, target := range a.ProbeTargets {
+		if s := strings.TrimSpace(target); s != "" {
+			targets[carrier] = s
+		}
+	}
+	if len(targets) > 0 {
+		return targets
+	}
+	return DefaultProbeTargets(a.Location)
+}
+
+// normalizeProbeTargets validates user-supplied per-carrier probe targets:
+// keys are limited to the three carriers; an empty value disables that
+// carrier. Each non-empty value must be a "host[:port]" TCP endpoint (no URL
+// scheme, no spaces); the port defaults to 80 and must be 1..65535.
+func normalizeProbeTargets(raw map[string]string) (map[string]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(raw))
+	for key, value := range raw {
+		carrier := strings.ToLower(strings.TrimSpace(key))
+		if _, ok := zstaticCarrierCodes[carrier]; !ok {
+			return nil, fmt.Errorf("未知运营商 %q（仅支持 telecom / unicom / mobile）", key)
+		}
+		s := strings.TrimSpace(value)
+		if s == "" {
+			continue // empty value = that carrier is not probed
+		}
+		if len(s) > 512 {
+			return nil, fmt.Errorf("探测目标过长（上限 512 字符）：%q", s)
+		}
+		if strings.Contains(s, "://") {
+			return nil, fmt.Errorf("探测目标必须是 host[:port] 形式的 TCP 端点，不能带协议 scheme：%q", s)
+		}
+		if strings.ContainsAny(s, " \t\r\n") {
+			return nil, fmt.Errorf("探测目标不能包含空格：%q", s)
+		}
+		host, port := s, "80"
+		if h, p, err := net.SplitHostPort(s); err == nil {
+			host, port = h, p
+		}
+		if host == "" {
+			return nil, fmt.Errorf("探测目标缺少主机名：%q", s)
+		}
+		if strings.Contains(host, ":") {
+			if net.ParseIP(host) == nil {
+				return nil, fmt.Errorf("探测目标主机名非法：%q", host)
+			}
+		} else if !probeHostRe.MatchString(host) {
+			return nil, fmt.Errorf("探测目标主机名非法：%q", host)
+		}
+		if len(host) > 253 {
+			return nil, fmt.Errorf("探测目标主机名过长（上限 253 字符）：%q", host)
+		}
+		if port != "" {
+			p, err := strconv.Atoi(port)
+			if err != nil || p < 1 || p > 65535 {
+				return nil, fmt.Errorf("探测目标端口必须在 1~65535：%q", s)
+			}
+		}
+		out[carrier] = host + ":" + port
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 // SetAgentBilling updates optional billing, traffic limits and notes for a host.
@@ -704,6 +844,12 @@ func (r *Registry) SetAgentBilling(id string, b HostBillingConfig) error {
 	a, ok := r.agents[id]
 	if !ok {
 		return fmt.Errorf("agent not found")
+	}
+	// Validate every field that can fail BEFORE touching the agent record so
+	// a rejected config never leaves a half-mutated agent in memory.
+	probeTargets, err := normalizeProbeTargets(b.ProbeTargets)
+	if err != nil {
+		return err
 	}
 	a.Price = b.Price
 	a.Currency = b.Currency
@@ -727,11 +873,7 @@ func (r *Registry) SetAgentBilling(id string, b HostBillingConfig) error {
 	}
 	a.RenewalURL = b.RenewalURL
 	a.ProbeEnabled = b.ProbeEnabled
-	probeURL, err := normalizeProbeURL(b.ProbeURL)
-	if err != nil {
-		return err
-	}
-	a.ProbeURL = probeURL
+	a.ProbeTargets = probeTargets
 	a.Notes = b.Notes
 	_ = r.persistAgentsLocked()
 	return nil

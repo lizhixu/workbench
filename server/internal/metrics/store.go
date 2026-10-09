@@ -30,19 +30,37 @@ type Point struct {
 	DiskRead  float64 `json:"disk_read"`
 	DiskWrite float64 `json:"disk_write"`
 	// Extended metrics (older records simply have zero values).
-	Load1         float64 `json:"load1"`
-	Load5         float64 `json:"load5"`
-	Load15        float64 `json:"load15"`
-	SwapTotal     int64   `json:"swap_total"`
-	SwapUsed      int64   `json:"swap_used"`
-	TcpEstablished int32  `json:"tcp_established"`
-	UdpCount      int32   `json:"udp_count"`
-	ProcessCount  int32   `json:"process_count"`
-	MonthRx       int64   `json:"month_rx"`
-	MonthTx       int64   `json:"month_tx"`
-	// Network quality probe (zero on records from older agents).
-	NetLatencyMs float64 `json:"net_latency_ms"`
-	NetLossPct   float64 `json:"net_loss_pct"`
+	Load1          float64 `json:"load1"`
+	Load5          float64 `json:"load5"`
+	Load15         float64 `json:"load15"`
+	SwapTotal      int64   `json:"swap_total"`
+	SwapUsed       int64   `json:"swap_used"`
+	TcpEstablished int32   `json:"tcp_established"`
+	UdpCount       int32   `json:"udp_count"`
+	ProcessCount   int32   `json:"process_count"`
+	MonthRx        int64   `json:"month_rx"`
+	MonthTx        int64   `json:"month_tx"`
+	// Network quality probe results per carrier ("telecom" / "unicom" /
+	// "mobile"); nil on records from older agents.
+	NetProbe map[string]ProbePoint `json:"net_probe,omitempty"`
+}
+
+// ProbePoint is one carrier's network quality probe reading: latency in
+// milliseconds (0 = no successful attempt in the round) and loss as a
+// percentage of failed attempts (0..100).
+type ProbePoint struct {
+	LatencyMs float64 `json:"latency_ms"`
+	LossPct   float64 `json:"loss_pct"`
+}
+
+// probeAcc accumulates one carrier's probe readings inside a downsample
+// bucket: latency averages only over samples that reported one (> 0), loss
+// over every sample carrying an entry for the carrier.
+type probeAcc struct {
+	latSum  float64
+	latN    int
+	lossSum float64
+	n       int
 }
 
 // Store handles metric persistence and downsampling.
@@ -75,27 +93,40 @@ func (s *Store) AddSample(hostID string, m *agentpb.MetricsSample) {
 		return
 	}
 	pt := Point{
-		Timestamp: m.GetTs(),
-		CPUUsage:  m.GetCpuUsage(),
-		MemUsage:  m.GetMemUsage(),
-		MemTotal:  m.GetMemTotal(),
-		MemUsed:   m.GetMemUsed(),
-		NetRx:     m.GetNetRx(),
-		NetTx:     m.GetNetTx(),
-		DiskRead:  m.GetDiskRead(),
-		DiskWrite: m.GetDiskWrite(),
-		Load1:         m.GetLoad1(),
-		Load5:         m.GetLoad5(),
-		Load15:        m.GetLoad15(),
-		SwapTotal:     m.GetSwapTotal(),
-		SwapUsed:      m.GetSwapUsed(),
+		Timestamp:      m.GetTs(),
+		CPUUsage:       m.GetCpuUsage(),
+		MemUsage:       m.GetMemUsage(),
+		MemTotal:       m.GetMemTotal(),
+		MemUsed:        m.GetMemUsed(),
+		NetRx:          m.GetNetRx(),
+		NetTx:          m.GetNetTx(),
+		DiskRead:       m.GetDiskRead(),
+		DiskWrite:      m.GetDiskWrite(),
+		Load1:          m.GetLoad1(),
+		Load5:          m.GetLoad5(),
+		Load15:         m.GetLoad15(),
+		SwapTotal:      m.GetSwapTotal(),
+		SwapUsed:       m.GetSwapUsed(),
 		TcpEstablished: m.GetTcpEstablished(),
-		UdpCount:      m.GetUdpCount(),
-		ProcessCount:  m.GetProcessCount(),
-		MonthRx:       m.GetMonthRx(),
-		MonthTx:       m.GetMonthTx(),
-		NetLatencyMs:  m.GetNetLatencyMs(),
-		NetLossPct:    m.GetNetLossPct(),
+		UdpCount:       m.GetUdpCount(),
+		ProcessCount:   m.GetProcessCount(),
+		MonthRx:        m.GetMonthRx(),
+		MonthTx:        m.GetMonthTx(),
+	}
+	if len(m.GetProbeResults()) > 0 {
+		pt.NetProbe = make(map[string]ProbePoint, len(m.GetProbeResults()))
+		for carrier, r := range m.GetProbeResults() {
+			if r == nil {
+				continue
+			}
+			pt.NetProbe[carrier] = ProbePoint{
+				LatencyMs: r.GetLatencyMs(),
+				LossPct:   r.GetLossPct(),
+			}
+		}
+		if len(pt.NetProbe) == 0 {
+			pt.NetProbe = nil
+		}
 	}
 	if pt.Timestamp == 0 {
 		pt.Timestamp = time.Now().Unix()
@@ -187,9 +218,7 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 		procCount float64
 		monthRx   int64
 		monthTx   int64
-		latencySum float64
-		latencyN   int
-		lossSum    float64
+		probe     map[string]*probeAcc
 	}
 
 	buckets := make(map[int64]*bucket)
@@ -227,13 +256,26 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 		// raw is sorted ascending, so the last write wins and is the newest.
 		b.monthRx = pt.MonthRx
 		b.monthTx = pt.MonthTx
-		// Latency averages only over samples that carry probe data
-		// (0 = no data: older agent, probing off, or a fully lost round).
-		if pt.NetLatencyMs > 0 {
-			b.latencySum += pt.NetLatencyMs
-			b.latencyN++
+		// Network quality probe: accumulate per carrier so the downsampled
+		// series keeps one latency/loss line per carrier.
+		for carrier, pr := range pt.NetProbe {
+			if b.probe == nil {
+				b.probe = make(map[string]*probeAcc, len(pt.NetProbe))
+			}
+			acc := b.probe[carrier]
+			if acc == nil {
+				acc = &probeAcc{}
+				b.probe[carrier] = acc
+			}
+			acc.n++
+			acc.lossSum += pr.LossPct
+			// Latency averages only over samples that carry probe data
+			// (0 = no data: older agent, probing off, or a fully lost round).
+			if pr.LatencyMs > 0 {
+				acc.latSum += pr.LatencyMs
+				acc.latN++
+			}
 		}
-		b.lossSum += pt.NetLossPct
 	}
 
 	sort.Slice(bucketKeys, func(i, j int) bool {
@@ -247,9 +289,16 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 			continue
 		}
 		n := float64(b.count)
-		latency := 0.0
-		if b.latencyN > 0 {
-			latency = b.latencySum / float64(b.latencyN)
+		var probe map[string]ProbePoint
+		if len(b.probe) > 0 {
+			probe = make(map[string]ProbePoint, len(b.probe))
+			for carrier, acc := range b.probe {
+				pp := ProbePoint{LossPct: acc.lossSum / float64(acc.n)}
+				if acc.latN > 0 {
+					pp.LatencyMs = acc.latSum / float64(acc.latN)
+				}
+				probe[carrier] = pp
+			}
 		}
 		result = append(result, Point{
 			Timestamp:      b.ts,
@@ -271,8 +320,7 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 			ProcessCount:   int32(b.procCount / n),
 			MonthRx:        b.monthRx,
 			MonthTx:        b.monthTx,
-			NetLatencyMs:   latency,
-			NetLossPct:     b.lossSum / n,
+			NetProbe:       probe,
 		})
 	}
 
@@ -346,7 +394,7 @@ func (s *Store) StartAutoCollector(ctx context.Context, reg *rpc.Registry, inter
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-				hosts := reg.ListAgents()
+			hosts := reg.ListAgents()
 			for _, h := range hosts {
 				if h.Status != "online" {
 					continue

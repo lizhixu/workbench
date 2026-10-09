@@ -54,7 +54,7 @@
 ### 3.2 资源监控
 
 - **实时监控**：CPU、内存、网络吞吐、磁盘读写吞吐的实时占用情况。
-- **网络质量监控（延迟 / 丢包率）**：Agent 每 30 秒向测速目标发起一轮 HTTP(S) 探测（4 次尝试、单次 3 秒超时），`MetricsSample.net_latency_ms`（field 24）为成功尝试的平均往返耗时（毫秒；0 = 无数据：未配置、探测关闭或整轮失败），`net_loss_pct`（field 25）为失败尝试占比（传输错误或 HTTP ≥500 计失败）。探测在独立协程运行、不阻塞指标采样，采集时只读最近一轮结果。测速目标按主机在「财务与规格」配置（`probe_url`，经 `RegisterResponse.probe_url`（field 8）在每次（重）连时下发，面板修改后 Agent 下次重连生效）；每台主机带独立开关 `probe_enabled`（默认关闭）：开启才下发目标并在资源监控展示两张图，关闭时下发空字符串、Agent 停止探测、前端不展示。未配置测速目标时用内置默认 `https://www.zstaticcdn.com/`，服务端校验必须是 http/https 绝对 URL（≤512 字符）。控制端存储降采样时延迟仅对有数据的样本求平均。前端资源监控提供「网络延迟」「丢包率」两张曲线图，无探测数据时图内明示暂无数据。
+- **网络质量监控（三网延迟 / 丢包率）**：按**电信 / 联通 / 移动**三个运营商分别探测（键固定为 `telecom` / `unicom` / `mobile`，map 化设计为后续扩展第四线路留出空间）。Agent 每 30 秒对每个运营商的探测目标各发起一轮 **TCP 连接探测**（`net.DialTimeout`，4 次尝试、单次 3 秒超时、尝试间隔 200ms），`MetricsSample.probe_results`（field 26，`map<string, ProbeResult>`）上报各运营商最近一轮结果：`ProbeResult.latency_ms` 为成功尝试 RTT 的**中位数**（毫秒；0 = 该轮无成功尝试），`ProbeResult.loss_pct` 为失败尝试占比（0~100，连不上即失败）。探测在独立协程运行、不阻塞指标采样，采集时只读最近一轮结果；某运营商至少完成过一轮探测才上报对应条目。探测目标按主机在「财务与规格」以**三个可编辑输入框**配置（电信 / 联通 / 移动，值形如 `zj-ct-v4.ip.zstaticcdn.com:80`，留空 = 不探测该运营商），经 `RegisterResponse.probe_targets`（field 9，`map<string,string>`，键 = 运营商、值 = `host[:port]`，端口缺省 80）在每次（重）连时下发，面板修改后 Agent 下次重连生效；每台主机带独立开关 `probe_enabled`（默认关闭）：开启才下发目标并在资源监控展示两张图，关闭时下发空 map、Agent 停止探测、前端不展示。三个目标全部留空时使用内置默认 **Zstatic CDN 三网节点** `{省份}-{ct|cu|cm}-v4.ip.zstaticcdn.com:80`（ct=电信、cu=联通、cm=移动），省份按主机注册时的 `location`（如「浙江省-杭州市」→ `zj`，兼容省/市/自治区后缀与无分隔拼接）自动解析，无法识别回落北京 `bj`；服务端校验目标必须是 `host[:port]` 形式的 TCP 端点（端口 1~65535、主机名 ≤253 字符、拒绝 URL scheme 与空格、键限三个运营商）。控制端存储降采样时**按运营商分别**累加：延迟仅对有数据的样本（latency>0）求平均，丢包率对有该运营商条目的样本求平均。前端资源监控提供「网络延迟」「丢包率」两张曲线图，每张三线（电信 #3b82f6 / 联通 #f59e0b / 移动 #10b981），tooltip 一次展示三家，无探测数据时图内明示暂无数据。**兼容说明**：本改造移除了早期的单目标协议（`RegisterResponse.probe_url` field 8 与 `MetricsSample.net_latency_ms`/`net_loss_pct` field 24/25）；更早版本的 Agent 收不到 `probe_targets`（字段 8 已删、字段 9 被旧代码忽略）即停止探测，其旧字段被新服务端按未知字段跳过，新旧组合均不会报错，升级 Agent 后恢复三网探测。
 - **存储监控**：展示各挂载点的容量与占用情况。
 - **历史监控**：默认保存 7 天历史数据，支持按起止日期、时长查看历史占用曲线。
 - **自定义阈值告警**：可按参数设置告警条件（见 3.11 监控告警）。
@@ -532,6 +532,10 @@ message RegisterResponse {
   string agent_id   = 2;
   string auth_token = 3;          // 长期凭证（后续回连携带）
   int32  heartbeat_interval_sec = 4;
+  int32  traffic_reset_day = 7;   // 月流量重置日（1~28，每次重连下发）
+  // 三网监控探测目标：键 = 运营商（telecom/unicom/mobile），值 = host[:port]
+  // TCP 端点（端口缺省 80）；仅下发有效目标，空 map = 探测关闭。
+  map<string, string> probe_targets = 9;
 }
 
 message TerminalOpen {
@@ -586,6 +590,13 @@ message MetricsSample {
   double disk_read = 9; double disk_write = 10;
   repeated Mount mounts = 11;      // 挂载点容量
   message Mount { string path=1; int64 total=2; int64 used=3; }
+  // 三网监控探测结果：键 = 运营商（telecom/unicom/mobile），至少完成过
+  // 一轮探测才上报对应条目；latency_ms = 0 表示该轮无成功尝试。
+  map<string, ProbeResult> probe_results = 26;
+  message ProbeResult {
+    double latency_ms = 1;         // 成功尝试 RTT 中位数（ms）
+    double loss_pct = 2;           // 失败尝试占比（0~100）
+  }
 }
 
 message SysInfoQuery { string kind=1; }   // process/port/user/login

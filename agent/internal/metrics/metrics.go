@@ -85,12 +85,12 @@ func (m *Manager) SetResetDay(day int) {
 	}
 }
 
-// SetProbeURL applies the probe target delivered by the server in
-// RegisterResponse (already resolved to the effective URL, default
-// included). Empty disables probing (old server).
-func (m *Manager) SetProbeURL(url string) {
+// SetProbeTargets applies the per-carrier probe targets delivered by the
+// server in RegisterResponse (carrier -> "host[:port]"). An empty map
+// disables probing (old server); carriers map to empty values are skipped.
+func (m *Manager) SetProbeTargets(targets map[string]string) {
 	if m.prober != nil {
-		m.prober.setURL(url)
+		m.prober.SetTargets(targets)
 	}
 }
 
@@ -228,12 +228,21 @@ func (m *Manager) collect() *agentpb.MetricsSample {
 	// CPU model name (static, cached after first lookup).
 	sample.CpuModel = m.cpuModelString()
 
-	// Network quality probe (latest completed round; runs off-thread so
-	// collection never waits on the network).
+	// Network quality probe (latest completed round per carrier; runs
+	// off-thread so collection never waits on the network).
 	if m.prober != nil {
-		if r := m.prober.latest(); r.done {
-			sample.NetLatencyMs = r.latencyMs
-			sample.NetLossPct = r.lossPct
+		results := m.prober.latest()
+		if len(results) > 0 {
+			sample.ProbeResults = make(map[string]*agentpb.ProbeResult, len(results))
+			for carrier, r := range results {
+				if !r.done {
+					continue
+				}
+				sample.ProbeResults[carrier] = &agentpb.ProbeResult{
+					LatencyMs: r.latencyMs,
+					LossPct:   r.lossPct,
+				}
+			}
 		}
 	}
 

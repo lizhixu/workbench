@@ -2,28 +2,30 @@ package metrics
 
 import (
 	"context"
-	"io"
-	"net/http"
+	"net"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
-// Network quality probe: periodically issues a few lightweight HTTP(S)
-// requests to a panel-configured target and derives latency + packet loss.
-// It runs on its own goroutine so metrics collection never blocks on the
-// network; collect() only reads the latest completed round.
+// Network quality probe (三网监控): periodically dials a few lightweight TCP
+// endpoints (one per carrier: telecom / unicom / mobile, panel-configured via
+// RegisterResponse.probe_targets) and derives latency + packet loss per
+// carrier. Every target runs on its own goroutine so metrics collection never
+// blocks on the network; collect() only reads the latest completed round.
 //
-// Result semantics (MetricsSample.net_latency_ms / net_loss_pct):
-//   - latency = mean round-trip time of the successful attempts (ms);
-//     0 when no attempt succeeded or no round has completed (no data).
+// Result semantics (MetricsSample.probe_results, per carrier):
+//   - latency = median round-trip time of the successful attempts (ms);
+//     0 when no attempt succeeded.
 //   - loss = share of failed attempts in the round (percent 0..100);
-//     an attempt fails on transport error or HTTP status >= 500.
+//     an attempt fails on dial error or timeout.
 const (
-	probeAttempts   = 4
-	probeTimeout    = 3 * time.Second
-	probeInterval   = 30 * time.Second
-	probeAttemptGap = 200 * time.Millisecond
-	probeBodyCap    = 64 << 10
+	probeAttempts    = 4
+	probeTimeout     = 3 * time.Second
+	probeInterval    = 30 * time.Second
+	probeAttemptGap  = 200 * time.Millisecond
+	defaultProbePort = "80"
 )
 
 type probeResult struct {
@@ -32,45 +34,84 @@ type probeResult struct {
 	done      bool // at least one round completed since (re)configuration
 }
 
-type prober struct {
-	mu     sync.Mutex
-	client *http.Client
-	url    string
+// targetProber probes a single carrier target on its own goroutine.
+type targetProber struct {
+	addr   string // normalized "host:port"
 	result probeResult
 	cancel context.CancelFunc
 }
 
+// prober manages one probing loop per carrier target.
+type prober struct {
+	mu      sync.Mutex
+	targets map[string]*targetProber // carrier -> prober (nil = probing off)
+}
+
 func newProber() *prober {
-	return &prober{client: &http.Client{Timeout: probeTimeout}}
+	return &prober{}
 }
 
-// setURL reconfigures the probe target. Empty stops probing (old server or
-// probing disabled); a changed URL restarts the round loop. Safe to call
-// on every (re)connect.
-func (p *prober) setURL(url string) {
+// SetTargets reconfigures the probe targets (carrier -> "host[:port]"). An
+// empty map stops probing (old server or monitoring disabled); a changed
+// target restarts its round loop while untouched targets keep running. Safe
+// to call on every (re)connect.
+func (p *prober) SetTargets(targets map[string]string) {
 	p.mu.Lock()
-	if url == p.url {
-		p.mu.Unlock()
+	defer p.mu.Unlock()
+
+	// Stop everything when probing is off.
+	if len(targets) == 0 {
+		for carrier, tp := range p.targets {
+			if tp.cancel != nil {
+				tp.cancel()
+			}
+			delete(p.targets, carrier)
+		}
 		return
 	}
-	if p.cancel != nil {
-		p.cancel()
-		p.cancel = nil
+
+	for carrier, raw := range targets {
+		addr := normalizeProbeAddr(raw)
+		if addr == "" {
+			// Carrier explicitly disabled: stop any running loop for it.
+			if tp, ok := p.targets[carrier]; ok {
+				if tp.cancel != nil {
+					tp.cancel()
+				}
+				delete(p.targets, carrier)
+			}
+			continue
+		}
+		if tp, ok := p.targets[carrier]; ok && tp.addr == addr {
+			continue // unchanged target keeps its running loop
+		}
+		if tp, ok := p.targets[carrier]; ok && tp.cancel != nil {
+			tp.cancel()
+		}
+		if p.targets == nil {
+			p.targets = make(map[string]*targetProber)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		p.targets[carrier] = &targetProber{addr: addr, cancel: cancel}
+		go p.loop(ctx, carrier, addr)
 	}
-	p.url = url
-	p.result = probeResult{}
-	if url == "" {
-		p.mu.Unlock()
-		return
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	p.cancel = cancel
-	p.mu.Unlock()
-	go p.loop(ctx, url)
 }
 
-func (p *prober) loop(ctx context.Context, url string) {
-	p.runOnce(url)
+// normalizeProbeAddr completes a "host[:port]" target with the default port.
+// Returns "" for an empty host so disabled carriers are simply skipped.
+func normalizeProbeAddr(raw string) string {
+	host := strings.TrimSpace(raw)
+	if host == "" {
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		return net.JoinHostPort(host, defaultProbePort)
+	}
+	return host
+}
+
+func (p *prober) loop(ctx context.Context, carrier, addr string) {
+	p.runOnce(carrier, addr)
 	t := time.NewTicker(probeInterval)
 	defer t.Stop()
 	for {
@@ -78,65 +119,82 @@ func (p *prober) loop(ctx context.Context, url string) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			p.runOnce(url)
+			p.runOnce(carrier, addr)
 		}
 	}
 }
 
-func (p *prober) runOnce(url string) {
-	res := runProbeRound(p.client, url)
+func (p *prober) runOnce(carrier, addr string) {
+	res := runProbeRound(addr)
 	p.mu.Lock()
-	// Only publish if this round still belongs to the current target.
-	if p.url == url {
-		p.result = res
+	// Only publish if this round still belongs to the carrier's current target.
+	if tp, ok := p.targets[carrier]; ok && tp.addr == addr {
+		tp.result = res
 	}
 	p.mu.Unlock()
 }
 
-// latest returns the most recent round. done=false means no usable data
-// (probing off, or the first round has not finished yet).
-func (p *prober) latest() probeResult {
+// latest returns the most recent round per carrier. A carrier is absent
+// (or done=false) when it has no usable data yet (probing off, or the first
+// round has not finished).
+func (p *prober) latest() map[string]probeResult {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.result
+	out := make(map[string]probeResult, len(p.targets))
+	for carrier, tp := range p.targets {
+		if tp.result.done {
+			out[carrier] = tp.result
+		}
+	}
+	return out
 }
 
-// runProbeRound performs one round of attempts against url and reduces it
-// to a latency/loss pair. Exposed for tests.
-func runProbeRound(client *http.Client, url string) probeResult {
+// dialFn dials a TCP endpoint, mirroring net.DialTimeout. Injectable so the
+// round logic can be tested without racing the host clock.
+type dialFn func(network, addr string, timeout time.Duration) (net.Conn, error)
+
+// runProbeRound performs one round of TCP dial attempts against addr and
+// reduces it to a latency/loss pair. Exposed for tests.
+func runProbeRound(addr string) probeResult {
+	return runProbeRoundWith(addr, net.DialTimeout)
+}
+
+// runProbeRoundWith is the round core with an injectable dial: production
+// passes net.DialTimeout, tests pass a fake with a controlled delay.
+func runProbeRoundWith(addr string, dial dialFn) probeResult {
 	res := probeResult{done: true}
-	var latSum float64
-	var okCount int
+	var rtts []float64
 	for i := 0; i < probeAttempts; i++ {
 		if i > 0 {
 			time.Sleep(probeAttemptGap)
 		}
 		start := time.Now()
-		if probeAttempt(client, url) {
-			latSum += float64(time.Since(start).Microseconds()) / 1000.0
-			okCount++
+		conn, err := dial("tcp", addr, probeTimeout)
+		if err != nil {
+			continue
 		}
+		rtts = append(rtts, float64(time.Since(start))/float64(time.Millisecond))
+		_ = conn.Close()
 	}
-	if okCount > 0 {
-		res.latencyMs = latSum / float64(okCount)
+	if len(rtts) > 0 {
+		res.latencyMs = median(rtts)
 	}
-	res.lossPct = float64(probeAttempts-okCount) / float64(probeAttempts) * 100
+	res.lossPct = float64(probeAttempts-len(rtts)) / float64(probeAttempts) * 100
 	return res
 }
 
-func probeAttempt(client *http.Client, url string) bool {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return false
+// median returns the median of a non-empty slice (mean of the two middle
+// values for even lengths).
+func median(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
 	}
-	req.Header.Set("User-Agent", "Watchman-Agent/probe")
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
+	sorted := make([]float64, len(values))
+	copy(sorted, values)
+	sort.Float64s(sorted)
+	mid := len(sorted) / 2
+	if len(sorted)%2 == 1 {
+		return sorted[mid]
 	}
-	defer resp.Body.Close()
-	// Drain a capped prefix so the measured time covers a real transfer
-	// (and the connection stays reusable) without downloading big pages.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, probeBodyCap))
-	return resp.StatusCode < 500
+	return (sorted[mid-1] + sorted[mid]) / 2
 }

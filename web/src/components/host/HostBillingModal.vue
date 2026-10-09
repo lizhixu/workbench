@@ -47,7 +47,7 @@ const calcTypeOptions = [
   { label: '仅下行 (入向流量)', value: 'in' },
 ]
 
-const form = ref<HostBillingConfig>({
+const form = ref<HostBillingConfig & { probe_targets: Record<string, string> }>({
   price: undefined,
   currency: 'CNY',
   billing_cycle: '年付',
@@ -58,7 +58,7 @@ const form = ref<HostBillingConfig>({
   traffic_reset_day: 1,
   renewal_url: '',
   probe_enabled: false,
-  probe_url: '',
+  probe_targets: { telecom: '', unicom: '', mobile: '' },
   notes: '',
 })
 
@@ -79,7 +79,11 @@ watch(
         traffic_reset_day: props.host.traffic_reset_day || 1,
         renewal_url: props.host.renewal_url || '',
         probe_enabled: !!props.host.probe_enabled,
-        probe_url: props.host.probe_url || '',
+        probe_targets: {
+          telecom: props.host.probe_targets?.telecom || '',
+          unicom: props.host.probe_targets?.unicom || '',
+          mobile: props.host.probe_targets?.mobile || '',
+        },
         notes: props.host.notes || '',
       }
       if (props.host.expires_at) {
@@ -233,22 +237,44 @@ async function handleSave() {
         />
       </NFormItem>
 
-      <!-- 第五行：延迟/丢包监控开关与测速目标 -->
-      <NFormItem label="延迟 / 丢包监控">
+      <!-- 第五行：延迟/丢包监控开关与三网探测目标 -->
+      <NFormItem label="延迟 / 丢包监控（三网）">
         <div style="display: flex; align-items: center; height: 34px; gap: 8px">
           <NSwitch v-model:value="form.probe_enabled" />
           <span style="font-size: 13px">{{ form.probe_enabled ? '已开启' : '已关闭' }}</span>
         </div>
       </NFormItem>
-      <NFormItem label="测速目标">
-        <NInput
-          v-model:value="form.probe_url"
-          :disabled="!form.probe_enabled"
-          placeholder="留空使用默认 https://www.zstaticcdn.com/"
-        />
-      </NFormItem>
+      <NGrid :cols="3" :x-gap="12">
+        <NGridItem>
+          <NFormItem label="电信">
+            <NInput
+              v-model:value="form.probe_targets.telecom"
+              :disabled="!form.probe_enabled"
+              placeholder="zj-ct-v4.ip.zstaticcdn.com:80"
+            />
+          </NFormItem>
+        </NGridItem>
+        <NGridItem>
+          <NFormItem label="联通">
+            <NInput
+              v-model:value="form.probe_targets.unicom"
+              :disabled="!form.probe_enabled"
+              placeholder="zj-cu-v4.ip.zstaticcdn.com:80"
+            />
+          </NFormItem>
+        </NGridItem>
+        <NGridItem>
+          <NFormItem label="移动">
+            <NInput
+              v-model:value="form.probe_targets.mobile"
+              :disabled="!form.probe_enabled"
+              placeholder="zj-cm-v4.ip.zstaticcdn.com:80"
+            />
+          </NFormItem>
+        </NGridItem>
+      </NGrid>
       <p class="muted tip-hint" style="margin: -2px 0 8px">
-        开启后 Agent 每 30 秒向测速目标发起轻量 HTTP 探测，资源监控据此展示网络延迟与丢包率；关闭后不探测、不展示。修改后在该主机 Agent 下次重连时生效。
+        每 30 秒对三个运营商的探测目标各发起一轮 TCP 探测（4 次尝试，延迟取中位数），资源监控据此展示三网的网络延迟与丢包率。留空 = 不探测该运营商；全部留空时使用按主机所在地自动选取的 Zstatic CDN 默认节点。修改后在该主机 Agent 下次重连时生效。
       </p>
 
       <!-- 第六行：备注说明 -->

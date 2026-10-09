@@ -70,7 +70,7 @@ export interface Host {
   traffic_reset_day?: number
   renewal_url?: string
   probe_enabled?: boolean
-  probe_url?: string
+  probe_targets?: Record<string, string>
   notes?: string
 }
 
@@ -85,7 +85,7 @@ export interface HostBillingConfig {
   traffic_reset_day?: number
   renewal_url?: string
   probe_enabled?: boolean
-  probe_url?: string
+  probe_targets?: Record<string, string>
   notes?: string
 }
 
@@ -168,8 +168,13 @@ export interface Metrics {
   cpu_model?: string
   month_rx?: number
   month_tx?: number
-  net_latency_ms?: number
-  net_loss_pct?: number
+  net_probe?: Record<string, ProbeReading>
+}
+
+// One carrier's network quality probe reading (latency in ms, loss in percent).
+export interface ProbeReading {
+  latency_ms: number
+  loss_pct: number
 }
 
 // ---- Docker ----

@@ -54,6 +54,7 @@ import {
 } from '../../api/alerts'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { useNotificationStore } from '../../stores/notifications'
+import { fmtDateTime } from '../../utils/time'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'AlertList' })
@@ -304,7 +305,7 @@ function ruleTypeLabel(t: RuleType) {
 
 function fmtTime(s: string): string {
   if (!s) return '-'
-  return s.slice(0, 19).replace('T', ' ')
+  return fmtDateTime(s)
 }
 
 function goHostDetail(hostId: string, hostname: string) {

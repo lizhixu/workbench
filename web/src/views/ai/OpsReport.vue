@@ -26,6 +26,7 @@ import { listHosts } from '../../api/hosts'
 import type { Host } from '../../api/types'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { copyToClipboard } from '../../utils/clipboard'
+import { fmtDateTime } from '../../utils/time'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'OpsReport' })
@@ -107,11 +108,7 @@ function viewReport(r: OpsReport) {
 
 function formatTime(t: string): string {
   if (!t) return '-'
-  try {
-    return new Date(t).toLocaleString('zh-CN')
-  } catch {
-    return t
-  }
+  return fmtDateTime(t)
 }
 
 async function copyReportText() {

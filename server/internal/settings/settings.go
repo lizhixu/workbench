@@ -38,6 +38,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Scope is the visibility/ownership of a setting key.
@@ -176,6 +177,11 @@ var Definitions = []Definition{
 		// 直接 IP 访问将被拦截），解绑后恢复 IP 访问。
 		{Key: "server.public_url", Scope: ScopeSystem, Kind: KindString, Title: "面板公网访问地址", Default: "",
 			MaxLen: 256, Validate: validatePublicURL},
+		// 面板时区（IANA 名称，如 Asia/Shanghai）：控制端进程本地时间与面板
+		// 全部时间展示的基准；空 = 跟随服务器操作系统时区。Agent 的月流量
+		// 计费周期仍按 Agent 所在主机的本地时间，不受此项影响。
+		{Key: "server.timezone", Scope: ScopeSystem, Kind: KindString, Title: "面板时区", Default: "",
+			MaxLen: 64, Validate: validateTimezone},
 		{Key: "security.panel_domain", Scope: ScopeSystem, Kind: KindString, Title: "面板绑定域名", Default: "",
 			MaxLen: 253, Validate: validateDomainName},
 
@@ -270,6 +276,21 @@ func validatePublicURL(v any) error {
 	u, err := url.Parse(s)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return errors.New("公网访问地址必须是有效的 http:// 或 https:// URL，例如 https://panel.example.com:18789")
+	}
+	return nil
+}
+
+// validateTimezone accepts an empty value (follow the server OS timezone) or
+// an IANA timezone name loadable by time.LoadLocation (e.g. Asia/Shanghai,
+// UTC). Anything else would silently fall back to UTC in Go, so reject it.
+func validateTimezone(v any) error {
+	s, _ := v.(string)
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	if _, err := time.LoadLocation(s); err != nil {
+		return errors.New("时区必须是有效的 IANA 名称，例如 Asia/Shanghai（留空表示跟随服务器系统时区）")
 	}
 	return nil
 }
@@ -760,6 +781,37 @@ func (s *Store) JoinBetaProgram() bool {
 	var v bool
 	s.decode(ScopeSystem, "", "system.join_beta_program", &v)
 	return v
+}
+
+// osLocal is the process-local timezone captured at package init, before any
+// panel timezone override is applied. Clearing the setting restores it.
+var osLocal = time.Local
+
+// Timezone returns the configured panel timezone (IANA name); "" means the
+// panel follows the server OS timezone.
+func (s *Store) Timezone() string {
+	var v string
+	s.decode(ScopeSystem, "", "server.timezone", &v)
+	return strings.TrimSpace(v)
+}
+
+// ApplyTimezone points the process-wide local time (time.Local) at the
+// configured panel timezone, or back to the OS zone when unset, so
+// server-side wall-clock rendering (log lines, API timestamps, day-boundary
+// math) matches the panel setting. Called once at startup and after every
+// system-settings update; the assignment is a plain global write — safe here
+// because changes are rare, admin-initiated events.
+func (s *Store) ApplyTimezone() {
+	name := s.Timezone()
+	if name == "" {
+		time.Local = osLocal
+		return
+	}
+	// Validation ran on write; a hand-edited settings.json could still hold
+	// an unusable name — keep the current zone instead of crashing.
+	if loc, err := time.LoadLocation(name); err == nil {
+		time.Local = loc
+	}
 }
 
 // CertAutoRenewDays returns how many days before expiry automatic renewal

@@ -19,6 +19,7 @@ import { RefreshOutline, StopCircleOutline } from '@vicons/ionicons5'
 import { getSysInfo, killProcess } from '../../api/hosts'
 import { useAuthStore } from '../../stores/auth'
 import { useTablePagination } from '../../composables/useTablePagination'
+import { fmtDateTime } from '../../utils/time'
 
 const props = defineProps<{ hostId: string }>()
 const message = useMessage()
@@ -77,8 +78,7 @@ async function refresh() {
     }
     rows.value = list
     resetPage()
-    const now = new Date()
-    updateTime.value = `${now.getFullYear()}.${String(now.getMonth() + 1).padStart(2, '0')}.${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`
+    updateTime.value = fmtDateTime(new Date())
   } catch (e: any) {
     rows.value = []
   } finally {

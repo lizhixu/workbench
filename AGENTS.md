@@ -182,6 +182,7 @@
 - **通用设置**：
   - 首选页面（进入主机管理时默认展示的模块：资源负载/系统状态/Docker/在线终端/文件管理/应用市场）。
   - 开关加载页面时的功能提示语。
+- **面板时区**（`server.timezone`，system 作用域，管理员在「系统设置 → 系统状态」中配置）：IANA 时区名称（如 `Asia/Shanghai`），空 = 跟随服务器系统时区。控制端进程本地时间（日志、API 时间戳、日界计算）与面板全部时间展示（告警、审计、会话、监控图表）统一按此时区渲染，所有登录用户一致；保存即时生效，无需重启。Agent 的月流量计费周期仍按各 Agent 所在主机的本地时间，不受此项影响。
 - **自定义常用命令**：增删改查，用于推送命令快速选取。
 - **监控告警**：见 3.11。
 - **在线终端配置**：登录行为、各主机登录账号、默认账号。
@@ -886,6 +887,7 @@ Agent internal/shell
 | 配置键 (Key) | 作用域 | 默认值 | 校验与说明 |
 | --- | --- | --- | --- |
 | `server.public_url` | `system` | `""` | 面板公网根访问地址（URL 格式，如 `https://panel.example.com:18789`，用于 Agent 一键安装与分享链接） |
+| `server.timezone` | `system` | `""` | 面板时区（IANA 名称，如 `Asia/Shanghai`；空 = 跟随服务器系统时区，`time.LoadLocation` 校验）。控制端进程本地时间（日志、API 时间戳）与面板全部时间展示（告警/审计/会话/图表）统一按此时区；经 `GET /version` 的 `timezone` 字段下发给所有登录用户，前端 `utils/time.ts` 统一格式化，未设置时前端回退浏览器本地时区。保存即时生效（启动与每次系统设置保存后 `ApplyTimezone`）。Agent 月流量计费周期仍按各 Agent 主机本地时间，不受此项影响 |
 | `security.panel_domain` | `system` | `""` | 面板绑定域名（主机名格式，如 `panel.example.com`）；绑定后自动启用严格域名限制，面板只能通过该域名访问 |
 | `security.panel_ssl_enabled` | `system` | `false` | 面板 SSL / HTTPS 总开关（通过端口级协议动态嗅探实现零停机热重载） |
 | `security.panel_ssl_mode` | `system` | `"cert_center"` | 证书来源模式（`cert_center` 从证书中心选取 / `custom` 自定义 PEM 证书与私钥） |

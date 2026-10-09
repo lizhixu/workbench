@@ -11,12 +11,14 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import {
   getMySettings,
+  getPanelTimezone,
   saveMySettings,
   SETTING_KEYS,
   type SettingsData,
   type SettingSchemaEntry,
   type ThemeMode,
 } from '../api/settings'
+import { setPanelTimezone } from '../utils/time'
 
 export type { ThemeMode }
 
@@ -38,7 +40,30 @@ export const useSettingsStore = defineStore('settings', () => {
   // gone and skip applying stale state.
   let generation = 0
 
+  // Panel timezone (system scope): fetched from /version because the
+  // system-settings endpoint is admin-only but every role needs the zone to
+  // render times. Tracked separately from user settings: the boot-time load
+  // may run logged-out (401) and user settings dedupe after login, but the
+  // zone must still land once a session exists. Failure keeps browser local.
+  let panelTzLoaded = false
+  let panelTzInflight: Promise<void> | null = null
+  function ensurePanelTimezone() {
+    if (panelTzLoaded || panelTzInflight) return
+    const gen = generation
+    panelTzInflight = getPanelTimezone()
+      .then((tz) => {
+        if (gen !== generation) return
+        setPanelTimezone(tz)
+        panelTzLoaded = true
+      })
+      .catch(() => {})
+      .finally(() => {
+        panelTzInflight = null
+      })
+  }
+
   function load(): Promise<void> {
+    ensurePanelTimezone()
     if (loaded.value) return Promise.resolve()
     if (inflight) return inflight
     const gen = generation
@@ -103,6 +128,11 @@ export const useSettingsStore = defineStore('settings', () => {
     schema.value = []
     loaded.value = false
     themeMode.value = readLocalTheme() || 'dark'
+    // The panel timezone belongs to the previous session's panel; drop it so
+    // a different panel/account never renders with a stale zone.
+    panelTzLoaded = false
+    panelTzInflight = null
+    setPanelTimezone('')
   }
 
   /** Read one user-scope key with a fallback (for facades like termPrefs). */

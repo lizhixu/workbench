@@ -17,6 +17,7 @@ import { useAuthStore } from '../../stores/auth'
 import { useSystemUpdateStore } from '../../stores/systemUpdate'
 import type { Host } from '../../api/types'
 import { formatUpgradeStage } from '../../utils/upgrade'
+import { fmtDateTime } from '../../utils/time'
 
 const auth = useAuthStore()
 const isAdmin = computed(() => auth.role === 'admin')
@@ -234,11 +235,7 @@ function formatBytes(bytes?: number): string {
 
 function formatDateTime(d?: string): string {
   if (!d) return ''
-  try {
-    return new Date(d).toLocaleString('zh-CN', { hour12: false })
-  } catch {
-    return d
-  }
+  return fmtDateTime(d)
 }
 
 async function doOnlineUpgradeServer() {

@@ -18,6 +18,7 @@ import {
   type Archive, type BackupJob, type CreateJobReq, type S3Target,
 } from '../../api/snapshots'
 import { listHosts } from '../../api/hosts'
+import { fmtDateTimeMinute } from '../../utils/time'
 
 defineOptions({ name: 'SnapshotList' })
 
@@ -348,10 +349,7 @@ const archiveColumns = computed<DataTableColumns<Archive>>(() => [
 
 function formatTime(v?: string) {
   if (!v) return '-'
-  const d = new Date(v)
-  if (Number.isNaN(d.getTime())) return '-'
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return fmtDateTimeMinute(v)
 }
 
 function formatBytes(b: number) {

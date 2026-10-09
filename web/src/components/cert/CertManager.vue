@@ -18,6 +18,7 @@ import {
   type Certificate, type CertHubConfig, type ChallengeMode,
   type ManualDNSOrder,
 } from '../../api/certs'
+import { fmtDate } from '../../utils/time'
 
 defineOptions({ name: 'CertManager' })
 
@@ -210,10 +211,7 @@ const accountSelectOptions = computed(() =>
 )
 
 function formatDate(v: string) {
-  const d = new Date(v)
-  if (Number.isNaN(d.getTime())) return '-'
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+  return fmtDate(v)
 }
 
 async function loadConfig() {

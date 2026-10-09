@@ -2270,6 +2270,10 @@ func (h *handlers) health(c *gin.Context) {
 // release manifest, and the public key agents can pin (-upgrade-pubkey)
 // to verify upgrade signatures.
 func (h *handlers) versionInfo(c *gin.Context) {
+	panelTZ := ""
+	if h.settings != nil {
+		panelTZ = h.settings.Timezone()
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"server_version":       version.Get(),
 		"server_commit":        version.Commit,
@@ -2278,6 +2282,9 @@ func (h *handlers) versionInfo(c *gin.Context) {
 		"agent_manifest":       agentRelease != nil,
 		"upgrade_pubkey":       UpgradePubKeyHex,
 		"public_url":           publicURL,
+		// Panel timezone (IANA name) so every client renders times in the
+		// same zone; "" = clients fall back to their local timezone.
+		"timezone": panelTZ,
 	})
 }
 

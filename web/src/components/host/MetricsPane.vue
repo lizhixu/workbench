@@ -22,6 +22,7 @@ echarts.use([LineChart, GridComponent, TooltipComponent, TitleComponent, CanvasR
 import { getMetrics, getMetricsHistory, type MetricPoint } from '../../api/hosts'
 import type { Metrics } from '../../api/types'
 import { useSettingsStore } from '../../stores/settings'
+import { fmtDateTime, fmtTime as fmtTimeOfDay } from '../../utils/time'
 
 const props = defineProps<{ hostId: string }>()
 const settings = useSettingsStore()
@@ -78,10 +79,7 @@ function fmtRate(n: number): string {
 
 function fmtTime(ts: number, full = false): string {
   const d = new Date(ts * 1000)
-  const pad = (v: number) => String(v).padStart(2, '0')
-  const timeStr = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-  if (!full) return timeStr
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${timeStr}`
+  return full ? fmtDateTime(d) : fmtTimeOfDay(d)
 }
 
 function getBaseChartOption(title: string, sub: string, yAxisFormatter?: (v: number) => string, max?: number) {

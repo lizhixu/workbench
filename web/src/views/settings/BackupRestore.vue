@@ -40,6 +40,7 @@ import {
   type RestoreResult,
 } from '../../api/backup'
 import { useAuthStore } from '../../stores/auth'
+import { fmtDateTime } from '../../utils/time'
 
 const message = useMessage()
 const auth = useAuthStore()
@@ -73,8 +74,7 @@ function formatBytes(n: number): string {
 
 function formatTime(s: string): string {
   if (!s) return '-'
-  const d = new Date(s)
-  return Number.isNaN(d.getTime()) ? s : d.toLocaleString('zh-CN')
+  return fmtDateTime(s)
 }
 
 async function refresh() {

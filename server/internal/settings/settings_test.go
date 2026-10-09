@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -570,5 +571,46 @@ func TestCertTimingKeys(t *testing.T) {
 	}
 	if got := s.CertExpiryReminderDays(); got != 30 {
 		t.Errorf("clamped CertExpiryReminderDays = %d, want 30", got)
+	}
+}
+
+func TestTimezoneValidationAndApply(t *testing.T) {
+	s := newTestStore(t)
+	// Other tests share this process: never leak a mutated time.Local.
+	t.Cleanup(func() { time.Local = osLocal })
+
+	// Unset by default: panel follows the server OS timezone.
+	if got := s.Timezone(); got != "" {
+		t.Fatalf("default timezone = %q, want empty", got)
+	}
+
+	// A bogus IANA name is rejected (Go would silently fall back to UTC).
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{"server.timezone": raw(t, "Mars/Olympus")}); err == nil {
+		t.Fatal("invalid timezone name accepted")
+	}
+	// System scope only: user-scope writes are refused.
+	if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{"server.timezone": raw(t, "UTC")}); err == nil {
+		t.Fatal("server.timezone accepted in user scope")
+	}
+
+	// A valid name is stored and ApplyTimezone points time.Local at it.
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{"server.timezone": raw(t, "Asia/Shanghai")}); err != nil {
+		t.Fatalf("valid timezone rejected: %v", err)
+	}
+	if got := s.Timezone(); got != "Asia/Shanghai" {
+		t.Fatalf("timezone = %q, want Asia/Shanghai", got)
+	}
+	s.ApplyTimezone()
+	if time.Local.String() != "Asia/Shanghai" {
+		t.Fatalf("time.Local = %v, want Asia/Shanghai", time.Local)
+	}
+
+	// Clearing the setting restores the OS zone captured at init.
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{"server.timezone": raw(t, "")}); err != nil {
+		t.Fatalf("clearing timezone: %v", err)
+	}
+	s.ApplyTimezone()
+	if time.Local != osLocal {
+		t.Fatalf("time.Local = %v, want OS zone %v", time.Local, osLocal)
 	}
 }

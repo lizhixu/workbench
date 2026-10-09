@@ -129,5 +129,8 @@ func (h *Handlers) putSystem(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// A timezone change takes effect immediately (server-side rendering
+	// follows time.Local); no restart needed.
+	h.store.ApplyTimezone()
 	h.getSystem(c)
 }

@@ -31,6 +31,7 @@ import {
   CopyOutline,
 } from '@vicons/ionicons5'
 import { copyToClipboard } from '../../../utils/clipboard'
+import { fmtDateTime } from '../../../utils/time'
 import { useTablePagination } from '../../../composables/useTablePagination'
 import {
   triggerScan,
@@ -234,11 +235,7 @@ async function copyRecCommand(cmd?: string) {
 
 function formatTime(t?: string): string {
   if (!t) return '-'
-  try {
-    return new Date(t).toLocaleString('zh-CN')
-  } catch {
-    return t
-  }
+  return fmtDateTime(t)
 }
 
 const findingColumns = [

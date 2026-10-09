@@ -268,6 +268,12 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("settings store ready")
+	// Panel timezone: point the process local time at the configured zone so
+	// logs and API timestamps render in panel time from the first request.
+	settingsStore.ApplyTimezone()
+	if tz := settingsStore.Timezone(); tz != "" {
+		log.Info("panel timezone applied", "timezone", tz)
+	}
 
 	// Control-plane backup/restore, so the whole dataset can be archived and
 	// moved to another machine (AGENTS.md 5.1 数据自主可控).

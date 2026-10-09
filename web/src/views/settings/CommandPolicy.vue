@@ -22,6 +22,7 @@ import {
   type CommandAuditEntry,
 } from '../../api/policy'
 import { useTablePagination } from '../../composables/useTablePagination'
+import { fmtDateTime } from '../../utils/time'
 
 const message = useMessage()
 
@@ -144,11 +145,7 @@ function riskTagType(risk: string): 'error' | 'warning' | 'info' | 'default' {
 
 function formatTime(t: string): string {
   if (!t) return '-'
-  try {
-    return new Date(t).toLocaleString('zh-CN')
-  } catch {
-    return t
-  }
+  return fmtDateTime(t)
 }
 
 const auditColumns = [

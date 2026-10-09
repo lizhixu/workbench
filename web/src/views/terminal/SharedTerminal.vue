@@ -21,6 +21,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import '@xterm/xterm/css/xterm.css'
 import { getShareInfo, type ShareInfoResponse } from '../../api/hosts'
+import { fmtDateTime } from '../../utils/time'
 
 const route = useRoute()
 const message = useMessage()
@@ -247,7 +248,7 @@ onBeforeUnmount(() => {
         <div class="header-right">
           <NTag type="default" size="small" :bordered="false">
             <template #icon><NIcon :component="TimeOutline" /></template>
-            有效期至 {{ new Date(shareInfo.expires_at).toLocaleTimeString() }}
+            有效期至 {{ fmtDateTime(shareInfo.expires_at) }}
           </NTag>
           <NTag :type="connected ? 'success' : 'error'" size="small">
             {{ connected ? '在线协同中' : '已断开' }}

@@ -15,6 +15,7 @@ import {
 } from '../../api/apps'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { useAuthStore } from '../../stores/auth'
+import { fmtDateTimeMinute } from '../../utils/time'
 
 defineOptions({ name: 'AppList' })
 
@@ -133,10 +134,7 @@ const columns = computed<DataTableColumns<AppEntity>>(() => [
 ])
 
 function formatTime(v: string) {
-  const d = new Date(v)
-  if (Number.isNaN(d.getTime())) return '-'
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return fmtDateTimeMinute(v)
 }
 
 async function loadData() {

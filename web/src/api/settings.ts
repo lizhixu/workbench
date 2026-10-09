@@ -41,6 +41,8 @@ export const SETTING_KEYS = {
   // Panel domain and public access (system scope).
   // 绑定域名即自动启用严格域名限制（只能通过该域名访问面板），无独立开关。
   publicURL: 'server.public_url',
+  // Panel timezone (system scope): IANA name; '' = server OS timezone.
+  timezone: 'server.timezone',
   panelDomain: 'security.panel_domain',
   // Panel SSL / HTTPS (system scope)
   panelSSLEnabled: 'security.panel_ssl_enabled',
@@ -144,5 +146,12 @@ export interface PanelCertStatus {
 
 export function getPanelCertStatus() {
   return unwrap<PanelCertStatus>(http.get('/system/panel-cert'))
+}
+
+// Panel timezone for client-side time rendering. GET /version is readable by
+// every signed-in role (unlike the admin-only system settings), so this is
+// how non-admin clients learn the zone. '' = follow the browser timezone.
+export function getPanelTimezone() {
+  return unwrap<{ timezone?: string }>(http.get('/version')).then((r) => r.timezone || '')
 }
 

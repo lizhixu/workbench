@@ -25,6 +25,7 @@ import {
 } from '../../api/audit'
 import { listHosts } from '../../api/hosts'
 import type { Host } from '../../api/types'
+import { fmtDateTime } from '../../utils/time'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'AuditList' })
@@ -83,7 +84,7 @@ const showDetailModal = ref(false)
 
 function fmtTime(ts?: string) {
   if (!ts) return '-'
-  return ts.slice(0, 19).replace('T', ' ')
+  return fmtDateTime(ts)
 }
 
 function formatTarget(row?: AuditEntry | null) {

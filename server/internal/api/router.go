@@ -1929,121 +1929,136 @@ func (h *handlers) auditMutation() gin.HandlerFunc {
 		if risk == "" {
 			risk = audit.RiskMedium
 		}
-		h.recordAudit(c, rule.action, targetType, targetID,
-			c.Request.Method+" "+c.FullPath(), risk, audit.ResultSuccess)
+		// The rule's Chinese description is the audit detail; the route dump
+		// is only a last-resort fallback for a rule added without a desc.
+		detail := rule.desc
+		if detail == "" {
+			detail = c.Request.Method + " " + c.FullPath()
+		}
+		h.recordAudit(c, rule.action, targetType, targetID, detail, risk, audit.ResultSuccess)
 	}
 }
 
 // mutationRule maps one mutating route to its audit action. targetType pins
 // the audited target type (empty = legacy param heuristic); targetParam names
 // the gin param holding the target ID (empty = heuristic, or none when
-// targetType is set); risk overrides the default medium level (empty = medium).
+// targetType is set); risk overrides the default medium level (empty = medium);
+// desc is the Chinese operation description stored as the audit detail — the
+// panel shows it verbatim, so it must read as an operation, never as an
+// "METHOD /route" dump.
 type mutationRule struct {
 	method, pattern, action string
-	targetType, targetParam  string
+	targetType, targetParam string
 	risk                    string
+	desc                    string
+}
+
+// deriveAllMutationRules returns the full rule table. It exists so tests can
+// assert table-wide invariants (every rule carries a Chinese desc) without
+// enumerating every route by hand.
+func deriveAllMutationRules() []mutationRule {
+	return []mutationRule{
+		{http.MethodPost, "/api/v1/auth/logout", "logout", "system", "", audit.RiskLow, "退出登录"},
+		{http.MethodPost, "/api/v1/users", "user_create", "", "", "", "创建用户"},
+		{http.MethodPut, "/api/v1/users/:username/password", "user_password", "", "", "", "修改用户密码"},
+		{http.MethodPut, "/api/v1/users/:username/role", "user_role", "", "", "", "调整用户角色"},
+		{http.MethodPost, "/api/v1/users/:username/reset-password", "user_reset_password", "", "", "", "重置用户密码"},
+		{http.MethodDelete, "/api/v1/users/:username", "user_delete", "", "", audit.RiskHigh, "删除用户"},
+		{http.MethodPut, "/api/v1/policy/command", "policy_update", "", "", audit.RiskHigh, "更新高危命令策略"},
+		{http.MethodPost, "/api/v1/hosts/:id/apps/install", "app_install", "", "", "", "安装应用"},
+		{http.MethodDelete, "/api/v1/hosts/:id/apps/:name", "app_uninstall", "", "", "", "卸载应用"},
+		{http.MethodPost, "/api/v1/hosts/:id/docker/install-script", "docker_install", "", "", audit.RiskHigh, "一键安装 Docker"},
+		{http.MethodPut, "/api/v1/me/settings", "user_settings_update", "", "", "", "更新个人设置"},
+		{http.MethodPut, "/api/v1/settings", "system_settings_update", "", "", "", "更新系统设置"},
+		// Control-plane backup / restore: a restore rewrites the whole dataset,
+		// so it is recorded as a high-risk action.
+		{http.MethodPost, "/api/v1/system/backup", "system_backup", "", "", "", "创建控制端备份"},
+		{http.MethodDelete, "/api/v1/system/backups/:name", "system_backup_delete", "", "", audit.RiskHigh, "删除控制端备份"},
+		{http.MethodPost, "/api/v1/system/backups/:name/restore", "system_restore", "", "", audit.RiskHigh, "从备份恢复控制端数据"},
+		{http.MethodPost, "/api/v1/system/restore", "system_restore", "", "", audit.RiskHigh, "从备份恢复控制端数据"},
+		// App lifecycle (Dokploy-style): deploy/rollback/start/stop/restart
+		// change the running state, so they are high-risk.
+		{http.MethodPost, "/api/v1/apps", "app_create", "app", "", "", "创建应用"},
+		{http.MethodPut, "/api/v1/apps/:id", "app_update", "app", "id", "", "更新应用配置"},
+		{http.MethodDelete, "/api/v1/apps/:id", "app_delete", "app", "id", audit.RiskHigh, "删除应用"},
+		{http.MethodPost, "/api/v1/apps/:id/deploy", "app_deploy", "app", "id", audit.RiskHigh, "部署应用"},
+		{http.MethodPost, "/api/v1/apps/:id/rollback", "app_rollback", "app", "id", audit.RiskHigh, "回滚应用到上一版本"},
+		{http.MethodPost, "/api/v1/apps/:id/stop", "app_stop", "app", "id", audit.RiskHigh, "停止应用"},
+		{http.MethodPost, "/api/v1/apps/:id/start", "app_start", "app", "id", audit.RiskHigh, "启动应用"},
+		{http.MethodPost, "/api/v1/apps/:id/restart", "app_restart", "app", "id", audit.RiskHigh, "重启应用"},
+		{http.MethodPost, "/api/v1/apps/:id/webhook/sync", "app_webhook_sync", "app", "id", audit.RiskHigh, "同步应用 Webhook 自动部署"},
+		// Reverse-proxy domain binding: traffic-affecting, high-risk.
+		{http.MethodPut, "/api/v1/apps/:id/proxy", "app_proxy_bind", "app", "id", audit.RiskHigh, "绑定反代域名"},
+		{http.MethodDelete, "/api/v1/apps/:id/proxy", "app_proxy_unbind", "app", "id", audit.RiskHigh, "解绑反代域名"},
+		// Certificate hub: key material is sensitive.
+		{http.MethodPut, "/api/v1/certs/config", "cert_config_update", "cert", "", "", "更新证书 DNS 自动验证配置"},
+		{http.MethodPost, "/api/v1/certs/accounts", "cert_account_create", "cert", "", "", "添加 ACME 账户"},
+		{http.MethodPut, "/api/v1/certs/accounts/:id", "cert_account_update", "cert", "id", "", "更新 ACME 账户"},
+		{http.MethodDelete, "/api/v1/certs/accounts/:id", "cert_account_delete", "cert", "id", audit.RiskHigh, "删除 ACME 账户"},
+		{http.MethodPost, "/api/v1/certs/issue", "cert_issue", "cert", "", audit.RiskHigh, "签发证书"},
+		{http.MethodPost, "/api/v1/certs/manual/:id/confirm", "cert_manual_dns_confirm", "cert", "id", audit.RiskHigh, "确认手动 DNS-01 解析并继续签发"},
+		{http.MethodDelete, "/api/v1/certs/manual/:id", "cert_manual_dns_cancel", "cert", "id", audit.RiskHigh, "取消手动 DNS-01 签发订单"},
+		{http.MethodPost, "/api/v1/certs/import", "cert_import", "cert", "", audit.RiskHigh, "导入已有证书"},
+		{http.MethodPost, "/api/v1/certs/:id/renew", "cert_renew", "cert", "id", audit.RiskHigh, "续期证书"},
+		{http.MethodDelete, "/api/v1/certs/:id", "cert_delete", "cert", "id", audit.RiskHigh, "删除证书"},
+		// File management on hosts: removal is destructive.
+		{http.MethodPost, "/api/v1/hosts/:id/files/mkdir", "file_mkdir", "host", "id", "", "新建目录"},
+		{http.MethodPost, "/api/v1/hosts/:id/files/move", "file_move", "host", "id", "", "移动/重命名文件"},
+		{http.MethodPost, "/api/v1/hosts/:id/files/copy", "file_copy", "host", "id", "", "复制文件"},
+		{http.MethodDelete, "/api/v1/hosts/:id/files", "file_remove", "host", "id", audit.RiskHigh, "删除文件"},
+		{http.MethodPost, "/api/v1/hosts/:id/files/upload", "file_upload", "host", "id", "", "上传文件"},
+		// Security scan trigger: active probing on the host.
+		{http.MethodPost, "/api/v1/hosts/:id/scans", "scan_trigger", "host", "id", "", "触发安全扫描"},
+		// Snapshot / backup jobs: a restore overwrites live data.
+		{http.MethodPost, "/api/v1/backups/jobs", "backup_job_create", "backup", "", "", "创建备份任务"},
+		{http.MethodPut, "/api/v1/backups/jobs/:id", "backup_job_update", "backup", "id", "", "更新备份任务"},
+		{http.MethodDelete, "/api/v1/backups/jobs/:id", "backup_job_delete", "backup", "id", audit.RiskHigh, "删除备份任务"},
+		{http.MethodPost, "/api/v1/backups/jobs/:id/run", "backup_job_run", "backup", "id", "", "立即执行备份任务"},
+		{http.MethodPost, "/api/v1/backups/jobs/:id/archives/:archiveID/restore", "backup_archive_restore", "backup", "archiveID", audit.RiskHigh, "从归档恢复数据"},
+		{http.MethodDelete, "/api/v1/backups/jobs/:id/archives/:archiveID", "backup_archive_delete", "backup", "archiveID", audit.RiskHigh, "删除备份归档"},
+		{http.MethodPost, "/api/v1/backups/s3-targets", "backup_s3_create", "backup", "", "", "添加 S3 备份目标"},
+		{http.MethodPut, "/api/v1/backups/s3-targets/:id", "backup_s3_update", "backup", "id", "", "更新 S3 备份目标"},
+		{http.MethodDelete, "/api/v1/backups/s3-targets/:id", "backup_s3_delete", "backup", "id", audit.RiskHigh, "删除 S3 备份目标"},
+		{http.MethodPost, "/api/v1/backups/s3-targets/:id/test", "backup_s3_test", "backup", "id", audit.RiskLow, "测试 S3 备份目标连通性"},
+		// Git provider credentials: token material is sensitive.
+		{http.MethodPost, "/api/v1/git/github/token", "git_token_set", "system", "", audit.RiskHigh, "设置 Git 访问令牌"},
+		{http.MethodDelete, "/api/v1/git/github", "git_account_delete", "system", "", audit.RiskHigh, "解绑 Git 账户"},
+		// Host groups + per-group grants: authorization changes are high-risk.
+		{http.MethodPost, "/api/v1/groups", "group_create", "group", "", "", "创建分组"},
+		{http.MethodPatch, "/api/v1/groups/:id", "group_update", "group", "id", "", "更新分组"},
+		{http.MethodDelete, "/api/v1/groups/:id", "group_delete", "group", "id", audit.RiskHigh, "删除分组"},
+		{http.MethodPost, "/api/v1/groups/:id/users", "group_grant", "group", "id", audit.RiskHigh, "授权用户访问分组"},
+		{http.MethodDelete, "/api/v1/groups/:id/users/:username", "group_revoke", "group", "id", audit.RiskHigh, "移除用户的分组授权"},
+		// Saved-command library.
+		{http.MethodPost, "/api/v1/commands", "command_create", "command", "", "", "新建常用命令"},
+		{http.MethodPatch, "/api/v1/commands/:id", "command_update", "command", "id", "", "更新常用命令"},
+		{http.MethodDelete, "/api/v1/commands/:id", "command_delete", "command", "id", audit.RiskHigh, "删除常用命令"},
+		// Alerts: rules/webhook changes and event evidence destruction.
+		{http.MethodPost, "/api/v1/alerts/rules", "alert_rule_create", "alert", "", "", "创建告警规则"},
+		{http.MethodPut, "/api/v1/alerts/rules/:id", "alert_rule_update", "alert", "id", "", "更新告警规则"},
+		{http.MethodDelete, "/api/v1/alerts/rules/:id", "alert_rule_delete", "alert", "id", audit.RiskHigh, "删除告警规则"},
+		{http.MethodPost, "/api/v1/alerts/events/ack-all", "alert_events_ack_all", "alert", "", audit.RiskLow, "全部确认告警"},
+		{http.MethodPost, "/api/v1/alerts/events/:id/ack", "alert_event_ack", "alert", "id", audit.RiskLow, "确认告警"},
+		{http.MethodDelete, "/api/v1/alerts/events/:id", "alert_event_delete", "alert", "id", audit.RiskHigh, "删除告警"},
+		{http.MethodDelete, "/api/v1/alerts/events", "alert_events_clear", "alert", "", audit.RiskHigh, "清空告警记录"},
+		{http.MethodPut, "/api/v1/alerts/webhook", "alert_webhook_update", "alert", "", "", "更新告警 Webhook 通知"},
+		{http.MethodPost, "/api/v1/alerts/webhook/test", "alert_webhook_test", "alert", "", audit.RiskLow, "测试告警 Webhook 通知"},
+		// AI assistant config: model/endpoint credentials.
+		{http.MethodPut, "/api/v1/ai/config", "ai_config_update", "system", "", "", "更新 AI 模型配置"},
+	}
 }
 
 // deriveMutationAction maps an HTTP method + gin route pattern to a concrete
 // audit action name.
 func deriveMutationAction(method, pattern string) (mutationRule, bool) {
-	rules := []mutationRule{
-		{http.MethodPost, "/api/v1/auth/logout", "logout", "system", "", audit.RiskLow},
-		{http.MethodPost, "/api/v1/users", "user_create", "", "", ""},
-		{http.MethodPut, "/api/v1/users/:username/password", "user_password", "", "", ""},
-		{http.MethodPut, "/api/v1/users/:username/role", "user_role", "", "", ""},
-		{http.MethodPost, "/api/v1/users/:username/reset-password", "user_reset_password", "", "", ""},
-		{http.MethodDelete, "/api/v1/users/:username", "user_delete", "", "", audit.RiskHigh},
-		{http.MethodPut, "/api/v1/policy/command", "policy_update", "", "", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/hosts/:id/apps/install", "app_install", "", "", ""},
-		{http.MethodDelete, "/api/v1/hosts/:id/apps/:name", "app_uninstall", "", "", ""},
-		{http.MethodPost, "/api/v1/hosts/:id/docker/install-script", "docker_install", "", "", audit.RiskHigh},
-		{http.MethodPut, "/api/v1/me/settings", "user_settings_update", "", "", ""},
-		{http.MethodPut, "/api/v1/settings", "system_settings_update", "", "", ""},
-		// Control-plane backup / restore: a restore rewrites the whole dataset,
-		// so it is recorded as a high-risk action.
-		{http.MethodPost, "/api/v1/system/backup", "system_backup", "", "", ""},
-		{http.MethodDelete, "/api/v1/system/backups/:name", "system_backup_delete", "", "", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/system/backups/:name/restore", "system_restore", "", "", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/system/restore", "system_restore", "", "", audit.RiskHigh},
-		// App lifecycle (Dokploy-style): deploy/rollback/start/stop/restart
-		// change the running state, so they are high-risk.
-		{http.MethodPost, "/api/v1/apps", "app_create", "app", "", ""},
-		{http.MethodPut, "/api/v1/apps/:id", "app_update", "app", "id", ""},
-		{http.MethodDelete, "/api/v1/apps/:id", "app_delete", "app", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/apps/:id/deploy", "app_deploy", "app", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/apps/:id/rollback", "app_rollback", "app", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/apps/:id/stop", "app_stop", "app", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/apps/:id/start", "app_start", "app", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/apps/:id/restart", "app_restart", "app", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/apps/:id/webhook/sync", "app_webhook_sync", "app", "id", audit.RiskHigh},
-		// Reverse-proxy domain binding: traffic-affecting, high-risk.
-		{http.MethodPut, "/api/v1/apps/:id/proxy", "app_proxy_bind", "app", "id", audit.RiskHigh},
-		{http.MethodDelete, "/api/v1/apps/:id/proxy", "app_proxy_unbind", "app", "id", audit.RiskHigh},
-		// Certificate hub: key material is sensitive.
-		{http.MethodPut, "/api/v1/certs/config", "cert_config_update", "cert", "", ""},
-		{http.MethodPost, "/api/v1/certs/accounts", "cert_account_create", "cert", "", ""},
-		{http.MethodPut, "/api/v1/certs/accounts/:id", "cert_account_update", "cert", "id", ""},
-		{http.MethodDelete, "/api/v1/certs/accounts/:id", "cert_account_delete", "cert", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/certs/issue", "cert_issue", "cert", "", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/certs/manual/:id/confirm", "cert_manual_dns_confirm", "cert", "id", audit.RiskHigh},
-		{http.MethodDelete, "/api/v1/certs/manual/:id", "cert_manual_dns_cancel", "cert", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/certs/import", "cert_import", "cert", "", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/certs/:id/renew", "cert_renew", "cert", "id", audit.RiskHigh},
-		{http.MethodDelete, "/api/v1/certs/:id", "cert_delete", "cert", "id", audit.RiskHigh},
-		// File management on hosts: removal is destructive.
-		{http.MethodPost, "/api/v1/hosts/:id/files/mkdir", "file_mkdir", "host", "id", ""},
-		{http.MethodPost, "/api/v1/hosts/:id/files/move", "file_move", "host", "id", ""},
-		{http.MethodPost, "/api/v1/hosts/:id/files/copy", "file_copy", "host", "id", ""},
-		{http.MethodDelete, "/api/v1/hosts/:id/files", "file_remove", "host", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/hosts/:id/files/upload", "file_upload", "host", "id", ""},
-		// Security scan trigger: active probing on the host.
-		{http.MethodPost, "/api/v1/hosts/:id/scans", "scan_trigger", "host", "id", ""},
-		// Snapshot / backup jobs: a restore overwrites live data.
-		{http.MethodPost, "/api/v1/backups/jobs", "backup_job_create", "backup", "", ""},
-		{http.MethodPut, "/api/v1/backups/jobs/:id", "backup_job_update", "backup", "id", ""},
-		{http.MethodDelete, "/api/v1/backups/jobs/:id", "backup_job_delete", "backup", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/backups/jobs/:id/run", "backup_job_run", "backup", "id", ""},
-		{http.MethodPost, "/api/v1/backups/jobs/:id/archives/:archiveID/restore", "backup_archive_restore", "backup", "archiveID", audit.RiskHigh},
-		{http.MethodDelete, "/api/v1/backups/jobs/:id/archives/:archiveID", "backup_archive_delete", "backup", "archiveID", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/backups/s3-targets", "backup_s3_create", "backup", "", ""},
-		{http.MethodPut, "/api/v1/backups/s3-targets/:id", "backup_s3_update", "backup", "id", ""},
-		{http.MethodDelete, "/api/v1/backups/s3-targets/:id", "backup_s3_delete", "backup", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/backups/s3-targets/:id/test", "backup_s3_test", "backup", "id", audit.RiskLow},
-		// Git provider credentials: token material is sensitive.
-		{http.MethodPost, "/api/v1/git/github/token", "git_token_set", "system", "", audit.RiskHigh},
-		{http.MethodDelete, "/api/v1/git/github", "git_account_delete", "system", "", audit.RiskHigh},
-		// Host groups + per-group grants: authorization changes are high-risk.
-		{http.MethodPost, "/api/v1/groups", "group_create", "group", "", ""},
-		{http.MethodPatch, "/api/v1/groups/:id", "group_update", "group", "id", ""},
-		{http.MethodDelete, "/api/v1/groups/:id", "group_delete", "group", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/groups/:id/users", "group_grant", "group", "id", audit.RiskHigh},
-		{http.MethodDelete, "/api/v1/groups/:id/users/:username", "group_revoke", "group", "id", audit.RiskHigh},
-		// Saved-command library.
-		{http.MethodPost, "/api/v1/commands", "command_create", "command", "", ""},
-		{http.MethodPatch, "/api/v1/commands/:id", "command_update", "command", "id", ""},
-		{http.MethodDelete, "/api/v1/commands/:id", "command_delete", "command", "id", audit.RiskHigh},
-		// Alerts: rules/webhook changes and event evidence destruction.
-		{http.MethodPost, "/api/v1/alerts/rules", "alert_rule_create", "alert", "", ""},
-		{http.MethodPut, "/api/v1/alerts/rules/:id", "alert_rule_update", "alert", "id", ""},
-		{http.MethodDelete, "/api/v1/alerts/rules/:id", "alert_rule_delete", "alert", "id", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/alerts/events/ack-all", "alert_events_ack_all", "alert", "", audit.RiskLow},
-		{http.MethodPost, "/api/v1/alerts/events/:id/ack", "alert_event_ack", "alert", "id", audit.RiskLow},
-		{http.MethodDelete, "/api/v1/alerts/events/:id", "alert_event_delete", "alert", "id", audit.RiskHigh},
-		{http.MethodDelete, "/api/v1/alerts/events", "alert_events_clear", "alert", "", audit.RiskHigh},
-		{http.MethodPut, "/api/v1/alerts/webhook", "alert_webhook_update", "alert", "", ""},
-		{http.MethodPost, "/api/v1/alerts/webhook/test", "alert_webhook_test", "alert", "", audit.RiskLow},
-		// AI assistant config: model/endpoint credentials.
-		{http.MethodPut, "/api/v1/ai/config", "ai_config_update", "system", "", ""},
-	}
-	for _, r := range rules {
+	for _, r := range deriveAllMutationRules() {
 		if method == r.method && pattern == r.pattern {
 			return r, true
 		}
 	}
 	// Vault credential mutations share one pattern family.
 	if strings.HasPrefix(pattern, "/api/v1/vault") {
-		return mutationRule{method: method, pattern: pattern, action: "vault_op", risk: audit.RiskHigh}, true
+		return mutationRule{method: method, pattern: pattern, action: "vault_op", risk: audit.RiskHigh, desc: "凭证库操作"}, true
 	}
 	return mutationRule{}, false
 }

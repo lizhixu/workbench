@@ -1180,10 +1180,13 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 
 5. **操作审计全覆盖 (Audit Coverage)**：
    - **所有改变系统/主机状态的写操作必须记审计**：凡是 `POST/PUT/PATCH/DELETE` 且会产生状态变更的 API（创建/更新/删除配置、启停/部署/回滚应用、签发/续期证书、文件增删改、执行命令、绑定解绑域名、授权变更、删除会话录像等），必须有一条审计记录（谁、何时、做了什么、目标对象、结果、风险等级）。
-   - **实现方式**：优先走 `server/internal/api/router.go` 的 `auditMutation()` 中间件——在 `deriveMutationAction` 里为新路由添加规则（action 名、targetType、targetParam、risk）；中间件覆盖不到的单个 handler（如异步任务启动、证据删除）用 `h.recordAudit(...)` 显式记录。
+   - **实现方式**：优先走 `server/internal/api/router.go` 的 `auditMutation()` 中间件——在 `deriveMutationAction` 里为新路由添加规则（action 名、targetType、targetParam、risk、desc）；中间件覆盖不到的单个 handler（如异步任务启动、证据删除）用 `h.recordAudit(...)` 显式记录。
    - **新增写路由必须同步加规则**：`deriveMutationAction` 的规则表是审计覆盖的唯一事实来源；新增任何写操作路由时，必须同时在规则表里加一条，并在 `server/internal/api/audit_coverage_test.go` 的 `TestDeriveMutationActionCoverage` 里加一条用例锁住它。Review 时发现写路由无规则 = 缺陷。
+   - **审计文案必须全中文、面向操作而非接口**：审计列表「操作」列与「详情」列对用户必须是中文自然语言——规则的 `desc` 就是详情列展示内容，必须是「部署应用」「续期证书」这类操作描述，**严禁写 `POST /api/v1/apps/:id/deploy` 这类方法+路由原文**（中间件仅在 desc 缺失时兜底）；显式埋点的 detail 同样逐条写中文描述。测试 `TestDeriveMutationActionCoverage` 对全规则表断言 desc 非空，新增规则漏写 desc 会直接测试失败。
+   - **操作列中文标签的唯一事实来源**是 `web/src/api/audit.ts` 的 `actionLabels`（action → 中文）、`actionTypeLabels`（`update`/`install`/`join`/`leave` 等短码按 `action:target_type` 精确匹配，如 `update:system` = 上传控制端二进制、`join:network_node` = 加入异地组网）、`targetTypeLabels`（目标类型）、`riskLabels`/`resultLabels`（风险/结果）；`AuditList.vue` 只消费这些映射，**新增 action 码必须同步补标签**，未登记的动作回落展示原始码（Review 时看到英文 action = 漏登记）。
    - **豁免**：纯读（GET）、诊断/分析类（AI diagnose、部署诊断）、机器对机器回调（Agent enroll、应用 webhook 回调）不记审计；失败请求（HTTP >= 400）由中间件自动跳过，显式埋点自行决定。
    - **风险分级**：删除/恢复/签发/授权变更/流量切换类记 `high`；常规增改记 `medium`；登出、连通性测试、告警确认等记 `low`。
+   - **CSV 导出口径**：`GET /api/v1/audit/export` 导出原始 action 码与字段值（机器消费用），不做中文翻译；中文展示只发生在面板 UI 层。
 
 ---
 

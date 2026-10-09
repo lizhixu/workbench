@@ -20,6 +20,9 @@ import {
   actionLabel,
   auditExportUrl,
   listAudit,
+  resultLabels,
+  riskLabels,
+  targetTypeLabel,
   type AuditEntry,
   type AuditStats,
 } from '../../api/audit'
@@ -52,15 +55,21 @@ const filterRange = ref<[number, number] | null>(null)
 const actionOptions = [
   { label: '全部操作', value: '' },
   { label: '登录控制台', value: 'login' },
-  { label: '打开终端', value: 'terminal_open' },
-  { label: '分享终端', value: 'terminal_share' },
+  { label: '终端会话', value: 'terminal_*' },
+  { label: '内网隧道', value: 'tunnel_*' },
   { label: '执行命令', value: 'exec' },
   { label: '批量推送命令', value: 'batch_exec' },
   { label: '文件操作', value: 'file_*' },
   { label: '解绑主机', value: 'host_unbind' },
-  { label: 'Docker 操作', value: 'docker_op' },
+  { label: 'Docker 操作', value: 'docker_*' },
   { label: '升级 Agent', value: 'agent_upgrade' },
+  { label: '应用中心', value: 'app_*' },
+  { label: '证书中心', value: 'cert_*' },
   { label: '用户管理', value: 'user_*' },
+  { label: '分组与授权', value: 'group_*' },
+  { label: '告警管理', value: 'alert_*' },
+  { label: '备份任务', value: 'backup_*' },
+  { label: '安全扫描', value: 'scan_trigger' },
   { label: '更新高危策略', value: 'policy_update' },
   { label: '凭证库操作', value: 'vault_op' },
 ]
@@ -116,15 +125,14 @@ function resultTagType(result: string) {
 }
 
 function resultLabel(result: string) {
-  if (result === 'success') return '成功'
-  if (result === 'blocked') return '已拦截'
-  return '失败'
+  return resultLabels[result] || result
 }
 
 function riskTag(risk: string) {
-  if (risk === 'high') return h(NTag, { size: 'small', type: 'error', bordered: false }, { default: () => '高危' })
-  if (risk === 'medium') return h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => '中危' })
-  return h(NTag, { size: 'small', type: 'default', bordered: false }, { default: () => '低危' })
+  const label = riskLabels[risk] || risk
+  if (risk === 'high') return h(NTag, { size: 'small', type: 'error', bordered: false }, { default: () => label })
+  if (risk === 'medium') return h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => label })
+  return h(NTag, { size: 'small', type: 'default', bordered: false }, { default: () => label })
 }
 
 const columns: DataTableColumns<AuditEntry> = [
@@ -140,7 +148,7 @@ const columns: DataTableColumns<AuditEntry> = [
     key: 'action',
     width: 140,
     render: (row) =>
-      h(NTag, { size: 'small', bordered: false, type: 'info' }, { default: () => actionLabel(row.action) }),
+      h(NTag, { size: 'small', bordered: false, type: 'info' }, { default: () => actionLabel(row.action, row.target_type) }),
   },
   {
     title: '目标',
@@ -352,13 +360,13 @@ onMounted(load)
           <div class="detail-label">用户</div>
           <div>{{ detailEntry.username || '-' }}</div>
           <div class="detail-label">操作</div>
-          <div>{{ actionLabel(detailEntry.action) }}</div>
+          <div>{{ actionLabel(detailEntry.action, detailEntry.target_type) }}</div>
           <div class="detail-label">目标类型</div>
-          <div>{{ detailEntry.target_type }}</div>
+          <div>{{ targetTypeLabel(detailEntry.target_type) }}</div>
           <div class="detail-label">目标</div>
           <div class="mono-font">{{ formatTarget(detailEntry) }}</div>
           <div class="detail-label">风险等级</div>
-          <div>{{ detailEntry.risk_level }}</div>
+          <div>{{ riskLabels[detailEntry.risk_level] || detailEntry.risk_level }}</div>
           <div class="detail-label">结果</div>
           <div>{{ resultLabel(detailEntry.result) }}</div>
           <div class="detail-label">来源 IP</div>

@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"watchman/server/internal/audit"
@@ -75,6 +76,18 @@ func TestDeriveMutationActionCoverage(t *testing.T) {
 		}
 		if gotRisk != wantRisk {
 			t.Errorf("%s %s: risk = %q, want %q", tc.method, tc.pattern, gotRisk, wantRisk)
+		}
+		// The detail column of the audit trail must read as a Chinese
+		// operation description, never as an "METHOD /route" dump.
+		if strings.TrimSpace(rule.desc) == "" {
+			t.Errorf("%s %s: rule has no desc, audit detail would fall back to the raw route", tc.method, tc.pattern)
+		}
+	}
+
+	// Every rule in the table must carry a desc, not just the sampled ones.
+	for _, r := range deriveAllMutationRules() {
+		if strings.TrimSpace(r.desc) == "" {
+			t.Errorf("%s %s: rule has no desc", r.method, r.pattern)
 		}
 	}
 

@@ -790,8 +790,13 @@ type RegisterResponse struct {
 	// configured for this host in the panel ("财务与规格"); the agent
 	// applies it to its monthly traffic accounting on (re)connect.
 	TrafficResetDay int32 `protobuf:"varint,7,opt,name=traffic_reset_day,json=trafficResetDay,proto3" json:"traffic_reset_day,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// probe_url is the effective HTTP(S) target for the agent's latency /
+	// packet-loss probe (per-host "测速目标" in the panel; the server
+	// resolves the built-in default when the host has none). Empty means
+	// probing disabled (old server).
+	ProbeUrl      string `protobuf:"bytes,8,opt,name=probe_url,json=probeUrl,proto3" json:"probe_url,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RegisterResponse) Reset() {
@@ -871,6 +876,13 @@ func (x *RegisterResponse) GetTrafficResetDay() int32 {
 		return x.TrafficResetDay
 	}
 	return 0
+}
+
+func (x *RegisterResponse) GetProbeUrl() string {
+	if x != nil {
+		return x.ProbeUrl
+	}
+	return ""
 }
 
 type Heartbeat struct {
@@ -1659,8 +1671,11 @@ type MetricsSample struct {
 	CpuModel       string  `protobuf:"bytes,21,opt,name=cpu_model,json=cpuModel,proto3" json:"cpu_model,omitempty"`                    // CPU model name (cached, static)
 	MonthRx        int64   `protobuf:"varint,22,opt,name=month_rx,json=monthRx,proto3" json:"month_rx,omitempty"`                      // bytes received this billing cycle
 	MonthTx        int64   `protobuf:"varint,23,opt,name=month_tx,json=monthTx,proto3" json:"month_tx,omitempty"`                      // bytes transmitted this billing cycle
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Network quality probe (panel-configured target, see RegisterResponse).
+	NetLatencyMs  float64 `protobuf:"fixed64,24,opt,name=net_latency_ms,json=netLatencyMs,proto3" json:"net_latency_ms,omitempty"` // mean HTTP probe latency in ms; 0 = no data
+	NetLossPct    float64 `protobuf:"fixed64,25,opt,name=net_loss_pct,json=netLossPct,proto3" json:"net_loss_pct,omitempty"`       // failed probe attempts, percent 0..100
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *MetricsSample) Reset() {
@@ -1850,6 +1865,20 @@ func (x *MetricsSample) GetMonthRx() int64 {
 func (x *MetricsSample) GetMonthTx() int64 {
 	if x != nil {
 		return x.MonthTx
+	}
+	return 0
+}
+
+func (x *MetricsSample) GetNetLatencyMs() float64 {
+	if x != nil {
+		return x.NetLatencyMs
+	}
+	return 0
+}
+
+func (x *MetricsSample) GetNetLossPct() float64 {
+	if x != nil {
+		return x.NetLossPct
 	}
 	return 0
 }
@@ -2890,7 +2919,7 @@ const file_agent_proto_rawDesc = "" +
 	"internalIp\x12\x1b\n" +
 	"\tpublic_ip\x18\f \x01(\tR\bpublicIp\x12\x1a\n" +
 	"\blocation\x18\r \x01(\tR\blocation\x12)\n" +
-	"\x10reconnect_reason\x18\x0e \x01(\tR\x0freconnectReason\"\xfe\x01\n" +
+	"\x10reconnect_reason\x18\x0e \x01(\tR\x0freconnectReason\"\x9b\x02\n" +
 	"\x10RegisterResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12\x19\n" +
@@ -2899,7 +2928,8 @@ const file_agent_proto_rawDesc = "" +
 	"auth_token\x18\x04 \x01(\tR\tauthToken\x124\n" +
 	"\x16heartbeat_interval_sec\x18\x05 \x01(\x05R\x14heartbeatIntervalSec\x12(\n" +
 	"\x10session_keep_sec\x18\x06 \x01(\x05R\x0esessionKeepSec\x12*\n" +
-	"\x11traffic_reset_day\x18\a \x01(\x05R\x0ftrafficResetDay\"\x1b\n" +
+	"\x11traffic_reset_day\x18\a \x01(\x05R\x0ftrafficResetDay\x12\x1b\n" +
+	"\tprobe_url\x18\b \x01(\tR\bprobeUrl\"\x1b\n" +
 	"\tHeartbeat\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x03R\x02ts\"\x1e\n" +
 	"\fHeartbeatAck\x12\x0e\n" +
@@ -2966,7 +2996,7 @@ const file_agent_proto_rawDesc = "" +
 	"\x06stderr\x18\x04 \x01(\fR\x06stderr\x12\x1f\n" +
 	"\vduration_ms\x18\x05 \x01(\x03R\n" +
 	"durationMs\x12\x14\n" +
-	"\x05error\x18\x06 \x01(\tR\x05error\"\x9b\x05\n" +
+	"\x05error\x18\x06 \x01(\tR\x05error\"\xe3\x05\n" +
 	"\rMetricsSample\x12\x19\n" +
 	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12\x0e\n" +
 	"\x02ts\x18\x02 \x01(\x03R\x02ts\x12\x1b\n" +
@@ -2993,7 +3023,10 @@ const file_agent_proto_rawDesc = "" +
 	"\rprocess_count\x18\x14 \x01(\x05R\fprocessCount\x12\x1b\n" +
 	"\tcpu_model\x18\x15 \x01(\tR\bcpuModel\x12\x19\n" +
 	"\bmonth_rx\x18\x16 \x01(\x03R\amonthRx\x12\x19\n" +
-	"\bmonth_tx\x18\x17 \x01(\x03R\amonthTx\"E\n" +
+	"\bmonth_tx\x18\x17 \x01(\x03R\amonthTx\x12$\n" +
+	"\x0enet_latency_ms\x18\x18 \x01(\x01R\fnetLatencyMs\x12 \n" +
+	"\fnet_loss_pct\x18\x19 \x01(\x01R\n" +
+	"netLossPct\"E\n" +
 	"\x05Mount\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x14\n" +
 	"\x05total\x18\x02 \x01(\x03R\x05total\x12\x12\n" +

@@ -47,6 +47,9 @@ type Manager struct {
 	// Monthly traffic accounting (persisted next to the agent state file).
 	traffic *trafficTracker
 
+	// Network quality probe (latency/loss vs a panel-configured target).
+	prober *prober
+
 	// CPU model is static — fetched once and cached.
 	cpuModelOnce sync.Once
 	cpuModel     string
@@ -56,7 +59,7 @@ func NewManager(log *slog.Logger) *Manager {
 	if log == nil {
 		log = slog.Default()
 	}
-	m := &Manager{log: log}
+	m := &Manager{log: log, prober: newProber()}
 	if hi, err := host.Info(); err == nil {
 		m.bootTime = int64(hi.BootTime)
 	}
@@ -79,6 +82,15 @@ func (m *Manager) SetResetDay(day int) {
 	defer m.mu.Unlock()
 	if m.traffic != nil {
 		m.traffic.setResetDay(day)
+	}
+}
+
+// SetProbeURL applies the probe target delivered by the server in
+// RegisterResponse (already resolved to the effective URL, default
+// included). Empty disables probing (old server).
+func (m *Manager) SetProbeURL(url string) {
+	if m.prober != nil {
+		m.prober.setURL(url)
 	}
 }
 
@@ -215,6 +227,15 @@ func (m *Manager) collect() *agentpb.MetricsSample {
 
 	// CPU model name (static, cached after first lookup).
 	sample.CpuModel = m.cpuModelString()
+
+	// Network quality probe (latest completed round; runs off-thread so
+	// collection never waits on the network).
+	if m.prober != nil {
+		if r := m.prober.latest(); r.done {
+			sample.NetLatencyMs = r.latencyMs
+			sample.NetLossPct = r.lossPct
+		}
+	}
 
 	// Network: per-interface cumulative counters. Loopback is excluded
 	// (host-internal traffic no ISP bills); an optional allowlist can

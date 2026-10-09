@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +48,8 @@ type persistedAgent struct {
 	TrafficCalcType string  `json:"traffic_calc_type,omitempty"`
 	TrafficResetDay int     `json:"traffic_reset_day,omitempty"`
 	RenewalURL      string  `json:"renewal_url,omitempty"`
+	ProbeEnabled    bool    `json:"probe_enabled,omitempty"`
+	ProbeURL        string  `json:"probe_url,omitempty"`
 	Notes           string  `json:"notes,omitempty"`
 	// AuthToken is the long-lived token issued at registration; kept here
 	// (NOT in r.tokens) so a server restart doesn't invalidate it.
@@ -111,6 +115,8 @@ type Agent struct {
 	TrafficCalcType string
 	TrafficResetDay int
 	RenewalURL      string
+	ProbeEnabled    bool
+	ProbeURL        string
 	Notes           string
 	// ReconnectReason is the reason sent by the agent on its most recent registration.
 	ReconnectReason string
@@ -231,6 +237,8 @@ func (r *Registry) loadAgents() error {
 			TrafficCalcType: p.TrafficCalcType,
 			TrafficResetDay: p.TrafficResetDay,
 			RenewalURL:      p.RenewalURL,
+			ProbeEnabled:    p.ProbeEnabled,
+			ProbeURL:        p.ProbeURL,
 			Notes:           p.Notes,
 			AuthToken:       p.AuthToken,
 		}
@@ -277,6 +285,8 @@ func (r *Registry) persistAgentsLocked() error {
 			TrafficCalcType: a.TrafficCalcType,
 			TrafficResetDay: a.TrafficResetDay,
 			RenewalURL:      a.RenewalURL,
+			ProbeEnabled:    a.ProbeEnabled,
+			ProbeURL:        a.ProbeURL,
 			Notes:           a.Notes,
 			AuthToken:       a.AuthToken,
 		}
@@ -397,6 +407,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 			HeartbeatIntervalSec: heartbeatSec,
 			SessionKeepSec:       sessionKeep,
 			TrafficResetDay:      int32(normTrafficResetDay(a.TrafficResetDay)),
+			ProbeUrl:             probePushURL(a),
 		}, nil
 	}
 
@@ -450,6 +461,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 		HeartbeatIntervalSec: heartbeatSec,
 		SessionKeepSec:       sessionKeep,
 		TrafficResetDay:      int32(normTrafficResetDay(a.TrafficResetDay)),
+		ProbeUrl:             probePushURL(a),
 	}, nil
 }
 
@@ -628,6 +640,8 @@ type HostBillingConfig struct {
 	TrafficCalcType string  `json:"traffic_calc_type"`
 	TrafficResetDay int     `json:"traffic_reset_day"`
 	RenewalURL      string  `json:"renewal_url"`
+	ProbeEnabled    bool    `json:"probe_enabled"`
+	ProbeURL        string  `json:"probe_url"`
 	Notes           string  `json:"notes"`
 }
 
@@ -638,6 +652,46 @@ func normTrafficResetDay(d int) int {
 		return 1
 	}
 	return d
+}
+
+// DefaultProbeURL is the built-in latency/loss probe target used for hosts
+// without a per-host "测速目标" override (lightweight CDN endpoint).
+const DefaultProbeURL = "https://www.zstaticcdn.com/"
+
+// effectiveProbeURL resolves the probe target pushed to an agent: the
+// per-host override when set, otherwise the built-in default.
+func effectiveProbeURL(stored string) string {
+	if s := strings.TrimSpace(stored); s != "" {
+		return s
+	}
+	return DefaultProbeURL
+}
+
+// probePushURL resolves what RegisterResponse pushes for an agent: empty
+// when the host has latency/loss monitoring switched off (the agent treats
+// an empty probe_url as "probing disabled"), otherwise the effective URL.
+func probePushURL(a *Agent) string {
+	if a == nil || !a.ProbeEnabled {
+		return ""
+	}
+	return effectiveProbeURL(a.ProbeURL)
+}
+
+// normalizeProbeURL validates a user-supplied probe target: empty means
+// "use the default"; otherwise it must be an absolute http(s) URL.
+func normalizeProbeURL(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", nil
+	}
+	if len(s) > 512 {
+		return "", fmt.Errorf("测速目标 URL 过长（上限 512 字符）")
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", fmt.Errorf("测速目标必须是 http/https URL：%q", s)
+	}
+	return s, nil
 }
 
 // SetAgentBilling updates optional billing, traffic limits and notes for a host.
@@ -672,6 +726,12 @@ func (r *Registry) SetAgentBilling(id string, b HostBillingConfig) error {
 		a.TrafficResetDay = b.TrafficResetDay
 	}
 	a.RenewalURL = b.RenewalURL
+	a.ProbeEnabled = b.ProbeEnabled
+	probeURL, err := normalizeProbeURL(b.ProbeURL)
+	if err != nil {
+		return err
+	}
+	a.ProbeURL = probeURL
 	a.Notes = b.Notes
 	_ = r.persistAgentsLocked()
 	return nil

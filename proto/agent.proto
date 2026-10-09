@@ -102,6 +102,11 @@ message RegisterResponse {
   // configured for this host in the panel ("财务与规格"); the agent
   // applies it to its monthly traffic accounting on (re)connect.
   int32 traffic_reset_day = 7;
+  // probe_url is the effective HTTP(S) target for the agent's latency /
+  // packet-loss probe (per-host "测速目标" in the panel; the server
+  // resolves the built-in default when the host has none). Empty means
+  // probing disabled (old server).
+  string probe_url = 8;
 }
 
 message Heartbeat {
@@ -219,6 +224,9 @@ message MetricsSample {
   string cpu_model = 21;     // CPU model name (cached, static)
   int64 month_rx = 22; // bytes received this billing cycle
   int64 month_tx = 23; // bytes transmitted this billing cycle
+  // Network quality probe (panel-configured target, see RegisterResponse).
+  double net_latency_ms = 24; // mean HTTP probe latency in ms; 0 = no data
+  double net_loss_pct = 25;   // failed probe attempts, percent 0..100
 }
 
 message Mount {

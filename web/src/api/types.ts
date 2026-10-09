@@ -69,6 +69,8 @@ export interface Host {
   traffic_calc_type?: 'both' | 'out' | 'in' | string
   traffic_reset_day?: number
   renewal_url?: string
+  probe_enabled?: boolean
+  probe_url?: string
   notes?: string
 }
 
@@ -82,6 +84,8 @@ export interface HostBillingConfig {
   traffic_calc_type?: 'both' | 'out' | 'in' | string
   traffic_reset_day?: number
   renewal_url?: string
+  probe_enabled?: boolean
+  probe_url?: string
   notes?: string
 }
 
@@ -164,6 +168,8 @@ export interface Metrics {
   cpu_model?: string
   month_rx?: number
   month_tx?: number
+  net_latency_ms?: number
+  net_loss_pct?: number
 }
 
 // ---- Docker ----

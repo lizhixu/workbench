@@ -40,6 +40,9 @@ type Point struct {
 	ProcessCount  int32   `json:"process_count"`
 	MonthRx       int64   `json:"month_rx"`
 	MonthTx       int64   `json:"month_tx"`
+	// Network quality probe (zero on records from older agents).
+	NetLatencyMs float64 `json:"net_latency_ms"`
+	NetLossPct   float64 `json:"net_loss_pct"`
 }
 
 // Store handles metric persistence and downsampling.
@@ -91,6 +94,8 @@ func (s *Store) AddSample(hostID string, m *agentpb.MetricsSample) {
 		ProcessCount:  m.GetProcessCount(),
 		MonthRx:       m.GetMonthRx(),
 		MonthTx:       m.GetMonthTx(),
+		NetLatencyMs:  m.GetNetLatencyMs(),
+		NetLossPct:    m.GetNetLossPct(),
 	}
 	if pt.Timestamp == 0 {
 		pt.Timestamp = time.Now().Unix()
@@ -182,6 +187,9 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 		procCount float64
 		monthRx   int64
 		monthTx   int64
+		latencySum float64
+		latencyN   int
+		lossSum    float64
 	}
 
 	buckets := make(map[int64]*bucket)
@@ -219,6 +227,13 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 		// raw is sorted ascending, so the last write wins and is the newest.
 		b.monthRx = pt.MonthRx
 		b.monthTx = pt.MonthTx
+		// Latency averages only over samples that carry probe data
+		// (0 = no data: older agent, probing off, or a fully lost round).
+		if pt.NetLatencyMs > 0 {
+			b.latencySum += pt.NetLatencyMs
+			b.latencyN++
+		}
+		b.lossSum += pt.NetLossPct
 	}
 
 	sort.Slice(bucketKeys, func(i, j int) bool {
@@ -232,6 +247,10 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 			continue
 		}
 		n := float64(b.count)
+		latency := 0.0
+		if b.latencyN > 0 {
+			latency = b.latencySum / float64(b.latencyN)
+		}
 		result = append(result, Point{
 			Timestamp:      b.ts,
 			CPUUsage:       b.cpu / n,
@@ -252,6 +271,8 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 			ProcessCount:   int32(b.procCount / n),
 			MonthRx:        b.monthRx,
 			MonthTx:        b.monthTx,
+			NetLatencyMs:   latency,
+			NetLossPct:     b.lossSum / n,
 		})
 	}
 

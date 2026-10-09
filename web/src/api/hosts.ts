@@ -188,6 +188,8 @@ export interface MetricPoint {
   process_count?: number
   month_rx?: number
   month_tx?: number
+  net_latency_ms?: number
+  net_loss_pct?: number
 }
 
 export interface MetricsHistoryResponse {

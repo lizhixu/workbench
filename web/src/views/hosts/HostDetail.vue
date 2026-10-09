@@ -198,6 +198,7 @@ onMounted(load)
               <MetricsPane
                 v-else-if="activeSubTab === 'metrics'"
                 :host-id="host.id"
+                :probe-enabled="!!host.probe_enabled"
               />
 
               <!-- 系统状态与进程 -->

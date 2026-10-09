@@ -24,7 +24,7 @@ import type { Metrics } from '../../api/types'
 import { useSettingsStore } from '../../stores/settings'
 import { fmtDateTime, fmtTime as fmtTimeOfDay } from '../../utils/time'
 
-const props = defineProps<{ hostId: string }>()
+const props = defineProps<{ hostId: string; probeEnabled?: boolean }>()
 const settings = useSettingsStore()
 
 type TimeSpan = 'realtime' | '1h' | '24h' | '7d'
@@ -53,11 +53,15 @@ const cpuChartEl = ref<HTMLDivElement | null>(null)
 const memChartEl = ref<HTMLDivElement | null>(null)
 const netChartEl = ref<HTMLDivElement | null>(null)
 const diskChartEl = ref<HTMLDivElement | null>(null)
+const latencyChartEl = ref<HTMLDivElement | null>(null)
+const lossChartEl = ref<HTMLDivElement | null>(null)
 
-let cpuChart: echarts.ECharts | null = null
+let cpuChart: echarts.ECharts | null
 let memChart: echarts.ECharts | null = null
 let netChart: echarts.ECharts | null = null
 let diskChart: echarts.ECharts | null = null
+let latencyChart: echarts.ECharts | null = null
+let lossChart: echarts.ECharts | null = null
 
 let timer: ReturnType<typeof setInterval> | null = null
 let resizeObserver: ResizeObserver | null = null
@@ -142,6 +146,12 @@ function initCharts() {
   }
   if (diskChartEl.value && !diskChart) {
     diskChart = echarts.init(diskChartEl.value)
+  }
+  if (latencyChartEl.value && !latencyChart) {
+    latencyChart = echarts.init(latencyChartEl.value)
+  }
+  if (lossChartEl.value && !lossChart) {
+    lossChart = echarts.init(lossChartEl.value)
   }
 }
 
@@ -312,6 +322,85 @@ function updateChartsWithPoints(points: MetricPoint[]) {
     ]
     diskChart.setOption(opt)
   }
+
+  // 5 & 6. Network latency / packet loss (panel-configured probe target).
+  // net_latency_ms <= 0 means "no probe data" (older agent, probing off, or
+  // a round where every attempt failed); gaps are rendered as nulls.
+  const hasProbeData =
+    points.some((p) => (p.net_latency_ms ?? 0) > 0) ||
+    points.some((p) => (p.net_loss_pct ?? 0) > 0)
+  const noProbeHint = '暂无数据（等待探测或未配置测速目标）'
+  const lastLatency = [...points].reverse().find((p) => (p.net_latency_ms ?? 0) > 0)
+  const lastLoss = points[points.length - 1]
+
+  if (latencyChart) {
+    const opt: any = getBaseChartOption(
+      '网络延迟',
+      hasProbeData && lastLatency
+        ? `当前: ${(lastLatency.net_latency_ms as number).toFixed(1)} ms`
+        : noProbeHint,
+      (v) => `${v} ms`,
+    )
+    opt.xAxis.data = times
+    opt.tooltip.formatter = (params: any[]) => {
+      const idx = params[0]?.dataIndex ?? 0
+      const pt = points[idx]
+      const v = pt.net_latency_ms
+      return `${fmtTime(pt.ts, true)}<br/>延迟: ${v && v > 0 ? v.toFixed(1) + ' ms' : '无数据'}<br/>丢包率: ${(pt.net_loss_pct ?? 0).toFixed(1)}%`
+    }
+    opt.series = [
+      {
+        name: '网络延迟',
+        type: 'line',
+        smooth: true,
+        showSymbol: false,
+        connectNulls: false,
+        data: points.map((p) =>
+          p.net_latency_ms && p.net_latency_ms > 0 ? +p.net_latency_ms.toFixed(1) : null,
+        ),
+        itemStyle: { color: '#14b8a6' },
+        areaStyle: {
+          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+            { offset: 0, color: 'rgba(20, 184, 166, 0.40)' },
+            { offset: 1, color: 'rgba(20, 184, 166, 0.02)' },
+          ]),
+        },
+      },
+    ]
+    latencyChart.setOption(opt)
+  }
+
+  if (lossChart) {
+    const opt: any = getBaseChartOption(
+      '丢包率',
+      hasProbeData ? `当前: ${(lastLoss.net_loss_pct ?? 0).toFixed(1)}%` : noProbeHint,
+      (v) => `${v}%`,
+      100,
+    )
+    opt.xAxis.data = times
+    opt.tooltip.formatter = (params: any[]) => {
+      const idx = params[0]?.dataIndex ?? 0
+      const pt = points[idx]
+      return `${fmtTime(pt.ts, true)}<br/>丢包率: ${(pt.net_loss_pct ?? 0).toFixed(1)}%`
+    }
+    opt.series = [
+      {
+        name: '丢包率',
+        type: 'line',
+        smooth: true,
+        showSymbol: false,
+        data: points.map((p) => (hasProbeData ? +(p.net_loss_pct ?? 0).toFixed(1) : null)),
+        itemStyle: { color: '#ef4444' },
+        areaStyle: {
+          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+            { offset: 0, color: 'rgba(239, 68, 68, 0.40)' },
+            { offset: 1, color: 'rgba(239, 68, 68, 0.02)' },
+          ]),
+        },
+      },
+    ]
+    lossChart.setOption(opt)
+  }
 }
 
 async function fetchRealtimeMetrics() {
@@ -331,6 +420,8 @@ async function fetchRealtimeMetrics() {
       net_tx: data.net_tx || 0,
       disk_read: data.disk_read || 0,
       disk_write: data.disk_write || 0,
+      net_latency_ms: data.net_latency_ms ?? 0,
+      net_loss_pct: data.net_loss_pct ?? 0,
     }
 
     realtimePoints.value.push(pt)
@@ -404,6 +495,8 @@ function handleResize() {
   memChart?.resize()
   netChart?.resize()
   diskChart?.resize()
+  latencyChart?.resize()
+  lossChart?.resize()
 }
 
 onMounted(() => {
@@ -444,6 +537,8 @@ onBeforeUnmount(() => {
   memChart?.dispose()
   netChart?.dispose()
   diskChart?.dispose()
+  latencyChart?.dispose()
+  lossChart?.dispose()
 })
 
 watch(() => props.hostId, () => {
@@ -571,6 +666,20 @@ watch(() => settings.themeMode, () => {
         <NGridItem>
           <div class="chart-card">
             <div ref="diskChartEl" class="echarts-box"></div>
+          </div>
+        </NGridItem>
+
+        <!-- 5. 网络延迟 监控（需在主机配置中开启延迟/丢包监控） -->
+        <NGridItem v-if="probeEnabled">
+          <div class="chart-card">
+            <div ref="latencyChartEl" class="echarts-box"></div>
+          </div>
+        </NGridItem>
+
+        <!-- 6. 丢包率 监控（需在主机配置中开启延迟/丢包监控） -->
+        <NGridItem v-if="probeEnabled">
+          <div class="chart-card">
+            <div ref="lossChartEl" class="echarts-box"></div>
           </div>
         </NGridItem>
       </NGrid>

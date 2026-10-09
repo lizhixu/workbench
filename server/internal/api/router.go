@@ -89,6 +89,8 @@ type HostDTO struct {
 	TrafficCalcType string  `json:"traffic_calc_type,omitempty"`
 	TrafficResetDay int     `json:"traffic_reset_day,omitempty"`
 	RenewalURL      string  `json:"renewal_url,omitempty"`
+	ProbeEnabled    bool    `json:"probe_enabled"`
+	ProbeURL        string  `json:"probe_url,omitempty"`
 	Notes           string  `json:"notes,omitempty"`
 	// Extended live metrics (from the agent's latest sample).
 	CpuModel  string  `json:"cpu_model,omitempty"`
@@ -780,8 +782,12 @@ func (h *handlers) setHostBilling(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if h.reg.GetAgent(c.Param("id")) == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "agent not found"})
+		return
+	}
 	if err := h.reg.SetAgentBilling(c.Param("id"), body); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	h.recordAudit(c, "host_billing", "host", c.Param("id"), "更新主机财务与流量配置", audit.RiskLow, audit.ResultSuccess)
@@ -1238,6 +1244,8 @@ func metricsToJSON(m *agentpb.MetricsSample) gin.H {
 		"cpu_model":       m.GetCpuModel(),
 		"month_rx":        m.GetMonthRx(),
 		"month_tx":        m.GetMonthTx(),
+		"net_latency_ms":  m.GetNetLatencyMs(),
+		"net_loss_pct":    m.GetNetLossPct(),
 	}
 }
 
@@ -2325,6 +2333,8 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 		TrafficCalcType:    a.TrafficCalcType,
 		TrafficResetDay:    a.TrafficResetDay,
 		RenewalURL:         a.RenewalURL,
+		ProbeEnabled:       a.ProbeEnabled,
+		ProbeURL:           a.ProbeURL,
 		Notes:              a.Notes,
 	}
 	// Surface the real OS uptime and latest metrics

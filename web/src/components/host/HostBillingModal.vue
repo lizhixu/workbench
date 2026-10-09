@@ -57,6 +57,8 @@ const form = ref<HostBillingConfig>({
   traffic_calc_type: 'both',
   traffic_reset_day: 1,
   renewal_url: '',
+  probe_enabled: false,
+  probe_url: '',
   notes: '',
 })
 
@@ -76,6 +78,8 @@ watch(
         traffic_calc_type: props.host.traffic_calc_type || 'both',
         traffic_reset_day: props.host.traffic_reset_day || 1,
         renewal_url: props.host.renewal_url || '',
+        probe_enabled: !!props.host.probe_enabled,
+        probe_url: props.host.probe_url || '',
         notes: props.host.notes || '',
       }
       if (props.host.expires_at) {
@@ -229,7 +233,25 @@ async function handleSave() {
         />
       </NFormItem>
 
-      <!-- 第五行：备注说明 -->
+      <!-- 第五行：延迟/丢包监控开关与测速目标 -->
+      <NFormItem label="延迟 / 丢包监控">
+        <div style="display: flex; align-items: center; height: 34px; gap: 8px">
+          <NSwitch v-model:value="form.probe_enabled" />
+          <span style="font-size: 13px">{{ form.probe_enabled ? '已开启' : '已关闭' }}</span>
+        </div>
+      </NFormItem>
+      <NFormItem label="测速目标">
+        <NInput
+          v-model:value="form.probe_url"
+          :disabled="!form.probe_enabled"
+          placeholder="留空使用默认 https://www.zstaticcdn.com/"
+        />
+      </NFormItem>
+      <p class="muted tip-hint" style="margin: -2px 0 8px">
+        开启后 Agent 每 30 秒向测速目标发起轻量 HTTP 探测，资源监控据此展示网络延迟与丢包率；关闭后不探测、不展示。修改后在该主机 Agent 下次重连时生效。
+      </p>
+
+      <!-- 第六行：备注说明 -->
       <NFormItem label="备注信息">
         <NInput
           v-model:value="form.notes"

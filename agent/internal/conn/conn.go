@@ -230,6 +230,7 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 	// setting (a 0 from an old server is ignored).
 	if d.metrics != nil {
 		d.metrics.SetResetDay(int(regResp.GetTrafficResetDay()))
+		d.metrics.SetProbeURL(regResp.GetProbeUrl())
 	}
 
 	if regResp.GetAuthToken() != "" {

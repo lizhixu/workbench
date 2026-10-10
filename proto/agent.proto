@@ -58,6 +58,7 @@ message ServerMessage {
     TunnelData tunnel_data = 18; // reverse TCP tunnel payload (server -> agent)
     TunnelClose tunnel_close = 19;
     UninstallRequest uninstall = 15; // ask agent to uninstall itself
+    ConfigUpdate config_update = 20; // push per-host runtime config to a connected agent
   }
 }
 
@@ -111,6 +112,16 @@ message RegisterResponse {
   // Field 8 was the removed single-target probe_url; never reuse it.
   reserved 8;
   reserved "probe_url";
+}
+
+// ConfigUpdate carries per-host runtime config changes to a CONNECTED agent,
+// mirroring what RegisterResponse would deliver on the next (re)connect, so
+// panel edits (billing modal: probe targets / switch, traffic reset day)
+// take effect immediately instead of waiting for a reconnect. An empty
+// probe_targets map disables probing, same as in RegisterResponse.
+message ConfigUpdate {
+  map<string, string> probe_targets = 1;
+  int32 traffic_reset_day = 2;
 }
 
 message Heartbeat {

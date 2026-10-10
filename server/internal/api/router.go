@@ -790,6 +790,12 @@ func (h *handlers) setHostBilling(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// Deliver the new runtime config (probe targets / switch, traffic reset
+	// day) to the agent right away when it is online; offline agents receive
+	// it from RegisterResponse on their next (re)connect.
+	if !h.reg.PushRuntimeConfig(c.Param("id")) {
+		h.log.Debug("runtime config push skipped (agent offline)", "host", c.Param("id"))
+	}
 	h.recordAudit(c, "host_billing", "host", c.Param("id"), "更新主机财务与流量配置", audit.RiskLow, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

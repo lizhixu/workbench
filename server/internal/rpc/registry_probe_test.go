@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // zstaticProvinceCode resolves the province segment of host location
@@ -206,5 +207,77 @@ func TestSetAgentBillingProbeTargets(t *testing.T) {
 	if r.agents["h1"].ProbeEnabled || r.agents["h1"].ProbeTargets != nil {
 		t.Fatalf("expected probing disabled with no targets, got enabled=%v targets=%v",
 			r.agents["h1"].ProbeEnabled, r.agents["h1"].ProbeTargets)
+	}
+}
+
+// PushRuntimeConfig delivers a billing-modal edit to a connected agent
+// without waiting for a reconnect; offline agents are skipped silently and
+// receive the same config from RegisterResponse on their next (re)connect.
+func TestPushRuntimeConfig(t *testing.T) {
+	r := NewRegistry("", slog.Default())
+	r.agents["h1"] = &Agent{ID: "h1", Hostname: "a", Location: "浙江省-杭州市", TrafficResetDay: 15}
+	r.hubs["h1"] = newHub("h1", 30, r)
+	r.hubs["h1"].MockConnectForTest()
+
+	// Probing off: the agent must receive an empty target map.
+	if !r.PushRuntimeConfig("h1") {
+		t.Fatal("push to connected hub should report success")
+	}
+	msg, ok := r.hubs["h1"].RecvForTest(time.Second)
+	if !ok {
+		t.Fatal("expected a ConfigUpdate on the hub channel")
+	}
+	cfg := msg.GetConfigUpdate()
+	if cfg == nil {
+		t.Fatalf("expected ConfigUpdate payload, got %T", msg.GetPayload())
+	}
+	if len(cfg.GetProbeTargets()) != 0 {
+		t.Fatalf("probe disabled: want empty targets, got %v", cfg.GetProbeTargets())
+	}
+	if cfg.GetTrafficResetDay() != 15 {
+		t.Fatalf("traffic_reset_day = %d, want 15", cfg.GetTrafficResetDay())
+	}
+
+	// Enable probing with no stored targets: the resolved Zstatic defaults
+	// must be pushed.
+	if err := r.SetAgentBilling("h1", HostBillingConfig{ProbeEnabled: true, TrafficResetDay: 21}); err != nil {
+		t.Fatalf("enable probing: %v", err)
+	}
+	if !r.PushRuntimeConfig("h1") {
+		t.Fatal("push to connected hub should report success")
+	}
+	msg, ok = r.hubs["h1"].RecvForTest(time.Second)
+	if !ok {
+		t.Fatal("expected a second ConfigUpdate on the hub channel")
+	}
+	cfg = msg.GetConfigUpdate()
+	want := DefaultProbeTargets("浙江省-杭州市")
+	if !reflect.DeepEqual(cfg.GetProbeTargets(), want) {
+		t.Fatalf("pushed targets = %v, want %v", cfg.GetProbeTargets(), want)
+	}
+	if cfg.GetTrafficResetDay() != 21 {
+		t.Fatalf("traffic_reset_day = %d, want 21", cfg.GetTrafficResetDay())
+	}
+
+	// Custom targets override the defaults.
+	if err := r.SetAgentBilling("h1", HostBillingConfig{
+		ProbeEnabled:    true,
+		ProbeTargets:    map[string]string{"telecom": "192.0.2.1:8080"},
+		TrafficResetDay: 21,
+	}); err != nil {
+		t.Fatalf("store custom target: %v", err)
+	}
+	if !r.PushRuntimeConfig("h1") {
+		t.Fatal("push to connected hub should report success")
+	}
+	msg, _ = r.hubs["h1"].RecvForTest(time.Second)
+	if got := msg.GetConfigUpdate().GetProbeTargets(); !reflect.DeepEqual(got, map[string]string{carrierTelecom: "192.0.2.1:8080"}) {
+		t.Fatalf("pushed custom targets = %v", got)
+	}
+
+	// Offline/unknown agents are skipped without error (config arrives on
+	// reconnect via RegisterResponse).
+	if r.PushRuntimeConfig("ghost") {
+		t.Fatal("unknown agent should report push failure")
 	}
 }

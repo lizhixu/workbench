@@ -54,7 +54,7 @@
 ### 3.2 资源监控
 
 - **实时监控**：CPU、内存、网络吞吐、磁盘读写吞吐的实时占用情况。
-- **网络质量监控（三网延迟 / 丢包率）**：按**电信 / 联通 / 移动**三个运营商分别探测（键固定为 `telecom` / `unicom` / `mobile`，map 化设计为后续扩展第四线路留出空间）。Agent 每 30 秒对每个运营商的探测目标各发起一轮 **TCP 连接探测**（`net.DialTimeout`，4 次尝试、单次 3 秒超时、尝试间隔 200ms），`MetricsSample.probe_results`（field 26，`map<string, ProbeResult>`）上报各运营商最近一轮结果：`ProbeResult.latency_ms` 为成功尝试 RTT 的**中位数**（毫秒；0 = 该轮无成功尝试），`ProbeResult.loss_pct` 为失败尝试占比（0~100，连不上即失败）。探测在独立协程运行、不阻塞指标采样，采集时只读最近一轮结果；某运营商至少完成过一轮探测才上报对应条目。探测目标按主机在「财务与规格」以**三个可编辑输入框**配置（电信 / 联通 / 移动，值形如 `zj-ct-v4.ip.zstaticcdn.com:80`，留空 = 不探测该运营商），经 `RegisterResponse.probe_targets`（field 9，`map<string,string>`，键 = 运营商、值 = `host[:port]`，端口缺省 80）在每次（重）连时下发，面板修改后 Agent 下次重连生效；每台主机带独立开关 `probe_enabled`（默认关闭）：开启才下发目标并在资源监控展示两张图，关闭时下发空 map、Agent 停止探测、前端不展示。三个目标全部留空时使用内置默认 **Zstatic CDN 三网节点** `{省份}-{ct|cu|cm}-v4.ip.zstaticcdn.com:80`（ct=电信、cu=联通、cm=移动），省份按主机注册时的 `location`（如「浙江省-杭州市」→ `zj`，兼容省/市/自治区后缀与无分隔拼接）自动解析，无法识别回落北京 `bj`；服务端校验目标必须是 `host[:port]` 形式的 TCP 端点（端口 1~65535、主机名 ≤253 字符、拒绝 URL scheme 与空格、键限三个运营商）。控制端存储降采样时**按运营商分别**累加：延迟仅对有数据的样本（latency>0）求平均，丢包率对有该运营商条目的样本求平均。前端资源监控提供「网络延迟」「丢包率」两张曲线图，每张三线（电信 #3b82f6 / 联通 #f59e0b / 移动 #10b981），tooltip 一次展示三家，无探测数据时图内明示暂无数据。**兼容说明**：本改造移除了早期的单目标协议（`RegisterResponse.probe_url` field 8 与 `MetricsSample.net_latency_ms`/`net_loss_pct` field 24/25）；更早版本的 Agent 收不到 `probe_targets`（字段 8 已删、字段 9 被旧代码忽略）即停止探测，其旧字段被新服务端按未知字段跳过，新旧组合均不会报错，升级 Agent 后恢复三网探测。
+- **网络质量监控（三网延迟 / 丢包率）**：按**电信 / 联通 / 移动**三个运营商分别探测（键固定为 `telecom` / `unicom` / `mobile`，map 化设计为后续扩展第四线路留出空间）。Agent 每 30 秒对每个运营商的探测目标各发起一轮 **TCP 连接探测**（`net.DialTimeout`，4 次尝试、单次 3 秒超时、尝试间隔 200ms），`MetricsSample.probe_results`（field 26，`map<string, ProbeResult>`）上报各运营商最近一轮结果：`ProbeResult.latency_ms` 为成功尝试 RTT 的**中位数**（毫秒；0 = 该轮无成功尝试），`ProbeResult.loss_pct` 为失败尝试占比（0~100，连不上即失败）。探测在独立协程运行、不阻塞指标采样，采集时只读最近一轮结果；某运营商至少完成过一轮探测才上报对应条目。探测目标按主机在「财务与规格」以**三个可编辑输入框**配置（电信 / 联通 / 移动，值形如 `zj-ct-v4.ip.zstaticcdn.com:80`，留空 = 不探测该运营商），经 `RegisterResponse.probe_targets`（field 9，`map<string,string>`，键 = 运营商、值 = `host[:port]`，端口缺省 80）在每次（重）连时下发；面板保存「财务与规格」后经 `ServerMessage.config_update`（field 20，`ConfigUpdate.probe_targets`）对**在线 Agent 即时下发**（`Registry.PushRuntimeConfig`，保存即生效），离线 Agent 收不到、由下次重连时的 RegisterResponse 兜底；每台主机带独立开关 `probe_enabled`（默认关闭）：开启才下发目标并在资源监控展示两张图，关闭时下发空 map、Agent 停止探测、前端不展示。三个目标全部留空时使用内置默认 **Zstatic CDN 三网节点** `{省份}-{ct|cu|cm}-v4.ip.zstaticcdn.com:80`（ct=电信、cu=联通、cm=移动），省份按主机注册时的 `location`（如「浙江省-杭州市」→ `zj`，兼容省/市/自治区后缀与无分隔拼接）自动解析，无法识别回落北京 `bj`；服务端校验目标必须是 `host[:port]` 形式的 TCP 端点（端口 1~65535、主机名 ≤253 字符、拒绝 URL scheme 与空格、键限三个运营商）。控制端存储降采样时**按运营商分别**累加：延迟仅对有数据的样本（latency>0）求平均，丢包率对有该运营商条目的样本求平均。前端资源监控提供「网络延迟」「丢包率」两张曲线图，每张三线（电信 #3b82f6 / 联通 #f59e0b / 移动 #10b981），tooltip 一次展示三家，无探测数据时图内明示暂无数据。**兼容说明**：本改造移除了早期的单目标协议（`RegisterResponse.probe_url` field 8 与 `MetricsSample.net_latency_ms`/`net_loss_pct` field 24/25）；更早版本的 Agent 收不到 `probe_targets`（字段 8 已删、字段 9 被旧代码忽略）即停止探测，其旧字段被新服务端按未知字段跳过，新旧组合均不会报错，升级 Agent 后恢复三网探测。`ConfigUpdate`（2026-10-10 起）同理：旧 Agent 收到未知 oneof 字段静默忽略、行为退化为下次重连生效，新 Agent 连旧服务端则永远收不到该消息、同样靠重连兜底，双向组合均无错误。
 - **存储监控**：展示各挂载点的容量与占用情况。
 - **历史监控**：默认保存 7 天历史数据，支持按起止日期、时长查看历史占用曲线。
 - **自定义阈值告警**：可按参数设置告警条件（见 3.11 监控告警）。
@@ -153,7 +153,7 @@
 - **内置监控项**：默认提供「主机上线」「主机离线」告警。
 - **月流量超额预警（内置，非规则）**：基于每台主机在「财务与规格」中配置的「流量限制 (GB)」与「月流量计算类型」（双向/仅上行/仅下行）自动判定：达到 80% 触发警告、达到 100% 触发严重告警（触发 ID 为 `builtin-traffic-80` / `builtin-traffic-100`），回落后自动标记解决。**不存在也不允许再创建 `traffic_high` 类型的告警规则**——流量配额是主机属性而非全局规则，告警中心的规则类型选项中已移除该项。未配置流量限制的主机不产生流量告警。
   - 实现备注（2026-10-08，流量计量重写）：Agent 按**网卡逐个**跟踪内核累计计数器的增量并落盘（`agent/internal/metrics/traffic.go`），**回环网卡（lo / Windows Loopback）不计入**；网卡消失（docker 网络删建、VPN 启停等）只丢弃其基线、**不再把剩余网卡的累计总量误作增量**（旧逻辑的幽灵流量 bug）；主机重启经 boot time 变化判定，当前计数器值即为重启后流量。docker/tailscale 等虚拟网卡仍会与其底层网卡重复计数同一报文——docker 重度主机可用 Agent 启动参数 `-traffic-ifaces=eth0` 把统计限定到外网网卡。
-  - **流量重置日**由面板「财务与规格」统一下发：`RegisterResponse.traffic_reset_day`（proto field 7）在每次 Agent（重）连时推送，Agent 经 `SetResetDay` 热应用并持久化，**面板修改后在 Agent 下次重连时生效**；取值范围统一为 1~28（server 侧 `SetAgentBilling` 同步钳制，前端输入框 `max=28`）。
+  - **流量重置日**由面板「财务与规格」统一下发：`RegisterResponse.traffic_reset_day`（proto field 7）在每次 Agent（重）连时推送，Agent 经 `SetResetDay` 热应用并持久化，**面板保存后同时经 `ServerMessage.config_update`（field 20，`ConfigUpdate.traffic_reset_day`）对在线 Agent 即时下发**（`Registry.PushRuntimeConfig`，离线 Agent 下次重连兜底，见 §3.2 兼容说明）；取值范围统一为 1~28（server 侧 `SetAgentBilling` 同步钳制，前端输入框 `max=28`）。
   - **单位为十进制 GB**：配额换算与前后端展示统一按 `1e9`，与面板「流量限制 (GB)」标签及云厂商账单口径一致（此前按 GiB `1<<30`，差 7.4%）。
 - **到期续费提醒（内置，非规则）**：主机在「财务与规格」中配置了「到期时间」后，距到期不足 30 天时自动发起一次续费提醒（触发 ID `builtin-expiry-remind`，警告级别，走告警中心与 webhook 通知）；到期时间在 30 天以外的主机不提醒，续费（到期时间推后）后提醒自动解除，逾期未续保持提醒且不重复触发。
 - **证书到期提醒（内置，非规则）**：不会自动续期的证书（手动 DNS-01 两阶段签发的、手动上传的）在到期阈值内自动发起一次到期提醒（触发 ID `builtin-cert-expiry`，警告级别，走告警中心与 webhook 通知，告警可跳转证书中心）；提前天数可在「系统设置 → 证书时间设置」中配置（`certs.expiry_reminder_days`，默认 30 天，1~90）；阈值与自动续期缩放一致（`min(配置天数, 有效期/3)`）；证书被续期/替换（到期时间推后）或删除后提醒自动解除，逾期未处理保持提醒且不重复触发。手动 DNS-01 签发的证书不自动续期（续期走自动验证通道，与管理员选择手动的原因相悖）。
@@ -519,6 +519,7 @@ message ServerMessage {           // 控制端 → Agent
     SysInfoQuery      sysinfo_q = 9;
     MetricsQuery      metrics_q = 10;  // 拉取当前/历史
     DockerOp          docker_op = 11;  // (P2)
+    ConfigUpdate      config_update=20; // 面板改配置后对在线 Agent 即时下发（重连兜底见 RegisterResponse）
   }
 }
 
@@ -540,6 +541,16 @@ message RegisterResponse {
   // 三网监控探测目标：键 = 运营商（telecom/unicom/mobile），值 = host[:port]
   // TCP 端点（端口缺省 80）；仅下发有效目标，空 map = 探测关闭。
   map<string, string> probe_targets = 9;
+}
+
+// ConfigUpdate 携带面板编辑后的主机级运行时配置，对在线 Agent 经
+// ServerMessage.config_update（field 20）即时下发，语义与 RegisterResponse
+// 同名字段一致；离线 Agent 收不到，下次（重）连时由 RegisterResponse 兜底。
+// 旧 Agent 收到未知 oneof 字段落 default 分支静默忽略，下次重连生效；新 Agent
+// 连旧服务端则永远收不到该消息，同样退化为重连生效——双向组合均无错误。
+message ConfigUpdate {
+  map<string, string> probe_targets = 1; // 语义同 RegisterResponse.probe_targets（空 map = 关闭探测）
+  int32  traffic_reset_day = 2;          // 语义同 RegisterResponse.traffic_reset_day
 }
 
 message TerminalOpen {

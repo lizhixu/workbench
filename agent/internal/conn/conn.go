@@ -368,6 +368,17 @@ func (d *Dialer) handleServerMessage(msg *agentpb.ServerMessage) error {
 		d.metrics.Handle(p.MetricsQ)
 		return nil
 
+	// Runtime config pushed live by the server when the admin saves the
+	// billing modal (probe targets / switch, traffic reset day) — same
+	// semantics as what RegisterResponse would carry on the next reconnect.
+	case *agentpb.ServerMessage_ConfigUpdate:
+		if d.metrics == nil {
+			return nil
+		}
+		d.metrics.SetProbeTargets(p.ConfigUpdate.GetProbeTargets())
+		d.metrics.SetResetDay(int(p.ConfigUpdate.GetTrafficResetDay()))
+		return nil
+
 	// SysInfo.
 	case *agentpb.ServerMessage_SysinfoQ:
 		if d.sysinfo == nil {

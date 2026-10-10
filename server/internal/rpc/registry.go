@@ -839,9 +839,9 @@ func normalizeProbeTargets(raw map[string]string) (map[string]string, error) {
 }
 
 // SetAgentBilling updates optional billing, traffic limits and notes for a host.
-// NOTE: a changed TrafficResetDay reaches the agent on its next (re)connect
-// via RegisterResponse; already-connected agents keep their current cycle
-// until then.
+// NOTE: a changed TrafficResetDay/probe config reaches a connected agent
+// immediately when the caller follows up with PushRuntimeConfig; offline
+// agents receive it on their next (re)connect via RegisterResponse.
 func (r *Registry) SetAgentBilling(id string, b HostBillingConfig) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -881,6 +881,29 @@ func (r *Registry) SetAgentBilling(id string, b HostBillingConfig) error {
 	a.Notes = b.Notes
 	_ = r.persistAgentsLocked()
 	return nil
+}
+
+// PushRuntimeConfig sends the agent's current per-host runtime config
+// (probe targets + traffic reset day, same semantics as the RegisterResponse
+// fields) to its live hub, so a billing-modal edit applies without waiting
+// for a reconnect. Best-effort: returns false for offline/unknown agents —
+// they pick the config up from RegisterResponse on their next (re)connect.
+func (r *Registry) PushRuntimeConfig(id string) bool {
+	r.mu.RLock()
+	a, okA := r.agents[id]
+	hub, okH := r.hubs[id]
+	if !okA || !okH {
+		r.mu.RUnlock()
+		return false
+	}
+	cfg := &agentpb.ConfigUpdate{
+		ProbeTargets:    EffectiveProbeTargets(a),
+		TrafficResetDay: int32(normTrafficResetDay(a.TrafficResetDay)),
+	}
+	r.mu.RUnlock()
+	return hub.Send(&agentpb.ServerMessage{
+		Payload: &agentpb.ServerMessage_ConfigUpdate{ConfigUpdate: cfg},
+	})
 }
 
 // RenameGroup rewrites every agent whose group is oldName to newName and

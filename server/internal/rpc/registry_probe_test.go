@@ -83,6 +83,25 @@ func TestNormalizeProbeTargets(t *testing.T) {
 		t.Fatalf("normalized = %v, want %v", got, want)
 	}
 
+	// An explicit but empty port takes the default; IPv6 literals are stored
+	// in bracketed host:port form so the agent can dial them as-is.
+	v6, err := normalizeProbeTargets(map[string]string{
+		"telecom": "example.com:", // empty port -> 80
+		"unicom":  "2001:db8::1",  // bare literal -> [..]:80
+		"mobile":  "[2001:db8::2]:8080",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wantV6 := map[string]string{
+		carrierTelecom: "example.com:80",
+		carrierUnicom:  "[2001:db8::1]:80",
+		carrierMobile:  "[2001:db8::2]:8080",
+	}
+	if !reflect.DeepEqual(v6, wantV6) {
+		t.Fatalf("normalized = %v, want %v", v6, wantV6)
+	}
+
 	// Empty map / all-empty values mean "no carrier probed".
 	if got, err := normalizeProbeTargets(nil); err != nil || got != nil {
 		t.Fatalf("nil: got (%v, %v), want (nil, nil)", got, err)

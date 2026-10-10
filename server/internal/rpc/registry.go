@@ -807,6 +807,10 @@ func normalizeProbeTargets(raw map[string]string) (map[string]string, error) {
 		if h, p, err := net.SplitHostPort(s); err == nil {
 			host, port = h, p
 		}
+		if port == "" {
+			// "host:" — an explicit but empty port takes the default too.
+			port = "80"
+		}
 		if host == "" {
 			return nil, fmt.Errorf("探测目标缺少主机名：%q", s)
 		}
@@ -826,7 +830,7 @@ func normalizeProbeTargets(raw map[string]string) (map[string]string, error) {
 				return nil, fmt.Errorf("探测目标端口必须在 1~65535：%q", s)
 			}
 		}
-		out[carrier] = host + ":" + port
+		out[carrier] = net.JoinHostPort(host, port)
 	}
 	if len(out) == 0 {
 		return nil, nil

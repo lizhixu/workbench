@@ -51,37 +51,37 @@ func newProber() *prober {
 	return &prober{}
 }
 
-// SetTargets reconfigures the probe targets (carrier -> "host[:port]"). An
-// empty map stops probing (old server or monitoring disabled); a changed
-// target restarts its round loop while untouched targets keep running. Safe
-// to call on every (re)connect.
+// SetTargets reconfigures the probe targets (carrier -> "host[:port]"). The
+// server pushes the host's full effective target set on every (re)connect, so
+// any carrier missing from the map (or mapped to an empty value) must stop
+// probing: the panel treats an empty target as "do not probe this carrier".
+// An empty map stops probing entirely (old server or monitoring disabled); a
+// changed target restarts its round loop while untouched targets keep
+// running. Safe to call on every (re)connect.
 func (p *prober) SetTargets(targets map[string]string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Stop everything when probing is off.
-	if len(targets) == 0 {
-		for carrier, tp := range p.targets {
+	// Resolve the set of carriers that should be probing after this update.
+	keep := make(map[string]string, len(targets))
+	for carrier, raw := range targets {
+		if addr := normalizeProbeAddr(raw); addr != "" {
+			keep[carrier] = addr
+		}
+	}
+
+	// Stop loops for carriers that are gone or disabled.
+	for carrier, tp := range p.targets {
+		if _, ok := keep[carrier]; !ok {
 			if tp.cancel != nil {
 				tp.cancel()
 			}
 			delete(p.targets, carrier)
 		}
-		return
 	}
 
-	for carrier, raw := range targets {
-		addr := normalizeProbeAddr(raw)
-		if addr == "" {
-			// Carrier explicitly disabled: stop any running loop for it.
-			if tp, ok := p.targets[carrier]; ok {
-				if tp.cancel != nil {
-					tp.cancel()
-				}
-				delete(p.targets, carrier)
-			}
-			continue
-		}
+	// Start or restart loops for new/changed targets.
+	for carrier, addr := range keep {
 		if tp, ok := p.targets[carrier]; ok && tp.addr == addr {
 			continue // unchanged target keeps its running loop
 		}
@@ -104,10 +104,15 @@ func normalizeProbeAddr(raw string) string {
 	if host == "" {
 		return ""
 	}
-	if _, _, err := net.SplitHostPort(host); err != nil {
-		return net.JoinHostPort(host, defaultProbePort)
+	if h, port, err := net.SplitHostPort(host); err == nil {
+		if port == "" {
+			// "host:" — an explicit but empty port takes the default too,
+			// otherwise every dial would fail on the missing port.
+			return net.JoinHostPort(h, defaultProbePort)
+		}
+		return host
 	}
-	return host
+	return net.JoinHostPort(host, defaultProbePort)
 }
 
 func (p *prober) loop(ctx context.Context, carrier, addr string) {

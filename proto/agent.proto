@@ -108,6 +108,9 @@ message RegisterResponse {
   // with a non-empty target are included. Empty means probing disabled
   // (old server or the host has the switch off).
   map<string, string> probe_targets = 9;
+  // Field 8 was the removed single-target probe_url; never reuse it.
+  reserved 8;
+  reserved "probe_url";
 }
 
 message Heartbeat {
@@ -230,6 +233,10 @@ message MetricsSample {
   // A carrier entry appears only once at least one probe round has
   // completed for its target.
   map<string, ProbeResult> probe_results = 26;
+  // Fields 24/25 were the removed single-target net_latency_ms /
+  // net_loss_pct; never reuse them.
+  reserved 24, 25;
+  reserved "net_latency_ms", "net_loss_pct";
 }
 
 // ProbeResult is one carrier's latest probe round outcome.

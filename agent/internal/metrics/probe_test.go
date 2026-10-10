@@ -125,6 +125,9 @@ func TestNormalizeProbeAddr(t *testing.T) {
 		{"zj-ct-v4.ip.zstaticcdn.com:80", "zj-ct-v4.ip.zstaticcdn.com:80"},
 		{"1.2.3.4:443", "1.2.3.4:443"},
 		{"  example.com  ", "example.com:80"},
+		{"example.com:", "example.com:80"}, // empty port takes the default
+		{"2001:db8::1", "[2001:db8::1]:80"},
+		{"[2001:db8::1]:8080", "[2001:db8::1]:8080"},
 		{"", ""},
 		{"   ", ""},
 	}
@@ -171,6 +174,17 @@ func TestProberLifecycle(t *testing.T) {
 	}
 	if r, ok := got["telecom"]; !ok || r.lossPct != 0 {
 		t.Fatalf("untouched carrier should keep probing: %+v", got)
+	}
+
+	// Removing a carrier from the pushed set (the server omits cleared
+	// targets instead of sending an empty value) must stop its loop too.
+	p.SetTargets(map[string]string{"unicom": addrB})
+	if _, ok := p.targets["telecom"]; ok {
+		t.Fatal("carrier absent from the new set should be stopped")
+	}
+	waitProbeResults(t, p, 1)
+	if got := p.latest(); got["unicom"].lossPct != 0 {
+		t.Fatalf("newly added carrier should be probing: %+v", got)
 	}
 
 	// Clearing everything stops probing and resets results.

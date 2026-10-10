@@ -2,6 +2,7 @@ package ai
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -28,6 +29,8 @@ func (h *Handlers) Register(rg *gin.RouterGroup) {
 	rg.POST("/ai/scan-report", h.analyzeScanReport)
 	rg.POST("/ai/scan-report/followup", h.scanReportFollowup)
 	rg.POST("/ai/chat", h.chat)
+	rg.POST("/ai/app-draft", h.appDraft)
+	rg.POST("/ai/app-chat", h.appChat)
 	rg.POST("/ai/ops-report", h.generateOpsReport)
 	rg.GET("/ai/ops-reports", h.listOpsReports)
 	rg.GET("/ai/ops-reports/:id", h.getOpsReport)
@@ -212,6 +215,49 @@ func (h *Handlers) chat(c *gin.Context) {
 		return
 	}
 	resp, err := h.assistant.Chat(c.Request.Context(), body.Question, body.History)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": resp})
+}
+
+func (h *Handlers) appDraft(c *gin.Context) {
+	var body struct {
+		Requirement string          `json:"requirement"`
+		Form        AppFormSnapshot `json:"form"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if strings.TrimSpace(body.Requirement) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "requirement required"})
+		return
+	}
+	resp, err := h.assistant.AppDraft(c.Request.Context(), body.Requirement, body.Form)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": resp})
+}
+
+func (h *Handlers) appChat(c *gin.Context) {
+	var body struct {
+		Question string          `json:"question"`
+		History  []ChatMessage   `json:"history"`
+		Form     AppFormSnapshot `json:"form"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if strings.TrimSpace(body.Question) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "question required"})
+		return
+	}
+	resp, err := h.assistant.AppChat(c.Request.Context(), body.Question, body.History, body.Form)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return

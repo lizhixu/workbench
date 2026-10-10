@@ -347,6 +347,10 @@ func main() {
 	if policyStore != nil {
 		aiAssistant.SetPolicyChecker(policyStore)
 	}
+	// Inject the app template catalog + mesh lookup so the create-app AI
+	// assistant can ground its form drafts in real hosts/templates.
+	aiAssistant.SetAppCatalog(appCatalogAdapter{})
+	aiAssistant.SetMeshRef(networkMeshAdapter{store: networkStore})
 	currentAICfg := aiAssistant.Config()
 	if currentAICfg.Enabled && currentAICfg.BaseURL != "" {
 		log.Info("AI diagnostics enabled", "url", currentAICfg.BaseURL, "model", currentAICfg.Model)
@@ -535,6 +539,54 @@ func main() {
 	}
 
 	log.Info("bye")
+}
+
+// appCatalogAdapter exposes the declarative apps.Catalog to the AI
+// assistant (create-app form drafts) without an import cycle.
+type appCatalogAdapter struct{}
+
+func (appCatalogAdapter) AppTemplates() []ai.AppTemplateInfo {
+	out := make([]ai.AppTemplateInfo, 0, len(apps.Catalog))
+	for _, t := range apps.Catalog {
+		info := ai.AppTemplateInfo{
+			ID:            t.ID,
+			Name:          t.Name,
+			Category:      t.Category,
+			Description:   t.Description,
+			Image:         t.Image,
+			DefaultPort:   t.DefaultPort,
+			ContainerPort: t.ContainerPort,
+			DefaultVolume: t.DefaultVolume,
+		}
+		for _, f := range t.EnvFields {
+			info.EnvFields = append(info.EnvFields, ai.AppTemplateField{
+				Key:         f.Key,
+				Label:       f.Label,
+				Description: f.Description,
+				Default:     f.Default,
+				Required:    f.Required,
+				IsSecret:    f.IsSecret,
+			})
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
+// networkMeshAdapter resolves a host's cached overlay (Tailscale) IP for
+// the AI assistant's bind_scope grounding.
+type networkMeshAdapter struct {
+	store *network.Store
+}
+
+func (a networkMeshAdapter) MeshIP(hostID string) string {
+	if a.store == nil {
+		return ""
+	}
+	if st, ok := a.store.GetNodeStatus(hostID); ok {
+		return st.IP
+	}
+	return ""
 }
 
 // alertStoreAdapter wraps *alert.Store to satisfy ai.alertStoreRef without

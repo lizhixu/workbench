@@ -45,6 +45,8 @@ type Assistant struct {
 	alertStore   alertStoreRef
 	reports      *reportStore
 	policy       policyChecker
+	appCatalog   appCatalogRef
+	mesh         meshRef
 }
 
 // policyChecker is a minimal interface over the command policy store, used to

@@ -111,6 +111,10 @@
   - 证书自动化：绑定域名时若证书中心无覆盖证书，自动用默认 ACME 账户签发后写入 Nginx 并热加载。
   - 网关主机 ID 持久化在 `Application.proxy_gateway_host_id`，解绑时同时清理应用主机与网关主机两侧配置。
 - **创建时即可绑定域名**：创建页填写域名与网关节点后，提交依次执行 创建应用 → 自动签发证书 → 下发反代；绑定失败不回滚应用创建，可稍后在详情页重试。
+- **创建页 AI 辅助**（2026-10-10）：创建应用页（`AppCreate.vue`）右侧挂载 AI 部署助手（`web/src/components/apps/AppAiAssistant.vue`），复用统一 LLM 适配层（§3.16），提供两种能力：
+  - **智能填充**：用户用自然语言描述需求，`POST /api/v1/ai/app-draft` 返回结构化表单草稿（`Assistant.AppDraft`，实现位于 `server/internal/ai/app_assist.go`）。服务端把在线主机清单（仅 id/主机名/系统/公网IP/组网IP）与模板目录（含 `env_fields`）作为接地上下文注入提示词；模型只能从清单中选 `host_id`/`template_id`，不得输出 `auth_vault_id`（Git 凭据必须人工选）。返回前经 `sanitizeAppDraft` 消毒（来源类型白名单、端口 1~65535、模板参数按声明字段过滤、`bind_scope=mesh` 与主机组网IP 一致性告警等），并计算 `missing`（还需用户补充的字段）；前端点「填充到表单」才合并进表单，**AI 永不直接创建应用**，最终提交仍走原有已审计的 `POST /apps` 与前端校验（§3.16.7 草稿-确认模型）。
+  - **对话辅助**：`POST /api/v1/ai/app-chat` 每次请求携带**当前表单快照**与最近 10 轮对话，回答可附带 `form_patch`（结构化改动，同样经消毒），前端以「建议修改」卡片呈现，用户点「应用到表单」才生效，禁止静默改表。
+  - **脱敏**：表单快照送模型前在服务端脱敏（`redactFormForLLM`）：环境变量值、模板密钥参数（`is_secret`）一律掩码为 `***`（只给键名与已填标记），Compose 内容中疑似口令行掩码，`auth_vault_id` 清空；不信任前端脱敏。AI 未启用/未配置时右侧面板明示并可跳转系统设置，手动填表完全不受影响（§3.16.1 降级原则）。两个接口均不改变系统状态，属 AI 诊断类，按 §7 豁免操作审计（与 `ai/nl2command` 同例）。
 - **系统设置面板安全与应用反代职责彻底解耦**（2026-09-28）：
   - 应用中心独立负责业务容器的反向代理与域名绑定（在应用详情 `AppDetail.vue` 的「域名与反代」页签中配置，经 Nginx 容器路由流量到应用容器或网关节点）；
   - 「系统设置 → 面板域名与证书」（`web/src/views/settings/CertDomain.vue`，`sections.ts` 注册 `key: 'cert-domain'`，`adminOnly` 仅管理员可见）**专用于 Watchman 控制台/面板自身的访问与安全配置**，与应用反向代理彻底解耦，采用宝塔式简化模型。**域名绑定**：`security.panel_domain` 为空表示通过 IP 访问；一旦绑定域名即**自动启用严格域名限制**（无独立开关），面板只能通过该域名访问，直接 IP/其他域名请求被 403 拦截（回环地址与 Agent 注册/数据接口等基础设施路径豁免）。**面板证书**：已绑定域名时「为绑定域名申请免费证书」（经证书中心 ACME 签发：普通域名优先 HTTP-01，需服务器 80 端口可被 CA 访问、签发时临时监听；80 端口不可用或 HTTP-01 验证失败时自动回退 DNS-01，需预先在证书中心配置 ACME 账户与 dns-mng；通配符域名仅支持 DNS-01；另支持「DNS-01（手动解析）」两阶段签发——服务端创建订单并展示 TXT 记录，管理员手动到 DNS 服务商添加解析后确认，CA 验证通过后自动绑定，不依赖 dns-mng）；未绑定域名时「为 IP 申请免费证书」（为公网 IP 签发 Let's Encrypt 等免费 IP 证书，走 HTTP-01 验证，签发期间临时监听 80 端口，证书有效期短、自动续期阈值按有效期 1/3 自适应，基准天数可在「系统设置 → 证书时间设置」中配置 `certs.auto_renew_days`）；签发成功后自动写入证书中心并绑定为面板证书、开启 HTTPS。另支持手动上传已有证书（先导入证书中心并校验、私钥不再直存 settings，再以 cert_center 模式绑定）与「强制 HTTPS 访问」（`security.panel_force_https`，明文 HTTP 自动 301 重定向至 HTTPS）。
@@ -740,6 +744,8 @@ GET/PUT  /api/v1/settings
 GET/PUT  /api/v1/ai/config                   # AI provider/模型/开关/限速
 GET/POST /api/v1/ai/chat                     # 自然语言问答（tool calling）
 POST   /api/v1/ai/nl2command                  # 自然语言转命令（带 host_id 上下文）
+POST   /api/v1/ai/app-draft                   # 需求描述 → 创建应用表单草稿（服务端消毒，不创建）
+POST   /api/v1/ai/app-chat                    # 创建页对话辅助（携带表单快照，可返回 form_patch 草稿）
 GET    /api/v1/ai/audit                       # AI 调用审计
 
 # 审计

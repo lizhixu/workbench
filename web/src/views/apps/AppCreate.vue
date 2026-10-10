@@ -21,6 +21,8 @@ import {
   type GitHubBranch, type GitHubRepo,
 } from '../../api/git'
 import { useWorkspaceStore } from '../../stores/workspace'
+import AppAiAssistant from '../../components/apps/AppAiAssistant.vue'
+import type { AppFormDraft, AppFormSnapshot } from '../../api/ai'
 
 defineOptions({ name: 'AppCreate' })
 
@@ -242,6 +244,88 @@ const parsedVolumes = computed<string[] | undefined>(() => {
     .filter((l) => l.length > 0)
   return list.length > 0 ? list : undefined
 })
+
+// 当前表单快照，随每次 AI 请求带给后端作上下文（密钥值由后端脱敏）。
+const formSnapshot = computed<AppFormSnapshot>(() => ({
+  source_mode: sourceMode.value,
+  name: form.name,
+  container_name: form.container_name,
+  host_id: form.host_id,
+  template_id: form.template_id,
+  template_params: { ...form.template_params },
+  image: form.image,
+  compose_content: form.compose_content,
+  repo_url: form.repo_url,
+  branch: form.branch,
+  auth_vault_id: form.auth_vault_id,
+  auto_deploy: form.auto_deploy,
+  build_type: form.build_type,
+  dockerfile: form.dockerfile,
+  build_context: form.build_context,
+  build_timeout_sec: form.build_timeout_sec,
+  ports: form.ports.map((p) => ({ host: p.host, container: p.container, bind_scope: p.bind_scope })),
+  env_vars: parsedEnvVars.value ?? {},
+  volumes: parsedVolumes.value ?? [],
+  healthcheck_url: form.healthcheck_url,
+  domain: form.domain,
+  proxy_mode: form.proxy_mode,
+  gateway_host_id: form.gateway_host_id,
+}))
+
+// AI 助手填充：把后端消毒过的草稿合并进表单。只覆盖草稿里出现的字段，
+// 绝不触发提交——最终仍由用户检查后点「创建应用」。
+function applyDraft(draft: AppFormDraft) {
+  const modeMap: Record<string, SourceMode> = {
+    template: 'template', image: 'image', raw_compose: 'compose', git: 'custom',
+  }
+  if (draft.source_type && modeMap[draft.source_type]) {
+    sourceMode.value = modeMap[draft.source_type]
+  }
+  if (sourceMode.value === 'template' && draft.template_id) {
+    if (templates.value.some((t) => t.id === draft.template_id)) {
+      // 先走选模板的常规预填（端口/卷/参数基线），再叠加草稿覆盖值。
+      selectTemplate(draft.template_id)
+    } else {
+      form.template_id = draft.template_id
+    }
+  }
+  if (draft.host_id && hosts.value.some((h) => h.id === draft.host_id)) {
+    form.host_id = draft.host_id
+  }
+  if (draft.name !== undefined) form.name = draft.name
+  if (draft.container_name !== undefined) form.container_name = draft.container_name
+  if (draft.template_params && sourceMode.value === 'template') {
+    form.template_params = { ...form.template_params, ...draft.template_params }
+  }
+  if (draft.image !== undefined) form.image = draft.image
+  if (draft.compose_content !== undefined) form.compose_content = draft.compose_content
+  if (draft.repo_url !== undefined) form.repo_url = draft.repo_url
+  if (draft.branch !== undefined) form.branch = draft.branch
+  if (draft.auto_deploy !== undefined) form.auto_deploy = draft.auto_deploy
+  if (draft.build_type !== undefined) form.build_type = draft.build_type
+  if (draft.dockerfile !== undefined) form.dockerfile = draft.dockerfile
+  if (draft.build_context !== undefined) form.build_context = draft.build_context
+  if (draft.build_timeout_sec !== undefined) form.build_timeout_sec = draft.build_timeout_sec
+  if (draft.ports && draft.ports.length > 0) {
+    form.ports = draft.ports.map((p) => ({
+      host: p.host,
+      container: p.container,
+      bind_scope: p.bind_scope === 'mesh' ? 'mesh' as const : 'public' as const,
+    }))
+  }
+  if (draft.env_vars && sourceMode.value !== 'template') {
+    form.env_vars_text = Object.entries(draft.env_vars)
+      .map(([k, v]) => `${k}=${v}`)
+      .join('\n')
+  }
+  if (draft.volumes && draft.volumes.length > 0) {
+    form.volumes_text = draft.volumes.join('\n')
+  }
+  if (draft.healthcheck_url !== undefined) form.healthcheck_url = draft.healthcheck_url
+  if (draft.domain !== undefined) form.domain = draft.domain
+  if (draft.proxy_mode !== undefined) form.proxy_mode = draft.proxy_mode
+  if (draft.gateway_host_id !== undefined) form.gateway_host_id = draft.gateway_host_id
+}
 
 async function loadData() {
   try {
@@ -489,6 +573,7 @@ onMounted(loadData)
       <h2 class="page-title">创建应用</h2>
     </div>
 
+    <div class="create-layout">
     <NCard :bordered="false" class="create-card">
       <NSpace vertical size="large">
         <!-- 部署来源 -->
@@ -814,6 +899,13 @@ onMounted(loadData)
       </NSpace>
     </NCard>
 
+    <AppAiAssistant
+      class="ai-side"
+      :snapshot="formSnapshot"
+      @apply-draft="applyDraft"
+    />
+    </div>
+
     <!-- 连接 GitHub 弹窗 -->
     <NModal
       v-model:show="showAuthModal"
@@ -886,8 +978,39 @@ onMounted(loadData)
   flex-shrink: 0;
 }
 
+.create-layout {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
 .create-card {
+  flex: 1;
+  min-width: 0;
   max-width: 860px;
+}
+
+.ai-side {
+  width: 420px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+}
+
+@media (max-width: 1240px) {
+  .create-layout {
+    flex-direction: column;
+  }
+
+  .create-card {
+    width: 100%;
+    max-width: none;
+  }
+
+  .ai-side {
+    width: 100%;
+    position: static;
+  }
 }
 
 .template-grid {

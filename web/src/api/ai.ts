@@ -141,3 +141,86 @@ export function listOpsReports() {
 export function getOpsReport(id: string) {
   return unwrap<{ data: OpsReport }>(http.get(`/ai/ops-reports/${id}`)).then((r) => r.data)
 }
+
+// ---- Create-app AI assistant (draft fill + form-aware chat) ----
+
+// Snapshot of the create-app form sent as AI context. Secret values are
+// redacted server-side before reaching the model.
+export interface AppFormSnapshot {
+  source_mode: 'template' | 'image' | 'compose' | 'github' | 'custom'
+  name: string
+  container_name: string
+  host_id: string
+  template_id: string
+  template_params: Record<string, string>
+  image: string
+  compose_content: string
+  repo_url: string
+  branch: string
+  auth_vault_id: string
+  auto_deploy: boolean
+  build_type: string
+  dockerfile: string
+  build_context: string
+  build_timeout_sec: number
+  ports: { host: number; container: number; bind_scope: string }[]
+  env_vars: Record<string, string>
+  volumes: string[]
+  healthcheck_url: string
+  domain: string
+  proxy_mode: string
+  gateway_host_id: string
+}
+
+// AI-proposed form fill; only present fields should be applied.
+export interface AppFormDraft {
+  source_type?: 'template' | 'image' | 'raw_compose' | 'git'
+  name?: string
+  container_name?: string
+  host_id?: string
+  template_id?: string
+  template_params?: Record<string, string>
+  image?: string
+  compose_content?: string
+  repo_url?: string
+  branch?: string
+  auto_deploy?: boolean
+  build_type?: 'dockerfile' | 'compose'
+  dockerfile?: string
+  build_context?: string
+  build_timeout_sec?: number
+  ports?: { host: number; container: number; bind_scope: string }[]
+  env_vars?: Record<string, string>
+  volumes?: string[]
+  healthcheck_url?: string
+  domain?: string
+  proxy_mode?: 'local' | 'gateway'
+  gateway_host_id?: string
+}
+
+export interface AppDraftResponse {
+  draft: AppFormDraft
+  explanation: string
+  missing: string[]
+  warnings: string[]
+  model: string
+}
+
+export interface AppChatResponse {
+  answer: string
+  form_patch?: AppFormDraft
+  patch_warnings?: string[]
+  model: string
+}
+
+export function generateAppDraft(requirement: string, form: AppFormSnapshot) {
+  return unwrap<{ data: AppDraftResponse }>(
+    http.post('/ai/app-draft', { requirement, form }, { timeout: 120000 }),
+  ).then((r) => r.data)
+}
+
+export function chatAppAssistant(question: string, history: ChatMessage[], form: AppFormSnapshot) {
+  return unwrap<{ data: AppChatResponse }>(
+    http.post('/ai/app-chat', { question, history, form }, { timeout: 120000 }),
+  ).then((r) => r.data)
+}

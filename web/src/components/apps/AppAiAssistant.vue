@@ -92,7 +92,8 @@ function startChatResize(e: PointerEvent) {
   const paneH = chatPaneEl.value?.clientHeight ?? 480
   const onMove = (ev: PointerEvent) => {
     const next = startH + (startY - ev.clientY)
-    chatInputH.value = Math.min(Math.max(next, 40), Math.max(paneH - 160, 40))
+    // 最小高度 64：输入框底部常驻发送按钮浮层区（34px 区域 + 一行文本）。
+    chatInputH.value = Math.min(Math.max(next, 64), Math.max(paneH - 160, 64))
   }
   const onUp = () => {
     window.removeEventListener('pointermove', onMove)
@@ -379,6 +380,7 @@ onMounted(async () => {
               v-model:value="chatInput"
               type="textarea"
               :rows="1"
+              :resizable="false"
               placeholder="问点什么，或让我调整表单…（Enter 发送）"
               class="chat-input"
               @keydown.enter.exact.prevent="doSend"
@@ -790,13 +792,11 @@ onMounted(async () => {
 
 .chat-composer {
   flex-shrink: 0;
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
+  position: relative; /* 发送按钮浮于输入框右下角 */
   border: 1px solid var(--border-color);
   border-radius: 10px;
   background-color: var(--bg-card-subtle);
-  padding: 6px 6px 6px 10px;
+  padding: 6px;
   transition: border-color 0.2s, box-shadow 0.2s;
 
   &:focus-within {
@@ -805,14 +805,10 @@ onMounted(async () => {
   }
 
   .chat-input {
-    flex: 1;
-    min-width: 0;
-    align-self: stretch;
+    width: 100%;
+    height: 100%;
+    background: transparent;
 
-    :deep(.n-input) {
-      background: transparent;
-      height: 100%;
-    }
     :deep(.n-input__border),
     :deep(.n-input__state-border) {
       display: none;
@@ -821,11 +817,16 @@ onMounted(async () => {
       font-size: 12.5px;
       line-height: 1.55;
       height: 100%;
+      /* 底部预留发送按钮浮层区，文本不会压到按钮 */
+      padding-bottom: 34px;
     }
   }
 
   .send-btn {
-    flex-shrink: 0;
+    position: absolute;
+    right: 10px;
+    bottom: 8px;
+    z-index: 1;
   }
 }
 </style>

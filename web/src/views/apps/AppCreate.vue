@@ -987,11 +987,12 @@ onMounted(loadData)
 .create-card {
   flex: 1;
   min-width: 0;
-  max-width: 860px;
 }
 
+/* 大屏下两列都随可用宽度自适应：表单卡片吃掉剩余空间，AI 面板在
+   420~560px 区间内按布局宽度伸缩，不再把右侧一整片留白浪费掉。 */
 .ai-side {
-  width: 420px;
+  width: clamp(420px, 34%, 560px);
   flex-shrink: 0;
   position: sticky;
   top: 0;

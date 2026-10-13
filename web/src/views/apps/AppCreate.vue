@@ -984,16 +984,20 @@ onMounted(loadData)
   align-items: flex-start;
 }
 
+/* 左侧表单保持原有 860px 上限（空间不足时按比例收缩），右侧 AI 区域
+   以 0% 基准纯靠 grow 吃掉全部剩余宽度（其根卡片 width:100% 不可作
+   为 flex 基准），大屏不再留白。 */
 .create-card {
-  flex: 1;
+  width: 100%;
+  max-width: 860px;
+  flex-shrink: 1;
+  flex-grow: 0;
   min-width: 0;
 }
 
-/* 大屏下两列都随可用宽度自适应：表单卡片吃掉剩余空间，AI 面板在
-   420~560px 区间内按布局宽度伸缩，不再把右侧一整片留白浪费掉。 */
 .ai-side {
-  width: clamp(420px, 34%, 560px);
-  flex-shrink: 0;
+  flex: 1 1 0%;
+  min-width: 420px;
   position: sticky;
   top: 0;
 }

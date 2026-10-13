@@ -122,7 +122,8 @@ const form = reactive({
   dockerfile: 'Dockerfile',
   build_context: '.',
   build_timeout_sec: 900,
-  compose_content: defaultComposeTemplate,
+  // 默认留空，由用户自行编写或点上方按钮载入「Web + Redis / WordPress + MySQL」模板
+  compose_content: '',
   env_vars_text: '',
   ports: [] as (PortMapping & { bind_scope: 'public' | 'mesh' })[],
   volumes_text: '',

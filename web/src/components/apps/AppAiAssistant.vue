@@ -5,7 +5,7 @@ import {
   NAlert, NButton, NCard, NIcon, NInput, NSpin, NTabPane, NTabs, NTag, useMessage,
 } from 'naive-ui'
 import {
-  ChatbubbleEllipsesOutline, CheckmarkOutline, SendOutline, SparklesOutline,
+  ChatbubbleEllipsesOutline, CheckmarkOutline, SparklesOutline,
 } from '@vicons/ionicons5'
 import {
   chatAppAssistant, generateAppDraft, getAIConfig,
@@ -190,9 +190,7 @@ onMounted(async () => {
   <NCard :bordered="false" class="ai-assistant-card" content-style="padding: 0;">
     <!-- Header -->
     <div class="ai-header">
-      <div class="ai-icon-chip">
-        <NIcon size="18"><SparklesOutline /></NIcon>
-      </div>
+      <NIcon size="18" color="#6366f1" class="ai-title-icon"><SparklesOutline /></NIcon>
       <div class="ai-header-text">
         <div class="ai-title">AI 部署助手</div>
         <div class="ai-subtitle">只生成草稿，创建前由你确认</div>
@@ -208,7 +206,7 @@ onMounted(async () => {
     <div v-else-if="!aiEnabled" class="ai-disabled">
       <NAlert type="warning" :show-icon="true">
         <div>AI 尚未启用或未配置模型端点，智能填充与对话不可用（手动填表不受影响）。</div>
-        <NButton size="small" secondary style="margin-top: 10px" @click="router.push('/settings')">
+        <NButton size="small" secondary style="margin-top: 10px" @click="router.push('/settings?s=ai')">
           前往系统设置 - AI 大模型
         </NButton>
       </NAlert>
@@ -230,8 +228,7 @@ onMounted(async () => {
             />
             <div class="composer-foot">
               <span class="composer-hint">Ctrl+Enter 生成</span>
-              <NButton type="primary" size="small" round :loading="generating" @click="doGenerate">
-                <template #icon><NIcon><SparklesOutline /></NIcon></template>
+              <NButton type="primary" size="small" :loading="generating" @click="doGenerate">
                 生成草稿
               </NButton>
             </div>
@@ -239,15 +236,17 @@ onMounted(async () => {
 
           <div v-if="!draftResult && !generating" class="quick-block">
             <div class="quick-title">试试这样描述</div>
-            <button
+            <NButton
               v-for="q in QUICK_REQUIREMENTS"
               :key="q"
-              type="button"
-              class="quick-chip"
+              size="small"
+              secondary
+              block
+              class="quick-btn"
               @click="requirement = q"
             >
               {{ q }}
-            </button>
+            </NButton>
           </div>
 
           <div v-if="generating" class="thinking-row">
@@ -283,13 +282,12 @@ onMounted(async () => {
               <NButton size="small" quaternary @click="draftResult = null">丢弃</NButton>
               <NButton
                 size="small"
-                round
                 :type="draftApplied ? 'success' : 'primary'"
                 :disabled="draftApplied"
                 @click="applyDraftResult"
               >
                 <template #icon>
-                  <NIcon><CheckmarkOutline v-if="draftApplied" /><SparklesOutline v-else /></NIcon>
+                  <NIcon v-if="draftApplied"><CheckmarkOutline /></NIcon>
                 </template>
                 {{ draftApplied ? '已填充到表单' : '填充到表单' }}
               </NButton>
@@ -303,9 +301,7 @@ onMounted(async () => {
         <div class="pane chat-pane">
           <div ref="chatScrollEl" class="chat-scroll">
             <div v-if="!chatMessages.length" class="chat-empty">
-              <div class="ai-icon-chip small">
-                <NIcon size="16"><ChatbubbleEllipsesOutline /></NIcon>
-              </div>
+              <NIcon size="22" color="var(--text-secondary)"><ChatbubbleEllipsesOutline /></NIcon>
               <p>边填表边问我，当前表单内容会自动带给我参考。也可以直接让我改，比如「把宿主端口改成 9000」。</p>
             </div>
 
@@ -315,41 +311,27 @@ onMounted(async () => {
               class="chat-msg"
               :class="m.role"
             >
-              <div v-if="m.role === 'assistant'" class="msg-avatar">
-                <NIcon size="13"><SparklesOutline /></NIcon>
-              </div>
-              <div class="msg-main">
-                <div class="chat-body">{{ m.content }}</div>
-                <div v-if="m.role === 'assistant' && m.patch" class="patch-card">
-                  <div class="patch-title">
-                    <NIcon size="13"><ChatbubbleEllipsesOutline /></NIcon>
-                    建议修改
-                  </div>
-                  <div v-for="line in describePatch(m.patch)" :key="line" class="patch-line">{{ line }}</div>
-                  <div v-for="w in m.patchWarnings || []" :key="w" class="patch-warn">{{ w }}</div>
-                  <div class="patch-actions">
-                    <NButton
-                      size="tiny"
-                      round
-                      :type="m.patchApplied ? 'success' : 'primary'"
-                      :disabled="m.patchApplied"
-                      @click="applyPatch(m)"
-                    >
-                      {{ m.patchApplied ? '已应用到表单' : '应用到表单' }}
-                    </NButton>
-                  </div>
+              <div class="chat-body">{{ m.content }}</div>
+              <div v-if="m.role === 'assistant' && m.patch" class="patch-card">
+                <div class="patch-title">建议修改</div>
+                <div v-for="line in describePatch(m.patch)" :key="line" class="patch-line">{{ line }}</div>
+                <div v-for="w in m.patchWarnings || []" :key="w" class="patch-warn">{{ w }}</div>
+                <div class="patch-actions">
+                  <NButton
+                    size="tiny"
+                    :type="m.patchApplied ? 'success' : 'primary'"
+                    :disabled="m.patchApplied"
+                    @click="applyPatch(m)"
+                  >
+                    {{ m.patchApplied ? '已应用到表单' : '应用到表单' }}
+                  </NButton>
                 </div>
               </div>
             </div>
 
             <div v-if="sending" class="chat-msg assistant">
-              <div class="msg-avatar">
-                <NIcon size="13"><SparklesOutline /></NIcon>
-              </div>
-              <div class="msg-main">
-                <div class="chat-body thinking">
-                  <span class="thinking-dots"><i /><i /><i /></span>
-                </div>
+              <div class="chat-body thinking">
+                <span class="thinking-dots"><i /><i /><i /></span>
               </div>
             </div>
           </div>
@@ -366,8 +348,8 @@ onMounted(async () => {
               class="chat-input"
               @keydown.enter.exact.prevent="doSend"
             />
-            <NButton type="primary" circle :loading="sending" class="send-btn" @click="doSend">
-              <template #icon><NIcon><SendOutline /></NIcon></template>
+            <NButton type="primary" size="small" :loading="sending" class="send-btn" @click="doSend">
+              发送
             </NButton>
           </div>
         </div>
@@ -394,23 +376,8 @@ onMounted(async () => {
   border-bottom: 1px solid var(--border-color);
 }
 
-.ai-icon-chip {
+.ai-title-icon {
   flex-shrink: 0;
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #fff;
-  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
-  box-shadow: 0 4px 10px rgba(99, 102, 241, 0.35);
-
-  &.small {
-    width: 28px;
-    height: 28px;
-    border-radius: 8px;
-  }
 }
 
 .ai-header-text {
@@ -507,30 +474,22 @@ onMounted(async () => {
 
 .quick-block {
   .quick-title {
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--text-secondary);
     margin-bottom: 8px;
   }
 }
 
-.quick-chip {
-  display: block;
-  width: 100%;
-  text-align: left;
-  margin-bottom: 6px;
-  padding: 7px 10px;
-  font-size: 12px;
-  line-height: 1.45;
-  color: var(--text-primary);
-  background-color: var(--bg-card-subtle);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  cursor: pointer;
-  transition: border-color 0.15s, background-color 0.15s;
+.quick-btn {
+  margin-bottom: 8px;
+  justify-content: flex-start;
+  height: auto;
+  padding: 7px 14px;
 
-  &:hover {
-    border-color: rgba(99, 102, 241, 0.5);
-    background-color: var(--bg-active);
+  :deep(.n-button__content) {
+    white-space: normal;
+    text-align: left;
+    line-height: 1.5;
   }
 
   &:last-child {
@@ -554,9 +513,9 @@ onMounted(async () => {
 }
 
 .explain-card {
-  background-color: var(--bg-active);
-  border: 1px solid rgba(99, 102, 241, 0.25);
-  border-radius: 10px;
+  background-color: var(--bg-card-subtle);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
   padding: 10px 12px;
 
   .explain-text {
@@ -679,15 +638,14 @@ onMounted(async () => {
 
 .chat-msg {
   display: flex;
+  flex-direction: column;
+  align-items: flex-start;
   gap: 7px;
   max-width: 100%;
 
   &.user {
-    flex-direction: row-reverse;
+    align-items: flex-end;
 
-    .msg-main {
-      align-items: flex-end;
-    }
     .chat-body {
       background-color: rgba(99, 102, 241, 0.14);
       color: var(--text-primary);
@@ -701,27 +659,6 @@ onMounted(async () => {
       border: 1px solid var(--border-color);
       border-radius: 4px 12px 12px 12px;
     }
-  }
-
-  .msg-avatar {
-    flex-shrink: 0;
-    width: 22px;
-    height: 22px;
-    margin-top: 2px;
-    border-radius: 7px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: #fff;
-    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
-  }
-
-  .msg-main {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    min-width: 0;
-    max-width: calc(100% - 29px);
   }
 
   .chat-body {
@@ -738,21 +675,16 @@ onMounted(async () => {
 }
 
 .patch-card {
-  margin-top: 7px;
   width: 100%;
-  border: 1px solid rgba(99, 102, 241, 0.3);
-  border-left: 3px solid #6366f1;
+  border: 1px solid var(--border-color);
   border-radius: 8px;
-  background-color: rgba(99, 102, 241, 0.06);
+  background-color: var(--bg-card-subtle);
   padding: 8px 10px;
 
   .patch-title {
-    display: flex;
-    align-items: center;
-    gap: 4px;
     font-size: 11.5px;
     font-weight: 600;
-    color: #6366f1;
+    color: var(--text-primary);
     margin-bottom: 5px;
   }
 

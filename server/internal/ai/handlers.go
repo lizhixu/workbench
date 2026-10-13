@@ -17,23 +17,27 @@ func NewHandlers(assistant *Assistant) *Handlers {
 	return &Handlers{assistant: assistant}
 }
 
-// Register mounts AI routes on the given authenticated group.
-func (h *Handlers) Register(rg *gin.RouterGroup) {
-	rg.POST("/ai/diagnose", h.diagnose)
-	rg.POST("/ai/analyze-exec", h.analyzeExec)
-	rg.POST("/ai/nl2command", h.nl2command)
-	rg.POST("/ai/plan", h.planTask)
-	rg.GET("/ai/config", h.getConfig)
-	rg.PUT("/ai/config", h.setConfig)
-	rg.POST("/ai/test", h.testConnection)
-	rg.POST("/ai/scan-report", h.analyzeScanReport)
-	rg.POST("/ai/scan-report/followup", h.scanReportFollowup)
-	rg.POST("/ai/chat", h.chat)
-	rg.POST("/ai/app-draft", h.appDraft)
-	rg.POST("/ai/app-chat", h.appChat)
-	rg.POST("/ai/ops-report", h.generateOpsReport)
-	rg.GET("/ai/ops-reports", h.listOpsReports)
-	rg.GET("/ai/ops-reports/:id", h.getOpsReport)
+// Register mounts AI routes: read/diagnostic endpoints on the authenticated
+// group, the plaintext-key reveal on the admin group (the masked config GET
+// is fine for any logged-in user; the reveal is not).
+func (h *Handlers) Register(authed, admin *gin.RouterGroup) {
+	authed.POST("/ai/diagnose", h.diagnose)
+	authed.POST("/ai/analyze-exec", h.analyzeExec)
+	authed.POST("/ai/nl2command", h.nl2command)
+	authed.POST("/ai/plan", h.planTask)
+	authed.GET("/ai/config", h.getConfig)
+	authed.PUT("/ai/config", h.setConfig)
+	authed.POST("/ai/test", h.testConnection)
+	authed.POST("/ai/scan-report", h.analyzeScanReport)
+	authed.POST("/ai/scan-report/followup", h.scanReportFollowup)
+	authed.POST("/ai/chat", h.chat)
+	authed.POST("/ai/app-draft", h.appDraft)
+	authed.POST("/ai/app-chat", h.appChat)
+	authed.POST("/ai/ops-report", h.generateOpsReport)
+	authed.GET("/ai/ops-reports", h.listOpsReports)
+	authed.GET("/ai/ops-reports/:id", h.getOpsReport)
+
+	admin.POST("/ai/config/key", h.revealAPIKey)
 }
 
 func (h *Handlers) diagnose(c *gin.Context) {
@@ -115,6 +119,13 @@ func (h *Handlers) getConfig(c *gin.Context) {
 		cfg.APIKey = "********"
 	}
 	c.JSON(http.StatusOK, gin.H{"data": cfg})
+}
+
+// revealAPIKey returns the plaintext API key on demand (admin-only route), so
+// the settings page can show the saved key when the admin explicitly clicks
+// the eye toggle. The regular config GET above stays masked either way.
+func (h *Handlers) revealAPIKey(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"api_key": h.assistant.Config().APIKey}})
 }
 
 func (h *Handlers) setConfig(c *gin.Context) {

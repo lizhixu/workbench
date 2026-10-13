@@ -30,6 +30,14 @@ export function setAIConfig(config: AIConfig) {
   return unwrap<{ ok: boolean }>(http.put('/ai/config', config))
 }
 
+// The regular config GET masks api_key as "********"; this admin-only call
+// returns the stored plaintext key for the settings page's eye toggle.
+export function revealAIKey() {
+  return unwrap<{ data: { api_key: string } }>(http.post('/ai/config/key')).then(
+    (r) => r.data.api_key,
+  )
+}
+
 export function testAIConfig(config: Partial<AIConfig>) {
   return unwrap<{ ok: boolean; message: string }>(http.post('/ai/test', config))
 }

@@ -752,7 +752,8 @@ GET/POST/PATCH/DELETE /api/v1/alert-rules
 
 # 设置
 GET/PUT  /api/v1/settings
-GET/PUT  /api/v1/ai/config                   # AI provider/模型/开关/限速
+GET/PUT  /api/v1/ai/config                   # AI provider/模型/开关/限速（GET 中 api_key 恒为掩码哨兵 "********"；PUT 传哨兵 = 保留原密钥）
+POST   /api/v1/ai/config/key                  # 明文查看已保存的 AI API Key（adminOnly；审计 ai_config_key_reveal / high）
 GET/POST /api/v1/ai/chat                     # 自然语言问答（tool calling）
 POST   /api/v1/ai/nl2command                  # 自然语言转命令（带 host_id 上下文）
 POST   /api/v1/ai/app-draft                   # 需求描述 → 创建应用表单草稿（服务端消毒，不创建）

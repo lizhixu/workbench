@@ -330,10 +330,14 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		vault.NewHandlers(vaultStore).Register(authed.Group("", h.auditMutation()))
 	}
 
-	// AI diagnostics. Only config changes are audited (the middleware skips
-	// the diagnostic POSTs, which have no mutation rules).
+	// AI diagnostics. Config changes and the plaintext key reveal (admin-only)
+	// are audited; the middleware skips the diagnostic POSTs, which have no
+	// mutation rules.
 	if aiAssistant != nil {
-		ai.NewHandlers(aiAssistant).Register(authed.Group("", h.auditMutation()))
+		ai.NewHandlers(aiAssistant).Register(
+			authed.Group("", h.auditMutation()),
+			adminOnly.Group("", h.auditMutation()),
+		)
 	}
 
 	// High-risk command control (policy + audit).
@@ -2051,6 +2055,7 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodPost, "/api/v1/alerts/webhook/test", "alert_webhook_test", "alert", "", audit.RiskLow, "测试告警 Webhook 通知"},
 		// AI assistant config: model/endpoint credentials.
 		{http.MethodPut, "/api/v1/ai/config", "ai_config_update", "system", "", "", "更新 AI 模型配置"},
+		{http.MethodPost, "/api/v1/ai/config/key", "ai_config_key_reveal", "system", "", audit.RiskHigh, "查看 AI API Key 明文"},
 	}
 }
 

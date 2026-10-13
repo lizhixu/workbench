@@ -14,8 +14,8 @@ import {
   NDynamicInput,
   useMessage,
 } from 'naive-ui'
-import { CheckmarkCircleOutline, SparklesOutline } from '@vicons/ionicons5'
-import { getAIConfig, setAIConfig, testAIConfig, type AIConfig } from '../../api/ai'
+import { CheckmarkCircleOutline, EyeOffOutline, EyeOutline, SparklesOutline } from '@vicons/ionicons5'
+import { getAIConfig, revealAIKey, setAIConfig, testAIConfig, type AIConfig } from '../../api/ai'
 
 // 从旧 Settings.vue 抽取：AI 大模型配置与助手
 defineOptions({ name: 'AiConfig' })
@@ -35,6 +35,35 @@ const testingAI = ref(false)
 const testResult = ref<{ ok: boolean; message: string } | null>(null)
 // 自定义请求头（键值对编辑器用，保存/测试前同步回 aiConfig.headers）
 const headerPairs = ref<{ key: string; value: string }[]>([])
+
+// API Key 可见性：后端 GET /ai/config 返回的是掩码哨兵 "********"（不是真
+// 值），眼睛按钮首次点开时才经 admin-only 接口拉取真值回填。
+const KEY_MASK = '********'
+const keyVisible = ref(false)
+const keyRevealing = ref(false)
+
+async function toggleKeyVisible() {
+  if (keyVisible.value) {
+    keyVisible.value = false
+    return
+  }
+  if (aiConfig.value.api_key === KEY_MASK) {
+    keyRevealing.value = true
+    try {
+      const realKey = await revealAIKey()
+      // 拉取期间用户可能清空了输入框，这种情况不回填真值
+      if (aiConfig.value.api_key === KEY_MASK) {
+        aiConfig.value.api_key = realKey
+      }
+    } catch (e: any) {
+      message.error(e.message || '获取已保存密钥失败')
+      keyRevealing.value = false
+      return
+    }
+    keyRevealing.value = false
+  }
+  keyVisible.value = true
+}
 
 function syncHeadersToConfig() {
   const headers: Record<string, string> = {}
@@ -109,6 +138,8 @@ async function loadAIConfig() {
     const data = await getAIConfig()
     if (data) {
       aiConfig.value = data
+      // 重新载入后密钥回到掩码态，可见性一并复位（保存后也会走到这里）
+      keyVisible.value = false
       headerPairs.value = Object.entries(data.headers || {}).map(([key, value]) => ({ key, value }))
       if (data.provider) {
         selectedProvider.value = data.provider
@@ -211,10 +242,25 @@ onMounted(() => {
       <NFormItem label="API Key (密钥)">
         <NInput
           v-model:value="aiConfig.api_key"
-          type="password"
-          show-password-on="click"
+          :type="keyVisible ? 'text' : 'password'"
           :placeholder="providerPresets[selectedProvider]?.key_tip || '输入 API Key'"
-        />
+        >
+          <template #suffix>
+            <NButton
+              quaternary
+              circle
+              size="tiny"
+              tabindex="-1"
+              :loading="keyRevealing"
+              :title="keyVisible ? '隐藏密钥' : '显示密钥'"
+              @click="toggleKeyVisible"
+            >
+              <template #icon>
+                <NIcon :component="keyVisible ? EyeOffOutline : EyeOutline" />
+              </template>
+            </NButton>
+          </template>
+        </NInput>
       </NFormItem>
 
       <NFormItem label="自定义请求头 (Headers)">

@@ -81,6 +81,26 @@ const chatInput = ref('')
 const sending = ref(false)
 const chatError = ref('')
 const chatScrollEl = ref<HTMLElement | null>(null)
+const chatPaneEl = ref<HTMLElement | null>(null)
+const chatComposerEl = ref<HTMLElement | null>(null)
+const chatInputH = ref(0) // px; 0 = 未拖拽过，随单行自适应
+
+// 拖住输入框上方的把手向上拉伸，把消息列表的高度让给输入框。
+function startChatResize(e: PointerEvent) {
+  const startY = e.clientY
+  const startH = chatInputH.value || chatComposerEl.value?.offsetHeight || 40
+  const paneH = chatPaneEl.value?.clientHeight ?? 480
+  const onMove = (ev: PointerEvent) => {
+    const next = startH + (startY - ev.clientY)
+    chatInputH.value = Math.min(Math.max(next, 40), Math.max(paneH - 160, 40))
+  }
+  const onUp = () => {
+    window.removeEventListener('pointermove', onMove)
+    window.removeEventListener('pointerup', onUp)
+  }
+  window.addEventListener('pointermove', onMove)
+  window.addEventListener('pointerup', onUp)
+}
 
 const patchLabels: Record<string, string> = {
   source_type: '部署来源',
@@ -187,7 +207,11 @@ onMounted(async () => {
 </script>
 
 <template>
-  <NCard :bordered="false" class="ai-assistant-card" content-style="padding: 0;">
+  <NCard
+    :bordered="false"
+    class="ai-assistant-card"
+    content-style="padding: 0; height: 100%; display: flex; flex-direction: column;"
+  >
     <!-- Header -->
     <div class="ai-header">
       <NIcon size="18" color="#6366f1" class="ai-title-icon"><SparklesOutline /></NIcon>
@@ -212,7 +236,7 @@ onMounted(async () => {
       </NAlert>
     </div>
 
-    <NTabs v-else v-model:value="tab" type="line" size="small" animated class="ai-tabs">
+    <NTabs v-else v-model:value="tab" type="line" size="small" :animated="false" class="ai-tabs">
       <!-- 智能填充 -->
       <NTabPane name="fill" tab="智能填充">
         <div class="pane">
@@ -220,8 +244,8 @@ onMounted(async () => {
             <NInput
               v-model:value="requirement"
               type="textarea"
+              resizable
               :rows="3"
-              :autosize="{ minRows: 3, maxRows: 5 }"
               placeholder="描述你想部署的应用，例如：在测试服上跑一个 Redis，只允许组网内访问"
               class="composer-input"
               @keydown.enter.ctrl="doGenerate"
@@ -298,7 +322,7 @@ onMounted(async () => {
 
       <!-- 对话辅助 -->
       <NTabPane name="chat" tab="对话辅助">
-        <div class="pane chat-pane">
+        <div ref="chatPaneEl" class="pane chat-pane">
           <div ref="chatScrollEl" class="chat-scroll">
             <div v-if="!chatMessages.length" class="chat-empty">
               <NIcon size="22" color="var(--text-secondary)"><ChatbubbleEllipsesOutline /></NIcon>
@@ -338,12 +362,23 @@ onMounted(async () => {
 
           <NAlert v-if="chatError" type="error" :show-icon="true">{{ chatError }}</NAlert>
 
-          <div class="chat-composer">
+          <div
+            class="chat-resize-handle"
+            title="上下拖拽调整输入框高度"
+            @pointerdown.prevent="startChatResize"
+          >
+            <span class="grip" />
+          </div>
+
+          <div
+            ref="chatComposerEl"
+            class="chat-composer"
+            :style="chatInputH ? { height: `${chatInputH}px` } : undefined"
+          >
             <NInput
               v-model:value="chatInput"
               type="textarea"
               :rows="1"
-              :autosize="{ minRows: 1, maxRows: 4 }"
               placeholder="问点什么，或让我调整表单…（Enter 发送）"
               class="chat-input"
               @keydown.enter.exact.prevent="doSend"
@@ -361,6 +396,7 @@ onMounted(async () => {
 <style scoped lang="scss">
 .ai-assistant-card {
   width: 100%;
+  height: 100%;
   background-color: var(--bg-card);
   border: 1px solid var(--border-color);
   border-radius: 12px;
@@ -417,10 +453,22 @@ onMounted(async () => {
 
 /* ---------- Tabs / panes ---------- */
 .ai-tabs {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+
   :deep(.n-tabs-nav) {
     padding: 0 16px;
   }
+  :deep(.n-tabs-pane-wrapper) {
+    flex: 1;
+    min-height: 0;
+  }
+  /* 无动画模式下 pane 是 .n-tabs 的直接子级（flex 列），用 grow 吃满剩余高度 */
   :deep(.n-tab-pane) {
+    flex: 1;
+    min-height: 0;
     padding: 0;
   }
 }
@@ -430,6 +478,8 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  height: 100%;
+  overflow-y: auto;
 }
 
 /* ---------- Fill composer ---------- */
@@ -452,6 +502,11 @@ onMounted(async () => {
   :deep(.n-input__border),
   :deep(.n-input__state-border) {
     display: none;
+  }
+  /* naive 把 resize 把手放在 wrapper 上，边界约束也要落在 wrapper */
+  :deep(.n-input-wrapper) {
+    min-height: 66px;
+    max-height: 320px;
   }
   :deep(textarea) {
     font-size: 13px;
@@ -603,10 +658,12 @@ onMounted(async () => {
 /* ---------- Chat ---------- */
 .chat-pane {
   gap: 10px;
+  overflow: hidden;
 }
 
 .chat-scroll {
-  height: 350px;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
@@ -708,7 +765,31 @@ onMounted(async () => {
   }
 }
 
+.chat-resize-handle {
+  flex-shrink: 0;
+  height: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: row-resize;
+  touch-action: none;
+  margin: -2px 0;
+
+  .grip {
+    width: 36px;
+    height: 3px;
+    border-radius: 2px;
+    background-color: var(--border-color);
+    transition: background-color 0.15s;
+  }
+
+  &:hover .grip {
+    background-color: rgba(99, 102, 241, 0.55);
+  }
+}
+
 .chat-composer {
+  flex-shrink: 0;
   display: flex;
   align-items: flex-end;
   gap: 8px;
@@ -726,9 +807,11 @@ onMounted(async () => {
   .chat-input {
     flex: 1;
     min-width: 0;
+    align-self: stretch;
 
     :deep(.n-input) {
       background: transparent;
+      height: 100%;
     }
     :deep(.n-input__border),
     :deep(.n-input__state-border) {
@@ -737,6 +820,7 @@ onMounted(async () => {
     :deep(textarea) {
       font-size: 12.5px;
       line-height: 1.55;
+      height: 100%;
     }
   }
 

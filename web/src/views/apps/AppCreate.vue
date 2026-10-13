@@ -1000,6 +1000,9 @@ onMounted(loadData)
   min-width: 420px;
   position: sticky;
   top: 0;
+  /* 右侧面板高度铺满可视区域：100vh 减去顶栏(50px)、页面上下内边距与
+     页头（返回按钮+标题一行 ≈46px），卡片内部再自行切分滚动区。 */
+  height: calc(100vh - 50px - var(--page-padding) * 2 - 46px);
 }
 
 @media (max-width: 1240px) {
@@ -1015,6 +1018,7 @@ onMounted(loadData)
   .ai-side {
     width: 100%;
     position: static;
+    height: auto;
   }
 }
 

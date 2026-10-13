@@ -1097,6 +1097,7 @@ onMounted(loadData)
   border: 1px dashed rgba(128, 128, 128, 0.25);
   border-radius: 8px;
   padding: 16px;
+  margin-bottom: 20px;
 }
 
 .github-connected-bar {
@@ -1104,6 +1105,7 @@ onMounted(loadData)
   border: 1px solid rgba(24, 160, 88, 0.2);
   border-radius: 8px;
   padding: 10px 14px;
+  margin-bottom: 20px;
 }
 
 .hint {

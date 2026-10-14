@@ -162,7 +162,7 @@ onUnmounted(() => {
         <NFormItem label="当前面板时间">
           <span class="mono-font">{{ nowText }}</span>
         </NFormItem>
-        <NFormItem>
+        <NFormItem label=" ">
           <NButton type="primary" :loading="tzSaving" @click="saveTimezone">保存</NButton>
         </NFormItem>
       </NForm>

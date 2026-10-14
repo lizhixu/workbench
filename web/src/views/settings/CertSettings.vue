@@ -107,7 +107,7 @@ load()
             <p class="muted tip-hint">手动签发 / 手动上传的证书不会自动续期，到期前 N 天经告警中心提醒一次（默认 30 天）。短期证书同样按 1/3 收紧；续期、替换或删除后提醒自动解除。</p>
           </NSpace>
         </NFormItem>
-        <NFormItem>
+        <NFormItem label=" ">
           <NButton type="primary" :loading="saving" @click="save">保存</NButton>
         </NFormItem>
       </NForm>

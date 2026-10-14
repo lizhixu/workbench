@@ -489,31 +489,35 @@ onMounted(async () => {
   border: 1px solid var(--border-color);
   border-radius: 10px;
   background-color: var(--bg-card-subtle);
+  overflow: hidden;
   transition: border-color 0.2s, box-shadow 0.2s;
 
   &:focus-within {
     border-color: rgba(99, 102, 241, 0.55);
     box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
   }
-}
 
-.composer-input {
-  :deep(.n-input) {
+  .composer-input {
     background: transparent;
-  }
-  :deep(.n-input__border),
-  :deep(.n-input__state-border) {
-    display: none;
-  }
-  /* naive 把 resize 把手放在 wrapper 上，边界约束也要落在 wrapper */
-  :deep(.n-input-wrapper) {
-    min-height: 66px;
-    max-height: 320px;
-  }
-  :deep(textarea) {
-    font-size: 13px;
-    line-height: 1.6;
-    padding: 4px 2px;
+    --n-color: transparent;
+    --n-color-focus: transparent;
+    border-radius: 10px 10px 0 0;
+
+    :deep(.n-input__border),
+    :deep(.n-input__state-border) {
+      display: none;
+    }
+    /* naive 把 resize 把手放在 wrapper 上，边界约束也要落在 wrapper */
+    :deep(.n-input-wrapper) {
+      background: transparent;
+      min-height: 66px;
+      max-height: 320px;
+    }
+    :deep(textarea) {
+      font-size: 13px;
+      line-height: 1.6;
+      padding: 6px 0 4px;
+    }
   }
 }
 

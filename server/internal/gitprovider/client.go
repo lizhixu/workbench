@@ -11,7 +11,11 @@ import (
 	"time"
 )
 
-const githubAPIBase = "https://api.github.com"
+// githubAPIBase is overridable for tests; production code keeps the default.
+var githubAPIBase = "https://api.github.com"
+
+// rawBase serves unauthenticated raw file downloads for public repositories.
+var rawBase = "https://raw.githubusercontent.com"
 
 // Client interacts with GitHub's REST API using the stored account token.
 type Client struct {

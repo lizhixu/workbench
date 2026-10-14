@@ -288,10 +288,12 @@ func strPtr(s string) *string { return &s }
 
 // sanitizeAppDraft validates a model-proposed draft against the real host
 // list and template catalog, nil-ing out anything invalid so the frontend
-// can apply the result blindly. It also computes what is still missing for a
+// can apply the result blindly. When probe facts are present (image/repo
+// metadata read from the ground truth) the draft is reconciled against
+// them afterwards. It also computes what is still missing for a
 // submittable form, taking the current form state as the fallback base.
 // It returns deduplicated missing/warning lists in Chinese.
-func sanitizeAppDraft(d *AppDraft, form AppFormSnapshot, hosts []appHostInfo, templates []AppTemplateInfo) (missing, warnings []string) {
+func sanitizeAppDraft(d *AppDraft, form AppFormSnapshot, hosts []appHostInfo, templates []AppTemplateInfo, facts *appFacts) (missing, warnings []string) {
 	if d == nil {
 		return []string{"目标主机", "应用名称"}, nil
 	}
@@ -418,6 +420,10 @@ func sanitizeAppDraft(d *AppDraft, form AppFormSnapshot, hosts []appHostInfo, te
 			}
 		}
 	}
+
+	// Reconcile against objectively probed image/repo facts (ports,
+	// build_type, dockerfile path) — see app_facts.go.
+	alignDraftWithFacts(d, form, facts, addWarning)
 
 	// Scalar hygiene.
 	trim := func(p **string, max int) {
@@ -579,7 +585,8 @@ const appAssistSystemRules = `规则：
 6. 不要输出 auth_vault_id（Git 凭据必须由用户在页面手选）。git 来源 branch 缺省 "main"，build_type 缺省 "dockerfile"。
 7. env_vars 只填用户明确要求的环境变量；不要编造连接串、口令等敏感值（用户要求生成时除外）。
 8. missing 列出还缺哪些用户必须补充的信息（中文短语，如 "目标主机"、"模板参数「数据库密码」"）；warnings 列出需要提醒用户的注意事项（中文）。explanation 用一两句中文说明你的选型理由。
-9. 能确定的字段都填上，不确定的留空并写入 missing，不要为了填满而编造。`
+9. 能确定的字段都填上，不确定的留空并写入 missing，不要为了填满而编造。
+10. 若上文给出【已客观读取的真实配置】区块，其内容优先级最高（高于你的先验知识）：ports、env_vars 变量名、build_type、卷路径一律以事实为准，不得凭印象覆盖；探测标记为失败的字段才允许按经验推断，且须在 warnings 中提醒用户核实。`
 
 const appDraftJSONSpec = `返回 JSON 格式（字段没把握就省略该字段，不要填 null）：
 {"draft":{"source_type":"template","name":"应用名","container_name":"","host_id":"主机id","template_id":"模板id","template_params":{"键":"值"},"image":"镜像","compose_content":"YAML","repo_url":"https://...","branch":"main","build_type":"dockerfile","dockerfile":"Dockerfile","build_context":".","build_timeout_sec":900,"auto_deploy":true,"ports":[{"host":8080,"container":80,"bind_scope":"public"}],"env_vars":{"K":"V"},"volumes":["/host:/container"],"healthcheck_url":"","domain":"","proxy_mode":"local","gateway_host_id":""},"explanation":"选型说明","missing":["目标主机"],"warnings":[]}`
@@ -602,6 +609,11 @@ func (a *Assistant) AppDraft(ctx context.Context, requirement string, form AppFo
 
 	hosts := a.appHosts()
 	templates := a.appTemplates()
+	facts := a.probeAppFacts(ctx, requirement, form)
+	factsBlock := factsContext(facts)
+	if factsBlock != "" {
+		factsBlock += "\n\n"
+	}
 
 	prompt := fmt.Sprintf(`你是一个应用部署配置助手。用户会用自然语言描述想部署的应用，请你把需求转换成「创建应用」表单草稿。
 
@@ -614,11 +626,11 @@ func (a *Assistant) AppDraft(ctx context.Context, requirement string, form AppFo
 用户当前表单状态（JSON，已脱敏，*** 表示已填写的密钥；可在此基础上补全）：
 %s
 
-用户需求：%s
+%s用户需求：%s
 
 %s
 
-%s`, hostsContext(hosts), templatesContext(templates), formContextJSON(form, templates), requirement, appAssistSystemRules, appDraftJSONSpec)
+%s`, hostsContext(hosts), templatesContext(templates), formContextJSON(form, templates), factsBlock, requirement, appAssistSystemRules, appDraftJSONSpec)
 
 	answer, err := a.callLLM(ctx, prompt)
 	if err != nil {
@@ -633,7 +645,7 @@ func (a *Assistant) AppDraft(ctx context.Context, requirement string, form AppFo
 	if err := json.Unmarshal([]byte(extractJSONPayload(answer)), &parsed); err != nil || parsed.Draft == nil {
 		return nil, fmt.Errorf("AI 返回的草稿无法解析，请换个说法重试")
 	}
-	missing, warnings := sanitizeAppDraft(parsed.Draft, form, hosts, templates)
+	missing, warnings := sanitizeAppDraft(parsed.Draft, form, hosts, templates, facts)
 	for _, m := range parsed.Missing {
 		found := false
 		for _, have := range missing {
@@ -681,6 +693,11 @@ func (a *Assistant) AppChat(ctx context.Context, question string, history []Chat
 
 	hosts := a.appHosts()
 	templates := a.appTemplates()
+	facts := a.probeAppFacts(ctx, question, form)
+	factsBlock := factsContext(facts)
+	if factsBlock != "" {
+		factsBlock += "\n\n"
+	}
 
 	// Cap the carried history so the prompt stays bounded.
 	if len(history) > 10 {
@@ -710,7 +727,7 @@ func (a *Assistant) AppChat(ctx context.Context, question string, history []Chat
 用户当前表单状态（JSON，已脱敏，*** 表示已填写的密钥）：
 %s
 
-对话历史：
+%s对话历史：
 %s
 
 用户问题：%s
@@ -719,7 +736,8 @@ func (a *Assistant) AppChat(ctx context.Context, question string, history []Chat
 1. 只返回一个 JSON 对象：{"answer":"中文回答","form_patch":null}。answer 用中文、简洁可执行。
 2. 当且仅当用户的意图是修改表单时，才在 form_patch 中给出要修改的字段（格式与表单草稿相同，只包含需要改动的字段，没把握的字段不要出现）；只是咨询问题时 form_patch 必须为 null。
 3. form_patch 的 host_id/template_id 只能从上面清单中选；不要给出 auth_vault_id；端口 bind_scope 仅在目标主机有组网IP 时才可建议 mesh。
-4. 表单里 *** 的字段是用户已填的密钥，不要要求用户重复提供，也不要在回答中猜测其内容。`, hostsContext(hosts), templatesContext(templates), formContextJSON(form, templates), histText, question)
+4. 表单里 *** 的字段是用户已填的密钥，不要要求用户重复提供，也不要在回答中猜测其内容。
+5. 若上文给出【已客观读取的真实配置】区块，端口、环境变量键、构建方式等一律以事实为准，不得凭印象覆盖。`, hostsContext(hosts), templatesContext(templates), formContextJSON(form, templates), factsBlock, histText, question)
 
 	answer, err := a.callLLM(ctx, prompt)
 	if err != nil {
@@ -737,7 +755,7 @@ func (a *Assistant) AppChat(ctx context.Context, question string, history []Chat
 	}
 	resp.Answer = strings.TrimSpace(parsed.Answer)
 	if parsed.FormPatch != nil {
-		_, patchWarnings := sanitizeAppDraft(parsed.FormPatch, form, hosts, templates)
+		_, patchWarnings := sanitizeAppDraft(parsed.FormPatch, form, hosts, templates, facts)
 		resp.FormPatch = parsed.FormPatch
 		resp.PatchWarnings = patchWarnings
 	}

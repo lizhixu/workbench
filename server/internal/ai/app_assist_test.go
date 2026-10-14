@@ -39,7 +39,7 @@ func TestSanitizeAppDraftDropsInvalidChoices(t *testing.T) {
 		},
 		EnvVars: map[string]string{"GOOD_KEY": "v", "bad-key": "v", "9BAD": "v"},
 	}
-	missing, warnings := sanitizeAppDraft(d, AppFormSnapshot{}, testHosts(), testTemplates())
+	missing, warnings := sanitizeAppDraft(d, AppFormSnapshot{}, testHosts(), testTemplates(), nil)
 	if d.SourceType != nil || d.HostID != nil || d.TemplateID != nil || d.RepoURL != nil {
 		t.Fatalf("invalid fields not dropped: %+v", d)
 	}
@@ -71,7 +71,7 @@ func TestSanitizeAppDraftTemplateParamsAndMissing(t *testing.T) {
 		TemplateID:     strPtr("redis"),
 		TemplateParams: map[string]string{"REDIS_DB": "2", "UNKNOWN_KEY": "x"},
 	}
-	missing, _ := sanitizeAppDraft(d, AppFormSnapshot{}, testHosts(), testTemplates())
+	missing, _ := sanitizeAppDraft(d, AppFormSnapshot{}, testHosts(), testTemplates(), nil)
 	if _, ok := d.TemplateParams["UNKNOWN_KEY"]; ok {
 		t.Fatalf("unknown template param kept: %+v", d.TemplateParams)
 	}
@@ -90,7 +90,7 @@ func TestSanitizeAppDraftTemplateParamsAndMissing(t *testing.T) {
 
 	// Same draft with the password already in the form: nothing missing.
 	form := AppFormSnapshot{TemplateParams: map[string]string{"REDIS_PASSWORD": "s3cret"}}
-	missing, _ = sanitizeAppDraft(d, form, testHosts(), testTemplates())
+	missing, _ = sanitizeAppDraft(d, form, testHosts(), testTemplates(), nil)
 	for _, m := range missing {
 		if strings.Contains(m, "访问密码") {
 			t.Fatalf("password present in form but still missing: %v", missing)
@@ -103,7 +103,7 @@ func TestSanitizeAppDraftPatchParamsAgainstFormTemplate(t *testing.T) {
 	// template already selected in the form instead of being dropped.
 	d := &AppDraft{TemplateParams: map[string]string{"REDIS_DB": "5", "UNKNOWN_KEY": "x"}}
 	form := AppFormSnapshot{SourceMode: "template", TemplateID: "redis"}
-	_, warnings := sanitizeAppDraft(d, form, testHosts(), testTemplates())
+	_, warnings := sanitizeAppDraft(d, form, testHosts(), testTemplates(), nil)
 	if d.TemplateParams == nil || d.TemplateParams["REDIS_DB"] != "5" {
 		t.Fatalf("form-template params should survive: %+v", d.TemplateParams)
 	}
@@ -126,7 +126,7 @@ func TestSanitizeAppDraftMeshWarning(t *testing.T) {
 		Image:      strPtr("redis:7"),
 		Ports:      []AppPortMapping{{Host: 6379, Container: 6379, BindScope: "mesh"}},
 	}
-	_, warnings := sanitizeAppDraft(d, AppFormSnapshot{}, testHosts(), testTemplates())
+	_, warnings := sanitizeAppDraft(d, AppFormSnapshot{}, testHosts(), testTemplates(), nil)
 	found := false
 	for _, w := range warnings {
 		if strings.Contains(w, "异地组网") {

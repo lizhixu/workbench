@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -39,6 +40,7 @@ import (
 	"watchman/server/internal/network"
 	"watchman/server/internal/panelsec"
 	"watchman/server/internal/policy"
+	"watchman/server/internal/registry"
 	"watchman/server/internal/release"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
@@ -351,6 +353,54 @@ func main() {
 	// assistant can ground its form drafts in real hosts/templates.
 	aiAssistant.SetAppCatalog(appCatalogAdapter{})
 	aiAssistant.SetMeshRef(networkMeshAdapter{store: networkStore})
+	// Inject the ground-truth image/repository probers so drafts reconcile
+	// with objectively read metadata instead of invented ports/variables.
+	aiAssistant.SetAppProbers(ai.AppProbers{
+		Image: func(ctx context.Context, ref string) *ai.AppImageProbe {
+			meta, err := registry.Inspect(ctx, ref)
+			if err != nil {
+				return &ai.AppImageProbe{Err: err.Error()}
+			}
+			return &ai.AppImageProbe{
+				Reference: meta.Reference,
+				Ports:     meta.ExposedPorts,
+				EnvVars:   meta.EnvVars,
+				Volumes:   meta.Volumes,
+				Cmd:       strings.Join(append(meta.Entrypoint, meta.Cmd...), " "),
+			}
+		},
+		Repo: func(ctx context.Context, repoURL string) *ai.AppRepoProbe {
+			meta, err := gitProviderStore.InspectRepo(ctx, repoURL)
+			if err != nil {
+				return &ai.AppRepoProbe{RepoURL: repoURL, Err: err.Error()}
+			}
+			probe := &ai.AppRepoProbe{
+				RepoURL:        meta.RepoURL,
+				Branch:         meta.Branch,
+				HasCompose:     meta.HasCompose,
+				ComposeFile:    meta.ComposeFile,
+				HasDockerfile:  meta.HasDockerfile,
+				DockerfilePath: meta.DockerfilePath,
+				ExposedPorts:   meta.ExposedPorts,
+				DockerfileEnv:  meta.DockerfileEnv,
+			}
+			for _, p := range meta.ComposePorts {
+				probe.ComposePorts = append(probe.ComposePorts, ai.AppPortMapping{
+					Host: p.Host, Container: p.Container, BindScope: "public",
+				})
+			}
+			keys := make([]string, 0, len(meta.EnvExample))
+			for k := range meta.EnvExample {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			if len(keys) > 16 {
+				keys = keys[:16]
+			}
+			probe.EnvExampleKeys = keys
+			return probe
+		},
+	})
 	currentAICfg := aiAssistant.Config()
 	if currentAICfg.Enabled && currentAICfg.BaseURL != "" {
 		log.Info("AI diagnostics enabled", "url", currentAICfg.BaseURL, "model", currentAICfg.Model)

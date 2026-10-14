@@ -47,6 +47,9 @@ type Assistant struct {
 	policy       policyChecker
 	appCatalog   appCatalogRef
 	mesh         meshRef
+	appProbers   AppProbers
+	probeMu      sync.Mutex
+	probeCache   map[string]appProbeCacheEntry
 }
 
 // policyChecker is a minimal interface over the command policy store, used to

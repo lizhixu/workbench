@@ -193,3 +193,61 @@ export function syncAppWebhook(appId: string) {
     http.post(`/apps/${encodeURIComponent(appId)}/webhook/sync`),
   )
 }
+
+// ---- Ground-truth metadata probing (read-only, used by the create form's
+// auto-fill hints and the AI assistant fact injection) ----
+
+export interface ImageMetadata {
+  registry: string
+  repository: string
+  tag: string
+  reference: string
+  os: string
+  architecture: string
+  exposed_ports: number[]
+  env_vars: Record<string, string>
+  volumes: string[]
+  cmd: string[]
+  entrypoint: string[]
+  working_dir: string
+}
+
+export interface ComposePort {
+  service: string
+  host: number
+  container: number
+}
+
+export interface RepoMetadata {
+  repo_url: string
+  owner: string
+  name: string
+  branch: string
+  has_compose: boolean
+  compose_file: string
+  /** Raw compose file content (server-capped at 64KB); may be empty. */
+  compose_content: string
+  compose_ports: ComposePort[]
+  compose_env: Record<string, string>
+  has_dockerfile: boolean
+  dockerfile_path: string
+  exposed_ports: number[]
+  dockerfile_env: Record<string, string>
+  volumes: string[]
+  env_example: Record<string, string>
+  language: string
+}
+
+// 探测接口放宽单请求超时：服务端 ctx 预算为镜像 15s / 仓库 20s，
+// 默认 http 实例 15s 超时会在后端即将返回前误报失败。
+export function inspectImage(image: string) {
+  return unwrap<{ data: ImageMetadata }>(
+    http.post('/apps/inspect-image', { image }, { timeout: 20000 }),
+  ).then((r) => r.data)
+}
+
+export function inspectRepo(repoUrl: string) {
+  return unwrap<{ data: RepoMetadata }>(
+    http.post('/apps/inspect-repo', { repo_url: repoUrl }, { timeout: 30000 }),
+  ).then((r) => r.data)
+}

@@ -38,6 +38,7 @@ import (
 	"watchman/server/internal/network"
 	"watchman/server/internal/panelsec"
 	"watchman/server/internal/policy"
+	"watchman/server/internal/registry"
 	"watchman/server/internal/release"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
@@ -223,8 +224,10 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	if appStore != nil {
 		appWrite := authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator), h.auditMutation())
 		appHandlers := apps.NewAppHandlers(reg, appStore, appEngine)
+		appHandlers.SetProbers(registry.Inspect, nil)
 		if gitProviderStore != nil {
 			appHandlers.SetGitProvider(gitProviderStore)
+			appHandlers.SetProbers(registry.Inspect, gitProviderStore.InspectRepo)
 		}
 		if aiAssistant != nil {
 			appHandlers.SetAI(func(ctx context.Context, command, stdout, stderr string, exitCode int32) (any, error) {

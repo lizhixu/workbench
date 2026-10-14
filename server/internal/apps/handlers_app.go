@@ -22,6 +22,9 @@ type AppHandlers struct {
 	engine      *Engine
 	ai          AIDiagnoseFunc
 	gitProvider GitWebhookManager
+
+	imageInspector ImageInspectFunc
+	repoInspector  RepoInspectFunc
 }
 
 // GitWebhookManager handles automatic lifecycle sync for Git provider webhooks.
@@ -57,6 +60,12 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	readRG.GET("/apps/:id/deployments/:depID", h.getDeployment)
 	readRG.POST("/apps/:id/deployments/:depID/diagnose", h.diagnoseDeployment)
 	readRG.GET("/apps/:id/status", h.appStatus)
+
+	// Image / repository metadata probing: read-only ground-truth fetchers used
+	// by the create-form auto-fill hints and the AI app assistant. No state is
+	// mutated, so these stay on the read group without operation audit.
+	readRG.POST("/apps/inspect-image", h.inspectImage)
+	readRG.POST("/apps/inspect-repo", h.inspectRepo)
 
 	writeRG.POST("/apps", h.createApp)
 	writeRG.PUT("/apps/:id", h.updateApp)

@@ -9,7 +9,8 @@ import {
   ArrowBackOutline, LogoGithub, RefreshOutline,
 } from '@vicons/ionicons5'
 import {
-  createApp, listAppCatalog, type AppEntity, type AppTemplate, type PortMapping,
+  createApp, listAppCatalog, inspectImage, inspectRepo,
+  type AppEntity, type AppTemplate, type ImageMetadata, type PortMapping, type RepoMetadata,
 } from '../../api/apps'
 import { bindProxy } from '../../api/certs'
 import { listHosts } from '../../api/hosts'
@@ -164,6 +165,185 @@ watch(sourceMode, (mode) => {
   if (mode === 'image' && form.ports.length === 0) {
     form.ports = [{ host: 8080, container: 8080, bind_scope: 'public' }]
   }
+})
+
+// ---- 镜像 / 仓库真实元数据探测（只读辅助，失败静默不打扰手动填写）----
+// 探测结果用于提示与一键预填端口/环境变量/构建方式，绝不自动提交表单。
+
+let probeSeq = 0
+const imageProbe = ref<{ loading: boolean; data: ImageMetadata | null; error: string }>({
+  loading: false, data: null, error: '',
+})
+let lastProbedImage = ''
+
+function plausibleImageRef(v: string): boolean {
+  const s = v.trim()
+  if (!s || /\s/.test(s) || s.includes('://') || s.includes('@')) return false
+  return /^[a-zA-Z0-9][\w./:-]*$/.test(s)
+}
+
+async function probeImage() {
+  const v = form.image.trim()
+  if (imageProbe.value.data || imageProbe.value.error) {
+    imageProbe.value = { loading: false, data: null, error: '' }
+  }
+  if (!plausibleImageRef(v)) return
+  lastProbedImage = v
+  const seq = ++probeSeq
+  imageProbe.value.loading = true
+  try {
+    const meta = await inspectImage(v)
+    if (seq !== probeSeq || lastProbedImage !== form.image.trim()) return
+    imageProbe.value = { loading: false, data: meta, error: '' }
+  } catch (e: any) {
+    if (seq !== probeSeq) return
+    imageProbe.value = { loading: false, data: null, error: e?.message || '镜像元数据读取失败' }
+  }
+}
+
+watch(() => form.image, () => {
+  if (form.image.trim() !== lastProbedImage) {
+    lastProbedImage = ''
+    imageProbe.value = { loading: false, data: null, error: '' }
+  }
+})
+
+const imageProbeSummary = computed(() => {
+  const m = imageProbe.value.data
+  if (!m) return ''
+  const parts: string[] = []
+  parts.push(m.exposed_ports?.length ? `端口 ${m.exposed_ports.join(' / ')}` : '未声明暴露端口')
+  const envCount = Object.keys(m.env_vars || {}).length
+  if (envCount > 0) parts.push(`预置变量 ${envCount} 项`)
+  if (m.volumes?.length) parts.push(`数据卷 ${m.volumes.length} 项`)
+  return parts.join(' · ')
+})
+
+function applyImageProbe() {
+  const m = imageProbe.value.data
+  if (!m) return
+  const real = (m.exposed_ports || []).filter((p) => p > 0 && p <= 65535)
+  if (real.length > 0) {
+    const isPlaceholder = form.ports.length === 1
+      && form.ports[0].host === 8080 && form.ports[0].container === 8080
+    if (form.ports.length === 0 || isPlaceholder) {
+      form.ports = real.map((p) => ({ host: p, container: p, bind_scope: 'public' as const }))
+    } else {
+      const realSet = new Set(real)
+      const kept = form.ports.filter((p) => realSet.has(p.container))
+      form.ports = kept.length > 0
+        ? kept
+        : real.map((p) => ({ host: p, container: p, bind_scope: 'public' as const }))
+    }
+  }
+  if (!form.env_vars_text.trim() && Object.keys(m.env_vars || {}).length > 0) {
+    form.env_vars_text = Object.entries(m.env_vars)
+      .map(([k, v]) => `${k}=${v}`)
+      .join('\n')
+  }
+  if (!form.healthcheck_url.trim() && real.length > 0) {
+    form.healthcheck_url = `http://127.0.0.1:${real[0]}/`
+  }
+  if (!form.name.trim()) {
+    const seg = (m.repository || '').split('/').pop() || ''
+    if (seg) form.name = seg
+  }
+  message.success('已按镜像真实配置带入端口与环境变量，请核对后提交')
+}
+
+const repoProbe = ref<{ loading: boolean; data: RepoMetadata | null; error: string }>({
+  loading: false, data: null, error: '',
+})
+let lastProbedRepo = ''
+// 构建方式的单选框一旦被用户手点过就不再自动替用户切换
+let buildTypeTouched = false
+function markBuildTypeTouched() {
+  buildTypeTouched = true
+}
+
+function normalizeRepoURL(v: string): string {
+  return v.trim().toLowerCase().replace(/\.git$/, '').replace(/\/+$/, '')
+}
+
+function isGitHubRepoURL(v: string): boolean {
+  return /^https?:\/\/(www\.)?github\.com\/[\w.-]+\/[\w.-]+/i.test(v.trim())
+}
+
+async function probeRepo(url: string) {
+  const v = url.trim()
+  if (repoProbe.value.data || repoProbe.value.error) {
+    repoProbe.value = { loading: false, data: null, error: '' }
+  }
+  if (!isGitHubRepoURL(v)) return
+  lastProbedRepo = normalizeRepoURL(v)
+  const seq = ++probeSeq
+  repoProbe.value.loading = true
+  try {
+    const meta = await inspectRepo(v)
+    if (seq !== probeSeq || lastProbedRepo !== normalizeRepoURL(form.repo_url)) return
+    repoProbe.value = { loading: false, data: meta, error: '' }
+    applyRepoProbeAuto(meta)
+  } catch (e: any) {
+    if (seq !== probeSeq) return
+    repoProbe.value = { loading: false, data: null, error: e?.message || '仓库配置读取失败' }
+  }
+}
+
+watch(() => form.repo_url, () => {
+  if (normalizeRepoURL(form.repo_url) !== lastProbedRepo) {
+    lastProbedRepo = ''
+    repoProbe.value = { loading: false, data: null, error: '' }
+  }
+})
+
+// 探测到事实后自动对齐：构建方式（仅用户未手改时）、编排/Dockerfile 路径
+//（仅仍是默认值时）、Dockerfile 模式下端口映射（仅端口列表为空时）。
+function applyRepoProbeAuto(meta: RepoMetadata) {
+  if (!buildTypeTouched) {
+    if (meta.has_compose && !meta.has_dockerfile) {
+      form.build_type = 'compose'
+    } else if (meta.has_dockerfile && !meta.has_compose) {
+      form.build_type = 'dockerfile'
+    }
+  }
+  const pathField = form.dockerfile.trim()
+  const pathIsDefault = pathField === '' || pathField === 'Dockerfile'
+  if (form.build_type === 'compose') {
+    if (meta.has_compose && pathIsDefault) {
+      form.dockerfile = meta.compose_file || 'compose.yaml'
+    }
+  } else if (meta.has_dockerfile && pathIsDefault && meta.dockerfile_path !== 'Dockerfile') {
+    form.dockerfile = meta.dockerfile_path
+  }
+  if (form.build_type === 'dockerfile' && meta.exposed_ports?.length && form.ports.length === 0) {
+    form.ports = meta.exposed_ports
+      .filter((p) => p > 0 && p <= 65535)
+      .map((p) => ({ host: p, container: p, bind_scope: 'public' as const }))
+  }
+  if (meta.branch && (!form.branch.trim() || form.branch.trim() === 'main') && meta.branch !== 'main') {
+    form.branch = meta.branch
+  }
+  if (!form.name.trim() && meta.name) {
+    form.name = meta.name
+  }
+}
+
+const repoProbeTags = computed(() => {
+  const m = repoProbe.value.data
+  if (!m) return []
+  const tags: string[] = []
+  if (m.has_compose) tags.push(`编排文件 ${m.compose_file}`)
+  if (m.has_dockerfile) {
+    tags.push(m.exposed_ports?.length
+      ? `${m.dockerfile_path}（EXPOSE ${m.exposed_ports.join(' / ')}）`
+      : m.dockerfile_path)
+  }
+  if (!m.has_compose && !m.has_dockerfile) {
+    tags.push(m.language ? `未检出 Dockerfile/Compose（${m.language} 项目）` : '未检出 Dockerfile/Compose')
+  }
+  const envKeys = Object.keys(m.env_example || {} || {})
+  if (envKeys.length > 0) tags.push(`.env 示例键：${envKeys.slice(0, 6).join('、')}${envKeys.length > 6 ? '…' : ''}`)
+  return tags
 })
 
 const bindScopeOptions = [
@@ -396,6 +576,8 @@ watch(selectedRepoFullName, async (fullName) => {
   if (!form.name) {
     form.name = repo.name
   }
+  // 顺带客观读取仓库的部署配置（Dockerfile/Compose/.env），失败静默
+  void probeRepo(repo.clone_url)
 
   loadingBranches.value = true
   try {
@@ -654,7 +836,22 @@ onMounted(loadData)
             </NSpace>
 
             <NFormItem label="镜像地址" required>
-              <NInput v-model:value="form.image" placeholder="nginx:alpine / redis:7.2 / registry.example.com/app:1.0" />
+              <NSpace vertical style="width: 100%" :size="6">
+                <NInput
+                  v-model:value="form.image"
+                  placeholder="nginx:alpine / redis:7.2 / registry.example.com/app:1.0"
+                  @blur="probeImage"
+                  @keyup.enter="probeImage"
+                />
+                <div v-if="imageProbe.loading" class="probe-bar loading">正在读取镜像仓库的真实配置…</div>
+                <div v-else-if="imageProbe.data" class="probe-bar ok">
+                  <span class="probe-text">已客观读取：{{ imageProbeSummary }}</span>
+                  <NButton size="tiny" secondary type="primary" @click="applyImageProbe">按真实配置填入</NButton>
+                </div>
+                <div v-else-if="imageProbe.error" class="probe-bar warn">
+                  {{ imageProbe.error }}（不影响手动填写）
+                </div>
+              </NSpace>
             </NFormItem>
           </template>
 
@@ -757,6 +954,8 @@ onMounted(loadData)
               <NInput
                 v-model:value="form.repo_url"
                 placeholder="https://github.com/yourname/your-repo.git"
+                @blur="probeRepo(form.repo_url)"
+                @keyup.enter="probeRepo(form.repo_url)"
               />
             </NFormItem>
 
@@ -773,6 +972,22 @@ onMounted(loadData)
             </NFormItem>
           </template>
 
+          <!-- 仓库客观探测结果徽标（GitHub / 通用 Git 共用，渲染在两段的下方） -->
+          <template v-if="sourceMode === 'github' || sourceMode === 'custom'">
+            <div v-if="repoProbe.loading" class="probe-bar loading">正在读取仓库的部署配置（Dockerfile / Compose / .env）…</div>
+            <div v-else-if="repoProbe.data" class="probe-bar ok">
+              <NTag size="tiny" type="success" :bordered="false">已客观读取</NTag>
+              <span class="probe-text">默认分支 {{ repoProbe.data.branch }}</span>
+              <NTag v-for="t in repoProbeTags" :key="t" size="tiny" type="info" :bordered="false">{{ t }}</NTag>
+              <span v-if="!buildTypeTouched && (repoProbe.data.has_compose !== repoProbe.data.has_dockerfile)" class="probe-text">
+                构建方式已按仓库事实自动对齐
+              </span>
+            </div>
+            <div v-else-if="repoProbe.error" class="probe-bar warn">
+              {{ repoProbe.error }}（不影响手动填写）
+            </div>
+          </template>
+
           <NFormItem label="目标主机" required>
             <NSelect
               v-model:value="form.host_id"
@@ -785,7 +1000,7 @@ onMounted(loadData)
           <!-- Git 构建配置 -->
           <template v-if="sourceMode === 'github' || sourceMode === 'custom'">
             <NFormItem label="构建部署模式">
-              <NRadioGroup v-model:value="form.build_type">
+              <NRadioGroup v-model:value="form.build_type" @update:value="markBuildTypeTouched">
                 <NSpace>
                   <NRadio value="dockerfile">Dockerfile 单容器镜像构建</NRadio>
                   <NRadio value="compose">Docker Compose 复合微服务栈</NRadio>
@@ -1111,5 +1326,38 @@ onMounted(loadData)
 .hint {
   font-size: 12px;
   color: var(--n-text-color-disabled, #999);
+}
+
+/* 镜像/仓库真实配置的探测提示条 */
+.probe-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  width: 100%;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 5px 10px;
+  border-radius: 6px;
+
+  &.ok {
+    background: rgba(24, 160, 88, 0.08);
+    border: 1px solid rgba(24, 160, 88, 0.22);
+  }
+
+  &.loading {
+    color: var(--text-secondary);
+    background: rgba(128, 128, 128, 0.08);
+  }
+
+  &.warn {
+    color: #d48806;
+    background: rgba(250, 173, 20, 0.08);
+    border: 1px solid rgba(250, 173, 20, 0.22);
+  }
+
+  .probe-text {
+    color: var(--text-secondary);
+  }
 }
 </style>

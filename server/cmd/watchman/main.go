@@ -57,6 +57,7 @@ import (
 
 func main() {
 	grpcAddr := flag.String("grpc", ":9090", "gRPC listen address (agents)")
+	opGRPCAddr := flag.String("opgrpc", "", "operator tunnel gRPC listen address (watchmanctl data plane; empty = disabled, requires -tls-cert/-tls-key)")
 	httpAddr := flag.String("http", ":18080", "HTTP listen address (browsers)")
 	dataDir := flag.String("data", "./data", "data directory (users.json, sessions, etc.)")
 	jwtKey := flag.String("jwt-key", "", "JWT signing key (random if empty)")
@@ -445,6 +446,68 @@ func main() {
 	defer cancel()
 	go grpcSrv.StartReaper(ctx)
 
+	// Operator tunnel data plane (§3.9.1): a user-authenticated gRPC service
+	// on its own dedicated port, physically separate from the panel and the
+	// agent ports. Fail-closed: refused without TLS (never serve user data
+	// plane in cleartext) and entirely off by default (-opgrpc empty).
+	var ops *grpc.Server
+	if *opGRPCAddr != "" {
+		if !tlsEnabled {
+			log.Error("-opgrpc requires -tls-cert/-tls-key; operator tunnel listener not started")
+			*opGRPCAddr = "" // fail-closed: client-info must not report enabled
+		} else if opLis, err := net.Listen("tcp", *opGRPCAddr); err != nil {
+			log.Error("opgrpc listen", "err", err)
+			*opGRPCAddr = "" // fail-closed: ditto
+		} else {
+			opSvc := rpc.NewOperatorService(rpc.OperatorServiceDeps{
+				Registry:    reg,
+				Coordinator: reg.TunnelCoordinator(),
+				Audit:       auditStore,
+				Log:         log,
+				CanAccessGroup: func(username string, isAdmin bool, group string) bool {
+					return groupStore.CanAccessGroup(username, isAdmin, group)
+				},
+				ResolveApp: func(appID string) (rpc.AppTargetInfo, bool) {
+					app, ok := appStore.GetApp(appID)
+					if !ok {
+						return rpc.AppTargetInfo{}, false
+					}
+					info := rpc.AppTargetInfo{HostID: app.HostID, Name: app.Name}
+					for _, p := range app.Ports {
+						info.Ports = append(info.Ports, rpc.AppPortInfo{Port: p.Host, Mesh: p.BindScope == "mesh"})
+					}
+					return info, true
+				},
+				MeshIP: func(hostID string) string {
+					st, ok := networkStore.GetNodeStatus(hostID)
+					if !ok {
+						return ""
+					}
+					return st.IP
+				},
+			})
+			// Same keepalive + TLS creds as the agent listener, plus the JWT
+			// interceptor. Enlarged HTTP/2 flow-control windows: the 64KB
+			// defaults cap a stream near ~17 Mbps at 30ms RTT, which would
+			// bottleneck tunneled throughput on anything but LAN.
+			opOpts := append(append([]grpc.ServerOption{}, grpcOpts...),
+				grpc.StreamInterceptor(rpc.OperatorAuthInterceptor(authStore)),
+				grpc.InitialWindowSize(4*1024*1024),
+				grpc.InitialConnWindowSize(16*1024*1024),
+			)
+			ops = grpc.NewServer(opOpts...)
+			agentpb.RegisterOperatorServiceServer(ops, opSvc)
+			go reg.TunnelCoordinator().StartReaper(ctx)
+			go func(l net.Listener) {
+				log.Info("operator tunnel server listening", "addr", *opGRPCAddr)
+				if err := ops.Serve(l); err != nil {
+					log.Error("opgrpc serve", "err", err)
+					cancel()
+				}
+			}(opLis)
+		}
+	}
+
 	// Background metrics auto-collector (15s) and 7-day retention janitor.
 	go metricsStore.StartAutoCollector(ctx, reg, 15*time.Second)
 	go metricsStore.StartJanitor(ctx, 7, 1*time.Hour)
@@ -498,7 +561,7 @@ func main() {
 	}()
 
 	// HTTP server (REST + WS).
-	hr := api.Router(reg, log, authStore, sessStore, alertStore, vaultStore, aiAssistant, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore, settingsStore, backupStore, networkStore, appStore, appEngine, certHub, snapshotStore, snapshotEngine, gitProviderStore, alertMonitor)
+	hr := api.Router(reg, log, authStore, sessStore, alertStore, vaultStore, aiAssistant, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore, settingsStore, backupStore, networkStore, appStore, appEngine, certHub, snapshotStore, snapshotEngine, gitProviderStore, alertMonitor, *opGRPCAddr)
 	// Install endpoints (one-line agent install + binary download).
 	installHandler := install.NewHandler(reg, "bin")
 	installHandler.UpgradePubKey = api.UpgradePubKeyHex
@@ -586,6 +649,23 @@ func main() {
 	case <-time.After(2 * time.Second):
 		log.Warn("gRPC graceful stop timed out, forcing stop")
 		gs.Stop()
+	}
+
+	// Mirror the graceful stop for the operator tunnel listener (its
+	// bidi streams likewise block GracefulStop, so keep the 2s fallback).
+	if ops != nil {
+		opStopped := make(chan struct{})
+		go func() {
+			ops.GracefulStop()
+			close(opStopped)
+		}()
+		select {
+		case <-opStopped:
+			log.Info("operator gRPC server gracefully stopped")
+		case <-time.After(2 * time.Second):
+			log.Warn("operator gRPC graceful stop timed out, forcing stop")
+			ops.Stop()
+		}
 	}
 
 	log.Info("bye")

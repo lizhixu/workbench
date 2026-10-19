@@ -2,10 +2,10 @@
 import { computed, h, onActivated, onDeactivated, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
-  NAlert, NButton, NDataTable, NDescriptions, NDescriptionsItem,
-  NForm, NFormItem, NIcon, NModal, NPopconfirm, NRadio, NRadioGroup,
+  NAlert, NButton, NCode, NDataTable, NDescriptions, NDescriptionsItem,
+  NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPopconfirm, NRadio, NRadioGroup,
   NSelect, NSpace, NSwitch, NTabPane, NTabs,
-  NTag, NCode, useMessage,
+  NTag, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import {
@@ -21,8 +21,11 @@ import {
 import { bindProxy, unbindProxy, type Certificate } from '../../api/certs'
 import { listCerts } from '../../api/certs'
 import { listHosts } from '../../api/hosts'
+import { listNetworkNodes } from '../../api/network'
+import { bothMeshed } from '../../utils/mesh'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useAuthStore } from '../../stores/auth'
+import OpsTunnelModal from '../../components/tunnels/OpsTunnelModal.vue'
 
 defineOptions({ name: 'AppDetail' })
 
@@ -44,6 +47,20 @@ const activeTab = ref('overview')
 // Deployment log viewer.
 const showLog = ref(false)
 const logDeployment = ref<Deployment | null>(null)
+
+// Ops tunnel one-click entry (kubectl port-forward style): opened from a
+// port mapping row, prefilled with that host port.
+const showTunnel = ref(false)
+const tunnelPort = ref(0)
+const tunnelPrefill = computed(() => ({
+  appId: app.value?.id ?? appId.value,
+  appName: app.value?.name,
+  port: tunnelPort.value,
+}))
+function openTunnel(port: number) {
+  tunnelPort.value = port
+  showTunnel.value = true
+}
 
 // AI Deployment diagnosis.
 const showAIDiagnosis = ref(false)
@@ -67,11 +84,40 @@ async function doDiagnose(dep: Deployment) {
 
 // ---- Reverse proxy binding (domain + cert + nginx distribution) ----
 const certs = ref<Certificate[]>([])
-const hostOptions = ref<{ label: string; value: string }[]>([])
+const hostsList = ref<{ id: string; hostname: string; status: string; public_ip?: string }[]>([])
+
+// 网关候选按「有公网 IP」优先排序并标注组网/直连路径。应用信息与主机列表是
+// 并发加载的（onMounted 同时 refreshAll/loadProxyData），故这里是 computed
+// 而非一次性构建——否则 app 晚到时「禁用应用主机自身」和路径标注会基于空 app。
+const hostOptions = computed(() => {
+  const appMesh = app.value ? meshIPById.value.get(app.value.host_id) || '' : ''
+  const list = hostsList.value
+    .filter((h) => h.status === 'online')
+    .map((h) => {
+      const mesh = meshIPById.value.get(h.id)
+      // 网关到应用主机：双方都在组网内则走 100.x，否则直连（公网/内网 IP）——组网非必需
+      const path = mesh && appMesh ? '组网直达' : '直连'
+      const recommended = !!h.public_ip
+      const tags = [h.public_ip ? `公网 ${h.public_ip}` : '无公网 IP', mesh ? `组网 ${mesh}` : '未组网', path]
+      return {
+        label: `${h.hostname}（${tags.join(' · ')}${recommended ? '，推荐' : ''}）`,
+        value: h.id,
+        // 网关主机不能是应用主机自身（相同场景即 local 模式）
+        disabled: h.id === app.value?.host_id,
+        rank: recommended ? 0 : 1,
+      }
+    })
+  list.sort((a, b) => a.rank - b.rank)
+  return list
+})
+// 网关主机必须自身已加入组网（网关需经组网访问应用主机），据此标注/禁用选项
+const meshIPById = ref<Map<string, string>>(new Map())
 const proxyForm = ref({
   domain: '',
   mode: 'local' as 'local' | 'gateway',
-  gateway_host_id: '',
+  // NSelect 绑定字段空值用 null：空串会被 naive-ui fallbackOption 合成空 label 选项，
+  // 让 select 自认为已选中、占位符永不渲染。
+  gateway_host_id: null as string | null,
   upstream: '',
   cert_id: '',
   websocket: true,
@@ -85,12 +131,18 @@ async function loadProxyData() {
     certs.value = []
   }
   try {
-    const res = await listHosts()
-    const hosts = ((res as { data: { id: string; hostname: string; status: string }[] }).data ?? []) as { id: string; hostname: string; status: string }[]
-    hostOptions.value = hosts.map((h) => ({ label: h.hostname, value: h.id }))
-    hostnameById.value = new Map(hosts.map((h) => [h.id, h.hostname]))
+    const nodes = (await listNetworkNodes()) ?? []
+    meshIPById.value = new Map(nodes.filter((n) => n.ip).map((n) => [n.host_id, n.ip]))
   } catch {
-    hostOptions.value = []
+    meshIPById.value = new Map()
+  }
+  try {
+    const res = await listHosts()
+    const hosts = ((res as { data: { id: string; hostname: string; status: string; public_ip?: string }[] }).data ?? []) as { id: string; hostname: string; status: string; public_ip?: string }[]
+    hostnameById.value = new Map(hosts.map((h) => [h.id, h.hostname]))
+    hostsList.value = hosts
+  } catch {
+    hostsList.value = []
   }
   if (app.value) {
     proxyForm.value.domain = app.value.domain ?? ''
@@ -117,14 +169,118 @@ const gatewayHostname = computed(() => {
   return hostnameById.value.get(app.value.proxy_gateway_host_id) || app.value.proxy_gateway_host_id
 })
 
+const forwardHostname = computed(() => {
+  if (!app.value?.mesh_forward_host_id) return ''
+  return hostnameById.value.get(app.value.mesh_forward_host_id) || app.value.mesh_forward_host_id
+})
+
+const appHostMeshIP = computed(() => {
+  if (!app.value?.host_id) return ''
+  return meshIPById.value.get(app.value.host_id) || ''
+})
+
+const forwardMeshLink = computed(() => {
+  const appHostId = app.value?.host_id
+  const fwdHostId = app.value?.mesh_forward_host_id || forwardForm.value.host_id
+  if (!appHostId || !fwdHostId) return false
+  return bothMeshed(meshIPById.value.get(appHostId), meshIPById.value.get(fwdHostId))
+})
+
+// 网关上游落在 Tailscale CGNAT 段（100.64.0.0/10）即视为走了异地组网，否则是直连
+const gatewayUpstreamIsMesh = computed(() => {
+  const ip = (app.value?.proxy_upstream ?? '').split(':')[0]
+  const parts = ip.split('.')
+  if (parts.length !== 4 || parts[0] !== '100') return false
+  const second = Number(parts[1])
+  return Number.isFinite(second) && second >= 64 && second <= 127
+})
+
+// ---- 组网端口转发表单与操作 ----
+const forwardForm = ref({
+  enabled: false,
+  host_id: null as string | null, // 同 proxyForm.gateway_host_id：NSelect 空值用 null
+  entry_port: null as number | null,
+  target_port: null as number | null,
+})
+const savingForward = ref(false)
+
+function syncForwardForm() {
+  if (app.value) {
+    forwardForm.value.enabled = !!app.value.mesh_forward_enabled
+    forwardForm.value.host_id = app.value.mesh_forward_host_id ?? null
+    forwardForm.value.entry_port = app.value.mesh_forward_entry_port || null
+    forwardForm.value.target_port = app.value.mesh_forward_target_port || null
+    if (!forwardForm.value.target_port && app.value.ports && app.value.ports.length > 0) {
+      // 中继拨的是宿主机发布端口：预填 host 端口，未发布时才回退容器端口
+      forwardForm.value.target_port = app.value.ports[0].host || app.value.ports[0].container || null
+    }
+  }
+}
+
+watch(
+  () => forwardForm.value.enabled,
+  (val) => {
+    if (val) {
+      if (!forwardForm.value.target_port && app.value?.ports && app.value.ports.length > 0) {
+        forwardForm.value.target_port = app.value.ports[0].host || app.value.ports[0].container || null
+      }
+      if (!forwardForm.value.entry_port && forwardForm.value.target_port) {
+        forwardForm.value.entry_port = forwardForm.value.target_port
+      }
+    }
+  }
+)
+
+async function doSaveForward() {
+  if (forwardForm.value.enabled) {
+    if (!forwardForm.value.host_id) {
+      message.warning('启用组网端口转发时必须选择入口主机')
+      return
+    }
+    if (forwardForm.value.host_id === app.value?.host_id) {
+      message.warning('组网转发入口主机不能与应用部署主机相同')
+      return
+    }
+    if (!forwardForm.value.entry_port || forwardForm.value.entry_port < 1 || forwardForm.value.entry_port > 65535) {
+      message.warning('请填写合法的入口监听端口（1-65535）')
+      return
+    }
+    if (!forwardForm.value.target_port || forwardForm.value.target_port < 1 || forwardForm.value.target_port > 65535) {
+      message.warning('请填写合法的应用目标端口（1-65535）')
+      return
+    }
+  }
+  savingForward.value = true
+  try {
+    await updateApp(appId.value, {
+      mesh_forward_enabled: forwardForm.value.enabled,
+      mesh_forward_host_id: forwardForm.value.enabled ? forwardForm.value.host_id || undefined : undefined,
+      mesh_forward_entry_port: forwardForm.value.enabled ? forwardForm.value.entry_port ?? undefined : undefined,
+      mesh_forward_target_port: forwardForm.value.enabled ? forwardForm.value.target_port ?? undefined : undefined,
+    })
+    message.success(forwardForm.value.enabled ? '组网端口转发已保存并同步中继容器' : '已关闭组网端口转发')
+    await loadApp()
+  } catch (e: any) {
+    message.error(e.message || '保存失败')
+  } finally {
+    savingForward.value = false
+  }
+}
+
 async function doBindProxy() {
   if (!proxyForm.value.domain.trim()) {
     message.warning('请填写域名')
     return
   }
-  if (proxyForm.value.mode === 'gateway' && !proxyForm.value.gateway_host_id) {
-    message.warning('网关模式需选择网关主机')
-    return
+  if (proxyForm.value.mode === 'gateway') {
+    if (!proxyForm.value.gateway_host_id) {
+      message.warning('网关模式需选择网关主机')
+      return
+    }
+    if (proxyForm.value.gateway_host_id === app.value?.host_id) {
+      message.warning('网关主机不能与应用主机相同（相同场景请改用 local 模式）')
+      return
+    }
   }
   savingProxy.value = true
   try {
@@ -189,6 +345,7 @@ async function loadApp() {
     if (app.value.compose_content) {
       composeEditContent.value = app.value.compose_content
     }
+    syncForwardForm()
   } catch (e: any) {
     message.error(e.message || '获取应用信息失败')
   }
@@ -519,6 +676,15 @@ onDeactivated(() => {
               <NDescriptionsItem v-if="app.source_type === 'image' || app.source_type === 'template'" label="镜像">
                 <span class="mono">{{ app.image || '-' }}</span>
               </NDescriptionsItem>
+              <NDescriptionsItem label="组网端口转发">
+                <template v-if="app.mesh_forward_enabled">
+                  <NTag size="small" type="success" :bordered="false">已启用</NTag>
+                  <span class="mono" style="margin-left: 8px">
+                    {{ forwardHostname || app.mesh_forward_host_id }}:{{ app.mesh_forward_entry_port }} → {{ app.mesh_forward_target || (app.mesh_forward_target_port ? `${appHostMeshIP || appHostname}:${app.mesh_forward_target_port}` : '-') }}
+                  </span>
+                </template>
+                <span v-else style="color: var(--n-text-color-3)">未启用</span>
+              </NDescriptionsItem>
               <NDescriptionsItem label="容器名">
                 <span class="mono">{{ app.container_name || '-' }}</span>
               </NDescriptionsItem>
@@ -526,11 +692,18 @@ onDeactivated(() => {
                 <span class="mono">{{ app.healthcheck_url || '未配置' }}</span>
               </NDescriptionsItem>
               <NDescriptionsItem label="端口映射">
-                <span class="mono">
-                  {{ (app.ports ?? [])
-                    .map((p) => `${p.host}:${p.container}${p.bind_scope === 'mesh' ? '（仅组网）' : ''}`)
-                    .join(', ') || '-' }}
-                </span>
+                <div v-if="(app.ports ?? []).length" class="port-rows">
+                  <div v-for="p in app.ports" :key="`${p.host}:${p.container}`" class="port-row">
+                    <span class="mono">
+                      {{ p.host }}:{{ p.container }}<template v-if="p.bind_scope === 'mesh'">（仅组网）</template>
+                    </span>
+                    <NButton size="tiny" secondary @click="openTunnel(p.host)">
+                      <template #icon><NIcon :component="SwapHorizontalOutline" /></template>
+                      隧道
+                    </NButton>
+                  </div>
+                </div>
+                <span v-else>-</span>
               </NDescriptionsItem>
               <NDescriptionsItem label="挂载卷">
                 <span class="mono">{{ (app.volumes ?? []).join(', ') || '-' }}</span>
@@ -633,14 +806,21 @@ onDeactivated(() => {
                     {{ gatewayHostname || appHostname }}
                   </div>
                 </div>
-                <div v-if="app.proxy_mode === 'gateway'" class="topology-arrow">Tailscale 组网</div>
+                <div v-if="app.proxy_mode === 'gateway'" class="topology-arrow">
+                  {{ gatewayUpstreamIsMesh ? 'Tailscale 组网' : '直连' }}
+                </div>
                 <div class="topology-node">
                   <div class="topology-label">应用容器</div>
                   <div class="topology-value">{{ app.container_name || app.name }}（{{ app.proxy_upstream }}）</div>
                 </div>
               </div>
               <div v-if="app.proxy_mode === 'gateway'" class="topology-hint">
-                应用主机无需公网 IP：公网流量在网关主机卸载 TLS 后，经 Tailscale 内网转发到应用容器的上游端口。
+                <template v-if="gatewayUpstreamIsMesh">
+                  应用主机无需公网 IP：公网流量在网关主机卸载 TLS 后，经 Tailscale 组网转发到应用容器的上游端口。
+                </template>
+                <template v-else>
+                  公网流量在网关主机卸载 TLS 后，经公网/内网 IP 直连转发到应用容器（未走异地组网）。
+                </template>
               </div>
             </div>
 
@@ -658,9 +838,12 @@ onDeactivated(() => {
                     v-if="proxyForm.mode === 'gateway'"
                     v-model:value="proxyForm.gateway_host_id"
                     :options="hostOptions"
-                    placeholder="选择运行 watchman-app-nginx 的网关主机"
+                    placeholder="选择运行 watchman-app-nginx 的网关主机（可走组网或直连）"
                     filterable
                   />
+                  <span v-if="proxyForm.mode === 'gateway'" class="hint" style="display: block; margin-top: 4px">
+                    网关主机不能是应用主机自身；到应用主机可走异地组网（双方均在组网内）或直连（公网/内网 IP），组网非必需
+                  </span>
                 </NSpace>
               </NFormItem>
               <NFormItem label="证书">
@@ -682,6 +865,118 @@ onDeactivated(() => {
                   </template>
                   确定解除 {{ app.domain }} 的反代绑定？
                 </NPopconfirm>
+              </NSpace>
+            </NForm>
+          </div>
+        </NTabPane>
+
+        <NTabPane name="forward" tab="组网端口转发">
+          <div class="overview-scroll">
+            <NAlert
+              v-if="app.mesh_forward_enabled"
+              type="success"
+              :show-icon="true"
+              style="margin-bottom: 14px"
+            >
+              <template #header>组网端口转发已启用</template>
+              入口：{{ forwardHostname || app.mesh_forward_host_id }}:{{ app.mesh_forward_entry_port }}，
+              转发目标：{{ app.mesh_forward_target || (app.mesh_forward_target_port ? `${appHostMeshIP || appHostname}:${app.mesh_forward_target_port}` : '-') }}
+            </NAlert>
+            <NAlert
+              v-else
+              type="default"
+              :show-icon="false"
+              style="margin-bottom: 14px"
+            >
+              未启用组网端口转发。启用后，系统将在选定的入口主机（如具有公网 IP 的中继节点）上运行 socat 容器，通过异地组网或直连将 4 层 TCP 端口流量转发至本应用。
+            </NAlert>
+
+            <!-- 流量拓扑：4层 TCP 端口转发链路 -->
+            <div v-if="app.mesh_forward_enabled" class="topology-box" style="margin-bottom: 16px;">
+              <div class="topology-line">
+                <div class="topology-node">
+                  <div class="topology-label">外部访问 / 客户端</div>
+                  <div class="topology-value">
+                    {{ forwardHostname || '入口主机' }}:{{ app.mesh_forward_entry_port }}
+                  </div>
+                </div>
+                <div class="topology-arrow">-&gt;</div>
+                <div class="topology-node">
+                  <div class="topology-label">入口主机（socat 中继容器）</div>
+                  <div class="topology-value">{{ forwardHostname }}</div>
+                </div>
+                <div class="topology-arrow">
+                  {{ forwardMeshLink ? 'Tailscale 组网' : '直连' }}
+                </div>
+                <div class="topology-node">
+                  <div class="topology-label">应用主机</div>
+                  <div class="topology-value">{{ appHostMeshIP || appHostname }}:{{ app.mesh_forward_target_port }}</div>
+                </div>
+                <div class="topology-arrow">-&gt;</div>
+                <div class="topology-node">
+                  <div class="topology-label">应用容器</div>
+                  <div class="topology-value">{{ app.container_name || app.name }}</div>
+                </div>
+              </div>
+              <div class="topology-hint">
+                <template v-if="forwardMeshLink">
+                  应用主机无需公网 IP：外部客户端连接入口主机的 {{ app.mesh_forward_entry_port }} 端口，流量经 Tailscale 组网直接送达应用主机的 {{ app.mesh_forward_target_port }} 端口。
+                </template>
+                <template v-else>
+                  外部客户端连接入口主机的 {{ app.mesh_forward_entry_port }} 端口，流量经公网/内网 IP 直连转发至应用主机（未走异地组网）。
+                </template>
+              </div>
+            </div>
+
+            <NForm label-placement="top" style="max-width: 640px">
+              <NFormItem label="启用组网端口转发 (TCP 4层中继)">
+                <NSwitch v-model:value="forwardForm.enabled" />
+              </NFormItem>
+
+              <template v-if="forwardForm.enabled">
+                <NFormItem label="入口主机（流量进入的主机）" required>
+                  <NSelect
+                    v-model:value="forwardForm.host_id"
+                    :options="hostOptions"
+                    placeholder="选择运行 socat 中继容器的主机"
+                    filterable
+                  />
+                  <span class="hint" style="display: block; margin-top: 4px">
+                    入口主机不能是应用主机自身；优先选择有公网 IP 的主机以对外暴露服务
+                  </span>
+                </NFormItem>
+
+                <NFormItem label="入口监听端口" required>
+                  <NInputNumber
+                    v-model:value="forwardForm.entry_port"
+                    placeholder="如 16379"
+                    :min="1"
+                    :max="65535"
+                    style="width: 100%"
+                  />
+                  <span class="hint" style="display: block; margin-top: 4px">
+                    入口主机上对外监听并接收客户端连接的 TCP 端口
+                  </span>
+                </NFormItem>
+
+                <NFormItem label="应用目标端口" required>
+                  <NInputNumber
+                    v-model:value="forwardForm.target_port"
+                    placeholder="如 6379"
+                    :min="1"
+                    :max="65535"
+                    style="width: 100%"
+                  />
+                  <span class="hint" style="display: block; margin-top: 4px">
+                    本应用主机上实际接收流量的服务端口
+                  </span>
+                </NFormItem>
+              </template>
+
+              <NSpace>
+                <NButton type="primary" :loading="savingForward" @click="doSaveForward">
+                  保存并同步中继
+                </NButton>
               </NSpace>
             </NForm>
           </div>
@@ -734,6 +1029,9 @@ onDeactivated(() => {
       </div>
     </NModal>
 
+    <!-- 运维隧道一键入口（kubectl port-forward 式） -->
+    <OpsTunnelModal v-model:show="showTunnel" :prefill="tunnelPrefill" />
+
     <!-- AI 部署排障诊断弹窗 -->
     <NModal
       v-model:show="showAIDiagnosis"
@@ -776,6 +1074,16 @@ onDeactivated(() => {
 </template>
 
 <style scoped lang="scss">
+.port-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.port-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
 .app-detail-view {
   gap: 10px;
 }

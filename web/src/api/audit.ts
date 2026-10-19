@@ -69,6 +69,9 @@ export const actionLabels: Record<string, string> = {
   batch_exec: '批量推送命令',
   tunnel_open: '打开内网隧道',
   tunnel_close: '关闭内网隧道',
+  op_tunnel_open: '打开运维隧道',
+  op_tunnel_close: '关闭运维隧道',
+  op_tunnel_deny: '拒绝运维隧道',
   // 文件
   file_mkdir: '新建目录',
   file_move: '移动/重命名文件',

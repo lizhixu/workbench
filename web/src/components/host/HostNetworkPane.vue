@@ -8,7 +8,7 @@ import {
 import {
   GitNetworkOutline, RefreshOutline, CheckmarkCircleOutline,
   PlayOutline, CloudUploadOutline, RadioOutline,
-  CopyOutline,
+  CopyOutline, SwapHorizontalOutline,
 } from '@vicons/ionicons5'
 import {
   checkNetworkNode, installNetworkNode, joinNetworkNode, leaveNetworkNode,
@@ -16,6 +16,7 @@ import {
   type PingResult,
 } from '../../api/network'
 import { copyToClipboard } from '../../utils/clipboard'
+import OpsTunnelModal from '../tunnels/OpsTunnelModal.vue'
 
 const props = defineProps<{
   hostId: string
@@ -49,6 +50,9 @@ const showPingModal = ref(false)
 const pingTarget = ref('100.64.0.1')
 const pinging = ref(false)
 const pingResult = ref<PingResult | null>(null)
+
+// 按需运维隧道入口（kubectl port-forward 式，与是否组网无关）
+const showTunnel = ref(false)
 
 async function copyText(text: string, label: string) {
   if (!text) return
@@ -265,6 +269,11 @@ onMounted(loadData)
                 <template #icon><NIcon :component="RefreshOutline" /></template>
                 探测状态
               </NButton>
+
+              <NButton secondary type="tertiary" @click="showTunnel = true">
+                <template #icon><NIcon :component="SwapHorizontalOutline" /></template>
+                临时隧道
+              </NButton>
             </NSpace>
           </div>
         </div>
@@ -426,6 +435,12 @@ onMounted(loadData)
         </NSpace>
       </template>
     </NModal>
+
+    <!-- 按需运维隧道入口：生成 watchmanctl 命令并可管理本人隧道 -->
+    <OpsTunnelModal
+      v-model:show="showTunnel"
+      :prefill="{ hostId, hostname, port: 8080 }"
+    />
   </div>
 </template>
 

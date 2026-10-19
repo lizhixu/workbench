@@ -105,24 +105,38 @@ func (h *AppHandlers) purgeAppResources(app *Application) ([]string, error) {
 		warn("删除应用工作目录失败")
 	}
 
-	// 6. Reverse-proxy vhost configs on the app host (+ gateway host).
-	if app.Domain != "" {
-		targets := []string{app.HostID}
-		if app.ProxyMode == "gateway" && app.ProxyGatewayHostID != "" {
-			targets = append(targets, app.ProxyGatewayHostID)
-		}
-		confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
-		for _, hostID := range dedupe(targets) {
-			phub := h.reg.Hub(hostID)
-			if phub == nil {
-				warn("主机 %s 离线，代理配置未清理", hostID)
-				continue
+		// 6. Reverse-proxy vhost configs on the app host (+ gateway host).
+		if app.Domain != "" {
+			targets := []string{app.HostID}
+			if app.ProxyMode == "gateway" && app.ProxyGatewayHostID != "" {
+				targets = append(targets, app.ProxyGatewayHostID)
 			}
-			_, _ = execOnAgent(phub, "purge-proxy-"+randomToken(4),
-				fmt.Sprintf("rm -f %s && docker exec %s nginx -s reload 2>/dev/null || true",
-					confPath, nginxContainer), 30)
+			confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
+			for _, hostID := range dedupe(targets) {
+				phub := h.reg.Hub(hostID)
+				if phub == nil {
+					warn("主机 %s 离线，代理配置未清理", hostID)
+					continue
+				}
+				_, _ = execOnAgent(phub, "purge-proxy-"+randomToken(4),
+					fmt.Sprintf("rm -f %s && docker exec %s nginx -s reload 2>/dev/null || true",
+						confPath, nginxContainer), 30)
+			}
 		}
-	}
 
-	return warnings, nil
+		// 7. Companion mesh forwarder container on the entry host. The gate is
+		// the recorded entry host alone (not MeshForwardEnabled) so legacy rows
+		// whose fields were cleared inconsistently can still be recovered.
+		if app.MeshForwardHostID != "" {
+			fwdHub := h.reg.Hub(app.MeshForwardHostID)
+			if fwdHub == nil {
+				warn("组网转发入口主机 %s 离线，中继容器未清理", app.MeshForwardHostID)
+			} else {
+				fwdContainer := "watchman-fwd-" + app.ID
+				_, _ = execOnAgent(fwdHub, "purge-fwd-"+randomToken(4),
+					"docker rm -f "+shellQuote(fwdContainer), 30)
+			}
+		}
+
+		return warnings, nil
 }

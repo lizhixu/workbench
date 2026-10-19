@@ -30,6 +30,12 @@ export interface AppEntity {
   build_timeout_sec?: number
   compose_content?: string
   image?: string
+  /** 组网端口转发（TCP 中继）配置 */
+  mesh_forward_enabled?: boolean
+  mesh_forward_host_id?: string
+  mesh_forward_entry_port?: number
+  mesh_forward_target_port?: number
+  mesh_forward_target?: string
   env_vars?: Record<string, string>
   ports?: PortMapping[]
   volumes?: string[]
@@ -76,6 +82,10 @@ export interface AppCreateRequest {
   build_timeout_sec?: number
   compose_content?: string
   image?: string
+  mesh_forward_enabled?: boolean
+  mesh_forward_host_id?: string
+  mesh_forward_entry_port?: number
+  mesh_forward_target_port?: number
   env_vars?: Record<string, string>
   ports?: PortMapping[]
   volumes?: string[]

@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  NAlert, NAvatar, NButton, NCard, NForm, NFormItem, NIcon, NInput, NInputNumber,
+  NAlert, NAvatar, NButton, NCard, NForm, NFormItem, NGi, NGrid, NIcon, NInput, NInputNumber,
   NModal, NRadio, NRadioGroup, NSelect, NSpace, NSwitch, NTag, useMessage,
 } from 'naive-ui'
 import {
@@ -14,7 +14,8 @@ import {
 } from '../../api/apps'
 import { bindProxy } from '../../api/certs'
 import { listHosts } from '../../api/hosts'
-import { listNetworkNodes } from '../../api/network'
+import { getNetworkConfig, listNetworkNodes, probeMeshIP, type NetworkConfig } from '../../api/network'
+import { bothMeshed } from '../../utils/mesh'
 import { listCredentials } from '../../api/vault'
 import {
   connectGitHubToken, disconnectGitHub, getGitProviders,
@@ -23,6 +24,7 @@ import {
 } from '../../api/git'
 import { useWorkspaceStore } from '../../stores/workspace'
 import AppAiAssistant from '../../components/apps/AppAiAssistant.vue'
+import AppTopologyPreview from '../../components/apps/AppTopologyPreview.vue'
 import type { AppFormDraft, AppFormSnapshot } from '../../api/ai'
 
 defineOptions({ name: 'AppCreate' })
@@ -57,6 +59,18 @@ const vaults = ref<VaultOption[]>([])
 const templates = ref<AppTemplate[]>([])
 const meshNodes = ref<MeshNode[]>([])
 const creating = ref(false)
+
+// ---- 异地组网：全局配置、选中主机实时组网 IP ----
+const networkConfig = ref<NetworkConfig | null>(null)
+const networkConfigLoaded = ref(false)
+const meshConfigDismissed = ref(false)
+// 配置拉取失败（null）时不误报；确实未配置 Auth Key 时才提示
+const meshConfigured = computed(() =>
+  networkConfig.value === null ? true : !!networkConfig.value.auth_key_set,
+)
+const meshProbeLoading = ref(false)
+// 实时探测结果只对「当前选中主机」有效，换主机即失效
+const meshProbeResult = ref<{ hostId: string; ip: string; source: '' | 'live' | 'cache' } | null>(null)
 
 // 部署来源。模板/单镜像/Compose 不依赖 Git，Git 保持原有授权与手填两种子模式。
 type SourceMode = 'template' | 'image' | 'compose' | 'github' | 'custom'
@@ -112,12 +126,14 @@ const loadingBranches = ref(false)
 
 const form = reactive({
   name: '',
-  host_id: '',
+  // NSelect 绑定的字段必须用 null 做空值：空串会被 naive-ui 的 fallbackOption
+  // 合成为一个 label 为空的真实选项，select 自认为"已选中"，占位符永不渲染。
+  host_id: null as string | null,
   template_id: '',
   image: '',
   repo_url: '',
   branch: 'main',
-  auth_vault_id: '',
+  auth_vault_id: null as string | null,
   auto_deploy: true,
   build_type: 'dockerfile' as 'dockerfile' | 'compose',
   dockerfile: 'Dockerfile',
@@ -125,6 +141,11 @@ const form = reactive({
   build_timeout_sec: 900,
   // 默认留空，由用户自行编写或点上方按钮载入「Web + Redis / WordPress + MySQL」模板
   compose_content: '',
+  // 组网端口转发（TCP 流量中继）：由入口主机运行 socat 中继容器
+  mesh_forward_enabled: false,
+  mesh_forward_host_id: null as string | null,
+  mesh_forward_entry_port: null as number | null,
+  mesh_forward_target_port: null as number | null,
   env_vars_text: '',
   ports: [] as (PortMapping & { bind_scope: 'public' | 'mesh' })[],
   volumes_text: '',
@@ -134,7 +155,7 @@ const form = reactive({
   // 域名与反代（可选，创建后立即绑定）
   domain: '',
   proxy_mode: 'local' as 'local' | 'gateway',
-  gateway_host_id: '',
+  gateway_host_id: null as string | null,
 })
 
 // 选模板后预填端口与卷，参数控件读模板 EnvFields
@@ -352,24 +373,42 @@ const bindScopeOptions = [
 ]
 
 const hostOptions = computed(() =>
-  hosts.value.map((h) => ({
-    label: `${h.hostname}${h.public_ip ? ` · ${h.public_ip}` : ''}${h.status !== 'online' ? ' · 离线' : ''}`,
-    value: h.id,
-    disabled: h.status !== 'online',
-  })),
+  hosts.value.map((h) => {
+    const mesh = meshIPMap.value.get(h.id)
+    const parts = [h.hostname]
+    if (h.public_ip) parts.push(h.public_ip)
+    parts.push(mesh ? `组网 ${mesh}` : '未组网')
+    if (h.status !== 'online') parts.push('离线')
+    return {
+      label: parts.join(' · '),
+      value: h.id,
+      disabled: h.status !== 'online',
+    }
+  }),
 )
 
-// 有公网 IP 的在线主机作为推荐网关；绑定 mesh 端口提示节点 IP
-const gatewayOptions = computed(() =>
-  hosts.value
+// 网关主机不能是应用主机自身（相同场景即 local）；到应用主机的链路有两种：
+// 双方都在组网内走 100.x（组网直达），否则直连应用主机的公网/内网 IP——
+// 异地组网不是网关模式的必需条件。
+const gatewayOptions = computed(() => {
+  const appMesh = form.host_id ? meshIPMap.value.get(form.host_id) || '' : ''
+  const list = hosts.value
     .filter((h) => h.status === 'online')
-    .map((h) => ({
-      label: h.public_ip
-        ? `${h.hostname}（公网 ${h.public_ip}，推荐）`
-        : `${h.hostname}`,
-      value: h.id,
-    })),
-)
+    .map((h) => {
+      const mesh = meshIPMap.value.get(h.id) || ''
+      const path = mesh && appMesh ? '组网直达' : '直连'
+      const recommended = !!h.public_ip
+      const tags = [h.public_ip ? `公网 ${h.public_ip}` : '无公网 IP', mesh ? `组网 ${mesh}` : '未组网', path]
+      return {
+        label: `${h.hostname}（${tags.join(' · ')}${recommended ? '，推荐' : ''}）`,
+        value: h.id,
+        disabled: h.id === form.host_id,
+        rank: recommended ? 0 : 1,
+      }
+    })
+  list.sort((a, b) => a.rank - b.rank)
+  return list
+})
 
 const meshIPMap = computed(() => {
   const m = new Map<string, string>()
@@ -379,7 +418,99 @@ const meshIPMap = computed(() => {
   return m
 })
 
-const selectedHostMeshIP = computed(() => meshIPMap.value.get(form.host_id) || '')
+// 选中主机的组网 IP：实时探测值优先、缓存兜底（与部署侧 resolveMeshIP 同序）
+const selectedHostMeshIP = computed(() => {
+  if (meshProbeResult.value?.hostId === form.host_id && meshProbeResult.value.ip) {
+    return meshProbeResult.value.ip
+  }
+  return form.host_id ? meshIPMap.value.get(form.host_id) || '' : ''
+})
+
+const selectedHostMeshSource = computed<'' | 'live' | 'cache'>(() => {
+  if (meshProbeResult.value?.hostId === form.host_id && meshProbeResult.value.ip) {
+    return meshProbeResult.value.source
+  }
+  return form.host_id && meshIPMap.value.get(form.host_id) ? 'cache' : ''
+})
+
+const selectedHost = computed(() => hosts.value.find((h) => h.id === form.host_id) || null)
+const selectedGateway = computed(() => hosts.value.find((h) => h.id === form.gateway_host_id) || null)
+const hasMeshPort = computed(() => form.ports.some((p) => p.bind_scope === 'mesh'))
+// 网关与应用主机都已在组网内才走 100.x；否则网关直连应用主机（公网/内网 IP）
+const gatewayMeshLink = computed(() =>
+  bothMeshed(selectedHostMeshIP.value, meshIPMap.value.get(form.gateway_host_id || '')),
+)
+
+// ---- 组网端口转发：入口主机下拉与直连/组网状态判定 ----
+const forwardHostOptions = computed(() => {
+  return hosts.value
+    .filter((h) => h.status === 'online')
+    .map((h) => {
+      const isSelf = h.id === form.host_id
+      const meshIP = meshIPMap.value.get(h.id) || ''
+      const tags: string[] = []
+      if (h.public_ip) tags.push(`公网 ${h.public_ip}`)
+      if (meshIP) tags.push(`组网 ${meshIP}`)
+      else tags.push('未组网')
+      if (isSelf) tags.push('应用所在主机，不可选')
+      const tagStr = tags.length ? ` (${tags.join(' · ')})` : ''
+      return {
+        label: `${h.hostname}${tagStr}`,
+        value: h.id,
+        disabled: isSelf,
+        hasPublicIp: !!h.public_ip,
+        hasMeshIp: !!meshIP,
+      }
+    })
+    .sort((a, b) => {
+      if (a.disabled !== b.disabled) return a.disabled ? 1 : -1
+      if (a.hasPublicIp !== b.hasPublicIp) return a.hasPublicIp ? -1 : 1
+      return 0
+    })
+})
+
+const selectedForwardHost = computed(() =>
+  hosts.value.find((h) => h.id === form.mesh_forward_host_id) || null,
+)
+
+const forwardMeshLink = computed(() =>
+  bothMeshed(selectedHostMeshIP.value, meshIPMap.value.get(form.mesh_forward_host_id || '')),
+)
+
+// 开启组网转发时，自动从已有端口映射中推荐预填目标端口和入口端口
+watch(() => form.mesh_forward_enabled, (enabled) => {
+  if (enabled) {
+    if (!form.mesh_forward_target_port && form.ports.length > 0 && form.ports[0].host > 0) {
+      form.mesh_forward_target_port = form.ports[0].host
+    }
+    if (!form.mesh_forward_entry_port && form.mesh_forward_target_port) {
+      form.mesh_forward_entry_port = form.mesh_forward_target_port
+    }
+  }
+})
+
+// 选中主机后实时探测其组网 IP（只读端点，不记审计）：--reset 重加入会更换
+// 100.x 地址，纯缓存值可能误导用户。
+let meshProbeSeq = 0
+watch(() => form.host_id, async (id) => {
+  meshProbeResult.value = null
+  // 应用主机变更后，原网关与原转发入口若恰好等于新主机则失去意义，清掉避免提交时报错
+  if (form.gateway_host_id && form.gateway_host_id === id) form.gateway_host_id = null
+  if (form.mesh_forward_host_id && form.mesh_forward_host_id === id) form.mesh_forward_host_id = null
+  if (!id) return
+  const seq = ++meshProbeSeq
+  meshProbeLoading.value = true
+  try {
+    const r = await probeMeshIP(id)
+    if (seq !== meshProbeSeq) return
+    meshProbeResult.value = { hostId: id, ip: r.ip, source: (r.source || '') as '' | 'live' | 'cache' }
+  } catch {
+    if (seq !== meshProbeSeq) return
+    meshProbeResult.value = null
+  } finally {
+    if (seq === meshProbeSeq) meshProbeLoading.value = false
+  }
+})
 
 const vaultOptions = computed(() => [
   { label: '不使用凭据（公开仓库）', value: '' },
@@ -431,14 +562,18 @@ const formSnapshot = computed<AppFormSnapshot>(() => ({
   source_mode: sourceMode.value,
   name: form.name,
   container_name: form.container_name,
-  host_id: form.host_id,
+  host_id: form.host_id || '',
   template_id: form.template_id,
   template_params: { ...form.template_params },
   image: form.image,
   compose_content: form.compose_content,
+  mesh_forward_enabled: form.mesh_forward_enabled,
+  mesh_forward_host_id: form.mesh_forward_host_id || '',
+  mesh_forward_entry_port: form.mesh_forward_entry_port ?? 0,
+  mesh_forward_target_port: form.mesh_forward_target_port ?? 0,
   repo_url: form.repo_url,
   branch: form.branch,
-  auth_vault_id: form.auth_vault_id,
+  auth_vault_id: form.auth_vault_id || '',
   auto_deploy: form.auto_deploy,
   build_type: form.build_type,
   dockerfile: form.dockerfile,
@@ -450,7 +585,7 @@ const formSnapshot = computed<AppFormSnapshot>(() => ({
   healthcheck_url: form.healthcheck_url,
   domain: form.domain,
   proxy_mode: form.proxy_mode,
-  gateway_host_id: form.gateway_host_id,
+  gateway_host_id: form.gateway_host_id || '',
 }))
 
 // AI 助手填充：把后端消毒过的草稿合并进表单。只覆盖草稿里出现的字段，
@@ -480,6 +615,12 @@ function applyDraft(draft: AppFormDraft) {
   }
   if (draft.image !== undefined) form.image = draft.image
   if (draft.compose_content !== undefined) form.compose_content = draft.compose_content
+  if (draft.mesh_forward_enabled !== undefined) form.mesh_forward_enabled = draft.mesh_forward_enabled
+  if (draft.mesh_forward_host_id && hosts.value.some((h) => h.id === draft.mesh_forward_host_id)) {
+    form.mesh_forward_host_id = draft.mesh_forward_host_id
+  }
+  if (draft.mesh_forward_entry_port !== undefined) form.mesh_forward_entry_port = draft.mesh_forward_entry_port
+  if (draft.mesh_forward_target_port !== undefined) form.mesh_forward_target_port = draft.mesh_forward_target_port
   if (draft.repo_url !== undefined) form.repo_url = draft.repo_url
   if (draft.branch !== undefined) form.branch = draft.branch
   if (draft.auto_deploy !== undefined) form.auto_deploy = draft.auto_deploy
@@ -529,6 +670,13 @@ async function loadData() {
     meshNodes.value = (await listNetworkNodes()) ?? []
   } catch {
     meshNodes.value = []
+  }
+  try {
+    networkConfig.value = await getNetworkConfig()
+  } catch {
+    networkConfig.value = null
+  } finally {
+    networkConfigLoaded.value = true
   }
   // Docker 面板「部署新应用」跳转时带 host_id，直接预选目标主机
   const presetHost = typeof route.query.host_id === 'string' ? route.query.host_id : ''
@@ -655,15 +803,26 @@ function validate(): string | null {
     if (p.host <= 0 || p.host > 65535 || p.container <= 0 || p.container > 65535) {
       return `端口映射非法: ${p.host}:${p.container}`
     }
-    if (p.bind_scope === 'mesh' && !meshIPMap.value.get(form.host_id)) {
+    if (p.bind_scope === 'mesh' && !selectedHostMeshIP.value) {
       return '所选主机未加入异地组网，无法使用「仅异地组网」端口范围（可在主机详情-异地组网中加入）'
+    }
+  }
+  if (form.mesh_forward_enabled) {
+    if (!form.mesh_forward_host_id) return '开启组网端口转发时必须选择入口主机'
+    if (form.mesh_forward_host_id === form.host_id) return '组网转发入口主机不能与应用部署主机相同'
+    if (!form.mesh_forward_entry_port || form.mesh_forward_entry_port < 1 || form.mesh_forward_entry_port > 65535) {
+      return '请填写合法的组网转发入口端口（1-65535）'
+    }
+    if (!form.mesh_forward_target_port || form.mesh_forward_target_port < 1 || form.mesh_forward_target_port > 65535) {
+      return '请填写合法的组网转发目标端口（1-65535）'
     }
   }
   if (form.domain.trim() && !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(form.domain.trim())) {
     return '域名格式不正确'
   }
-  if (form.domain.trim() && form.proxy_mode === 'gateway' && !form.gateway_host_id) {
-    return '网关模式需选择网关主机'
+  if (form.domain.trim() && form.proxy_mode === 'gateway') {
+    if (!form.gateway_host_id) return '网关模式需选择网关主机'
+    if (form.gateway_host_id === form.host_id) return '网关主机不能与应用主机相同（相同场景请改用 local 模式）'
   }
   return null
 }
@@ -681,7 +840,7 @@ async function submit() {
     const isGit = mode === 'github' || mode === 'custom'
     const app = (await createApp({
       name: form.name.trim(),
-      host_id: form.host_id,
+      host_id: form.host_id as string, // validate() 已拦截空值
       source_type: mode === 'template' ? 'template' : isCompose ? 'raw_compose' : isGit ? 'git' : 'image',
       template_id: mode === 'template' ? form.template_id : undefined,
       template_params: mode === 'template' && Object.keys(form.template_params).length > 0
@@ -697,6 +856,10 @@ async function submit() {
       build_context: isGit ? form.build_context.trim() || '.' : undefined,
       build_timeout_sec: isGit ? Number(form.build_timeout_sec) || 900 : undefined,
       image: mode === 'image' ? form.image.trim() : undefined,
+      mesh_forward_enabled: form.mesh_forward_enabled,
+      mesh_forward_host_id: form.mesh_forward_enabled ? form.mesh_forward_host_id || undefined : undefined,
+      mesh_forward_entry_port: form.mesh_forward_enabled ? form.mesh_forward_entry_port ?? undefined : undefined,
+      mesh_forward_target_port: form.mesh_forward_enabled ? form.mesh_forward_target_port ?? undefined : undefined,
       env_vars: parsedEnvVars.value,
       ports: form.ports.filter((p) => p.host > 0 && p.container > 0),
       volumes: parsedVolumes.value,
@@ -710,7 +873,7 @@ async function submit() {
         await bindProxy(app.id, {
           domain: form.domain.trim(),
           mode: form.proxy_mode,
-          gateway_host_id: form.proxy_mode === 'gateway' ? form.gateway_host_id : undefined,
+          gateway_host_id: form.proxy_mode === 'gateway' ? form.gateway_host_id || undefined : undefined,
         })
         message.success(`域名 ${form.domain.trim()} 已绑定并下发反代`)
       } catch (e: any) {
@@ -758,6 +921,26 @@ onMounted(loadData)
 
     <div class="create-layout">
     <NCard :bordered="false" class="create-card">
+      <NAlert
+        v-if="networkConfigLoaded && !meshConfigured && !meshConfigDismissed"
+        type="warning"
+        :show-icon="true"
+        closable
+        style="margin-bottom: 12px"
+        @close="meshConfigDismissed = true"
+      >
+        <template #header>异地组网尚未配置</template>
+        尚未配置组网控制面与 Auth Key，主机无法加入组网，「仅异地组网」端口与网关反代暂不可用。
+        <NButton
+          size="tiny"
+          secondary
+          type="primary"
+          style="margin-left: 8px"
+          @click="router.push('/network')"
+        >
+          前往配置
+        </NButton>
+      </NAlert>
       <NSpace vertical size="large">
         <!-- 部署来源 -->
         <NFormItem label="部署来源" required>
@@ -1021,7 +1204,7 @@ onMounted(loadData)
             </NSpace>
           </template>
 
-          <!-- 端口与网络（Compose 除外，其端口在 YAML 中声明） -->
+          <!-- 端口与网络（Compose 在 YAML 中声明） -->
           <template v-if="sourceMode !== 'compose'">
             <NFormItem label="端口映射与网络范围">
               <NSpace vertical style="width: 100%">
@@ -1037,9 +1220,29 @@ onMounted(loadData)
                   <NButton quaternary type="error" size="small" @click="removePort(idx)">移除</NButton>
                 </NSpace>
                 <NButton dashed size="small" @click="addPort">添加端口映射</NButton>
-                <span v-if="selectedHostMeshIP" class="hint">
-                  目标主机组网 IP：{{ selectedHostMeshIP }}，「仅异地组网」端口将只绑定该 IP，公网无法访问
+                <span v-if="meshProbeLoading" class="hint">正在探测目标主机的组网 IP…</span>
+                <span v-else-if="selectedHostMeshIP" class="hint">
+                  目标主机组网 IP：{{ selectedHostMeshIP }}（{{ selectedHostMeshSource === 'live' ? '实时探测' : '缓存' }}），「仅异地组网」端口将只绑定该 IP，公网无法访问
                 </span>
+                <NAlert
+                  v-if="form.host_id && hasMeshPort && !selectedHostMeshIP"
+                  type="warning"
+                  size="small"
+                  :show-icon="true"
+                  style="margin-top: 8px"
+                >
+                  <template #header>所选主机尚未加入异地组网</template>
+                  「仅异地组网」端口需要主机先在组网内取得 100.x 地址。
+                  <NButton
+                    size="tiny"
+                    secondary
+                    type="primary"
+                    style="margin-left: 8px"
+                    @click="router.push(`/hosts/${form.host_id}?tab=network`)"
+                  >
+                    前往加入组网
+                  </NButton>
+                </NAlert>
               </NSpace>
             </NFormItem>
 
@@ -1050,6 +1253,94 @@ onMounted(loadData)
               />
             </NFormItem>
           </template>
+
+          <!-- 组网端口转发 (TCP 流量中继) -->
+          <div class="network-forward-box" style="margin-bottom: 16px; padding: 14px; background: rgba(99, 102, 241, 0.04); border: 1px solid rgba(99, 102, 241, 0.15); border-radius: 8px;">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+              <div>
+                <span style="font-weight: 600; font-size: 14px;">组网端口转发 (TCP 流量中继)</span>
+                <span class="hint" style="margin-left: 8px;">由选定的入口主机运行 socat 容器，通过异地组网或直连将 4 层 TCP 端口转发给本应用</span>
+              </div>
+              <NSwitch v-model:value="form.mesh_forward_enabled" />
+            </div>
+
+            <template v-if="form.mesh_forward_enabled">
+              <NGrid :cols="24" :x-gap="12" style="margin-top: 12px;">
+                <NGi :span="12">
+                  <NFormItem label="入口主机（流量进入的主机）" required>
+                    <NSelect
+                      v-model:value="form.mesh_forward_host_id"
+                      :options="forwardHostOptions"
+                      placeholder="选择入口主机（优先推荐带公网 IP 的节点）"
+                      filterable
+                    />
+                  </NFormItem>
+                </NGi>
+                <NGi :span="6">
+                  <NFormItem label="入口监听端口" required>
+                    <NInputNumber
+                      v-model:value="form.mesh_forward_entry_port"
+                      placeholder="如 16379"
+                      :min="1"
+                      :max="65535"
+                      style="width: 100%"
+                    />
+                  </NFormItem>
+                </NGi>
+                <NGi :span="6">
+                  <NFormItem label="应用目标端口" required>
+                    <NInputNumber
+                      v-model:value="form.mesh_forward_target_port"
+                      placeholder="如 6379"
+                      :min="1"
+                      :max="65535"
+                      style="width: 100%"
+                    />
+                  </NFormItem>
+                </NGi>
+              </NGrid>
+
+              <div class="hint" style="margin-top: 4px;">
+                <template v-if="form.mesh_forward_host_id && selectedForwardHost">
+                  <span v-if="forwardMeshLink">
+                    链路：外部客户端 → {{ selectedForwardHost.hostname }} (:{{ form.mesh_forward_entry_port || '入口端口' }}) → 异地组网 ({{ selectedHostMeshIP }}:{{ form.mesh_forward_target_port || '目标端口' }}) → 应用容器，应用主机无需公网 IP
+                  </span>
+                  <span v-else>
+                    链路：外部客户端 → {{ selectedForwardHost.hostname }} (:{{ form.mesh_forward_entry_port || '入口端口' }}) → 直连 ({{ selectedHost?.public_ip || '内网 IP' }}:{{ form.mesh_forward_target_port || '目标端口' }}) → 应用容器；请确认入口主机能访问该目标
+                  </span>
+                </template>
+                <template v-else>
+                  请选择入口主机并指定入口与目标端口。
+                </template>
+              </div>
+            </template>
+          </div>
+
+          <!-- 流量拓扑预览：随表单实时反映主机/端口范围/反代模式/组网转发的最终链路 -->
+          <AppTopologyPreview
+            v-if="form.host_id"
+            :domain="form.domain.trim()"
+            :proxy-mode="form.proxy_mode"
+            :app-name="form.name.trim()"
+            :host-name="selectedHost?.hostname || ''"
+            :host-online="selectedHost?.status === 'online'"
+            :host-public-ip="selectedHost?.public_ip || ''"
+            :host-mesh-ip="selectedHostMeshIP"
+            :host-mesh-source="selectedHostMeshSource"
+            :gateway-name="selectedGateway?.hostname || ''"
+            :gateway-online="selectedGateway?.status === 'online'"
+            :gateway-public-ip="selectedGateway?.public_ip || ''"
+            :gateway-mesh-ip="meshIPMap.get(selectedGateway?.id || '') || ''"
+            :ports="form.ports"
+            :compose-mode="sourceMode === 'compose'"
+            :mesh-forward-enabled="form.mesh_forward_enabled"
+            :mesh-forward-host-name="selectedForwardHost?.hostname || ''"
+            :mesh-forward-host-online="selectedForwardHost?.status === 'online'"
+            :mesh-forward-host-public-ip="selectedForwardHost?.public_ip || ''"
+            :mesh-forward-host-mesh-ip="meshIPMap.get(selectedForwardHost?.id || '') || ''"
+            :mesh-forward-entry-port="form.mesh_forward_entry_port"
+            :mesh-forward-target-port="form.mesh_forward_target_port"
+          />
 
           <NFormItem v-if="sourceMode === 'image' || sourceMode === 'template'" label="挂载卷（每行 宿主路径:容器路径）">
             <NInput
@@ -1084,12 +1375,36 @@ onMounted(loadData)
                   v-if="form.proxy_mode === 'gateway'"
                   v-model:value="form.gateway_host_id"
                   :options="gatewayOptions"
-                  placeholder="选择网关主机（推荐选有公网 IP 的节点）"
+                  placeholder="选择网关主机（可走组网或直连）"
                   filterable
                 />
                 <span v-if="form.proxy_mode === 'gateway'" class="hint">
-                  公网用户 -&gt; 网关主机 (Nginx/SSL) -&gt; 异地组网 -&gt; 应用主机，应用主机无需公网 IP
+                  <template v-if="gatewayMeshLink">
+                    公网用户 -&gt; 网关主机 (Nginx/SSL) -&gt; 异地组网 ({{ selectedHostMeshIP }}) -&gt; 应用主机，应用主机无需公网 IP
+                  </template>
+                  <template v-else>
+                    公网用户 -&gt; 网关主机 (Nginx/SSL) -&gt; 直连 应用主机 {{ selectedHost?.public_ip || '内网 IP' }}，无需异地组网；请确认网关能访问该地址
+                  </template>
                 </span>
+                <NAlert
+                  v-if="form.proxy_mode === 'local' && selectedHost && !selectedHost.public_ip"
+                  type="warning"
+                  size="small"
+                  :show-icon="true"
+                  style="margin-top: 4px"
+                >
+                  <template #header>应用主机没有公网 IP</template>
+                  local 模式下域名无法从公网访问该应用；如主机位于 NAT 内网，建议改用「统一网关」模式。
+                  <NButton
+                    size="tiny"
+                    secondary
+                    type="primary"
+                    style="margin-left: 8px"
+                    @click="form.proxy_mode = 'gateway'"
+                  >
+                    切换到网关模式
+                  </NButton>
+                </NAlert>
               </template>
             </NSpace>
           </NFormItem>

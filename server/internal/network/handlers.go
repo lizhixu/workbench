@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -38,6 +39,8 @@ func (h *Handlers) Register(rg, writeRG *gin.RouterGroup) {
 	rg.GET("/network/config", h.getConfig)
 	rg.GET("/network/nodes", h.listNodes)
 	rg.GET("/network/nodes/:id", h.getNode)
+	// Read-only live mesh-IP probe: audit-exempt on purpose (see meshIP).
+	rg.GET("/network/nodes/:id/mesh-ip", h.meshIP)
 
 	writeRG.PUT("/network/config", h.updateConfig)
 	writeRG.POST("/network/nodes/:id/check", h.checkNode)
@@ -45,6 +48,57 @@ func (h *Handlers) Register(rg, writeRG *gin.RouterGroup) {
 	writeRG.POST("/network/nodes/:id/join", h.joinNode)
 	writeRG.POST("/network/nodes/:id/leave", h.leaveNode)
 	writeRG.POST("/network/nodes/:id/ping", h.pingNode)
+}
+
+// meshIP returns the host's current Tailscale IPv4, probing live first and
+// falling back to the cached NodeStatus.IP (cf. §8.7 rule 6).
+//
+// It lives in the read group (every authenticated role, no audit): the
+// create-app page calls it on every host selection, and a mutating probe
+// like POST .../check would flood the operational audit trail. A live hit
+// that differs from the cache is written back so the gateway proxy and the
+// network list benefit without a manual check.
+func (h *Handlers) meshIP(c *gin.Context) {
+	hostID := c.Param("id")
+
+	liveIP := ""
+	if hub := h.reg.Hub(hostID); hub != nil {
+		// `tailscale ip -4` takes no arguments and is shell-agnostic
+		// (sh/bash/powershell/cmd), so no quoting concerns.
+		if res, err := h.runExec(hub, hostID, "tailscale ip -4", 10); err == nil && res != nil && res.ExitCode == 0 {
+			liveIP = parseIPv4(string(res.Stdout))
+		}
+	}
+
+	cached, cacheOK := h.store.GetNodeStatus(hostID)
+	ip, source := liveIP, "live"
+	if ip == "" {
+		ip, source = cached.IP, "cache"
+	}
+	if ip == "" {
+		source = ""
+	}
+	if liveIP != "" && (!cacheOK || cached.IP != liveIP) {
+		cached.HostID = hostID
+		cached.IP = liveIP
+		_ = h.store.SetNodeStatus(cached)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{
+		"host_id": hostID,
+		"ip":      ip,
+		"source":  source, // live | cache | ""（未加入组网或探测失败）
+	}})
+}
+
+// parseIPv4 extracts the first valid IPv4 address from command output.
+func parseIPv4(out string) string {
+	for _, f := range strings.Fields(out) {
+		if ip := net.ParseIP(f); ip != nil && ip.To4() != nil {
+			return f
+		}
+	}
+	return ""
 }
 
 // networkConfigView is the API-facing shape of NetworkConfig.

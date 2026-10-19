@@ -68,6 +68,14 @@ export function checkNetworkNode(hostId: string) {
   return unwrap<{ data: NetworkNode }>(http.post(`/network/nodes/${hostId}/check`)).then((r) => r.data)
 }
 
+// 只读实时探测主机的组网 IP（live 优先、缓存兜底）。创建应用页选中主机时
+// 调用，避免展示因 --reset 换 IP 而过期的缓存值；只读端点，不记审计。
+export function probeMeshIP(hostId: string) {
+  return unwrap<{ data: { host_id: string; ip: string; source: string } }>(
+    http.get(`/network/nodes/${hostId}/mesh-ip`),
+  ).then((r) => r.data)
+}
+
 export function installNetworkNode(hostId: string) {
   return unwrap<{ ok: boolean; message: string; duration_ms?: number; output?: string }>(
     http.post(`/network/nodes/${hostId}/install`),

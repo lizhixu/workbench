@@ -34,9 +34,9 @@ const (
 //     offline/NAT-hidden) app hosts; upstream points at the app host's mesh
 //     IP when available, falling back to its internal IP.
 type ProxyHandler struct {
-	reg   *rpc.Registry
-	store *Store
-	hub   *cert.Hub
+	reg          *rpc.Registry
+	store        *Store
+	hub          *cert.Hub
 	networkStore *network.Store
 }
 
@@ -120,6 +120,10 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "网关模式必须指定网关主机"})
 			return
 		}
+		if req.GatewayHostID == app.HostID {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "网关主机不能与应用主机相同（相同场景请改用 local 模式）"})
+			return
+		}
 		targetHost = req.GatewayHostID
 	}
 	gatewayHub := h.reg.Hub(targetHost)
@@ -162,12 +166,12 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 	}
 
 	// Compute the upstream unless overridden: local mode always proxies to
-	// the loopback app port; gateway mode uses the app host's mesh IP when
-	// it has one, else its internal IP.
+	// the loopback app port; gateway mode prefers the overlay (100.x) path
+	// when both hosts are in the mesh, else 直连 the app host directly.
 	upstream := strings.TrimSpace(req.Upstream)
 	if upstream == "" {
 		var err error
-		upstream, err = h.defaultUpstream(app, mode)
+		upstream, err = h.defaultUpstream(app, mode, req.GatewayHostID)
 		if err != nil {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
@@ -265,7 +269,17 @@ func (h *ProxyHandler) unbindProxy(c *gin.Context) {
 }
 
 // defaultUpstream derives the proxy target for the app.
-func (h *ProxyHandler) defaultUpstream(app *Application, mode string) (string, error) {
+//
+// Gateway mode has two paths to the app host and 异地组网 is NOT a
+// prerequisite:
+//   - 组网路径：app host and gateway host are BOTH in the overlay → use the app
+//     host's 100.x address (works even behind NAT);
+//   - 直连路径：otherwise proxy straight to the app host's public IP, falling
+//     back to its internal IP (same LAN / VPC).
+//
+// 127.0.0.1 is never used as a gateway upstream: it would point at the gateway
+// itself and blackhole traffic.
+func (h *ProxyHandler) defaultUpstream(app *Application, mode, gatewayHostID string) (string, error) {
 	var port int
 	if len(app.Ports) > 0 {
 		port = app.Ports[0].Host
@@ -276,16 +290,43 @@ func (h *ProxyHandler) defaultUpstream(app *Application, mode string) (string, e
 	if mode == "local" {
 		return fmt.Sprintf("127.0.0.1:%d", port), nil
 	}
-	// Gateway mode: prefer the app host's overlay IP (100.x.y.z), which works
-	// even when the app host sits behind NAT. There is no sane default
-	// without one — 127.0.0.1 would point at the gateway itself and
-	// blackhole traffic — so refuse with a clear message instead.
+
+	appMesh, gwMesh := "", ""
 	if h.networkStore != nil {
-		if st, ok := h.networkStore.GetNodeStatus(app.HostID); ok && st.IP != "" {
-			return fmt.Sprintf("%s:%d", st.IP, port), nil
+		if st, ok := h.networkStore.GetNodeStatus(app.HostID); ok {
+			appMesh = st.IP
+		}
+		if gatewayHostID != "" {
+			if st, ok := h.networkStore.GetNodeStatus(gatewayHostID); ok {
+				gwMesh = st.IP
+			}
 		}
 	}
-	return "", fmt.Errorf("网关模式需要应用主机已加入异地组网（未找到其组网 IP），或手动填写 Upstream")
+	appPublicIP, appInternalIP := "", ""
+	if ag := h.reg.GetAgent(app.HostID); ag != nil {
+		appPublicIP, appInternalIP = ag.PublicIP, ag.InternalIP
+	}
+	return resolveGatewayUpstream(port, appMesh, gwMesh, appPublicIP, appInternalIP)
+}
+
+// resolveGatewayUpstream picks the gateway → app host upstream:
+//   - 组网：both ends carry a mesh IP → the app host's 100.x;
+//   - 直连：otherwise the app host's public IP, then its internal IP.
+//
+// 127.0.0.1 is deliberately never returned (it would point at the gateway
+// itself and blackhole traffic); when nothing resolves the caller must ask the
+// user for an explicit Upstream.
+func resolveGatewayUpstream(port int, appMesh, gwMesh, appPublicIP, appInternalIP string) (string, error) {
+	if appMesh != "" && gwMesh != "" {
+		return fmt.Sprintf("%s:%d", appMesh, port), nil
+	}
+	if appPublicIP != "" {
+		return fmt.Sprintf("%s:%d", appPublicIP, port), nil
+	}
+	if appInternalIP != "" {
+		return fmt.Sprintf("%s:%d", appInternalIP, port), nil
+	}
+	return "", fmt.Errorf("无法确定网关到应用主机的上游地址：应用主机未加入异地组网，且没有可用的公网/内网 IP；请在应用详情「域名与反代」手动填写 Upstream")
 }
 
 // validProxyDomain enforces a strict RFC-1035-ish hostname shape.

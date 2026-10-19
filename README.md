@@ -82,29 +82,109 @@ sudo bash install.sh --help    # 查看全部选项（--version、--port、--mir
     .\watchman-agent-windows-amd64.exe -server <SERVER_IP>:9090 -token <ENROLL_TOKEN>
     ```
 
-### 源码构建
+### 源码构建与本地调试
+
+#### 1. 编译构建
 
 ```bash
-make build-all        # 构建 server + agent
-make test vet fmt    # 测试 / vet / 格式化
+make build-all        # 快速编译 server 与 agent 二进制到 bin/ 目录
+make test vet fmt     # 执行测试 / go vet 语法校验 / 代码格式化
 ```
 
-前端：
-
+前端校验与生产构建：
 ```bash
-cd web && npm install
-npm run dev           # 开发（代理 /api 到本地 server）
-npx vue-tsc -b        # 类型检查
-npm run build         # 生产构建
+cd web
+npx vue-tsc -b        # TypeScript 类型检查
+npm run build         # 前端生产打包（输出至 web/dist/）
 ```
 
-常用 server 参数：`-grpc :9090`（Agent 接入）、`-http :18080`、`-data ./data`、`-jwt-key`、`-vault-pass`、`-ai-url`/`-ai-model`/`-ai-key`。
+#### 2. 本地启动调试（前后端分离开发）
 
-锁死恢复（忘记安全入口路径时）：`watchman-server -reset-secure-entry -data /opt/watchman/data`。
+- **启动控制端 Server**（默认监听 HTTP `:18080`、gRPC `:9090`）：
+  ```bash
+  # 方式 1：直接通过 go run 启动
+  go run ./server/cmd/watchman -http :18080 -grpc :9090 -data ./data
+
+  # 方式 2：使用固定 JWT 密钥与 Vault 密码启动（避免重启后需重新登录）
+  go run ./server/cmd/watchman -http :18080 -grpc :9090 -data ./data \
+    -jwt-key 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+    -vault-pass devpass123
+  ```
+
+- **启动 Web 前端**（支持热重载，自动反向代理 `/api` 到本地 Server）：
+  ```bash
+  cd web
+  npm install
+  npm run dev           # 开发服务器启动于 http://localhost:5173
+  ```
+  在浏览器中打开 `http://localhost:5173` 即可进入控制台，初始管理员账号密码均为 `admin`。
+
+- **启动被管端 Agent**（本地回连调试）：
+  1. 在控制台「主机」页面点击「添加主机」，生成一次性 `enroll_token`；
+  2. 本地启动 Agent 进行反向回连：
+  ```bash
+  # Linux / macOS
+  go run ./agent/cmd/watchman-agent -server localhost:9090 -enroll <ENROLL_TOKEN> -state ./data/agent-state.json
+
+  # Windows (PowerShell)
+  go run .\agent\cmd\watchman-agent -server localhost:9090 -enroll <ENROLL_TOKEN> -state .\data\agent-state.json
+  ```
+  *说明：首次凭 token 注册成功后，Agent 会将长期凭证存入 `-state` 状态文件；后续只需运行 `go run ./agent/cmd/watchman-agent -server localhost:9090 -state ./data/agent-state.json` 即可直接连回。*
+
+#### 3. 常用调试参数与应急恢复
+
+- **对接本地 AI 大模型调试（如 Ollama）**：
+  ```bash
+  go run ./server/cmd/watchman -data ./data -ai-url http://localhost:11434 -ai-model qwen2.5:14b
+  ```
+- **构建包含内嵌 Web UI 的单二进制**：
+  ```bash
+  make build-server-with-ui   # 编译前端并自动将 dist 嵌入 server，产出独立可运行的 bin/watchman
+  ```
+- **应急恢复命令（调试时若误开启安全入口或证书导致无法访问面板）**：
+  ```bash
+  go run ./server/cmd/watchman -reset-secure-entry -data ./data   # 关闭安全入口（恢复通过 / 正常访问）
+  go run ./server/cmd/watchman -reset-panel-ssl -data ./data      # 关闭面板 SSL 与强制 HTTPS 重定向
+  go run ./server/cmd/watchman -reset-panel-domain -data ./data   # 解绑面板域名（恢复 IP 访问）
+  ```
 
 ### 绑定一台主机
 
 在控制台「主机」页生成安装命令，复制到被管主机执行即可完成注册；Windows 可下载安装包。
+
+## 开发注意事项
+
+在进行二次开发或提交代码前，请务必仔细阅读并严格遵守 [`AGENTS.md`](AGENTS.md) 中的工程规范：
+
+1. **唯一事实来源与文档同步**
+   - [`AGENTS.md`](AGENTS.md) 是系统需求、协议字段、REST/WS 接口与架构设计的唯一事实来源，每次开工前必读。
+   - 所有功能的改动或新增，在实现代码的同时**必须同步更新 AGENTS.md** 对应章节，严禁只改代码不更新文档。
+
+2. **零错误防线与质量校验**
+   - **前端 (Vue 3 / TypeScript)**：任何代码修改必须通过 `npx vue-tsc -b` 类型检查与 `npm run build` 构建，确保组件导入正确、模板语法完整无误、严格去除废弃 Emoji 符号，且符合 TypeScript 类型约束。
+   - **后端 (Go)**：修改后必须运行 `make test vet fmt` 或 `go vet` / `go build`，确保导出函数、结构体字段与 Protobuf IDL 接口声明及实现 100% 对齐。
+
+3. **版本唯一真相源与发版纪律**
+   - 系统各组件（Server、Agent、升级清单 Manifest 等）的**版本号完全由官方 Git Tag 触发的 GitHub Release 提供**（形如 `v1.2.3` 或 `v1.2.3-beta.1`）。
+   - **严禁私自捏造或拼接版本号**（例如取 commit hash 拼接 `0.1.0-<hash>`）；开发态一律为 `0.1.0-dev` 占位，所有线上升级验证基准必须来源于官方 Release 产物与 CI 生成的 `manifest.json`。
+   - **严禁使用裸 tag**：打 tag 必须为附注 tag（`git tag -a vX.Y.Z -m "..."`），并在说明中详细列出 Added / Changed / Fixed / Security 清单。
+
+4. **操作审计全覆盖**
+   - 凡是会改变系统或主机状态的写操作（`POST`/`PUT`/`PATCH`/`DELETE`），必须记录操作审计日志。
+   - 新增写操作路由时，必须在 `server/internal/api/router.go` 的 `deriveMutationAction` 中登记规则，并同步在 `audit_coverage_test.go` 中补充覆盖用例。
+   - 审计文案必须为面向操作的**全中文描述**（如「部署应用」「续期证书」），严禁直接展示原始 HTTP 方法与路径；新增 action 码必须在 `web/src/api/audit.ts` 中注册中文标签。
+
+5. **前端 UI 与布局设计规范**
+   - **组件选用**：优先直接使用 Naive UI 原生组件（`NCard`、`NDataTable`、`NTabs`、`NButton` 等），杜绝无意义的低效套壳封装；独立页面主标题统一为外层单文字 `<h2 class="page-title">`，无中英文混排。
+   - **页面留白统一**：页面外层内边距由 `AppShell` 统一施加，页面组件根节点**严禁再定义外层 padding**。
+   - **大数据表格布局**：承载不定长数据的表格一律使用「整页填满视口 + 表头与分页固定 + 仅数据区滚动 + **必须分页**」规范（`NDataTable flex-height` + 弹性容器 `min-height: 0`），禁止使用原生无分页的 `<NTable>` 承载不定长数据。
+   - **多页签工作区 (KeepAlive)**：路由组件必须使用 `defineOptions({ name: 'Xxx' })` 声明稳定组件名，并与路由配置中的 `meta.viewName` 保持一致，确保切页签时保留表单与终端等运行状态。
+
+6. **Agent 通信与并发安全底线**
+   - **零入站端口**：守住被管机不开放入站端口的原则，所有操作均由 Agent 主动出站长连接（gRPC over TLS）承载。
+   - **命令下发安全**：下发到 Agent 的命令必须根据目标主机操作系统动态选择 Shell（Windows 为 PowerShell、Alpine 为 sh、其他 Linux 为 bash），所有外部参数必须进行 Shell 转义，严禁直接字符串拼接以防命令注入。
+   - **RPC Hub 并发与锁纪律**：持锁期间严禁调用外部回调（防止自死锁），关闭共享 Channel 必须带 `closed` 状态守卫（防止并发向已关闭通道发送导致 panic）。
+   - **双向维护握手**：控制端重启与 Agent 升级必须通过双向维护信令（`MaintenanceNotice` 与 `reconnect_reason`）进行状态对齐，杜绝因重启和重连引发虚假离线/上线告警轰炸。
 
 ## 发版
 

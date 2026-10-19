@@ -87,7 +87,7 @@ jobs:
           cp -r web/dist/. server/web/dist/
           ls server/web/dist | head
 
-      - name: Build server + agent binaries
+      - name: Build server + agent + watchmanctl binaries
         env:
           CGO_ENABLED: '0'
         run: |
@@ -104,6 +104,12 @@ jobs:
           GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchman-agent-linux-amd64 ./agent/cmd/watchman-agent
           GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchman-agent-linux-arm64 ./agent/cmd/watchman-agent
           GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchman-agent-windows-amd64.exe ./agent/cmd/watchman-agent
+          # watchmanctl operator CLI: on-demand ops tunnel client (AGENTS.md §3.17)
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchmanctl-linux-amd64 ./cmd/watchmanctl
+          GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchmanctl-linux-arm64 ./cmd/watchmanctl
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchmanctl-windows-amd64.exe ./cmd/watchmanctl
+          GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchmanctl-darwin-amd64 ./cmd/watchmanctl
+          GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/bin/watchmanctl-darwin-arm64 ./cmd/watchmanctl
           # canonical bare name for linux/amd64 (matches install.FindAgentBinary dev fallback)
           cp dist/bin/watchman-agent-linux-amd64 dist/bin/watchman-agent
           ls -la dist/bin
@@ -122,7 +128,11 @@ jobs:
           cp dist/bin/watchman-agent-linux-amd64 dist/
           cp dist/bin/watchman-agent-linux-arm64 dist/
           cp dist/bin/watchman-agent-windows-amd64.exe dist/
-
+          cp dist/bin/watchmanctl-linux-amd64 dist/
+          cp dist/bin/watchmanctl-linux-arm64 dist/
+          cp dist/bin/watchmanctl-windows-amd64.exe dist/
+          cp dist/bin/watchmanctl-darwin-amd64 dist/
+          cp dist/bin/watchmanctl-darwin-arm64 dist/
           # 2. Compute SHA-256 for all individual agent binaries to construct manifest.json
           sha_amd64="$(sha256sum "dist/watchman-agent-linux-amd64" | cut -d' ' -f1)"
           sha_arm64="$(sha256sum "dist/watchman-agent-linux-arm64" | cut -d' ' -f1)"
@@ -171,6 +181,11 @@ jobs:
             watchman-agent-linux-amd64 \
             watchman-agent-linux-arm64 \
             watchman-agent-windows-amd64.exe \
+            watchmanctl-linux-amd64 \
+            watchmanctl-linux-arm64 \
+            watchmanctl-windows-amd64.exe \
+            watchmanctl-darwin-amd64 \
+            watchmanctl-darwin-arm64 \
             watchman-dist-*.tar.gz \
             manifest.json > CHECKSUMS.txt)
           ls -la dist/
@@ -198,6 +213,11 @@ jobs:
             dist/watchman-agent-linux-amd64 \
             dist/watchman-agent-linux-arm64 \
             dist/watchman-agent-windows-amd64.exe \
+            dist/watchmanctl-linux-amd64 \
+            dist/watchmanctl-linux-arm64 \
+            dist/watchmanctl-windows-amd64.exe \
+            dist/watchmanctl-darwin-amd64 \
+            dist/watchmanctl-darwin-arm64 \
             dist/watchman-dist-*.tar.gz \
             dist/manifest.json \
             dist/CHECKSUMS.txt
@@ -210,6 +230,7 @@ jobs:
           path: |
             dist/watchman-server-*
             dist/watchman-agent-*
+            dist/watchmanctl-*
             dist/watchman-dist-*.tar.gz
             dist/manifest.json
             dist/CHECKSUMS.txt

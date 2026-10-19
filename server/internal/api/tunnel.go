@@ -9,10 +9,14 @@ package api
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"watchman/server/internal/audit"
 	"watchman/server/internal/auth"
+	"watchman/server/internal/rpc"
 
 	"github.com/gin-gonic/gin"
 )
@@ -141,5 +145,110 @@ func (h *handlers) closeTunnel(c *gin.Context) {
 		fmt.Sprintf("关闭反向 TCP 隧道 %s (本地端口: %d, 目标: %s:%d)", t.ID, t.LocalPort, t.TargetHost, t.TargetPort),
 		audit.RiskLow, audit.ResultSuccess)
 
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ---- Operator tunnel control plane (§3.9.1, watchmanctl helper API) --------
+
+// watchmanctlReleaseBase points at the rolling latest-release download page
+// for the watchmanctl CLI binaries.
+const watchmanctlReleaseBase = "https://github.com/lizhixu/workbench/releases/latest/download/"
+
+// registerOperatorTunnelRoutes mounts the operator tunnel control-plane API.
+// Read endpoints (client-info, mine) are audit-exempt; closing a leg is
+// audited. The data plane itself lives on the dedicated -opgrpc listener and
+// never touches this port.
+func (h *handlers) registerOperatorTunnelRoutes(authed *gin.RouterGroup) {
+	g := authed.Group("/tunnels")
+	g.GET("/client-info", h.tunnelClientInfo)
+	g.GET("/mine", h.listMyOperatorTunnels)
+	g.DELETE("/mine/:tid", h.closeMyOperatorTunnel)
+}
+
+// tunnelClientInfo tells the web console and the watchmanctl CLI whether the
+// operator data plane is enabled, where to reach it, and where to download
+// the CLI. Read-only and audit-exempt (the console probes it on page load).
+func (h *handlers) tunnelClientInfo(c *gin.Context) {
+	enabled := h.opGRPCAddr != "" && h.reg.TunnelCoordinator() != nil
+	out := gin.H{
+		"enabled": enabled,
+		"cli": gin.H{
+			"linux_amd64":   watchmanctlReleaseBase + "watchmanctl-linux-amd64",
+			"linux_arm64":   watchmanctlReleaseBase + "watchmanctl-linux-arm64",
+			"windows_amd64": watchmanctlReleaseBase + "watchmanctl-windows-amd64.exe",
+			"darwin_amd64":  watchmanctlReleaseBase + "watchmanctl-darwin-amd64",
+			"darwin_arm64":  watchmanctlReleaseBase + "watchmanctl-darwin-arm64",
+		},
+	}
+	if enabled {
+		out["endpoint"] = h.operatorEndpoint(c)
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// operatorEndpoint derives the host:port of the operator data plane: the port
+// comes from the -opgrpc listen address, the host from the panel public URL
+// setting, then the -public-url flag, else from the request's Host header.
+func (h *handlers) operatorEndpoint(c *gin.Context) string {
+	port := "9443"
+	if _, p, err := net.SplitHostPort(h.opGRPCAddr); err == nil && p != "" && p != "0" {
+		port = p
+	}
+	host := ""
+	for _, candidate := range []string{h.settings.PanelSecurity().PublicURL, publicURL} {
+		if candidate == "" {
+			continue
+		}
+		if u, err := url.Parse(candidate); err == nil && u.Hostname() != "" {
+			host = u.Hostname()
+			break
+		}
+	}
+	if host == "" {
+		host = c.Request.Host
+		if hh, _, err := net.SplitHostPort(host); err == nil {
+			host = hh
+		}
+	}
+	// A bare bracketed IPv6 literal gets here when Host carried no port;
+	// strip the brackets so JoinHostPort brackets it exactly once instead of
+	// producing [[::1]]:9443.
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// listMyOperatorTunnels lists the caller's live operator tunnel legs.
+func (h *handlers) listMyOperatorTunnels(c *gin.Context) {
+	if !h.tunnelCoord(c) {
+		return
+	}
+	legs := h.reg.TunnelCoordinator().ListOwnerLegs(auth.Username(c))
+	if legs == nil {
+		legs = []rpc.OwnerLeg{}
+	}
+	c.JSON(http.StatusOK, gin.H{"tunnels": legs})
+}
+
+// closeMyOperatorTunnel force-closes one of the caller's own tunnel legs
+// (admins may close anyone's). Audited as op_tunnel_close.
+func (h *handlers) closeMyOperatorTunnel(c *gin.Context) {
+	if !h.tunnelCoord(c) {
+		return
+	}
+	tid := c.Param("tid")
+	isAdmin := auth.RoleOf(c) == auth.RoleAdmin
+	err := h.reg.TunnelCoordinator().CloseOwnerLeg(tid, auth.Username(c), isAdmin)
+	if err != nil {
+		if strings.HasPrefix(err.Error(), "forbidden") {
+			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	h.recordAudit(c, "op_tunnel_close", "tunnel", tid,
+		fmt.Sprintf("手动关闭运维隧道腿 %s", tid), audit.RiskLow, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

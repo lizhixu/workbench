@@ -131,3 +131,133 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "agent.proto",
 }
+
+const (
+	OperatorService_Connect_FullMethodName = "/watchman.agent.OperatorService/Connect"
+)
+
+// OperatorServiceClient is the client API for OperatorService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// ---- Operator tunnel (on-demand ops port-forward) ----------------------
+// A user-authenticated data plane for the watchmanctl CLI, served on its own
+// dedicated listener (see -opgrpc; TLS mandatory), physically separate from
+// both the web panel port and the agent-facing port. One bidirectional
+// stream proxies exactly one local TCP connection; the server bridges it to
+// an agent tunnel leg using the TunnelOpen/TunnelData/TunnelClose frames
+// above. Flow:
+//
+//	client -> server: OperatorOpen  (must be the first frame)
+//	server -> client: OperatorOpenAck{ok, error, conn_id}
+//	both ways:        OperatorData{data}
+//	either way:       OperatorClose{reason}
+//
+// The server enforces role/group/port allowlists per open and audits every
+// open/close/deny with the operator identity. Business bytes never touch the
+// web panel listener.
+type OperatorServiceClient interface {
+	Connect(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[OperatorMessage, OperatorMessage], error)
+}
+
+type operatorServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewOperatorServiceClient(cc grpc.ClientConnInterface) OperatorServiceClient {
+	return &operatorServiceClient{cc}
+}
+
+func (c *operatorServiceClient) Connect(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[OperatorMessage, OperatorMessage], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &OperatorService_ServiceDesc.Streams[0], OperatorService_Connect_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[OperatorMessage, OperatorMessage]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OperatorService_ConnectClient = grpc.BidiStreamingClient[OperatorMessage, OperatorMessage]
+
+// OperatorServiceServer is the server API for OperatorService service.
+// All implementations must embed UnimplementedOperatorServiceServer
+// for forward compatibility.
+//
+// ---- Operator tunnel (on-demand ops port-forward) ----------------------
+// A user-authenticated data plane for the watchmanctl CLI, served on its own
+// dedicated listener (see -opgrpc; TLS mandatory), physically separate from
+// both the web panel port and the agent-facing port. One bidirectional
+// stream proxies exactly one local TCP connection; the server bridges it to
+// an agent tunnel leg using the TunnelOpen/TunnelData/TunnelClose frames
+// above. Flow:
+//
+//	client -> server: OperatorOpen  (must be the first frame)
+//	server -> client: OperatorOpenAck{ok, error, conn_id}
+//	both ways:        OperatorData{data}
+//	either way:       OperatorClose{reason}
+//
+// The server enforces role/group/port allowlists per open and audits every
+// open/close/deny with the operator identity. Business bytes never touch the
+// web panel listener.
+type OperatorServiceServer interface {
+	Connect(grpc.BidiStreamingServer[OperatorMessage, OperatorMessage]) error
+	mustEmbedUnimplementedOperatorServiceServer()
+}
+
+// UnimplementedOperatorServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedOperatorServiceServer struct{}
+
+func (UnimplementedOperatorServiceServer) Connect(grpc.BidiStreamingServer[OperatorMessage, OperatorMessage]) error {
+	return status.Errorf(codes.Unimplemented, "method Connect not implemented")
+}
+func (UnimplementedOperatorServiceServer) mustEmbedUnimplementedOperatorServiceServer() {}
+func (UnimplementedOperatorServiceServer) testEmbeddedByValue()                         {}
+
+// UnsafeOperatorServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to OperatorServiceServer will
+// result in compilation errors.
+type UnsafeOperatorServiceServer interface {
+	mustEmbedUnimplementedOperatorServiceServer()
+}
+
+func RegisterOperatorServiceServer(s grpc.ServiceRegistrar, srv OperatorServiceServer) {
+	// If the following call pancis, it indicates UnimplementedOperatorServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&OperatorService_ServiceDesc, srv)
+}
+
+func _OperatorService_Connect_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(OperatorServiceServer).Connect(&grpc.GenericServerStream[OperatorMessage, OperatorMessage]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OperatorService_ConnectServer = grpc.BidiStreamingServer[OperatorMessage, OperatorMessage]
+
+// OperatorService_ServiceDesc is the grpc.ServiceDesc for OperatorService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var OperatorService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "watchman.agent.OperatorService",
+	HandlerType: (*OperatorServiceServer)(nil),
+	Methods:     []grpc.MethodDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Connect",
+			Handler:       _OperatorService_Connect_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
+	Metadata: "agent.proto",
+}

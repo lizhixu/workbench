@@ -74,9 +74,13 @@ type AppFormSnapshot struct {
 	HostID          string            `json:"host_id"`
 	TemplateID      string            `json:"template_id"`
 	TemplateParams  map[string]string `json:"template_params"`
-	Image           string            `json:"image"`
-	ComposeContent  string            `json:"compose_content"`
-	RepoURL         string            `json:"repo_url"`
+		Image                 string            `json:"image"`
+		ComposeContent        string            `json:"compose_content"`
+		MeshForwardEnabled    bool              `json:"mesh_forward_enabled"`
+		MeshForwardHostID     string            `json:"mesh_forward_host_id"`
+		MeshForwardEntryPort  int               `json:"mesh_forward_entry_port"`
+		MeshForwardTargetPort int               `json:"mesh_forward_target_port"`
+		RepoURL               string            `json:"repo_url"`
 	Branch          string            `json:"branch"`
 	AuthVaultID     string            `json:"auth_vault_id"`
 	AutoDeploy      bool              `json:"auto_deploy"`
@@ -103,9 +107,13 @@ type AppDraft struct {
 	HostID          *string           `json:"host_id,omitempty"`
 	TemplateID      *string           `json:"template_id,omitempty"`
 	TemplateParams  map[string]string `json:"template_params,omitempty"`
-	Image           *string           `json:"image,omitempty"`
-	ComposeContent  *string           `json:"compose_content,omitempty"`
-	RepoURL         *string           `json:"repo_url,omitempty"`
+		Image                 *string           `json:"image,omitempty"`
+		ComposeContent        *string           `json:"compose_content,omitempty"`
+		MeshForwardEnabled    *bool             `json:"mesh_forward_enabled,omitempty"`
+		MeshForwardHostID     *string           `json:"mesh_forward_host_id,omitempty"`
+		MeshForwardEntryPort  *int              `json:"mesh_forward_entry_port,omitempty"`
+		MeshForwardTargetPort *int              `json:"mesh_forward_target_port,omitempty"`
+		RepoURL               *string           `json:"repo_url,omitempty"`
 	Branch          *string           `json:"branch,omitempty"`
 	AutoDeploy      *bool             `json:"auto_deploy,omitempty"`
 	BuildType       *string           `json:"build_type,omitempty"`
@@ -321,15 +329,43 @@ func sanitizeAppDraft(d *AppDraft, form AppFormSnapshot, hosts []appHostInfo, te
 		tplByID[t.ID] = t
 	}
 
-	// Source type whitelist.
-	if d.SourceType != nil {
-		switch *d.SourceType {
-		case "template", "image", "raw_compose", "git":
-		default:
-			addWarning(fmt.Sprintf("AI 给出的部署来源 %q 不受支持，已忽略", *d.SourceType))
-			d.SourceType = nil
+		// Source type whitelist.
+		if d.SourceType != nil {
+			switch *d.SourceType {
+			case "template", "image", "raw_compose", "git":
+			default:
+				addWarning(fmt.Sprintf("AI 给出的部署来源 %q 不受支持，已忽略", *d.SourceType))
+				d.SourceType = nil
+			}
 		}
-	}
+
+		// 组网转发参数校验
+		if d.MeshForwardEnabled != nil && *d.MeshForwardEnabled {
+			if d.MeshForwardHostID != nil {
+				fwdHost, ok := hostByID[*d.MeshForwardHostID]
+				effHost := form.HostID
+				if d.HostID != nil {
+					effHost = *d.HostID
+				}
+				if !ok {
+					addWarning("AI 选择的组网转发入口主机不存在或不在线，已忽略")
+					d.MeshForwardHostID = nil
+				} else if effHost != "" && *d.MeshForwardHostID == effHost {
+					addWarning("AI 选择的组网转发入口主机与应用主机相同，已忽略")
+					d.MeshForwardHostID = nil
+				} else if fwdHost.MeshIP == "" {
+					addWarning("AI 选择的组网转发入口主机未加入异地组网，将按直连转发，请确认网络可达")
+				}
+			}
+			if d.MeshForwardEntryPort != nil && (*d.MeshForwardEntryPort < 1 || *d.MeshForwardEntryPort > 65535) {
+				addWarning("AI 给出的组网转发入口端口不合法，已忽略")
+				d.MeshForwardEntryPort = nil
+			}
+			if d.MeshForwardTargetPort != nil && (*d.MeshForwardTargetPort < 1 || *d.MeshForwardTargetPort > 65535) {
+				addWarning("AI 给出的组网转发目标端口不合法，已忽略")
+				d.MeshForwardTargetPort = nil
+			}
+		}
 
 	// Host must be one of the online hosts.
 	if d.HostID != nil {
@@ -473,9 +509,27 @@ func sanitizeAppDraft(d *AppDraft, form AppFormSnapshot, hosts []appHostInfo, te
 		d.ProxyMode = nil
 	}
 	if d.GatewayHostID != nil {
-		if _, ok := hostByID[*d.GatewayHostID]; !ok {
+		gw, ok := hostByID[*d.GatewayHostID]
+		if !ok {
 			addWarning("AI 选择的网关主机不存在或不在线，已忽略")
 			d.GatewayHostID = nil
+		} else {
+			// The gateway can reach the app host either through the overlay or
+			// by 直连 (public/internal IP), so a missing mesh IP is only a
+			// note, not a reason to drop the choice. Being the app host itself
+			// is still invalid (that is local mode).
+			effHost := ""
+			if d.HostID != nil {
+				effHost = *d.HostID
+			} else {
+				effHost = form.HostID
+			}
+			if effHost != "" && *d.GatewayHostID == effHost {
+				addWarning("AI 选择的网关主机与应用主机相同（相同场景应使用 local 模式），已忽略")
+				d.GatewayHostID = nil
+			} else if gw.MeshIP == "" {
+				addWarning("AI 选择的网关主机未加入异地组网，将按直连（应用主机公网/内网 IP）转发，请确认网关到应用主机网络可达")
+			}
 		}
 	}
 
@@ -551,45 +605,69 @@ func sanitizeAppDraft(d *AppDraft, form AppFormSnapshot, hosts []appHostInfo, te
 				}
 			}
 		}
-	case "image":
-		if pickStr(d.Image, form.Image) == "" {
-			addMissing("镜像地址")
+		case "image":
+			if pickStr(d.Image, form.Image) == "" {
+				addMissing("镜像地址")
+			}
+		case "raw_compose":
+			if pickStr(d.ComposeContent, form.ComposeContent) == "" {
+				addMissing("Compose 内容")
+			}
+		case "git":
+			if pickStr(d.RepoURL, form.RepoURL) == "" {
+				addMissing("Git 仓库地址")
+			}
 		}
-	case "raw_compose":
-		if pickStr(d.ComposeContent, form.ComposeContent) == "" {
-			addMissing("Compose 内容")
+		if effSource != "template" && pickStr(d.Name, form.Name) == "" {
+			addMissing("应用名称")
 		}
-	case "git":
-		if pickStr(d.RepoURL, form.RepoURL) == "" {
-			addMissing("Git 仓库地址")
-		}
-	}
-	if effSource != "template" && pickStr(d.Name, form.Name) == "" {
-		addMissing("应用名称")
-	}
-	if missing == nil {
-		missing = []string{}
-	}
-	if warnings == nil {
-		warnings = []string{}
-	}
-	return missing, warnings
-}
 
-const appAssistSystemRules = `规则：
-1. 只返回一个 JSON 对象，不要输出任何解释性文字或 markdown 围栏。
-2. source_type 只能是 "template"、"image"、"raw_compose"、"git" 之一；用户说"部署某个现成软件/模板"时优先 template；给镜像名时用 image；用户贴了或要求 compose 编排时用 raw_compose；给 Git 仓库时用 git。
-3. host_id 只能从「可用主机」清单中选择 id；用户按主机名或 IP 指代某台时据此匹配；完全没提部署到哪里时留空（不要瞎猜）。
-4. template_id 只能从「模板目录」中选择 id；template_params 的键只能是该模板声明的参数键；必填的密钥参数除非用户明确要求生成，否则留空并在 missing 里列出。
-5. 端口 bind_scope 只能是 "public" 或 "mesh"；仅当目标主机有组网IP 且用户要求内网/组网访问，或部署数据库类服务（redis/mysql/postgres 等）时才建议 mesh。
-6. 不要输出 auth_vault_id（Git 凭据必须由用户在页面手选）。git 来源 branch 缺省 "main"，build_type 缺省 "dockerfile"。
-7. env_vars 只填用户明确要求的环境变量；不要编造连接串、口令等敏感值（用户要求生成时除外）。
-8. missing 列出还缺哪些用户必须补充的信息（中文短语，如 "目标主机"、"模板参数「数据库密码」"）；warnings 列出需要提醒用户的注意事项（中文）。explanation 用一两句中文说明你的选型理由。
-9. 能确定的字段都填上，不确定的留空并写入 missing，不要为了填满而编造。
-10. 若上文给出【已客观读取的真实配置】区块，其内容优先级最高（高于你的先验知识）：ports、env_vars 变量名、build_type、卷路径一律以事实为准，不得凭印象覆盖；探测标记为失败的字段才允许按经验推断，且须在 warnings 中提醒用户核实。`
+		effFwdEnabled := form.MeshForwardEnabled
+		if d.MeshForwardEnabled != nil {
+			effFwdEnabled = *d.MeshForwardEnabled
+		}
+		if effFwdEnabled {
+			effFwdHost := form.MeshForwardHostID
+			if d.MeshForwardHostID != nil {
+				effFwdHost = *d.MeshForwardHostID
+			}
+			if effFwdHost == "" {
+				addMissing("组网转发入口主机")
+			}
+			effFwdPort := form.MeshForwardEntryPort
+			if d.MeshForwardEntryPort != nil {
+				effFwdPort = *d.MeshForwardEntryPort
+			}
+			if effFwdPort <= 0 {
+				addMissing("组网转发入口端口")
+			}
+		}
 
-const appDraftJSONSpec = `返回 JSON 格式（字段没把握就省略该字段，不要填 null）：
-{"draft":{"source_type":"template","name":"应用名","container_name":"","host_id":"主机id","template_id":"模板id","template_params":{"键":"值"},"image":"镜像","compose_content":"YAML","repo_url":"https://...","branch":"main","build_type":"dockerfile","dockerfile":"Dockerfile","build_context":".","build_timeout_sec":900,"auto_deploy":true,"ports":[{"host":8080,"container":80,"bind_scope":"public"}],"env_vars":{"K":"V"},"volumes":["/host:/container"],"healthcheck_url":"","domain":"","proxy_mode":"local","gateway_host_id":""},"explanation":"选型说明","missing":["目标主机"],"warnings":[]}`
+		if missing == nil {
+			missing = []string{}
+		}
+		if warnings == nil {
+			warnings = []string{}
+		}
+		return missing, warnings
+	}
+
+	const appAssistSystemRules = `规则：
+	1. 只返回一个 JSON 对象，不要输出任何解释性文字或 markdown 围栏。
+	2. source_type 只能是 "template"、"image"、"raw_compose"、"git" 之一；用户说"部署某个现成软件/模板"时优先 template；给镜像名时用 image；用户贴了或要求 compose 编排时用 raw_compose；给 Git 仓库时用 git。
+	3. host_id 只能从「可用主机」清单中选择 id；用户按主机名或 IP 指代某台时据此匹配；完全没提部署到哪里时留空（不要瞎猜）。
+	4. template_id 只能从「模板目录」中选择 id；template_params 的键只能是该模板声明的参数键；必填的密钥参数除非用户明确要求生成，否则留空并在 missing 里列出。
+	5. 端口 bind_scope 只能是 "public" 或 "mesh"；仅当目标主机有组网IP 且用户要求内网/组网访问，或部署数据库类服务（redis/mysql/postgres 等）时才建议 mesh。
+	6. 不要输出 auth_vault_id（Git 凭据必须由用户在页面手选）。git 来源 branch 缺省 "main"，build_type 缺省 "dockerfile"。
+	7. env_vars 只填用户明确要求的环境变量；不要编造连接串、口令等敏感值（用户要求生成时除外）。
+	8. missing 列出还缺哪些用户必须补充的信息（中文短语，如 "目标主机"、"模板参数「数据库密码」"）；warnings 列出需要提醒用户的注意事项（中文）。explanation 用一两句中文说明你的选型理由。
+	9. 能确定的字段都填上，不确定的留空并写入 missing，不要为了填满而编造。
+	10. 若上文给出【已客观读取的真实配置】区块，其内容优先级最高（高于你的先验知识）：ports、env_vars 变量名、build_type、卷路径一律以事实为准，不得凭印象覆盖；探测标记为失败的字段才允许按经验推断，且须在 warnings 中提醒用户核实。
+	11. proxy_mode 为 "gateway" 时 gateway_host_id 只能从「可用主机」清单中选择，优先选有公网IP 的在线主机，且不能与应用主机 host_id 相同；网关到应用主机可走异地组网或直连（公网/内网 IP），组网不是必需条件。用户没有提到域名或反向代理时，不要输出 domain / proxy_mode / gateway_host_id。
+	12. 用户要求"通过某台入口主机中继/转发端口访问该应用"时，设置 mesh_forward_enabled 为 true，mesh_forward_host_id 从「可用主机」清单选择入口主机（优先有公网IP，不能等于应用主机 host_id），mesh_forward_entry_port 为入口主机监听端口，mesh_forward_target_port 为应用暴露端口。`
+
+	const appDraftJSONSpec = `返回 JSON 格式（字段没把握就省略该字段，不要填 null）：
+	{"draft":{"source_type":"template","name":"应用名","container_name":"","host_id":"主机id","template_id":"模板id","template_params":{"键":"值"},"image":"镜像","compose_content":"YAML","repo_url":"https://...","branch":"main","build_type":"dockerfile","dockerfile":"Dockerfile","build_context":".","build_timeout_sec":900,"auto_deploy":true,"ports":[{"host":8080,"container":80,"bind_scope":"public"}],"mesh_forward_enabled":false,"mesh_forward_host_id":"","mesh_forward_entry_port":0,"mesh_forward_target_port":0,"env_vars":{"K":"V"},"volumes":["/host:/container"],"healthcheck_url":"","domain":"","proxy_mode":"local","gateway_host_id":""},"explanation":"选型说明","missing":["目标主机"],"warnings":[]}`
 
 // AppDraft turns a natural-language requirement into a sanitized create-app
 // form draft. It never creates anything: the frontend fills the form with
@@ -735,7 +813,7 @@ func (a *Assistant) AppChat(ctx context.Context, question string, history []Chat
 要求：
 1. 只返回一个 JSON 对象：{"answer":"中文回答","form_patch":null}。answer 用中文、简洁可执行。
 2. 当且仅当用户的意图是修改表单时，才在 form_patch 中给出要修改的字段（格式与表单草稿相同，只包含需要改动的字段，没把握的字段不要出现）；只是咨询问题时 form_patch 必须为 null。
-3. form_patch 的 host_id/template_id 只能从上面清单中选；不要给出 auth_vault_id；端口 bind_scope 仅在目标主机有组网IP 时才可建议 mesh。
+3. form_patch 的 host_id/template_id 只能从上面清单中选；不要给出 auth_vault_id；端口 bind_scope 仅在目标主机有组网IP 时才可建议 mesh；proxy_mode=gateway 时 gateway_host_id 须为在线主机且不能等于 host_id（网关可走组网或直连，不强制组网）。
 4. 表单里 *** 的字段是用户已填的密钥，不要要求用户重复提供，也不要在回答中猜测其内容。
 5. 若上文给出【已客观读取的真实配置】区块，端口、环境变量键、构建方式等一律以事实为准，不得凭印象覆盖。`, hostsContext(hosts), templatesContext(templates), formContextJSON(form, templates), factsBlock, histText, question)
 

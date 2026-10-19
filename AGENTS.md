@@ -104,13 +104,37 @@
   - `image`：直接输入镜像引用（`nginx:alpine`、`registry.example.com/app:1.0`）部署单容器。
   - `raw_compose`：在线编写 Docker Compose YAML 编排微服务栈。
   - `git`：链接 Git 仓库（GitHub 授权选择或手动 URL），Dockerfile / Compose 构建，支持推送自动部署（Webhook）。
+- **集成组网端口转发（4 层 TCP 流量中继，2026-10-16）**：
+  - 组网转发彻底从独立的假应用收敛为**具体业务应用的内置 4 层网络中继能力**（与 7 层 HTTP/HTTPS 域名反代并列）。
+  - 用户在部署或维护任意具体应用（模板/镜像/Compose/Git）时，可开启「组网端口转发」，指定**入口主机**（`mesh_forward_host_id`，如带公网 IP 的跳板机/网关节点，不能是应用主机自身）、**入口监听端口**（`mesh_forward_entry_port`，1~65535）与**目标端口**（`mesh_forward_target_port`，缺省预填应用暴露端口）。
+  - **部署引擎自动联动**：主应用在应用主机成功部署后，引擎自动在入口主机调度运行 companion `alpine/socat` 容器（`watchman-fwd-<appID>`，`--entrypoint /usr/bin/socat`，`TCP-LISTEN:<entryPort>,fork,reuseaddr TCP:<targetIP>:<targetPort>`）。
+  - **双路径自动解析**：应用主机与入口主机双方均在异地组网内时，流量经 Tailscale 组网直接指向应用主机 Mesh IP（`100.x:targetPort`，应用主机无需公网 IP）；若未组网则平滑回退直连路径（应用主机公网 IP 或内网 IP）。
+  - **全生命周期协同**：应用的主机启停（`stop`/`start`/`restart`）及彻底删除（`purge`）自动协同操作入口主机上的中继容器；关闭转发或修改配置时自动平滑更新或清理旧中继容器（2026-10-19 加固）：
+    - **创建与更新同一套校验**（`validateMeshForward`）：开启转发时入口主机必填、入口主机不能是应用主机自身、入口/目标端口均须 1~65535；更新时应用主机不可变更，故以存储的 `host_id` 为准校验。
+    - **（入口主机， 入口端口）全应用唯一**（`meshForwardConflict`）：创建与更新均校验（更新排除自身），冲突返回 409 并提示占用方应用名。
+    - **入口主机变更/关闭转发即拆除旧中继**：入口主机变更时先按旧坐标 `CleanMeshForwarder`（新表单已清空旧字段，不清理会遗留孤儿容器）；purge 以**记录过入口主机**为准（而非仅看 Enabled 开关），历史遗留配置仍可被回收。
+    - **更新响应同步化**：`PUT /apps/:id` 在转发配置变化时同步执行 `SyncMeshForwarder`，结果经响应字段 `mesh_forward_target`（生效的中继目标）/ `mesh_forward_warning`（同步失败原因）返回，不再只依赖异步协程。
+    - **部署完成重读存储**：`finishDeploySuccess` 创建中继前重新 `GetApp`，应用在部署期间被删除则跳过并在部署日志说明（消除用过期指针建中继的竞态）。
+    - **启停联动结果可观测**：`containerAction`（stop/start/restart）对中继容器的联动失败（入口主机离线/执行失败/非零退出）以响应字段 `relay_warning` 上抛，主操作仍按自身结果返回。
+  - **拓扑预览协同**：创建页与详情页的流量拓扑实时呈现 TCP 4 层中继链路与 7 层 HTTP/HTTPS 反代链路。
 - **端口绑定范围**（`PortMapping.bind_scope`）：每条端口映射可选「公网开放」（默认，`-p host:container` 绑定 0.0.0.0）或「仅异地组网」（`-p <tailscaleIP>:host:container` 只绑定主机 Tailscale IP，公网不可达）。选择「仅异地组网」时目标主机必须已加入组网，引擎找不到 Mesh IP 时降级为公网绑定并在部署日志中告警。
 - **域名与反代集成**（`PUT /apps/:id/proxy`）：
   - `local` 模式：应用所在主机自建 Nginx（`watchman-app-nginx` 容器）反代，上游 `127.0.0.1:<port>`。
-  - `gateway` 模式：另选一台有公网 IP 的网关主机运行 Nginx，上游指向**应用主机的 Tailscale Mesh IP**（经 `network.Store.GetNodeStatus` 解析），公网流量在网关卸载 TLS 后经组网内网穿透到无公网的应用主机。
+  - `gateway` 模式：另选一台有公网 IP 的网关主机运行 Nginx，公网流量在网关卸载 TLS 后转发到应用主机。**异地组网不是必需条件**，上游按两条路径自动解析（`defaultUpstream`）：
+    - **组网路径**：应用主机与网关主机**双方都已在组网内** → 上游取应用主机的 Tailscale Mesh IP（100.64.0.0/10），应用主机无需公网 IP、可隐藏在 NAT 后；
+    - **直连路径**：否则 → 上游取应用主机的**公网 IP**，无公网 IP 再回退**内网 IP**（同局域网/VPC 场景），仅两者皆无时才报错并要求在详情页手动填写 Upstream。
+    - 上游永不用 `127.0.0.1`（会指向网关自身造成流量黑洞）；网关主机**不能是应用主机自身**（相同场景即 local 模式）。
   - 证书自动化：绑定域名时若证书中心无覆盖证书，自动用默认 ACME 账户签发后写入 Nginx 并热加载。
   - 网关主机 ID 持久化在 `Application.proxy_gateway_host_id`，解绑时同时清理应用主机与网关主机两侧配置。
 - **创建时即可绑定域名**：创建页填写域名与网关节点后，提交依次执行 创建应用 → 自动签发证书 → 下发反代；绑定失败不回滚应用创建，可稍后在详情页重试。
+- **创建页异地组网防错与拓扑预览**（2026-10-16）：
+  - **网关主机约束**（前端禁用 + 提交校验 + 后端兜底）：网关主机**不能与应用主机相同**（相同场景即 local）。**异地组网非必需**：网关到应用主机可走组网（双方都在组网内 → 100.x）或直连（应用主机公网 → 内网 IP），下拉按「有公网 IP」优先排序并标注 `组网直达`/`直连` 路径，未组网主机不再禁选。后端 `bindProxy`：同主机返回 400；两条路径都无法解析出上游时返回 409 并提示手动填写 Upstream。
+  - **组网 IP 实时探测**：选中主机即调只读端点 `GET /network/nodes/:id/mesh-ip`（§8.7 第 8 条），提示区分「实时探测/缓存」；mesh 端口但主机未组网时，端口区给出 NAlert 与「前往加入组网」深链（`/hosts/:id?tab=network`），不再等到提交才报错。
+  - **组网全局未配置引导**：创建页拉取 `GET /network/config`，未配置 Auth Key/控制面时顶部 NAlert 提示并深链 `/network`（可关闭）。
+  - **local 模式与主机公网能力不匹配**：填写域名后若 local 模式但应用主机无公网 IP，NAlert 建议切「统一网关」并提供一键切换。
+  - **流量拓扑预览卡片**（`web/src/components/apps/AppTopologyPreview.vue`，创建页选中主机后渲染）：随表单实时展示 公网用户 → 网关主机(Nginx/443) → （`Tailscale 组网` 或 `直连`）→ 应用主机 → 应用容器 的链路与每条端口的绑定范围（`0.0.0.0:host` 公网开放 / `meshIP:host` 仅异地组网），节点离线时降亮；链路箭头的「组网/直连」由双方是否都有组网 IP 决定。视觉语言复用 AppDetail「域名与反代」页 topology-box（§8.8 组件规范）。
+  - **AppDetail 域名与反代同步**：网关下拉同样标注组网状态与 `组网直达`/`直连` 路径、仅禁用应用主机自身；保存前校验网关非应用主机自身（两路径均由后端解析，不强制组网）；已绑定应用的拓扑展示按 `proxy_upstream` 是否落在 100.64.0.0/10 判定并显示「Tailscale 组网」或「直连」。
+  - **AI 草稿一致性**：`app_assist` 系统规则第 11 条与对话规则要求 `gateway_host_id` 为在线主机、不能等于 `host_id`（网关可走组网或直连，不强制组网）；`sanitizeAppDraft` 仅在同主机时丢弃并告警，未组网时追加「将按直连转发，请确认网络可达」提示而不丢弃。
 - **创建页 AI 辅助**（2026-10-10）：创建应用页（`AppCreate.vue`）右侧挂载 AI 部署助手（`web/src/components/apps/AppAiAssistant.vue`），复用统一 LLM 适配层（§3.16），提供两种能力：
   - **智能填充**：用户用自然语言描述需求，`POST /api/v1/ai/app-draft` 返回结构化表单草稿（`Assistant.AppDraft`，实现位于 `server/internal/ai/app_assist.go`）。服务端把在线主机清单（仅 id/主机名/系统/公网IP/组网IP）与模板目录（含 `env_fields`）作为接地上下文注入提示词；模型只能从清单中选 `host_id`/`template_id`，不得输出 `auth_vault_id`（Git 凭据必须人工选）。返回前经 `sanitizeAppDraft` 消毒（来源类型白名单、端口 1~65535、模板参数按声明字段过滤、`bind_scope=mesh` 与主机组网IP 一致性告警等），并计算 `missing`（还需用户补充的字段）；前端点「填充到表单」才合并进表单，**AI 永不直接创建应用**，最终提交仍走原有已审计的 `POST /apps` 与前端校验（§3.16.7 草稿-确认模型）。
   - **对话辅助**：`POST /api/v1/ai/app-chat` 每次请求携带**当前表单快照**与最近 10 轮对话，回答可附带 `form_patch`（结构化改动，同样经消毒），前端以「建议修改」卡片呈现，用户点「应用到表单」才生效，禁止静默改表。
@@ -128,7 +152,7 @@
   - 独立「证书中心」（`/certs`，`CertList.vue` + `CertManager.vue`）保持作为全局基础设施，管理 ACME 自动化证书与证书凭证，供面板及各业务应用按需选用。
 - **全生命周期管理**：部署历史、构建日志、健康检查探活失败自动保留旧版本（`-next`/`-prev` 滚动替换）、回滚、启停、AI 排障诊断，对所有来源的应用一致生效。
   - 实现备注（2026-09-28）：`deploySingleContainer` 的起新容器命令只清理残留的 `-next` 容器（`docker rm -f <name>-next`），旧版本容器在 swap 前全程运行、失败时原样保留——此前曾误删旧容器（`rm -f` 目标写成了正式容器名），与"探活失败自动保留旧版本"的设计相悖，已修复。
-  - 实现备注（2026-09-28，发布流程 review）：git 拉取脚本必须 `set -e`——此前 `fetch` 失败会落到 `checkout --force` 用本地旧代码继续部署并上报成功；Git token 只持久化在 server 端 vault，下发时经 `git -c http.extraHeader="Authorization: Basic <base64(git:token)>"` 随单次 clone/fetch 使用，不再 `remote set-url` 写进 agent 的 `.git/config`（自动发布每次从 vault 现取，不受影响）；下发到 agent 的命令里所有用户输入变量必须 shell 转义（环境变量值曾因空格打散 `docker run` 参数）；swap 脚本 `set -e`，`docker rename` 失败不得被末尾 `docker inspect` 的退出码掩盖；镜像清理只针对 `watchman-app-*` 自建镜像、按创建时间保留最新 5 个（此前 `docker images repo:tag` 只匹配单个 tag 导致从不清，且 `head -n 6 | tail -n +6` 语义错误）；store 的 `GetApp/ListApps/FindAppByWebhookToken` 返回深拷贝——部署协程 `ResolveTemplate` 原地写 EnvVars map 时 HTTP 层正 marshal 同一对象，曾有 crash 风险；反代域名做严格 hostname 校验并检查跨应用重复绑定；网关模式拿不到 Mesh IP 时直接报错（此前回退 `127.0.0.1` 会指向网关自身造成流量黑洞）；`raw_compose` 每次部署快照 compose 内容到部署记录，回滚时恢复快照（此前"回滚"实际重部署了当前内容）；healer 跳过有部署在途的应用。
+  - 实现备注（2026-09-28，发布流程 review）：git 拉取脚本必须 `set -e`——此前 `fetch` 失败会落到 `checkout --force` 用本地旧代码继续部署并上报成功；Git token 只持久化在 server 端 vault，下发时经 `git -c http.extraHeader="Authorization: Basic <base64(git:token)>"` 随单次 clone/fetch 使用，不再 `remote set-url` 写进 agent 的 `.git/config`（自动发布每次从 vault 现取，不受影响）；下发到 agent 的命令里所有用户输入变量必须 shell 转义（环境变量值曾因空格打散 `docker run` 参数）；swap 脚本 `set -e`，`docker rename` 失败不得被末尾 `docker inspect` 的退出码掩盖；镜像清理只针对 `watchman-app-*` 自建镜像、按创建时间保留最新 5 个（此前 `docker images repo:tag` 只匹配单个 tag 导致从不清，且 `head -n 6 | tail -n +6` 语义错误）；store 的 `GetApp/ListApps/FindAppByWebhookToken` 返回深拷贝——部署协程 `ResolveTemplate` 原地写 EnvVars map 时 HTTP 层正 marshal 同一对象，曾有 crash 风险；反代域名做严格 hostname 校验并检查跨应用重复绑定；网关模式上游按「组网（双方都在组网内 → 100.x）→ 直连（应用主机公网 IP → 内网 IP）」顺序解析，绝不回退 `127.0.0.1`（会指向网关自身造成流量黑洞），两条路径都拿不到才报错要求手动填 Upstream（2026-10-16 起：早期版本在拿不到 Mesh IP 时直接报错，现改为直连兜底）；`raw_compose` 每次部署快照 compose 内容到部署记录，回滚时恢复快照（此前"回滚"实际重部署了当前内容）；healer 跳过有部署在途的应用。
 - **已安装管理**：应用列表/详情支持重启、停止、启动、查看日志、删除（`watchman.app` 标签标记容器归属）。
 - **可扩展**：模板定义为服务端声明式配置（`server/internal/apps/templates.go` 的 `Catalog`），支持自定义接入新模板。
 
@@ -259,6 +283,25 @@
 - **不自动高危操作**：AI 仅给建议/草稿，高危命令、删除、重启等一律需人工二次确认。
 - **审计留痕**：记录每次 AI 调用的输入摘要、输出、操作者、是否被采纳/执行。
 - **按用户/分组限速**：可对 AI 调用做配额与频率限制。
+
+### 3.17 按需运维隧道（kubectl port-forward 式）
+
+> 落地日期：2026-10-19。解决「临时打开某台主机/某个应用的某端口做运维调试」场景：不要求在主机、交换机或安全组上开任何面向公网/内网的监听端口，由运维本机发起、经既有 Agent 反向回连通道中继、进程退出即关闭的按需隧道。
+
+- **数据通路**：`运维本机 127.0.0.1:<本地端口> → watchmanctl → 控制端运维隧道端口（默认 :9443，TLS+用户 JWT）→ rpc.Coordinator 隧道腿 → 目标主机 Agent 的既有 gRPC 长连接（复用 TunnelOpen/TunnelData/TunnelClose 帧）→ 目标主机上的目标端口`。目标主机**零新开口**；无伴生容器、无安全组改动。
+- **三端口物理隔离（铁律）**：
+  - **面板端口**（默认 18789）：仅承载 Web 控制台与 REST 控制面（登录、查应用、取 CLI 信息），**不流任何业务字节**；
+  - **Agent 回连端口**（默认 9090）：被管主机出站长连接，隧道腿帧复用其上（`ServerMessage.tunnel_open` field 17 / `tunnel_data` field 18 / `tunnel_close` field 19 与 `AgentMessage.tunnel_data` field 11 / `tunnel_close` field 12）；
+  - **运维隧道数据面端口**：新启动参数 `-opgrpc`（**默认关闭**，启用时**强制 TLS**，无 `-tls-cert/-tls-key` 时拒绝明文启动），仅服务 `OperatorService`（一条 bidi 流代理一条本地 TCP 连接，首帧强制 `OperatorOpen`，回 `OperatorOpenAck{ok,error,conn_id}`，随后 `OperatorData` 双向传输/`OperatorClose` 拆除）。
+- **watchmanctl CLI**（`cmd/watchmanctl`，独立二进制，随 Release 发布 linux amd64/arm64、windows amd64、darwin amd64/arm64 共 5 个形态）：
+  - `watchmanctl login --server https://<面板>:18789 [--insecure]`：交互输入用户名/密码换取面板 JWT，落盘 `~/.watchmanctl.json`（写入后强制 `Chmod 0600`，已存在文件同样收紧）；`ls`/`close`/`tunnel` 对已用 `--insecure` 登录的配置在输出前打印一次明文告警；
+  - `watchmanctl tunnel --app <appID> --port <端口> [--listen [ip:]port]`：应用定向模式，本地随机或指定端口转发到应用暴露端口（服务端按 `app.Ports[].Host` 白名单校验，`bind_scope=mesh` 时上游自动解析为主机组网 IP，否则 `127.0.0.1`）；
+  - `watchmanctl tunnel --host <hostID或主机名> --target 127.0.0.1:<端口> [--listen ...]`：主机模式，`--target` 任意内网地址仅 admin 可用且记高危审计（防网络跳板滥用），operator 仅允许回环目标；
+  - `watchmanctl ls` / `watchmanctl close <connID>` / `watchmanctl version`；
+  - 每次启动隧道**实时**调 `GET /api/v1/tunnels/client-info` 取数据面端点（不缓存，防面板漂移；`enabled` 反映数据面监听器真实状态——`-opgrpc` 未配置证书或监听失败时服务端 fail-closed 上报未启用；`endpoint` 推导链：面板公网地址设置 → `-public-url` 启动参数 → 请求 Host，IPv6 字面量去重围括号后 `JoinHostPort` 保证 `[::1]:9443` 形态）；断流语义对齐 kubectl——不自动重连，干净退出（隧道是会话态工具），代理首帧 15 秒 ack 看门狗超时即取消整条流（per-stream ctx，防 `stream.Recv` 永久阻塞）。HTTP/2 流控窗口增大（流 4MB / 连接 16MB，两端对称），TLS 启用会话恢复（`ClientSessionCache`）。
+- **Web 控制面入口**：应用详情页「端口映射」每行端口带「隧道」按钮、主机详情组网页工具区带「临时隧道」按钮，打开共享弹层（`web/src/components/tunnels/OpsTunnelModal.vue`）：展示可复制的 `watchmanctl login`（以 `window.location.origin` 为面板地址）与 `watchmanctl tunnel` 命令、5 平台 CLI 下载链接（GitHub Release 直链）、当前用户活动隧道列表及逐项关闭；数据面未启用时给出管理员开启 `-opgrpc` 的引导。
+- **安全边界**：角色仅限 admin/operator（viewer 拒绝并记审计）；分组可见性按 `groups.CanAccessGroup` 实时校验；开腿鉴权**每次 open 实时重查**（不缓存）；`target_port` 强制 1~65535（应用模式白名单之前先过界值）；目标存在性对外不透露——应用不存在/主机不存在/跨分组无权访问统一回 `目标不存在或无权访问`（消除存在性预言机）；**错误分类**：策略拒绝（角色、分组、端口白名单、并发腿数超限）→ `PermissionDenied` + `op_tunnel_deny`（ResultBlocked）；基础设施失败（Agent 下线、腿建立失败）→ `Unavailable` + `op_tunnel_open`（ResultFailed），两者绝不混记；`OperatorOpenAck` 发送失败时拆除腿并补记一条成对的 `op_tunnel_close`，保证 open/close 审计配平。审计动作 `op_tunnel_open`（app 模式 medium，任意 target_host 的 host 模式 high）、`op_tunnel_close`（low）、`op_tunnel_deny`（ResultBlocked）。
+- **限额与回收**：每用户并发隧道腿 ≤ 8（`maxLegsPerOperator`），单 Agent 流式腿 ≤ 64；两个上限在 `Coordinator.OpenLeg` 内**同一把互斥锁下完成计数+插入**（并发开腿无 TOCTOU 窗口），超限返回哨兵错误 `ErrOwnerLegsExceeded`/`ErrAgentLegsExceeded`（`errors.Is` 可辨，归为策略拒绝类审计）；每腿空闲 15 分钟或存活 8 小时由 `Coordinator.StartReaper` 自动回收；Agent 断连时 `CloseByAgent` 连带清扫其孤儿流腿；慢消费流腿按既有策略丢弃（`toSock` 满即弃腿）。
 
 ---
 
@@ -623,6 +666,29 @@ message SysInfoQuery { string kind=1; }   // process/port/user/login
 message SysInfoSnapshot {
   string kind = 1; bytes json_payload = 2; // 结构化 JSON（不同 kind 不同 schema）
 }
+
+// 按需运维隧道数据面（§3.17）：挂在控制端独立 -opgrpc 端口（默认 :9443，
+// 强制 TLS + 面板 JWT），一条 bidi 流代理一条本地 TCP 连接。
+service OperatorService {
+  rpc Connect(stream OperatorMessage) returns (stream OperatorMessage);
+}
+message OperatorMessage {
+  oneof payload {
+    OperatorOpen    open  = 1;   // 客户端首帧（强制）
+    OperatorOpenAck ack   = 2;   // 服务端首帧：ok/error/conn_id
+    OperatorData    data  = 3;   // 双向传输字节
+    OperatorClose   close = 4;   // 任一侧拆除（带 reason）
+  }
+}
+message OperatorOpen {
+  string host_id     = 1;        // 目标主机（app_id 为空时必填）
+  string app_id      = 2;        // 应用定向模式：服务端解析主机 + 端口白名单
+  string target_host = 3;        // 空=自动（127.0.0.1 或组网 IP）；任意值仅 admin
+  uint32 target_port = 4;
+}
+message OperatorOpenAck { bool ok = 1; string error = 2; string conn_id = 3; }
+message OperatorData  { bytes data = 1; }
+message OperatorClose { string reason = 1; }
 ```
 
 约定：
@@ -902,6 +968,7 @@ Agent internal/shell
 | --- | --- | --- | --- |
 | `-http` | `:18080` (安装脚本设 `:18789`) | `HTTP_PORT` | HTTP 服务监听地址（Web 页面、REST API 与 WS 网关） |
 | `-grpc` | `:9090` | — | gRPC 服务监听地址（供 Agent 主动回连） |
+| `-opgrpc` | `""`（关闭） | — | 按需运维隧道数据面 gRPC 监听地址（§3.17，watchmanctl 数据面，建议 `:9443`）；默认零新开口，启用时强制 TLS——无 `-tls-cert`/`-tls-key` 时拒绝以明文启动该端口 |
 | `-data` | `./data` (安装部署为 `/opt/watchman/data`) | `DATA_DIR` | 持久化数据目录（存储用户、会话、录像、统一设置、证书等） |
 | `-jwt-key` | 随机生成 | `WATCHMAN_JWT_KEY` | JWT 鉴权签名密钥（`watchman.env` 持久化 32 字节 hex） |
 | `-vault-pass` | 随机生成 | `WATCHMAN_VAULT_PASS` | 凭证密码箱加密及 Ed25519 升级签名派生根密钥 |
@@ -964,7 +1031,7 @@ Agent internal/shell
   ```
   GitHub Release notes 也必须同步保留上述详细变更清单，确保版本迭代历史 100% 透明可溯。
 - tag 规范：`v1.2.3` 为正式版；`v1.3.0-rc.1` / `v1.3.0-beta.1`（带 `-` 后缀）由 CI 自动标记为 pre-release。
-- 构建矩阵：server（linux amd64/arm64）+ agent（linux amd64/arm64、windows amd64），全部 `CGO_ENABLED=0` 静态编译。
+- 构建矩阵：server（linux amd64/arm64）+ agent（linux amd64/arm64、windows amd64）+ watchmanctl（linux amd64/arm64、windows amd64、darwin amd64/arm64），全部 `CGO_ENABLED=0` 静态编译。
 - **发布产物规范（双轨发布体系：独立单二进制 + 完整安装包）**：
   每次发布直出以下完整资产列表，满足直接运行与自动化安装双重需求：
   1. **直接可执行的独立二进制（无须解压，下载即用）**：
@@ -973,6 +1040,9 @@ Agent internal/shell
      - `watchman-agent-linux-amd64`：Linux x86_64 被管端 Agent 独立程序
      - `watchman-agent-linux-arm64`：Linux ARM64 被管端 Agent 独立程序
      - `watchman-agent-windows-amd64.exe`：Windows x86_64 被管端可执行程序
+     - `watchmanctl-linux-amd64` / `watchmanctl-linux-arm64`：Linux 运维 CLI（§3.17 按需运维隧道客户端）
+     - `watchmanctl-windows-amd64.exe`：Windows x86_64 运维 CLI
+     - `watchmanctl-darwin-amd64` / `watchmanctl-darwin-arm64`：macOS（Intel / Apple Silicon）运维 CLI
   2. **完整套件安装包（供 install.sh 脚本与系统化一键部署）**：
      - `watchman-dist-${TAG}-linux-amd64.tar.gz`（内含控制端、各平台 agent 二进制、`install.sh` 与 `manifest.json`）
      - `watchman-dist-${TAG}-linux-arm64.tar.gz`
@@ -1043,7 +1113,9 @@ applications(id, name, host_id, source_type,        # git | image | template | r
              template_id, template_params json,
              repo_url, branch, auth_vault_id, auto_deploy,
              build_type, dockerfile, build_context, build_timeout_sec, compose_content,
-             image, env_vars json,
+             image,
+             mesh_forward_enabled, mesh_forward_host_id, mesh_forward_entry_port, mesh_forward_target_port, mesh_forward_target, # 4层 TCP 组网端口中继
+             env_vars json,
              ports json,                              # [{host, container, bind_scope}]，bind_scope: public|mesh
              volumes json, healthcheck_url, container_name,
              domain, proxy_mode,                      # local | gateway
@@ -1099,7 +1171,7 @@ GET    /api/v1/apps                        # 应用列表（全部来源统一�
 GET    /api/v1/apps/catalog                # 内置模板目录（声明式 Catalog）
 POST   /api/v1/apps/inspect-image          # 镜像元数据免拉取探测 {image} → Registry V2/OCI 真实端口/环境变量/卷/启动命令（只读）
 POST   /api/v1/apps/inspect-repo           # GitHub 仓库探测 {repo_url} → 默认分支/Dockerfile/Compose/.env.example 解析（只读）
-POST   /api/v1/apps                        # 创建应用 {source_type, host_id, template_id/template_params | image | compose_content | repo_url/branch, ports[{host,container,bind_scope}], ...}
+POST   /api/v1/apps                        # 创建应用 {source_type, host_id, template_id/template_params | image | compose_content | repo_url/branch, mesh_forward_enabled, mesh_forward_host_id, mesh_forward_entry_port, mesh_forward_target_port, ports[{host,container,bind_scope}], ...}
 GET    /api/v1/apps/:id                    # 应用详情
 PUT    /api/v1/apps/:id                    # 更新（如 Compose 内容）
 DELETE /api/v1/apps/:id                    # 删除
@@ -1111,10 +1183,17 @@ PUT    /api/v1/apps/:id/proxy              # 绑定域名 {domain, mode: local|g
 DELETE /api/v1/apps/:id/proxy              # 解绑（同时清理应用主机与网关主机配置）
 POST   /api/v1/apps/webhook/:token         # Git push 自动部署（token 鉴权）
 
+# 按需运维隧道（§3.17，控制面；数据面走 -opgrpc 端口的 OperatorService）
+GET    /api/v1/tunnels/client-info          # CLI 引导信息 {enabled, endpoint, cli{各平台 Release 直链}}；authed 读、免审计；enabled 反映数据面监听器真实状态（启动失败 fail-closed 置假），endpoint 推导链：server.public_url 设置 → -public-url 参数 → 请求 Host（IPv6 去重围括号）
+GET    /api/v1/tunnels/mine                 # 当前用户活动隧道腿（conn_id/目标/建立时间/空闲秒）；authed 读、免审计
+DELETE /api/v1/tunnels/mine/:id             # 强制关闭本人的隧道腿（服务层按用户名过滤，只能关自己的）；写组 + 审计 op_tunnel_close
+
 # 组网（P2）
 POST   /api/v1/networks/:id/join          # 选中主机加入
 GET    /api/v1/networks/topology
 DELETE /api/v1/networks/:id/hosts/:hid
+GET    /api/v1/network/nodes/:id/mesh-ip  # 只读实时探测主机组网 IP（live 优先、缓存兜底，返回 source: live|cache|""）；
+                                          # 挂 authed 读分组、免审计（创建页选主机即调，见 §8.7 第 8 条）；实际路由前缀为 /network
 
 # 备份/迁移
 POST   /api/v1/system/backup              # 导出 SQLite/配置/录像打包
@@ -1302,6 +1381,12 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 - 一个可滚动区域只允许有一个滚动源。页面外层把滚动交给表格时，外层容器必须 `overflow: hidden`，防止出现双层滚动条。
 - 长列表滚动容器统一带 `-webkit-overflow-scrolling: touch` 与 `overscroll-behavior: contain`（`global.scss` 已按类名集中声明）。
 
+### 8.3.1 NSelect 空值约定（2026-10-19）
+
+- **绑定 NSelect `v-model:value` 的字段一律用 `null` 做空值**（声明 `null as string | null`），**严禁 `''`**：naive-ui 对未命中选项的值会走默认 `fallbackOption` 合成一个 `label` 为空串的真实选项，select 自认为「已选中」，占位符永不渲染（幽灵选中态）。`null` 才被识别为空，占位符正常显示。
+- 例外：选项列表里**真实存在 `value: ''` 条目**时才允许用 `''`（如 AppDetail 证书选择的「按域名自动匹配」）。
+- 连带约束：清空该值的代码（watcher、重置）必须写 `null`；提交载荷用 `|| undefined` 归一化；`Map.get(id)` 等强 string 入参处先判 truthy。AppCreate/AppDetail 已全部按此改造。
+
 ### 8.4 页签工作区与 KeepAlive
 
 顶部页签是工作区语义：切走再切回**不能丢状态**。终端会话、已填未提交的表单、翻到的页码、展开的树节点，都必须原样保留。
@@ -1434,6 +1519,11 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 7. **Alpine 一键安装对照官方 installer.sh 补齐预检**：
    - `installNode` 的 `sh` 分支（`buildInstallCommand`）先检查 `/etc/apk/repositories` 是否启用 community（`grep -Eq '^http.*/community$'`），缺失时 `setup-apkrepos -c -1` 自动启用；两者皆无则明确报错退出，不再是泛化的"安装脚本执行失败"。
    - 服务启动用 `rc-service tailscale start || rc-service tailscale restart`（与官方一致走 `start` 优先）：`restart` 在从未启动过的服务上退出码不可靠，曾导致"装好了但 UI 报失败"的误报。
+
+8. **只读实时探测端点 `GET /network/nodes/:id/mesh-ip`（2026-10-16）**：
+   - 创建应用页选中主机即调用：实时 `tailscale ip -4`（1 次 exec）优先，命中则采用并**回写 Store 缓存**（网关反代与网络列表同步受益）；失败回落缓存 `NodeStatus.IP`，两者皆无返回空。响应 `{ip, source}`，`source` ∈ `live`/`cache`/`""`（未加入组网或探测失败），前端据此标注「实时探测/缓存」。
+   - **必须挂在 authed 读分组、免审计**：`POST /network/nodes/:id/check` 虽能刷新缓存，但在 writeRG（审计），每次选主机都调会灌爆操作审计流；诊断类只读探测按 §7 豁免（与 `ai/nl2command` 同例）。
+   - 部署侧（`resolveMeshIP`）保持自己的实时探测逻辑不读此端点——部署在 agent 侧执行，与此 API 互为独立实现，均遵循"live 优先、cache 兜底、禁止静默降级公网"。
 
 ### 8.8 组件选用与页面布局进阶规范
 

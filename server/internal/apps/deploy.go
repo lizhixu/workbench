@@ -217,15 +217,15 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 		return
 	}
 
-	// Branch for single pre-built image deployment (app store / quick run):
-	if app.SourceType == "image" {
-		e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
-		logBuf.WriteString("$ deploy pre-built image\n")
-		e.deploySingleContainer(hub, app, dep, logBuf, app.Image)
-		return
-	}
+		// Branch for single pre-built image deployment (app store / quick run):
+		if app.SourceType == "image" {
+			e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
+			logBuf.WriteString("$ deploy pre-built image\n")
+			e.deploySingleContainer(hub, app, dep, logBuf, app.Image)
+			return
+		}
 
-	// Branch for built-in template deployment:
+		// Branch for built-in template deployment:
 	if app.SourceType == "template" {
 		e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
 		logBuf.WriteString("$ deploy built-in template\n")
@@ -378,16 +378,16 @@ func (e *Engine) deploySingleContainer(hub *rpc.Hub, app *Application, dep *Depl
 			runArgs = append(runArgs, "-p", fmt.Sprintf("%d:%d", pm.Host, pm.Container))
 		}
 	}
-	for _, v := range app.Volumes {
-		runArgs = append(runArgs, "-v", shellQuote(v))
-	}
-	runArgs = append(runArgs, "--label", shellQuote("watchman.app="+app.ID))
-	// All interpolated values are shell-quoted: container names, env values
-	// and image refs all originate from user input (spaces would otherwise
-	// break `docker run`, metacharacters would inject commands — and the
-	// audit log would not reflect what actually ran).
-	runCmd := fmt.Sprintf("docker rm -f %s 2>/dev/null; docker run -d --name %s --restart unless-stopped %s %s %s",
-		shellQuote(nextName), shellQuote(nextName), strings.Join(envArgs, " "), strings.Join(runArgs, " "), shellQuote(imageRef))
+		for _, v := range app.Volumes {
+			runArgs = append(runArgs, "-v", shellQuote(v))
+		}
+		runArgs = append(runArgs, "--label", shellQuote("watchman.app="+app.ID))
+		// All interpolated values are shell-quoted: container names, env values
+		// and image refs all originate from user input (spaces would otherwise
+		// break `docker run`, metacharacters would inject commands — and the
+		// audit log would not reflect what actually ran).
+		runCmd := fmt.Sprintf("docker rm -f %s 2>/dev/null; docker run -d --name %s --restart unless-stopped %s %s %s",
+			shellQuote(nextName), shellQuote(nextName), strings.Join(envArgs, " "), strings.Join(runArgs, " "), shellQuote(imageRef))
 	logBuf.WriteString("$ start replacement container\n")
 	res, err := execOnAgent(hub, "docker-run-"+randomToken(4), runCmd, 120)
 	if err != nil {
@@ -520,18 +520,32 @@ func (e *Engine) finishDeploySuccess(app *Application, dep *Deployment, commit, 
 		d.DurationMS = now.Sub(d.StartedAt).Milliseconds()
 		d.BuildLog = finalLog
 	})
-	e.store.UpdateApp(app.ID, func(a *Application) error {
-		a.CurrentCommit = commit
-		if imageRef != "" {
-			a.Image = imageRef
+		e.store.UpdateApp(app.ID, func(a *Application) error {
+			a.CurrentCommit = commit
+			if imageRef != "" {
+				a.Image = imageRef
+			}
+			if container != "" {
+				a.ContainerName = container
+			}
+			a.LastDeployAt = now
+			return nil
+		})
+		// The cached app pointer predates the update above, and a purge may have
+		// run while this deploy was finishing: re-read before any relay action so
+		// a deleted app never recreates its forwarder behind purge's back.
+		fresh, ok := e.store.GetApp(app.ID)
+		if !ok {
+			logBuf.WriteString("\nmesh-forward: 应用在部署期间已被删除，跳过中继创建\n")
+			e.log.Info("deployment succeeded but app was removed; skipping mesh forwarder", "app", app.ID)
+			return
 		}
-		if container != "" {
-			a.ContainerName = container
+		if fresh.MeshForwardEnabled && fresh.MeshForwardHostID != "" && fresh.MeshForwardEntryPort > 0 {
+			e.syncMeshForwarder(fresh, logBuf)
+		} else if fresh.MeshForwardHostID != "" {
+			e.cleanMeshForwarder(fresh.MeshForwardHostID, fresh.ID)
 		}
-		a.LastDeployAt = now
-		return nil
-	})
-	e.log.Info("deployment succeeded", "app", app.ID, "commit", commit, "deployment", dep.ID)
+		e.log.Info("deployment succeeded", "app", app.ID, "commit", commit, "deployment", dep.ID)
 }
 
 func (e *Engine) fail(app *Application, dep *Deployment, logBuf *logBuffer, msg string) {
@@ -694,6 +708,11 @@ type logBuffer struct {
 	b strings.Builder
 }
 
+// forwarderImage is the OCI image for 组网转发 (source_type=forward) apps:
+// an alpine/socat relay container listening on the entry host and forwarding
+// to the target over the overlay network.
+const forwarderImage = "alpine/socat"
+
 const maxBuildLogBytes = 64 * 1024
 
 func (l *logBuffer) WriteString(s string) {
@@ -792,4 +811,178 @@ func resolveVaultRef(vs *vault.Store, v string) string {
 	}
 	// Fall back to the whole secret for single-field credentials.
 	return cred.Secret
+}
+
+// resolveMeshForwardTarget derives the upstream target (IP:port) on the app host
+// for the entry host's socat forwarder container:
+//   - 组网路径: if both app host and entry host have Tailscale Mesh IPs -> app host 100.x:port
+//   - 直连路径: otherwise app host's public IP:port, then internal IP:port
+func (e *Engine) resolveMeshForwardTarget(app *Application) (string, error) {
+	port := app.MeshForwardTargetPort
+	if port <= 0 {
+		if len(app.Ports) > 0 && app.Ports[0].Host > 0 {
+			port = app.Ports[0].Host
+		} else {
+			port = 8080
+		}
+	}
+
+	appMesh, entryMesh := "", ""
+	if e.networkStore != nil {
+		if st, ok := e.networkStore.GetNodeStatus(app.HostID); ok {
+			appMesh = st.IP
+		}
+		if app.MeshForwardHostID != "" {
+			if st, ok := e.networkStore.GetNodeStatus(app.MeshForwardHostID); ok {
+				entryMesh = st.IP
+			}
+		}
+	}
+	appPublicIP, appInternalIP := "", ""
+	if e.reg != nil {
+		if ag := e.reg.GetAgent(app.HostID); ag != nil {
+			appPublicIP, appInternalIP = ag.PublicIP, ag.InternalIP
+		}
+	}
+	return resolveForwardUpstream(port, appMesh, entryMesh, appPublicIP, appInternalIP)
+}
+
+// resolveForwardUpstream picks the entry host -> app host upstream:
+//   - 组网: both ends carry a mesh IP -> the app host's 100.x:port;
+//   - 直连: otherwise the app host's public IP, then its internal IP.
+func resolveForwardUpstream(port int, appMesh, entryMesh, appPublicIP, appInternalIP string) (string, error) {
+	if appMesh != "" && entryMesh != "" {
+		return fmt.Sprintf("%s:%d", appMesh, port), nil
+	}
+	if appPublicIP != "" {
+		return fmt.Sprintf("%s:%d", appPublicIP, port), nil
+	}
+	if appInternalIP != "" {
+		return fmt.Sprintf("%s:%d", appInternalIP, port), nil
+	}
+	return "", fmt.Errorf("无法确定入口主机到应用主机的转发目标地址：应用主机未加入异地组网，且没有可用的公网/内网 IP")
+}
+
+func (e *Engine) syncMeshForwarder(app *Application, logBuf *logBuffer) {
+	if e.reg == nil || app.MeshForwardHostID == "" || app.MeshForwardEntryPort <= 0 {
+		return
+	}
+	fwdHub := e.reg.Hub(app.MeshForwardHostID)
+	if fwdHub == nil {
+		if logBuf != nil {
+			logBuf.WriteString(fmt.Sprintf("WARN: 组网转发入口主机 (%s) 离线，未能启动中继容器\n", app.MeshForwardHostID))
+		}
+		return
+	}
+
+	target, err := e.resolveMeshForwardTarget(app)
+	if err != nil {
+		if logBuf != nil {
+			logBuf.WriteString(fmt.Sprintf("WARN: 解析组网转发目标失败: %v\n", err))
+		}
+		return
+	}
+
+	fwdContainer := "watchman-fwd-" + app.ID
+	runCmd := fmt.Sprintf(
+		"docker rm -f %s 2>/dev/null; docker run -d --name %s --restart unless-stopped -p %d:%d --init --entrypoint /usr/bin/socat %s %s %s",
+		shellQuote(fwdContainer),
+		shellQuote(fwdContainer),
+		app.MeshForwardEntryPort,
+		app.MeshForwardEntryPort,
+		shellQuote(forwarderImage),
+		shellQuote(fmt.Sprintf("TCP-LISTEN:%d,fork,reuseaddr", app.MeshForwardEntryPort)),
+		shellQuote("TCP:"+target),
+	)
+
+	if logBuf != nil {
+		logBuf.WriteString(fmt.Sprintf("$ deploy mesh forwarder on entry host %s (%d -> %s)\n", app.MeshForwardHostID, app.MeshForwardEntryPort, target))
+	}
+	res, err := execOnAgent(fwdHub, "fwd-run-"+randomToken(4), runCmd, 60)
+	if err != nil {
+		if logBuf != nil {
+			logBuf.WriteString(fmt.Sprintf("WARN: 部署组网中继容器通信失败: %v\n", err))
+		}
+		return
+	}
+	if res.GetExitCode() != 0 {
+		if logBuf != nil {
+			logBuf.WriteString(fmt.Sprintf("WARN: 部署组网中继容器失败 (exit %d): %s\n", res.GetExitCode(), string(res.GetStderr())))
+		}
+		return
+	}
+
+	_ = e.store.UpdateApp(app.ID, func(a *Application) error {
+		a.MeshForwardTarget = target
+		return nil
+	})
+	if logBuf != nil {
+		logBuf.WriteString(fmt.Sprintf("组网端口转发已就绪: 入口主机端口 %d -> %s\n", app.MeshForwardEntryPort, target))
+	}
+}
+
+func (e *Engine) cleanMeshForwarder(hostID, appID string) {
+	if e.reg == nil || hostID == "" || appID == "" {
+		return
+	}
+	fwdHub := e.reg.Hub(hostID)
+	if fwdHub == nil {
+		return
+	}
+	fwdContainer := "watchman-fwd-" + appID
+	_, _ = execOnAgent(fwdHub, "clean-fwd-"+randomToken(4), "docker rm -f "+shellQuote(fwdContainer), 30)
+}
+
+// CleanMeshForwarder removes the companion relay container on the given entry
+// host. Exported so updateApp can tear down the old relay when forwarding is
+// disabled or moved to another entry host (the record no longer references it).
+func (e *Engine) CleanMeshForwarder(hostID, appID string) {
+	e.cleanMeshForwarder(hostID, appID)
+}
+
+// SyncMeshForwarder updates or clears the companion socat relay container on the entry host.
+func (e *Engine) SyncMeshForwarder(app *Application) (string, error) {
+	if !app.MeshForwardEnabled {
+		if app.MeshForwardHostID != "" {
+			e.cleanMeshForwarder(app.MeshForwardHostID, app.ID)
+		}
+		return "", nil
+	}
+	if app.MeshForwardHostID == "" || app.MeshForwardEntryPort <= 0 {
+		return "", fmt.Errorf("组网转发配置不完整")
+	}
+	if e.reg == nil {
+		return "", fmt.Errorf("RPC registry not initialized")
+	}
+	fwdHub := e.reg.Hub(app.MeshForwardHostID)
+	if fwdHub == nil {
+		return "", fmt.Errorf("组网转发入口主机离线")
+	}
+	target, err := e.resolveMeshForwardTarget(app)
+	if err != nil {
+		return "", err
+	}
+	fwdContainer := "watchman-fwd-" + app.ID
+	runCmd := fmt.Sprintf(
+		"docker rm -f %s 2>/dev/null; docker run -d --name %s --restart unless-stopped -p %d:%d --init --entrypoint /usr/bin/socat %s %s %s",
+		shellQuote(fwdContainer),
+		shellQuote(fwdContainer),
+		app.MeshForwardEntryPort,
+		app.MeshForwardEntryPort,
+		shellQuote(forwarderImage),
+		shellQuote(fmt.Sprintf("TCP-LISTEN:%d,fork,reuseaddr", app.MeshForwardEntryPort)),
+		shellQuote("TCP:"+target),
+	)
+	res, err := execOnAgent(fwdHub, "fwd-run-"+randomToken(4), runCmd, 60)
+	if err != nil {
+		return "", fmt.Errorf("在中继主机执行部署失败: %w", err)
+	}
+	if res.GetExitCode() != 0 {
+		return "", fmt.Errorf("启动中继容器失败 (exit %d): %s", res.GetExitCode(), string(res.GetStderr()))
+	}
+	_ = e.store.UpdateApp(app.ID, func(a *Application) error {
+		a.MeshForwardTarget = target
+		return nil
+	})
+	return target, nil
 }

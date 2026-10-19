@@ -10,6 +10,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/shirou/gopsutil/v3 v3.24.5
 	golang.org/x/crypto v0.55.0
+	golang.org/x/term v0.45.0
 	google.golang.org/grpc v1.83.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1

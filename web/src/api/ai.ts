@@ -163,6 +163,10 @@ export interface AppFormSnapshot {
   template_params: Record<string, string>
   image: string
   compose_content: string
+  mesh_forward_enabled?: boolean
+  mesh_forward_host_id?: string
+  mesh_forward_entry_port?: number
+  mesh_forward_target_port?: number
   repo_url: string
   branch: string
   auth_vault_id: string
@@ -190,6 +194,10 @@ export interface AppFormDraft {
   template_params?: Record<string, string>
   image?: string
   compose_content?: string
+  mesh_forward_enabled?: boolean
+  mesh_forward_host_id?: string
+  mesh_forward_entry_port?: number
+  mesh_forward_target_port?: number
   repo_url?: string
   branch?: string
   auto_deploy?: boolean

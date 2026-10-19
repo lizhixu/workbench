@@ -117,7 +117,7 @@ type HostDTO struct {
 // authorization, prefsStore backs per-user terminal preferences and
 // backupStore backs control-plane backup/restore; all may be nil to disable
 // those features.
-func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, settingsStore *settings.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine, gitProviderStore *gitprovider.Store, alertMon *alert.Monitor) *gin.Engine {
+func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, settingsStore *settings.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine, gitProviderStore *gitprovider.Store, alertMon *alert.Monitor, opGRPCAddr string) *gin.Engine {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -144,7 +144,7 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 
 	v1 := r.Group("/api/v1")
 	entryGuard.RegisterRoutes(v1)
-	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, settings: settingsStore, certHub: certHub, panelCert: panelsec.NewPanelCertIssuer(settingsStore, certHub, log), alertMon: alertMon}
+	h := &handlers{reg: reg, log: log, sess: sessStore, auth: authStore, metrics: metricsStore, policy: policyStore, audit: auditStore, groups: groupStore, settings: settingsStore, certHub: certHub, panelCert: panelsec.NewPanelCertIssuer(settingsStore, certHub, log), alertMon: alertMon, opGRPCAddr: opGRPCAddr}
 
 	// ---- Public routes (no auth) ----
 	// Auth login.
@@ -396,6 +396,7 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 
 	// Reverse TCP tunnels (§3.9).
 	h.registerTunnelRoutes(authed)
+	h.registerOperatorTunnelRoutes(authed)
 
 	// WebSocket endpoint (token via query param, since browsers can't set
 	// Authorization headers on WebSocket upgrades easily; also supports share_token or code).
@@ -448,6 +449,9 @@ type handlers struct {
 	certHub   *cert.Hub
 	panelCert *panelsec.PanelCertIssuer
 	alertMon  *alert.Monitor
+	// opGRPCAddr is the -opgrpc listen address ("" = operator tunnel data
+	// plane disabled); used by /tunnels/client-info to advertise the endpoint.
+	opGRPCAddr string
 }
 
 // canSeeHost reports whether the caller is allowed to reach the given host,

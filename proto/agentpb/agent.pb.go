@@ -2976,6 +2976,336 @@ func (x *TunnelClose) GetTunnelId() string {
 	return ""
 }
 
+type OperatorMessage struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Payload:
+	//
+	//	*OperatorMessage_Open
+	//	*OperatorMessage_Ack
+	//	*OperatorMessage_Data
+	//	*OperatorMessage_Close
+	Payload       isOperatorMessage_Payload `protobuf_oneof:"payload"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OperatorMessage) Reset() {
+	*x = OperatorMessage{}
+	mi := &file_agent_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OperatorMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OperatorMessage) ProtoMessage() {}
+
+func (x *OperatorMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OperatorMessage.ProtoReflect.Descriptor instead.
+func (*OperatorMessage) Descriptor() ([]byte, []int) {
+	return file_agent_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *OperatorMessage) GetPayload() isOperatorMessage_Payload {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+func (x *OperatorMessage) GetOpen() *OperatorOpen {
+	if x != nil {
+		if x, ok := x.Payload.(*OperatorMessage_Open); ok {
+			return x.Open
+		}
+	}
+	return nil
+}
+
+func (x *OperatorMessage) GetAck() *OperatorOpenAck {
+	if x != nil {
+		if x, ok := x.Payload.(*OperatorMessage_Ack); ok {
+			return x.Ack
+		}
+	}
+	return nil
+}
+
+func (x *OperatorMessage) GetData() *OperatorData {
+	if x != nil {
+		if x, ok := x.Payload.(*OperatorMessage_Data); ok {
+			return x.Data
+		}
+	}
+	return nil
+}
+
+func (x *OperatorMessage) GetClose() *OperatorClose {
+	if x != nil {
+		if x, ok := x.Payload.(*OperatorMessage_Close); ok {
+			return x.Close
+		}
+	}
+	return nil
+}
+
+type isOperatorMessage_Payload interface {
+	isOperatorMessage_Payload()
+}
+
+type OperatorMessage_Open struct {
+	Open *OperatorOpen `protobuf:"bytes,1,opt,name=open,proto3,oneof"`
+}
+
+type OperatorMessage_Ack struct {
+	Ack *OperatorOpenAck `protobuf:"bytes,2,opt,name=ack,proto3,oneof"`
+}
+
+type OperatorMessage_Data struct {
+	Data *OperatorData `protobuf:"bytes,3,opt,name=data,proto3,oneof"`
+}
+
+type OperatorMessage_Close struct {
+	Close *OperatorClose `protobuf:"bytes,4,opt,name=close,proto3,oneof"`
+}
+
+func (*OperatorMessage_Open) isOperatorMessage_Payload() {}
+
+func (*OperatorMessage_Ack) isOperatorMessage_Payload() {}
+
+func (*OperatorMessage_Data) isOperatorMessage_Payload() {}
+
+func (*OperatorMessage_Close) isOperatorMessage_Payload() {}
+
+type OperatorOpen struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	HostId        string                 `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`             // target host; required unless app_id is set
+	AppId         string                 `protobuf:"bytes,2,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`                // app-scoped open: server resolves host & allowlists ports
+	TargetHost    string                 `protobuf:"bytes,3,opt,name=target_host,json=targetHost,proto3" json:"target_host,omitempty"` // empty = auto (127.0.0.1, or mesh IP for mesh-bound ports); arbitrary values are admin-only
+	TargetPort    uint32                 `protobuf:"varint,4,opt,name=target_port,json=targetPort,proto3" json:"target_port,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OperatorOpen) Reset() {
+	*x = OperatorOpen{}
+	mi := &file_agent_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OperatorOpen) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OperatorOpen) ProtoMessage() {}
+
+func (x *OperatorOpen) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OperatorOpen.ProtoReflect.Descriptor instead.
+func (*OperatorOpen) Descriptor() ([]byte, []int) {
+	return file_agent_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *OperatorOpen) GetHostId() string {
+	if x != nil {
+		return x.HostId
+	}
+	return ""
+}
+
+func (x *OperatorOpen) GetAppId() string {
+	if x != nil {
+		return x.AppId
+	}
+	return ""
+}
+
+func (x *OperatorOpen) GetTargetHost() string {
+	if x != nil {
+		return x.TargetHost
+	}
+	return ""
+}
+
+func (x *OperatorOpen) GetTargetPort() uint32 {
+	if x != nil {
+		return x.TargetPort
+	}
+	return 0
+}
+
+type OperatorOpenAck struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Ok            bool                   `protobuf:"varint,1,opt,name=ok,proto3" json:"ok,omitempty"`
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	ConnId        string                 `protobuf:"bytes,3,opt,name=conn_id,json=connId,proto3" json:"conn_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OperatorOpenAck) Reset() {
+	*x = OperatorOpenAck{}
+	mi := &file_agent_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OperatorOpenAck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OperatorOpenAck) ProtoMessage() {}
+
+func (x *OperatorOpenAck) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OperatorOpenAck.ProtoReflect.Descriptor instead.
+func (*OperatorOpenAck) Descriptor() ([]byte, []int) {
+	return file_agent_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *OperatorOpenAck) GetOk() bool {
+	if x != nil {
+		return x.Ok
+	}
+	return false
+}
+
+func (x *OperatorOpenAck) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *OperatorOpenAck) GetConnId() string {
+	if x != nil {
+		return x.ConnId
+	}
+	return ""
+}
+
+type OperatorData struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Data          []byte                 `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OperatorData) Reset() {
+	*x = OperatorData{}
+	mi := &file_agent_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OperatorData) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OperatorData) ProtoMessage() {}
+
+func (x *OperatorData) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OperatorData.ProtoReflect.Descriptor instead.
+func (*OperatorData) Descriptor() ([]byte, []int) {
+	return file_agent_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *OperatorData) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+type OperatorClose struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Reason        string                 `protobuf:"bytes,1,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OperatorClose) Reset() {
+	*x = OperatorClose{}
+	mi := &file_agent_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OperatorClose) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OperatorClose) ProtoMessage() {}
+
+func (x *OperatorClose) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OperatorClose.ProtoReflect.Descriptor instead.
+func (*OperatorClose) Descriptor() ([]byte, []int) {
+	return file_agent_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *OperatorClose) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
 var File_agent_proto protoreflect.FileDescriptor
 
 const file_agent_proto_rawDesc = "" +
@@ -3232,9 +3562,32 @@ const file_agent_proto_rawDesc = "" +
 	"\ttunnel_id\x18\x01 \x01(\tR\btunnelId\x12\x12\n" +
 	"\x04data\x18\x02 \x01(\fR\x04data\"*\n" +
 	"\vTunnelClose\x12\x1b\n" +
-	"\ttunnel_id\x18\x01 \x01(\tR\btunnelId2Z\n" +
+	"\ttunnel_id\x18\x01 \x01(\tR\btunnelId\"\xf0\x01\n" +
+	"\x0fOperatorMessage\x122\n" +
+	"\x04open\x18\x01 \x01(\v2\x1c.watchman.agent.OperatorOpenH\x00R\x04open\x123\n" +
+	"\x03ack\x18\x02 \x01(\v2\x1f.watchman.agent.OperatorOpenAckH\x00R\x03ack\x122\n" +
+	"\x04data\x18\x03 \x01(\v2\x1c.watchman.agent.OperatorDataH\x00R\x04data\x125\n" +
+	"\x05close\x18\x04 \x01(\v2\x1d.watchman.agent.OperatorCloseH\x00R\x05closeB\t\n" +
+	"\apayload\"\x80\x01\n" +
+	"\fOperatorOpen\x12\x17\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12\x15\n" +
+	"\x06app_id\x18\x02 \x01(\tR\x05appId\x12\x1f\n" +
+	"\vtarget_host\x18\x03 \x01(\tR\n" +
+	"targetHost\x12\x1f\n" +
+	"\vtarget_port\x18\x04 \x01(\rR\n" +
+	"targetPort\"P\n" +
+	"\x0fOperatorOpenAck\x12\x0e\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\x12\x17\n" +
+	"\aconn_id\x18\x03 \x01(\tR\x06connId\"\"\n" +
+	"\fOperatorData\x12\x12\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data\"'\n" +
+	"\rOperatorClose\x12\x16\n" +
+	"\x06reason\x18\x01 \x01(\tR\x06reason2Z\n" +
 	"\fAgentService\x12J\n" +
-	"\aConnect\x12\x1c.watchman.agent.AgentMessage\x1a\x1d.watchman.agent.ServerMessage(\x010\x01B Z\x1ewatchman/proto/agentpb;agentpbb\x06proto3"
+	"\aConnect\x12\x1c.watchman.agent.AgentMessage\x1a\x1d.watchman.agent.ServerMessage(\x010\x012b\n" +
+	"\x0fOperatorService\x12O\n" +
+	"\aConnect\x12\x1f.watchman.agent.OperatorMessage\x1a\x1f.watchman.agent.OperatorMessage(\x010\x01B Z\x1ewatchman/proto/agentpb;agentpbb\x06proto3"
 
 var (
 	file_agent_proto_rawDescOnce sync.Once
@@ -3248,7 +3601,7 @@ func file_agent_proto_rawDescGZIP() []byte {
 	return file_agent_proto_rawDescData
 }
 
-var file_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
+var file_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 42)
 var file_agent_proto_goTypes = []any{
 	(*AgentMessage)(nil),      // 0: watchman.agent.AgentMessage
 	(*ServerMessage)(nil),     // 1: watchman.agent.ServerMessage
@@ -3284,9 +3637,14 @@ var file_agent_proto_goTypes = []any{
 	(*TunnelOpen)(nil),        // 31: watchman.agent.TunnelOpen
 	(*TunnelData)(nil),        // 32: watchman.agent.TunnelData
 	(*TunnelClose)(nil),       // 33: watchman.agent.TunnelClose
-	nil,                       // 34: watchman.agent.RegisterResponse.ProbeTargetsEntry
-	nil,                       // 35: watchman.agent.ConfigUpdate.ProbeTargetsEntry
-	nil,                       // 36: watchman.agent.MetricsSample.ProbeResultsEntry
+	(*OperatorMessage)(nil),   // 34: watchman.agent.OperatorMessage
+	(*OperatorOpen)(nil),      // 35: watchman.agent.OperatorOpen
+	(*OperatorOpenAck)(nil),   // 36: watchman.agent.OperatorOpenAck
+	(*OperatorData)(nil),      // 37: watchman.agent.OperatorData
+	(*OperatorClose)(nil),     // 38: watchman.agent.OperatorClose
+	nil,                       // 39: watchman.agent.RegisterResponse.ProbeTargetsEntry
+	nil,                       // 40: watchman.agent.ConfigUpdate.ProbeTargetsEntry
+	nil,                       // 41: watchman.agent.MetricsSample.ProbeResultsEntry
 }
 var file_agent_proto_depIdxs = []int32{
 	2,  // 0: watchman.agent.AgentMessage.register:type_name -> watchman.agent.RegisterRequest
@@ -3321,18 +3679,24 @@ var file_agent_proto_depIdxs = []int32{
 	33, // 29: watchman.agent.ServerMessage.tunnel_close:type_name -> watchman.agent.TunnelClose
 	28, // 30: watchman.agent.ServerMessage.uninstall:type_name -> watchman.agent.UninstallRequest
 	4,  // 31: watchman.agent.ServerMessage.config_update:type_name -> watchman.agent.ConfigUpdate
-	34, // 32: watchman.agent.RegisterResponse.probe_targets:type_name -> watchman.agent.RegisterResponse.ProbeTargetsEntry
-	35, // 33: watchman.agent.ConfigUpdate.probe_targets:type_name -> watchman.agent.ConfigUpdate.ProbeTargetsEntry
+	39, // 32: watchman.agent.RegisterResponse.probe_targets:type_name -> watchman.agent.RegisterResponse.ProbeTargetsEntry
+	40, // 33: watchman.agent.ConfigUpdate.probe_targets:type_name -> watchman.agent.ConfigUpdate.ProbeTargetsEntry
 	18, // 34: watchman.agent.MetricsSample.mounts:type_name -> watchman.agent.Mount
-	36, // 35: watchman.agent.MetricsSample.probe_results:type_name -> watchman.agent.MetricsSample.ProbeResultsEntry
-	17, // 36: watchman.agent.MetricsSample.ProbeResultsEntry.value:type_name -> watchman.agent.ProbeResult
-	0,  // 37: watchman.agent.AgentService.Connect:input_type -> watchman.agent.AgentMessage
-	1,  // 38: watchman.agent.AgentService.Connect:output_type -> watchman.agent.ServerMessage
-	38, // [38:39] is the sub-list for method output_type
-	37, // [37:38] is the sub-list for method input_type
-	37, // [37:37] is the sub-list for extension type_name
-	37, // [37:37] is the sub-list for extension extendee
-	0,  // [0:37] is the sub-list for field type_name
+	41, // 35: watchman.agent.MetricsSample.probe_results:type_name -> watchman.agent.MetricsSample.ProbeResultsEntry
+	35, // 36: watchman.agent.OperatorMessage.open:type_name -> watchman.agent.OperatorOpen
+	36, // 37: watchman.agent.OperatorMessage.ack:type_name -> watchman.agent.OperatorOpenAck
+	37, // 38: watchman.agent.OperatorMessage.data:type_name -> watchman.agent.OperatorData
+	38, // 39: watchman.agent.OperatorMessage.close:type_name -> watchman.agent.OperatorClose
+	17, // 40: watchman.agent.MetricsSample.ProbeResultsEntry.value:type_name -> watchman.agent.ProbeResult
+	0,  // 41: watchman.agent.AgentService.Connect:input_type -> watchman.agent.AgentMessage
+	34, // 42: watchman.agent.OperatorService.Connect:input_type -> watchman.agent.OperatorMessage
+	1,  // 43: watchman.agent.AgentService.Connect:output_type -> watchman.agent.ServerMessage
+	34, // 44: watchman.agent.OperatorService.Connect:output_type -> watchman.agent.OperatorMessage
+	43, // [43:45] is the sub-list for method output_type
+	41, // [41:43] is the sub-list for method input_type
+	41, // [41:41] is the sub-list for extension type_name
+	41, // [41:41] is the sub-list for extension extendee
+	0,  // [0:41] is the sub-list for field type_name
 }
 
 func init() { file_agent_proto_init() }
@@ -3376,15 +3740,21 @@ func file_agent_proto_init() {
 		(*ServerMessage_Uninstall)(nil),
 		(*ServerMessage_ConfigUpdate)(nil),
 	}
+	file_agent_proto_msgTypes[34].OneofWrappers = []any{
+		(*OperatorMessage_Open)(nil),
+		(*OperatorMessage_Ack)(nil),
+		(*OperatorMessage_Data)(nil),
+		(*OperatorMessage_Close)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_proto_rawDesc), len(file_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   37,
+			NumMessages:   42,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   2,
 		},
 		GoTypes:           file_agent_proto_goTypes,
 		DependencyIndexes: file_agent_proto_depIdxs,

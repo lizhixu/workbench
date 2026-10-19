@@ -605,7 +605,7 @@ onMounted(async () => {
       style="width: 560px; max-width: 92vw"
     >
       <div class="upload-dialog-content">
-        <NAlert type="info" :bordered="false" style="margin-bottom: 14px">
+        <NAlert type="info" :bordered="false">
           请选择为您当前控制端架构编译的最新版 <code>watchman-server</code> 可执行文件。<br />
           上传后服务端将进行原子备份与覆盖替换，并广播维护预告，保护全网 0 误报。
         </NAlert>
@@ -632,10 +632,9 @@ onMounted(async () => {
           type="line"
           :percentage="uploadPercent"
           indicator-placement="inside"
-          style="margin-top: 12px"
         />
 
-        <NAlert v-if="uploadResult" type="success" :bordered="false" style="margin-top: 14px">
+        <NAlert v-if="uploadResult" type="success" :bordered="false">
           {{ uploadResult.message }}<br />
           <span style="font-size: 12px; color: var(--text-secondary)">备份文件路径: {{ uploadResult.bak_path }}</span>
         </NAlert>
@@ -778,7 +777,7 @@ onMounted(async () => {
           </NDescriptionsItem>
         </NDescriptions>
 
-        <NAlert type="warning" :bordered="false" style="margin-top: 14px">
+        <NAlert type="warning" :bordered="false">
           升级前系统将自动向全网在线 Agent 下发维护信令，开启 2 分钟维护免告警期。服务平滑重载约持续 3~5 秒，重载完成后页面将自动重连刷新。
         </NAlert>
       </div>
@@ -975,9 +974,9 @@ onMounted(async () => {
   .upload-dialog-content {
     display: flex;
     flex-direction: column;
+    gap: 12px;
 
     .file-picked-info {
-      margin-top: 10px;
       font-size: 12.5px;
       color: var(--text-secondary);
     }
@@ -986,7 +985,7 @@ onMounted(async () => {
   .batch-upgrade-dialog {
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 12px;
 
     .dialog-prompt {
       font-size: 14px;

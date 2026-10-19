@@ -46,6 +46,13 @@ func tokenFor(t *testing.T, store *auth.Store, username string, role auth.Role) 
 // and the test exercises real authorization rather than a 404.
 func newTestRouter(t *testing.T) (*gin.Engine, *auth.Store, *settings.Store) {
 	t.Helper()
+	return newTestRouterOp(t, "")
+}
+
+// newTestRouterOp is newTestRouter with a configurable operator tunnel data
+// plane address ("" = disabled, per the -opgrpc flag semantics).
+func newTestRouterOp(t *testing.T, opAddr string) (*gin.Engine, *auth.Store, *settings.Store) {
+	t.Helper()
 	dir := t.TempDir()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -89,7 +96,7 @@ func newTestRouter(t *testing.T) (*gin.Engine, *auth.Store, *settings.Store) {
 	reg.SetTunnelCoordinator(rpc.NewTunnelCoordinator(reg, log))
 	r := Router(reg, log, authStore, sessStore, alertStore, vaultStore,
 		nil, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore,
-		settingsStore, backupStore, networkStore, appStore, appEngine, nil, nil, nil, nil, nil)
+		settingsStore, backupStore, networkStore, appStore, appEngine, nil, nil, nil, nil, nil, opAddr)
 	return r, authStore, settingsStore
 }
 

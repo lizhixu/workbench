@@ -44,7 +44,7 @@ func TestUpgradeAgentDynamicURLAndDefaults(t *testing.T) {
 		t.Fatalf("auth: %v", err)
 	}
 
-	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "")
 
 	// In background, wait for the UpgradeRequest sent to the hub and respond with progress
 	var receivedURL string
@@ -136,7 +136,7 @@ func TestUpgradeAgentAttachesSignature(t *testing.T) {
 	}
 	defer func() { UpgradeSigner = origSigner }()
 
-	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "")
 
 	var receivedSig []byte
 	var receivedSha string
@@ -211,7 +211,7 @@ func TestUpgradeHostDTOStateOnError(t *testing.T) {
 		t.Fatalf("auth: %v", err)
 	}
 
-	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "")
 
 	// 1. Mark in-progress
 	reg.SetAgentUpgrading(resp.GetAgentId(), "v1.0.0")
@@ -276,7 +276,7 @@ func TestSystemUpgrade_RejectsCorruptBinary(t *testing.T) {
 		t.Fatalf("auth: %v", err)
 	}
 
-	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "")
 
 	// Send base64 corrupt data
 	body := `{"data":"bm90IGFuIGV4ZWN1dGFibGU="}` // "not an executable"
@@ -308,7 +308,7 @@ func TestSystemUpgrade_RejectsShaMismatch(t *testing.T) {
 		t.Fatalf("auth: %v", err)
 	}
 
-	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(reg, log, authStore, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "")
 
 	body := `{"data":"bm90IGFuIGV4ZWN1dGFibGU=","sha256":"1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"}`
 	httpReq := httptest.NewRequest("POST", "/api/v1/system/upgrade", strings.NewReader(body))

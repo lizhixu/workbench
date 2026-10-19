@@ -12,7 +12,7 @@ LDFLAGS := -s -w -X watchman/internal/version.Version=$(VERSION) -X watchman/int
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: all build-web build-server build-server-with-ui build-agent build-all test vet fmt
+.PHONY: all build-web build-server build-server-with-ui build-agent build-ctl build-all test vet fmt
 
 all: build-server build-agent
 
@@ -37,7 +37,11 @@ build-server-with-ui: build-web
 build-agent:
 	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags "$(LDFLAGS)" -o bin/watchman-agent ./agent/cmd/watchman-agent
 
-build-all: build-server build-agent
+# Operator CLI (watchmanctl): on-demand ops tunnel client (§3.17).
+build-ctl:
+	GOOS=$(GOOS) GOARCH=$(GOOS) go build -trimpath -ldflags "$(LDFLAGS)" -o bin/watchmanctl ./cmd/watchmanctl
+
+build-all: build-server build-agent build-ctl
 
 test:
 	go test ./...
@@ -46,4 +50,4 @@ vet:
 	go vet ./...
 
 fmt:
-	gofmt -w agent internal proto server
+	gofmt -w agent cmd internal proto server

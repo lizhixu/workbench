@@ -392,3 +392,51 @@ message TunnelData {
 message TunnelClose {
   string tunnel_id = 1;
 }
+
+// ---- Operator tunnel (on-demand ops port-forward) ----------------------
+// A user-authenticated data plane for the watchmanctl CLI, served on its own
+// dedicated listener (see -opgrpc; TLS mandatory), physically separate from
+// both the web panel port and the agent-facing port. One bidirectional
+// stream proxies exactly one local TCP connection; the server bridges it to
+// an agent tunnel leg using the TunnelOpen/TunnelData/TunnelClose frames
+// above. Flow:
+//   client -> server: OperatorOpen  (must be the first frame)
+//   server -> client: OperatorOpenAck{ok, error, conn_id}
+//   both ways:        OperatorData{data}
+//   either way:       OperatorClose{reason}
+// The server enforces role/group/port allowlists per open and audits every
+// open/close/deny with the operator identity. Business bytes never touch the
+// web panel listener.
+service OperatorService {
+  rpc Connect(stream OperatorMessage) returns (stream OperatorMessage);
+}
+
+message OperatorMessage {
+  oneof payload {
+    OperatorOpen open = 1;
+    OperatorOpenAck ack = 2;
+    OperatorData data = 3;
+    OperatorClose close = 4;
+  }
+}
+
+message OperatorOpen {
+  string host_id = 1;    // target host; required unless app_id is set
+  string app_id = 2;     // app-scoped open: server resolves host & allowlists ports
+  string target_host = 3; // empty = auto (127.0.0.1, or mesh IP for mesh-bound ports); arbitrary values are admin-only
+  uint32 target_port = 4;
+}
+
+message OperatorOpenAck {
+  bool ok = 1;
+  string error = 2;
+  string conn_id = 3;
+}
+
+message OperatorData {
+  bytes data = 1;
+}
+
+message OperatorClose {
+  string reason = 1;
+}

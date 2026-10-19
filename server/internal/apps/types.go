@@ -44,6 +44,16 @@ type Application struct {
 	HealthcheckURL string            `json:"healthcheck_url,omitempty"` // e.g. "http://127.0.0.1:8080/healthz"
 	ContainerName  string            `json:"container_name,omitempty"`
 
+	// Mesh Forwarding (TCP Relay via an entry host).
+	// When enabled, an alpine/socat relay container runs on MeshForwardHostID,
+	// listening on MeshForwardEntryPort and forwarding to MeshForwardTarget
+	// (resolved from MeshForwardTargetPort on the app host).
+	MeshForwardEnabled    bool   `json:"mesh_forward_enabled"`
+	MeshForwardHostID     string `json:"mesh_forward_host_id,omitempty"`     // Entry host ID
+	MeshForwardEntryPort  int    `json:"mesh_forward_entry_port,omitempty"`  // Port on entry host
+	MeshForwardTargetPort int    `json:"mesh_forward_target_port,omitempty"` // Target port on app host
+	MeshForwardTarget     string `json:"mesh_forward_target,omitempty"`      // Resolved host:port target
+
 	// Reverse proxy binding.
 	Domain            string `json:"domain,omitempty"`
 	ProxyMode         string `json:"proxy_mode,omitempty"`           // "local" | "gateway"

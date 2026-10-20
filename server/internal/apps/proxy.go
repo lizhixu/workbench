@@ -18,13 +18,20 @@ import (
 	"watchman/server/internal/rpc"
 )
 
-// proxyConfigDir is the conf.d watched by the watchman nginx container
-// (watchman-app-nginx from the app store). All reverse-proxy vhosts land
-// there as watchman-<app>.conf so they are easy to enumerate and remove.
+// proxyConfigDir / proxyCertDir are host-side directories bind-mounted into
+// the system-managed reverse-proxy container: vhosts land in conf.d as
+// watchman-<app>.conf, certs in certs/<domain>.{crt,key}. Both are created by
+// ensureProxyNginx — nothing assumes the operator prepared them by hand.
 const (
-	proxyConfigDir   = "/opt/apps/nginx/conf.d"
-	proxyCertDir     = "/opt/apps/nginx/certs"
-	nginxContainer   = "watchman-app-nginx"
+	proxyConfigDir = "/opt/apps/nginx/conf.d"
+	proxyCertDir   = "/opt/apps/nginx/certs"
+	// nginxContainer names the system-managed reverse proxy — deliberately
+	// OUTSIDE the user app namespace (watchman-app-*) so a user-deployed
+	// nginx application can never shadow or collide with it, the same
+	// reserved-name philosophy as dokploy-traefik. The container is created
+	// and kept healthy by ensureProxyNginx (1Panel OpenResty model), never
+	// expected to pre-exist.
+	nginxContainer   = "watchman-proxy-nginx"
 	writeChunkSize   = 64 * 1024
 	fileWriteTimeout = 60 * time.Second
 )
@@ -146,6 +153,35 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 	gatewayHub := h.reg.Hub(targetHost)
 	if gatewayHub == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "目标网关主机 Agent 不在线"})
+		return
+	}
+
+	// The reverse proxy is a system-managed nginx companion container whose
+	// lifecycle scripts (docker run --network host, /opt/apps/nginx bind
+	// mounts) assume a Linux host. Reject Windows up front instead of
+	// letting it fail deep inside a docker exec with a cryptic message.
+	if ag := h.reg.GetAgent(targetHost); ag != nil && strings.EqualFold(ag.OS, "windows") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "反代绑定暂仅支持 Linux 主机（系统托管的反代 Nginx 容器依赖 Linux 宿主）"})
+		return
+	}
+
+	// Guarantee the proxy container BEFORE resolving the certificate: a
+	// broken host (no docker, 80/443 occupied) must fail fast here instead of
+	// burning a synchronous ACME issuance and failing at the file push.
+	// Serialized against the push/re-push flow (rebuild never races an
+	// in-flight reload), but released before cert resolution so a slow ACME
+	// call never holds the lock.
+	h.pushMu.Lock()
+	ensureErr := h.ensureProxyNginx(gatewayHub)
+	h.pushMu.Unlock()
+	if ensureErr != nil {
+		if errors.Is(ensureErr, errProxyDockerUnavailable) ||
+			errors.Is(ensureErr, errProxyPortConflict) ||
+			errors.Is(ensureErr, errProxyImagePull) {
+			c.JSON(http.StatusConflict, gin.H{"error": ensureErr.Error()})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": ensureErr.Error()})
+		}
 		return
 	}
 
@@ -295,6 +331,163 @@ func (h *ProxyHandler) pushCertFiles(agentHub *rpc.Hub, domain string, crt *cert
 // deadline, so bind can answer 504 for it while config validation failures
 // stay a plain 500.
 var errReloadTimeout = errors.New("nginx reload 超时")
+
+// Actionable ensure failures — host conditions the user can fix themselves.
+// They answer 409 so the message reads as a host problem, not a server bug;
+// everything else stays a generic 500 with a log excerpt.
+var (
+	errProxyDockerUnavailable = errors.New("目标主机 Docker 不可用：请先在主机详情 Docker 页一键安装或启动 Docker 后重试")
+	errProxyPortConflict      = errors.New("目标主机 80/443 端口已被占用，反代 Nginx 无法监听：请检查主机上已有 Web 服务，或改用其他主机作为反代节点")
+	errProxyImagePull         = errors.New("nginx:alpine 镜像拉取失败：请检查主机网络，或为主机配置 Docker 镜像加速后重试")
+)
+
+// Exit codes of the ensure scripts, checked by classifyEnsureError. The check
+// script emits 0 (inspect line), 3 (container missing) or 4/5/6 (docker /
+// daemon / mkdir broken); the run script emits 10 (docker run failed) or 11
+// (container not running after start).
+const (
+	proxyEnsureExitNoContainer = 3
+	proxyEnsureExitNoDocker    = 4
+	proxyEnsureExitDaemonDown  = 5
+	proxyEnsureExitMkdirFailed = 6
+	proxyEnsureExitRunFailed   = 10
+	proxyEnsureExitNotRunning  = 11
+)
+
+// proxyEnsureCheckScript probes whether the system proxy container is present
+// and healthy. Exit 0 prints "status|mounts" for proxyContainerHealthy; the
+// other exits map to classifyEnsureError. The mkdir is not incidental: the
+// bind mounts need both host dirs to exist before docker run.
+func proxyEnsureCheckScript() string {
+	return fmt.Sprintf(`mkdir -p %s %s || exit %d
+command -v docker >/dev/null 2>&1 || exit %d
+docker info >/dev/null 2>&1 || exit %d
+docker inspect %s >/dev/null 2>&1 || exit %d
+echo "$(docker inspect --format '{{.State.Status}}' %s)|$(docker inspect --format '{{range .Mounts}}{{.Source}}:{{.Destination}};{{end}}' %s)"`,
+		proxyConfigDir, proxyCertDir, proxyEnsureExitMkdirFailed,
+		proxyEnsureExitNoDocker,
+		proxyEnsureExitDaemonDown,
+		nginxContainer, proxyEnsureExitNoContainer,
+		nginxContainer, nginxContainer)
+}
+
+// proxyEnsureRunScript rebuilds the proxy container from scratch — same
+// idempotent rm -f + run replacement pattern as the socat mesh forwarder.
+// --network host is load-bearing: local-mode upstreams are 127.0.0.1:<port>,
+// which under bridge networking would point at the container itself and
+// blackhole traffic; host networking makes it the host's loopback and lets
+// nginx bind 80/443 directly (no -p mappings to keep in sync). Both mounts
+// are :ro — nginx only reads conf and certs, writes go through file pushes.
+// The 2s settle + status check turns "started but immediately dying" (port
+// conflict, bad config) into a classified error instead of a silent success.
+func proxyEnsureRunScript() string {
+	return fmt.Sprintf(`docker rm -f %s 2>/dev/null
+docker run -d --name %s --restart unless-stopped --network host --label watchman.managed=proxy -v %s:/etc/nginx/conf.d:ro -v %s:/opt/apps/nginx/certs:ro nginx:alpine || exit %d
+sleep 2
+st=$(docker inspect --format '{{.State.Status}}' %s 2>/dev/null || echo missing)
+if [ "$st" != "running" ]; then
+  echo "STATUS=$st"
+  docker logs --tail 30 %s 2>&1 || true
+  exit %d
+fi`,
+		nginxContainer,
+		nginxContainer, proxyConfigDir, proxyCertDir, proxyEnsureExitRunFailed,
+		nginxContainer,
+		nginxContainer, proxyEnsureExitNotRunning)
+}
+
+// proxyContainerHealthy parses the check script's "status|mounts" line: the
+// container must be running with both host dirs mounted where the system
+// expects them. Anything else (stopped, recreated by hand without the mounts,
+// a user container squatting on the name) triggers a rebuild.
+func proxyContainerHealthy(out string) bool {
+	status, mounts, ok := strings.Cut(out, "|")
+	if !ok || strings.TrimSpace(status) != "running" {
+		return false
+	}
+	return strings.Contains(mounts, proxyConfigDir+":/etc/nginx/conf.d") &&
+		strings.Contains(mounts, proxyCertDir+":/opt/apps/nginx/certs")
+}
+
+// ensureProxyNginx idempotently guarantees the system-managed reverse-proxy
+// container on the nginx host — the 1Panel OpenResty / dokploy-traefik hosting
+// model, minus their dependencies: no host-level nginx install, no docker.sock
+// exposure, config still flows through audited file pushes + agent reloads.
+// The check is a sub-second exec that leaves a healthy container untouched;
+// missing/broken containers are rebuilt. Callers hold pushMu so a rebuild
+// never races an in-flight cert/conf push or reload.
+func (h *ProxyHandler) ensureProxyNginx(agentHub *rpc.Hub) error {
+	res, err := execOnAgent(agentHub, "proxy-ensure-check-"+randomToken(4), proxyEnsureCheckScript(), 30)
+	if err != nil {
+		return fmt.Errorf("反代容器检查失败: %w", err)
+	}
+	switch res.GetExitCode() {
+	case 0:
+		if proxyContainerHealthy(string(res.GetStdout())) {
+			return nil
+		}
+		h.log.Info("反代容器状态异常（停止或挂载缺失），正在重建")
+	case proxyEnsureExitNoContainer:
+		h.log.Info("反代容器不存在，正在初始化")
+	default:
+		// docker / daemon / mkdir broken — classified as-is, no rebuild
+		// attempt that would fail the same way.
+		return classifyEnsureError(res.GetExitCode(), string(res.GetStdout()), string(res.GetStderr()))
+	}
+	res, err = execOnAgent(agentHub, "proxy-ensure-run-"+randomToken(4), proxyEnsureRunScript(), 300)
+	if err != nil {
+		return fmt.Errorf("反代容器重建失败: %w", err)
+	}
+	if res.GetExitCode() != 0 {
+		return classifyEnsureError(res.GetExitCode(), string(res.GetStdout()), string(res.GetStderr()))
+	}
+	return nil
+}
+
+// classifyEnsureError turns a failed ensure exec into the error the user
+// sees. Pure string classification over the exec's exit code and captured
+// output, so it is table-driven testable. Order matters: docker availability
+// first (nothing else can succeed without it), then pull vs runtime vs
+// port-conflict by output sniffing, generic + log excerpt last so no failure
+// is ever silently swallowed.
+func classifyEnsureError(exit int32, stdout, stderr string) error {
+	switch {
+	case exit == proxyEnsureExitNoDocker || exit == proxyEnsureExitDaemonDown:
+		return errProxyDockerUnavailable
+	case exit == proxyEnsureExitRunFailed && proxyPullFailure(stderr):
+		return errProxyImagePull
+	case strings.Contains(strings.ToLower(stdout+"\n"+stderr), "address already in use"):
+		return errProxyPortConflict
+	}
+	excerpt := strings.TrimSpace(stderr)
+	if excerpt == "" {
+		excerpt = strings.TrimSpace(stdout)
+	}
+	if len(excerpt) > 200 {
+		excerpt = excerpt[:200] + "…"
+	}
+	if excerpt != "" {
+		return fmt.Errorf("反代 Nginx 容器保障失败: %s", excerpt)
+	}
+	return fmt.Errorf("反代 Nginx 容器保障失败（exit %d）", exit)
+}
+
+// proxyPullFailure reports whether a `docker run` failure was the image pull
+// (registry unreachable / rate-limited / image gone) rather than a runtime
+// error — the user-facing fix differs: 配置镜像加速 vs 查看日志.
+func proxyPullFailure(stderr string) bool {
+	s := strings.ToLower(stderr)
+	for _, kw := range []string{
+		"unable to find image", "pull access denied", "manifest",
+		"i/o timeout", "client.timeout exceeded", "tls handshake timeout",
+		"dial tcp", "proxyconnect", "connection reset by peer", "unexpected eof",
+	} {
+		if strings.Contains(s, kw) {
+			return true
+		}
+	}
+	return false
+}
 
 // reloadNginx validates the pushed config (nginx -t) and hot-reloads nginx in
 // the proxy container. Shared by the bind flow and the renewal re-push.
@@ -492,7 +685,10 @@ func renderVhost(domain, upstream string, websocket bool) string {
 	fmt.Fprintf(&b, "    server_name %s;\n", domain)
 	fmt.Fprintf(&b, "    ssl_certificate %s/%s.crt;\n", proxyCertDir, domain)
 	fmt.Fprintf(&b, "    ssl_certificate_key %s/%s.key;\n", proxyCertDir, domain)
-	fmt.Fprintf(&b, "    ssl_protocols TLSv1.2 TLSv1.3;\n\n")
+	fmt.Fprintf(&b, "    ssl_protocols TLSv1.2 TLSv1.3;\n")
+	// nginx defaults to a 1m body limit; proxied uploads would be silently
+	// truncated with a confusing 413 for the app behind the vhost.
+	fmt.Fprintf(&b, "    client_max_body_size 64m;\n\n")
 	fmt.Fprintf(&b, "    location / {\n")
 	fmt.Fprintf(&b, "        proxy_pass http://%s;\n", upstream)
 	fmt.Fprintf(&b, "        proxy_set_header Host $host;\n")

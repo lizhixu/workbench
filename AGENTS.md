@@ -119,7 +119,8 @@
   - **拓扑预览协同**：创建页与详情页的流量拓扑实时呈现 TCP 4 层中继链路与 7 层 HTTP/HTTPS 反代链路。
 - **端口绑定范围**（`PortMapping.bind_scope`）：每条端口映射可选「公网开放」（默认，`-p host:container` 绑定 0.0.0.0）或「仅异地组网」（`-p <tailscaleIP>:host:container` 只绑定主机 Tailscale IP，公网不可达）。选择「仅异地组网」时目标主机必须已加入组网，引擎找不到 Mesh IP 时降级为公网绑定并在部署日志中告警。
 - **域名与反代集成**（`PUT /apps/:id/proxy`）：
-  - `local` 模式：应用所在主机自建 Nginx（`watchman-app-nginx` 容器）反代，上游 `127.0.0.1:<port>`。
+  - **系统托管反代容器（2026-10-20，对齐 1Panel OpenResty / dokploy-traefik 的面板托管反代模式）**：反代 Nginx 不要求宿主机安装任何 nginx 服务（宝塔式宿主安装污染系统、跨发行版负担，不采纳），而是由系统在绑定域名时于目标主机**自动初始化并持续保障**专用伴生容器 `watchman-proxy-nginx`（`nginx:alpine`，`--restart unless-stopped --network host --label watchman.managed=proxy`，挂载 `/opt/apps/nginx/conf.d:/etc/nginx/conf.d:ro` 与 `/opt/apps/nginx/certs:/opt/apps/nginx/certs:ro`，两个宿主目录由保障脚本 `mkdir -p` 自建，不假定运维手工准备）。命名**刻意脱离 `watchman-app-*` 用户应用命名空间**（防用户部署同名 nginx 应用劫持/冲突，与 dokploy-traefik 保留名同哲学）。`ensureProxyNginx` 幂等保障：先跑 30s 检查脚本（mkdir 两目录 + `command -v docker` + `docker info` + `docker inspect` 容器状态与两挂载），容器运行中且挂载齐全则跳过重建（秒回、不动用户在线服务）；缺失/停止/挂载不符/用户手工改坏 → 执行 300s 重建脚本（`docker rm -f` 吞不存在 → `docker run` 重建 → sleep 2 验 running，起后即退则抓 `docker logs --tail 30` 分类），与 socat 中继容器同一套幂等替换先例（`server/internal/apps/proxy.go`）。bind 在目标主机 hub 解析后、**证书解析前**执行 ensure（基础设施坏了快速失败，不浪费同步 ACME 签发）；ensure 与文件推送/续期回推共用 `pushMu` 全串行（重建不与在途 reload 竞态），但**不跨证书解析持锁**（慢 ACME 不阻塞他人）。`RepushAppCerts` 系统动作**不做 ensure**（保持轻量；容器被手动删除由下次用户绑定自愈）。**`--network host` 的因果**：local 模式上游是 `127.0.0.1:<port>`，bridge 网络下容器内 127.0.0.1 指向容器自身（流量黑洞），host 网络下语义正确且 80/443 直监听宿主（无 `-p` 映射需维护）。**错误分类**（`classifyEnsureError`，纯字符串表驱动可测）：Docker 不可用 → 409「一键安装或启动 Docker」；80/443 被占（nginx 日志含 `address already in use`）→ 409；`nginx:alpine` 拉取失败 → 409「配置镜像加速」；其余 → 500 + 日志摘要（≤200 字符截断），绝不静默吞错。**Windows 主机前置 400**（「反代绑定暂仅支持 Linux 主机」）：保障脚本假定 Linux 宿主，明确拒绝而非在 docker exec 深处晦涩失败。vhost 443 块含 `client_max_body_size 64m;`（nginx 默认 1m，走反代的上传会被 413 静默截断）。**保留 nginx 而非 Traefik 的取舍**：gateway 模式上游是另一台主机的 mesh/公网 IP（Dokploy 的 docker.sock label 发现无法表达跨主机）；nginx 容器零 docker.sock 攻击面；证书中心是唯一证书真相源（ACME/续期/回推闭环，不建第二套）；conf.d 文件推送 + agent reload 与既有实现零迁移成本。
+  - `local` 模式：应用所在主机运行系统托管反代容器，上游 `127.0.0.1:<port>`。
   - `gateway` 模式：另选一台有公网 IP 的网关主机运行 Nginx，公网流量在网关卸载 TLS 后转发到应用主机。**异地组网不是必需条件**，上游按两条路径自动解析（`defaultUpstream`）：
     - **组网路径**：应用主机与网关主机**双方都已在组网内** → 上游取应用主机的 Tailscale Mesh IP（100.64.0.0/10），应用主机无需公网 IP、可隐藏在 NAT 后；
     - **直连路径**：否则 → 上游取应用主机的**公网 IP**，无公网 IP 再回退**内网 IP**（同局域网/VPC 场景），仅两者皆无时才报错并要求在详情页手动填写 Upstream。
@@ -129,7 +130,7 @@
   - 网关主机 ID 持久化在 `Application.proxy_gateway_host_id`，解绑时同时清理应用主机与网关主机两侧配置，并清空该字段（2026-10-20 修复：此前解绑残留旧网关 ID 的脏字段）。
 - **创建时证书配置与签发编排**（2026-10-20）：
   - **覆盖探测端点**：新只读端点 `GET /api/v1/certs/cover?domain=<d>`（登录即可、免操作审计，与 detail/download 同例）复用 `hub.FindByDomain` 同源匹配（精确 SAN 或通配符覆盖子域名、不含通配符裸域名本身），响应 `{covered, cert?{id,domains,source,account_name,not_after}}`（PEM 经 `json:"-"` 永不出网），前端永不复刻匹配规则、预检与最终绑定不会分叉；域名非法/空/通配符 → 400（校验语义与反代 `validProxyDomain` 镜像一致）。
-  - **创建页证书区**（`AppCreate.vue`，域名非空时于网关选择后展示）：域名输入防抖 ~500ms 实时调覆盖端点——已覆盖 → NTag 绿标（SAN 与有效期）+ 可选「指定证书」NSelect（默认「按域名自动匹配」，与 AppDetail certOptions 同款）；未覆盖 → NAlert + 签发配置区：ACME 账户 NSelect（预填默认账户）、challenge NRadio（自动推荐 / HTTP-01 / DNS-01）；无账户 → 提示并深链 `/certs`；选 DNS-01 且 dns-mng 未配置（`enabled && base_url` 同款判定）→ NAlert + 深链。**手动 DNS-01 两阶段不进创建页**（深链证书中心策略）：通配符域名提示「先到证书中心手动 DNS-01 签发后回来选择」+ 深链。探测失败静默降级（提示条注明不影响创建），手动流程不受影响。
+  - **创建页证书区**（`AppCreate.vue`，域名非空时于网关选择后展示）：域名输入防抖 ~500ms 实时调覆盖端点——已覆盖 → NTag 绿标（SAN 与有效期）+ 可选「指定证书」NSelect（默认「按域名自动匹配」，与 AppDetail certOptions 同款）；未覆盖 → NAlert + 签发配置区：ACME 账户 NSelect（预填默认账户）、challenge NRadio（自动推荐 / HTTP-01 / DNS-01）；无账户 → 提示并深链 `/certs`；选 DNS-01 且 dns-mng 未配置（`enabled && base_url` 同款判定）→ NAlert + 深链。**手动 DNS-01 两阶段不进创建页**（深链证书中心策略）：通配符域名提示「先到证书中心手动 DNS-01 签发后回来选择」+ 深链。探测失败静默降级（提示条注明不影响创建），手动流程不受影响。域名输入下方新增托管容器提示行：「绑定后将在目标主机自动初始化系统托管的反代 Nginx 容器（占用 80/443，仅 Linux 主机）」；local 单选文案同步为「应用所在主机运行反代」（系统托管、非用户自建）。
   - **提交编排**（`bindDomainWithCert`）：创建应用成功后——显式指定证书 → 直接带 `cert_id` 绑定；自动匹配 → 提交前**再实测一次**覆盖端点（域名可能改动后未失焦，预检结果可能过期）：已覆盖 → 绑定由服务端同源解析；未覆盖且有账户 → `POST /certs/issue`（202 异步受理，携带所选账户与 challenge）→ 轮询覆盖端点 5s×24 次（2 分钟，证书中心签发弹窗同惯例）covered=true 即得新证书 id 再绑定；签发超时/受理失败 → 仅提示「应用已创建，证书签发未完成：可到证书中心查看进度，稍后在应用详情-域名与反代中重试」并**跳过绑定**（不回滚应用创建、不阻断跳转；同时避免落到后端兜底路径同步签发长阻塞请求）；未覆盖且无账户 → 直接绑定，由后端 409 精确提示先配置 ACME 账户。轮询为有界 await 循环（无 setInterval 遗留），视图卸载提前终止；创建按钮 loading 文案阶段化「签发证书中… / 绑定反代中…」。
   - **拓扑协同**：`AppTopologyPreview` 新增 `certStatus` prop，Nginx/SSL 节点实时展示「已有证书 / 提交时签发 / 指定证书」小标签（探测中/失败/未填域名不展示）。
   - **AI 一致性**：AI 草稿**不新增任何证书字段**（证书选择与 `auth_vault_id` 同理必须人工选）；`sanitizeAppDraft` 现状已不含证书字段，仅在此注明边界。
@@ -1185,7 +1186,7 @@ POST   /api/v1/apps/:id/deploy|rollback    # 部署 / 回滚
 POST   /api/v1/apps/:id/stop|start|restart
 GET    /api/v1/apps/:id/deployments        # 部署历史（分页）
 POST   /api/v1/apps/:id/deployments/:depID/diagnose   # AI 排障
-PUT    /api/v1/apps/:id/proxy              # 绑定域名 {domain, mode: local|gateway, gateway_host_id, cert_id?, upstream?}；无证书时用默认 ACME 账户自动签发
+PUT    /api/v1/apps/:id/proxy              # 绑定域名 {domain, mode: local|gateway, gateway_host_id, cert_id?, upstream?}；无证书时用默认 ACME 账户自动签发；绑定前自动保障系统托管反代容器（ensureProxyNginx，见 §3.7）：Windows 主机 400、Docker 不可用/80-443 被占/镜像拉取失败 → 409 分类提示、其余保障失败 500+日志摘要
 DELETE /api/v1/apps/:id/proxy              # 解绑（同时清理应用主机与网关主机配置）
 POST   /api/v1/apps/webhook/:token         # Git push 自动部署（token 鉴权）
 

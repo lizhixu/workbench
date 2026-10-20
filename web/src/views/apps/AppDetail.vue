@@ -831,14 +831,14 @@ onDeactivated(() => {
               <NFormItem label="反代模式">
                 <NSpace vertical style="width: 100%">
                   <NRadioGroup v-model:value="proxyForm.mode">
-                    <NRadio value="local">节点本地（应用所在主机自建 Nginx）</NRadio>
+                    <NRadio value="local">节点本地（应用所在主机运行反代）</NRadio>
                     <NRadio value="gateway">统一网关（公网网关主机反代穿透到应用）</NRadio>
                   </NRadioGroup>
                   <NSelect
                     v-if="proxyForm.mode === 'gateway'"
                     v-model:value="proxyForm.gateway_host_id"
                     :options="hostOptions"
-                    placeholder="选择运行 watchman-app-nginx 的网关主机（可走组网或直连）"
+                    placeholder="选择作为反代网关的主机（可走组网或直连，将自动初始化反代容器）"
                     filterable
                   />
                   <span v-if="proxyForm.mode === 'gateway'" class="hint" style="display: block; margin-top: 4px">

@@ -1534,9 +1534,10 @@ onMounted(loadData)
             <NSpace vertical style="width: 100%">
               <NInput v-model:value="form.domain" placeholder="app.example.com（留空则不绑定域名）" />
               <template v-if="form.domain">
+                <span class="hint">绑定后将在目标主机自动初始化系统托管的反代 Nginx 容器（占用 80/443，仅 Linux 主机）</span>
                 <NRadioGroup v-model:value="form.proxy_mode">
                   <NSpace>
-                    <NRadio value="local">节点本地（应用所在主机自建 Nginx）</NRadio>
+                    <NRadio value="local">节点本地（应用所在主机运行反代）</NRadio>
                     <NRadio value="gateway">统一网关（公网网关主机反代穿透到应用）</NRadio>
                   </NSpace>
                 </NRadioGroup>

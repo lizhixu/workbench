@@ -1283,19 +1283,22 @@ onUnmounted(() => {
             </NDescriptionsItem>
           </NDescriptions>
 
-          <NCollapse v-if="detail.chain_pem || keyPEM" :default-expanded-names="['chain', 'key']">
-            <NCollapseItem v-if="detail.chain_pem" title="证书链（公钥 PEM）" name="chain">
-              <pre class="cert-chain-pre">{{ detail.chain_pem }}</pre>
-              <NButton size="tiny" secondary @click="copyChain">复制证书链</NButton>
-            </NCollapseItem>
-            <NCollapseItem title="私钥（KEY PEM，敏感）" name="key">
-              <pre v-if="keyPEM" class="cert-chain-pre">{{ keyPEM }}</pre>
-              <NButton v-if="keyPEM" size="tiny" secondary @click="copyKey">复制私钥</NButton>
-              <span v-else-if="keyError" class="key-load-error">{{ keyError }}</span>
-              <NSpin v-else size="small" />
-              <p v-if="keyPEM" class="key-warning">私钥即站点控制权：仅复制到安全位置，切勿提交到代码仓库或发送给他人。</p>
-            </NCollapseItem>
-          </NCollapse>
+          <template v-if="detail.chain_pem || keyPEM">
+            <div class="detail-section-title">证书材料</div>
+            <NCollapse :default-expanded-names="['chain', 'key']">
+              <NCollapseItem v-if="detail.chain_pem" title="证书链（公钥 PEM）" name="chain">
+                <pre class="cert-chain-pre">{{ detail.chain_pem }}</pre>
+                <NButton size="tiny" secondary @click="copyChain">复制证书链</NButton>
+              </NCollapseItem>
+              <NCollapseItem title="私钥（KEY PEM，敏感）" name="key">
+                <pre v-if="keyPEM" class="cert-chain-pre">{{ keyPEM }}</pre>
+                <NButton v-if="keyPEM" size="tiny" secondary @click="copyKey">复制私钥</NButton>
+                <span v-else-if="keyError" class="key-load-error">{{ keyError }}</span>
+                <NSpin v-else size="small" />
+                <p v-if="keyPEM" class="key-warning">私钥即站点控制权：仅复制到安全位置，切勿提交到代码仓库或发送给他人。</p>
+              </NCollapseItem>
+            </NCollapse>
+          </template>
           </template>
         </div>
       </NSpin>
@@ -1420,6 +1423,26 @@ onUnmounted(() => {
   // 分区间距统一收口（取代逐个内联 margin-bottom）
   :deep(.n-descriptions) {
     margin-bottom: 12px;
+  }
+
+  // 「证书材料」区为自渲染标题（非 NDescriptions header），复刻同一视觉语言
+  .detail-section-title {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 10px;
+
+    &::before {
+      content: '';
+      flex-shrink: 0;
+      width: 3px;
+      height: 13px;
+      border-radius: 2px;
+      background: #6366f1;
+    }
   }
 }
 

@@ -15,11 +15,19 @@ type Handlers struct {
 	// issuing serializes Issue/Renew calls: ACME rate limits are strict and
 	// two concurrent wildcard orders for the same zone would race.
 	mu sync.Mutex
+	// panelCertInfo resolves (bound cert id, panel domain) from the panel
+	// security settings for the used-by reverse lookup; injected at wiring
+	// time to keep the cert package decoupled from the settings store.
+	panelCertInfo func() (certID, domain string)
+	// appDomains lists deployed applications with a bound domain, for the
+	// same used-by lookup.
+	appDomains func() []AppDomainRef
 }
 
-// NewHandlers creates the certificate hub handlers.
-func NewHandlers(hub *Hub) *Handlers {
-	return &Handlers{hub: hub}
+// NewHandlers creates the certificate hub handlers. Both lookup deps may be
+// nil (unit tests); the detail endpoint then simply omits those predicates.
+func NewHandlers(hub *Hub, panelCertInfo func() (string, string), appDomains func() []AppDomainRef) *Handlers {
+	return &Handlers{hub: hub, panelCertInfo: panelCertInfo, appDomains: appDomains}
 }
 
 // Register mounts routes. Config reads are open to all roles (the UI shows
@@ -31,6 +39,8 @@ func (h *Handlers) Register(readRG, writeRG *gin.RouterGroup) {
 	readRG.GET("/certs/accounts", h.listAccounts)
 	readRG.GET("/certs", h.listCerts)
 	readRG.GET("/certs/:id", h.getCert)
+	readRG.GET("/certs/:id/detail", h.getCertDetail)
+	readRG.GET("/certs/:id/download", h.downloadCert)
 	readRG.GET("/certs/manual/:id", h.getManualOrder)
 
 	writeRG.PUT("/certs/config", h.putConfig)
@@ -42,6 +52,8 @@ func (h *Handlers) Register(readRG, writeRG *gin.RouterGroup) {
 	writeRG.DELETE("/certs/manual/:id", h.cancelManualOrder)
 	writeRG.POST("/certs/import", h.importCert)
 	writeRG.POST("/certs/:id/renew", h.renewCert)
+	writeRG.PUT("/certs/:id/remark", h.putCertRemark)
+	writeRG.POST("/certs/:id/key", h.revealCertKey)
 	writeRG.DELETE("/certs/:id", h.deleteCert)
 }
 
@@ -150,9 +162,9 @@ func (h *Handlers) putConfig(c *gin.Context) {
 }
 
 func (h *Handlers) listCerts(c *gin.Context) {
-	list := h.hub.List()
+	list := h.hub.ListView()
 	if list == nil {
-		list = []*Certificate{}
+		list = []*CertView{}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": list})
 }
@@ -165,6 +177,73 @@ func (h *Handlers) getCert(c *gin.Context) {
 	}
 	crt.KeyPEM = "" // never expose the private key over REST
 	c.JSON(http.StatusOK, gin.H{"data": crt})
+}
+
+// getCertDetail serves the enriched X.509 view (fingerprint, serial, key
+// algorithm, chain length, used-by reverse lookup) for the detail dialog.
+// Read-only and login-accessible like getCert; the chain PEM in the response
+// is public certificate material only — the private key leaves the hub via
+// the explicit revealCertKey endpoint (adminOnly, audited), never here.
+func (h *Handlers) getCertDetail(c *gin.Context) {
+	var certID, domain string
+	if h.panelCertInfo != nil {
+		certID, domain = h.panelCertInfo()
+	}
+	var apps []AppDomainRef
+	if h.appDomains != nil {
+		apps = h.appDomains()
+	}
+	d, ok := h.hub.Detail(c.Param("id"), certID, domain, apps)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "certificate not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": d})
+}
+
+// downloadCert serves the stored certificate chain as a "<domain>.crt"
+// attachment. The download stays public-chain-only — the private key is not
+// bundled with it (servers need the key placed separately, and a download
+// must not hand over the site's identity in one file); key viewing goes
+// through revealCertKey instead. Read-only and login-accessible like the
+// detail endpoint; the browser navigates to it with the JWT in the query
+// string (the standard download-auth path shared with audit export /
+// backup / file downloads).
+func (h *Handlers) downloadCert(c *gin.Context) {
+	crt, ok := h.hub.Get(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "certificate not found"})
+		return
+	}
+	if strings.TrimSpace(crt.CertPEM) == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "证书材料缺失，无法下载"})
+		return
+	}
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", downloadFilename(crt)))
+	c.Data(http.StatusOK, "application/x-pem-file", []byte(crt.CertPEM))
+}
+
+// downloadFilename builds a filesystem-safe "<primary-domain>.crt" name for
+// the chain download: "*.example.com" maps to "_wildcard.example.com.crt",
+// remaining filename-unsafe characters collapse to "_", and a certificate
+// without domains falls back to its id.
+func downloadFilename(c *Certificate) string {
+	base := c.ID
+	if len(c.Domains) > 0 {
+		base = strings.TrimSpace(c.Domains[0])
+	}
+	if base == "" {
+		base = c.ID
+	}
+	base = strings.ReplaceAll(base, "*", "_wildcard")
+	base = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-':
+			return r
+		}
+		return '_'
+	}, base)
+	return base + ".crt"
 }
 
 func (h *Handlers) issueCert(c *gin.Context) {
@@ -300,4 +379,47 @@ func (h *Handlers) deleteCert(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// putCertRemark edits the admin remark of one certificate. Metadata only;
+// runs under the audited admin write group like every other cert mutation.
+func (h *Handlers) putCertRemark(c *gin.Context) {
+	id := c.Param("id")
+	var req struct {
+		Remark string `json:"remark"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if _, ok := h.hub.Get(id); !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "certificate not found"})
+		return
+	}
+	updated, err := h.hub.UpdateRemark(id, req.Remark)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	updated.CertPEM, updated.KeyPEM = "", "" // same material stripping as list/get
+	c.JSON(http.StatusOK, gin.H{"data": updated})
+}
+
+// revealCertKey returns the stored private key in clear text for the detail
+// dialog. Every routine response (list/get/detail/download) strips the key;
+// this endpoint is the single explicit door, kept on the audited admin write
+// group and recorded as cert_key_reveal / RiskHigh — the same convention as
+// the AI API key reveal. POST (not GET) because the shared audit middleware
+// skips GET requests.
+func (h *Handlers) revealCertKey(c *gin.Context) {
+	crt, ok := h.hub.Get(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "certificate not found"})
+		return
+	}
+	if strings.TrimSpace(crt.KeyPEM) == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "私钥材料缺失，无法查看"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"key_pem": crt.KeyPEM}})
 }

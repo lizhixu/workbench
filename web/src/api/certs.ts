@@ -39,6 +39,35 @@ export interface Certificate {
   created_at: string
   renewing?: boolean
   last_error?: string
+  // 管理员备注（≤200 字，仅元信息；经 PUT /certs/:id/remark 编辑）
+  remark?: string
+  // 列表由服务端派生（与详情端点同源），前端不再自行推断：
+  // 申请方式 / 签发所用 ACME 账户名
+  source?: 'acme' | 'manual_dns01' | 'manual_upload'
+  account_name?: string
+}
+
+// 详情弹窗的扩展视图：服务端对存储的证书链现场解析 leaf 得到的 X.509
+// 元数据 + 用途反查。chain_pem 仅为公钥证书链；私钥不随本响应下发，
+// 明文查看走 getCertKey 显式端点。
+export interface CertDetail extends Certificate {
+  source: 'acme' | 'manual_dns01' | 'manual_upload'
+  account_name?: string
+  subject_cn?: string
+  serial_number?: string
+  sha256_fingerprint?: string
+  public_key_algorithm?: string // 如 "RSA 2048" / "ECDSA P-256"
+  signature_algorithm?: string
+  chain_length?: number
+  valid_now?: boolean
+  not_yet_valid?: boolean
+  days_remaining?: number
+  auto_renew_days?: number
+  panel_bound?: boolean
+  panel_fallback?: boolean
+  used_by_apps?: { id: string; name: string; domain: string }[]
+  chain_pem?: string
+  parse_error?: string
 }
 
 export function getCertConfig() {
@@ -71,6 +100,29 @@ export function deleteACMEAccount(id: string) {
 
 export function listCerts() {
   return unwrap<{ data: Certificate[] }>(http.get('/certs')).then((r) => r.data)
+}
+
+export function getCertDetail(id: string) {
+  return unwrap<{ data: CertDetail }>(http.get(`/certs/${id}/detail`)).then((r) => r.data)
+}
+
+// 查看证书私钥明文（详情弹窗「私钥」区）：常规响应一律不出私钥，这里是唯一显式
+// 入口——adminOnly + 高危审计（cert_key_reveal），与 AI API Key 明文查看同惯例；
+// 用 POST 以确保命中审计中间件（其跳过 GET 请求）。
+export function getCertKey(id: string) {
+  return unwrap<{ data: { key_pem: string } }>(http.post(`/certs/${id}/key`)).then(
+    (r) => r.data.key_pem,
+  )
+}
+
+// 下载证书公钥链（服务端提供 <主域名>.crt 文件名，仅公钥链、私钥永不外发）。
+// 浏览器直接导航下载：JWT 走 ?token= 查询参数（与审计导出 / 备份下载同惯例，
+// 鉴权中间件对无法带 header 的导航类请求提供查询参数回退）。
+export function certDownloadUrl(id: string): string {
+  const base = import.meta.env.VITE_API_BASE || '/api/v1'
+  const token = localStorage.getItem('watchman_token') || ''
+  const tokParam = token ? `?token=${encodeURIComponent(token)}` : ''
+  return `${base}/certs/${id}/download${tokParam}`
 }
 
 // challenge: ''（自动）| 'http-01' | 'dns-01' | 'dns-01-manual'（手动添加 DNS TXT 解析）。
@@ -129,6 +181,13 @@ export function cancelManualDNSOrder(id: string) {
 
 export function renewCert(id: string) {
   return unwrap<{ ok: boolean; message: string }>(http.post(`/certs/${id}/renew`))
+}
+
+// 编辑证书管理员备注（≤200 字，仅元信息，不影响证书本身；adminOnly + 审计）。
+export function updateCertRemark(id: string, remark: string) {
+  return unwrap<{ data: Certificate }>(http.put(`/certs/${id}/remark`, { remark })).then(
+    (r) => r.data,
+  )
 }
 
 // 上传已有证书（其他渠道申请的 PEM 证书+私钥）：导入证书中心，

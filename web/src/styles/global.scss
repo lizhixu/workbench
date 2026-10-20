@@ -207,6 +207,49 @@ code, .mono-font {
   }
 }
 
+/* ===================== 表格粘性列（fixed: left/right）遮罩与纯色防透 =====================
+   防止横向滚动时，底层单元格文字穿透显示在固定列（如操作列、首列）之下；
+   同时消除暗色模式/亮色模式下 hover 或 focus 变为半透明导致的文字重叠。 */
+.n-data-table {
+  .n-data-table-td--fixed-left,
+  .n-data-table-td--fixed-right {
+    background-color: var(--bg-card, #ffffff) !important;
+  }
+  .n-data-table-th--fixed-left,
+  .n-data-table-th--fixed-right {
+    background-color: var(--bg-card, #ffffff) !important;
+  }
+
+  /* 悬停或聚焦行时，固定列背景必须同步切换为不透明的 hover/active 颜色，不能透出底层 */
+  .n-data-table-tr:hover {
+    .n-data-table-td--fixed-left,
+    .n-data-table-td--fixed-right {
+      background-color: #f8fafc !important;
+    }
+  }
+}
+
+[data-theme="dark"],
+html.dark {
+  .n-data-table {
+    .n-data-table-td--fixed-left,
+    .n-data-table-td--fixed-right {
+      background-color: #131b2e !important;
+    }
+    .n-data-table-th--fixed-left,
+    .n-data-table-th--fixed-right {
+      background-color: #18223a !important;
+    }
+
+    .n-data-table-tr:hover {
+      .n-data-table-td--fixed-left,
+      .n-data-table-td--fixed-right {
+        background-color: #18223a !important;
+      }
+    }
+  }
+}
+
 /* 分页条：钉在表格下方，不参与滚动。
    固定条高 + 上下对称内边距，让分页在条内垂直居中；只给 padding-top 会让分页
    紧贴卡片底边，视觉上像被裁掉，「每页条数」下拉也会顶到边缘。 */

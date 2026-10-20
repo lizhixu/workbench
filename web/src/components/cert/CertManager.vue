@@ -1,23 +1,27 @@
 <script setup lang="ts">
 import { computed, h, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
-  NAlert, NButton, NCard, NDataTable, NForm, NFormItem, NIcon, NInput,
-  NModal, NPopconfirm, NRadio, NRadioGroup, NSelect, NSpace, NSwitch,
-  NTabPane, NTabs, NTag, useMessage,
+  NAlert, NButton, NCard, NCollapse, NCollapseItem, NDataTable,
+  NDescriptions, NDescriptionsItem, NForm, NFormItem, NIcon, NInput,
+  NModal, NPopconfirm, NPopover, NRadio, NRadioGroup, NSelect, NSpace, NSpin,
+  NSwitch, NTabPane, NTabs, NTag, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import {
-  AddCircleOutline, CloudUploadOutline, LockClosedOutline,
-  RefreshOutline, ShieldCheckmarkOutline, TrashOutline,
+  AddCircleOutline, CloudUploadOutline, CopyOutline, CreateOutline,
+  DownloadOutline, LockClosedOutline, RefreshOutline, ShieldCheckmarkOutline,
+  TrashOutline,
 } from '@vicons/ionicons5'
 import {
-  createACMEAccount, deleteACMEAccount, deleteCert, getCertConfig,
-  importCert, issueCert, listACMEAccounts, listCerts, listPresets, renewCert,
-  updateACMEAccount, updateCertConfig, startManualDNSIssue, getManualDNSOrder,
-  confirmManualDNSOrder, cancelManualDNSOrder, type ACMEAccount, type ACMEPreset,
-  type Certificate, type CertHubConfig, type ChallengeMode,
-  type ManualDNSOrder,
+  certDownloadUrl, createACMEAccount, deleteACMEAccount, deleteCert, getCertConfig,
+  getCertDetail, getCertKey, importCert, issueCert, listACMEAccounts, listCerts, listPresets,
+  renewCert, updateACMEAccount, updateCertConfig, updateCertRemark,
+  startManualDNSIssue, getManualDNSOrder, confirmManualDNSOrder, cancelManualDNSOrder,
+  type ACMEAccount, type ACMEPreset, type Certificate, type CertDetail,
+  type CertHubConfig, type ChallengeMode, type ManualDNSOrder,
 } from '../../api/certs'
+import { useRouter } from 'vue-router'
+import { useTablePagination } from '../../composables/useTablePagination'
 import { fmtDate } from '../../utils/time'
 
 defineOptions({ name: 'CertManager' })
@@ -83,63 +87,135 @@ const configReady = computed(() => config.enabled && config.base_url !== '')
 const daysLeft = (cert: Certificate) =>
   Math.max(0, Math.floor((new Date(cert.not_after).getTime() - Date.now()) / 86400000))
 
-// 证书列表列
+// 证书列表列（宝塔式 11 列）：域名 / 其他域名 / 申请方式 / ACME 账号 / 状态 /
+// 日志 / 颁发组织 / 备注 / 自动续签 / 过期时间 / 操作。
 const certColumns = computed<DataTableColumns<Certificate>>(() => [
   {
     title: '域名',
     key: 'domains',
-    render: (row) =>
-      h(NSpace, { size: 4, wrap: false }, {
-        default: () => row.domains.map((d) =>
-          h(NTag, { size: 'small', bordered: false, type: 'info' }, { default: () => d })),
-      }),
-  },
-  {
-    title: '有效期',
-    key: 'not_after',
-    width: 220,
-    render: (row) => {
-      const days = daysLeft(row)
-      const type = days > 30 ? 'success' : days > 7 ? 'warning' : 'error'
-      return h('span', null, [
-        h(NTag, { size: 'small', type, bordered: false }, { default: () => `${days} 天后到期` }),
-        !row.auto_renew
-          ? h(NTag, { size: 'small', type: 'warning', bordered: false, style: 'margin-left: 6px', title: '该证书不会自动续期，到期前将经告警中心提醒，请手动重新签发或上传' }, { default: () => '手动维护' })
-          : null,
-        h('span', { style: 'margin-left: 8px; font-size: 12px; color: #999' },
-          formatDate(row.not_after)),
-      ])
-    },
-  },
-  {
-    title: '颁发 CA 机构',
-    key: 'issuer',
-    width: 170,
+    width: 160,
+    fixed: 'left',
     ellipsis: { tooltip: true },
-    render: (r) => {
-      const acc = accounts.value.find((a) => a.id === r.account_id)
-      return acc ? `${acc.name} (${r.issuer || 'ACME'})` : r.issuer || 'Let\'s Encrypt'
+    render: (row) => h('span', { style: 'font-weight: 500' }, row.domains[0] || '-'),
+  },
+  {
+    title: '其他域名',
+    key: 'other_domains',
+    width: 130,
+    ellipsis: { tooltip: true },
+    render: (row) => {
+      const rest = row.domains.slice(1)
+      return rest.length
+        ? h('span', null, rest.join('、'))
+        : h('span', { style: 'color: #999' }, '-')
     },
+  },
+  {
+    title: '申请方式',
+    key: 'source',
+    width: 100,
+    render: (r) => {
+      if (!r.source) return h('span', { style: 'color: #999' }, '-')
+      const m = certSourceMeta(r.source)
+      return h(NTag, { size: 'small', type: m.type, bordered: false }, { default: () => m.text })
+    },
+  },
+  {
+    title: 'ACME 账号',
+    key: 'account_name',
+    width: 110,
+    ellipsis: { tooltip: true },
+    render: (r) => r.account_name || h('span', { style: 'color: #999' }, '-'),
   },
   {
     title: '状态',
     key: 'status',
-    width: 110,
+    width: 80,
+    render: (r) => {
+      const s = certStatus(r)
+      return h(NTag, { size: 'small', type: s.type, bordered: false }, { default: () => s.text })
+    },
+  },
+  {
+    title: '日志',
+    key: 'last_error',
+    width: 130,
+    render: (r) => {
+      if (!r.last_error) return h('span', { style: 'color: #999' }, '-')
+      // 失败原因全文以限宽弹层展示（替代内置 ellipsis tooltip：后者对 300+ 字符
+      // 的错误实测会铺出 1088px 宽的巨框）；单元格内手动省略截断。
+      return h(
+        NPopover,
+        { trigger: 'hover', placement: 'top', showArrow: false },
+        {
+          trigger: () =>
+            h(
+              'span',
+              { style: 'color: #d03050; display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;' },
+              r.last_error,
+            ),
+          default: () => [
+            h('div', { style: 'font-size: 11px; color: #999; margin-bottom: 4px' }, '最近一次失败原因'),
+            h('div', { style: 'font-size: 12px; line-height: 1.6; word-break: break-all; max-width: 340px; max-height: 200px; overflow: auto;' }, r.last_error),
+          ],
+        },
+      )
+    },
+  },
+  {
+    title: '颁发组织',
+    key: 'issuer',
+    width: 120,
+    ellipsis: { tooltip: true },
+    render: (r) => r.issuer || h('span', { style: 'color: #999' }, '-'),
+  },
+  {
+    title: '备注',
+    key: 'remark',
+    width: 140,
+    render: (r) => renderRemarkCell(r),
+  },
+  {
+    title: '自动续签',
+    key: 'auto_renew',
+    width: 90,
     render: (r) =>
-      r.renewing
-        ? h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '续期中' })
-        : r.last_error
-          ? h(NTag, { size: 'small', type: 'error', bordered: false }, { default: () => '异常' })
-          : h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => '正常' }),
+      r.auto_renew
+        ? h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => '自动续签' })
+        : h(NTag, { size: 'small', type: 'warning', bordered: false, title: '该证书不会自动续期，到期前将经告警中心提醒，请手动重新签发或上传' }, { default: () => '手动维护' }),
+  },
+  {
+    title: '过期时间',
+    key: 'not_after',
+    width: 120,
+    render: (row) => {
+      const days = daysLeft(row)
+      const type = days > 30 ? 'success' : days > 7 ? 'warning' : 'error'
+      return h('span', null, [
+        h(NTag, { size: 'small', type, bordered: false }, { default: () => (days > 0 ? `${days} 天后到期` : '已过期') }),
+        h('div', { style: 'font-size: 11px; color: #999; margin-top: 2px' }, formatDate(row.not_after)),
+      ])
+    },
   },
   {
     title: '操作',
     key: 'actions',
-    width: 160,
+    width: 185,
+    fixed: 'right',
     render: (r) =>
-      h(NSpace, { size: 6 }, {
+      h(NSpace, { size: 6, wrap: false }, {
         default: () => [
-          h(NButton, { size: 'tiny', secondary: true, onClick: () => doRenew(r) }, { default: () => '续期' }),
+          h(NButton, { size: 'tiny', secondary: true, onClick: () => openDetail(r) }, { default: () => '详情' }),
+          h(
+            NButton,
+            { size: 'tiny', secondary: true, title: '下载证书（.crt 公钥链，不含私钥）', onClick: () => window.open(certDownloadUrl(r.id), '_blank') },
+            { icon: () => h(NIcon, null, { default: () => h(DownloadOutline) }) },
+          ),
+          // 手动上传的证书没有 ACME 账户：续期会被服务端回落到默认账户重新签发并
+          // 覆盖上传的材料，语义上应为「重新上传」而非续期，故不展示续期按钮。
+          ...(r.source === 'manual_upload'
+            ? []
+            : [h(NButton, { size: 'tiny', secondary: true, onClick: () => doRenew(r) }, { default: () => '续期' })]),
           h(
             NPopconfirm,
             { onPositiveClick: () => doDelete(r) },
@@ -152,6 +228,93 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
       }),
   },
 ])
+
+// ---- 证书备注行内编辑（PUT /certs/:id/remark，仅元信息，adminOnly + 审计） ----
+const remarkEditId = ref<string | null>(null)
+const remarkDraft = ref('')
+const remarkSaving = ref(false)
+
+function startEditRemark(r: Certificate) {
+  if (remarkEditId.value === r.id) {
+    remarkEditId.value = null
+    return
+  }
+  remarkDraft.value = r.remark || ''
+  remarkEditId.value = r.id
+}
+
+async function saveRemark(r: Certificate) {
+  if (remarkSaving.value) return
+  remarkSaving.value = true
+  try {
+    const updated = await updateCertRemark(r.id, remarkDraft.value.trim())
+    r.remark = updated.remark
+    message.success('备注已保存')
+    remarkEditId.value = null
+  } catch (e: any) {
+    message.error(e?.message || '备注保存失败')
+  } finally {
+    remarkSaving.value = false
+  }
+}
+
+// 备注单元格：内容省略展示 + 铅笔按钮弹出编辑框（点击空白处自动关闭）。
+function renderRemarkCell(r: Certificate) {
+  return h(NSpace, { size: 2, align: 'center', wrap: false }, {
+    default: () => [
+      h(
+        'span',
+        {
+          style:
+            'display: inline-block; max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle;' +
+            (r.remark ? '' : ' color: #999'),
+          title: r.remark || '',
+        },
+        r.remark || '-',
+      ),
+      h(
+        NPopover,
+        {
+          show: remarkEditId.value === r.id,
+          'onUpdate:show': (v: boolean) => {
+            if (!v && !remarkSaving.value) remarkEditId.value = null
+          },
+          trigger: 'manual',
+          placement: 'left',
+        },
+        {
+          trigger: () =>
+            h(
+              NButton,
+              { size: 'tiny', quaternary: true, title: '编辑备注', onClick: () => startEditRemark(r) },
+              { icon: () => h(NIcon, null, { default: () => h(CreateOutline) }) },
+            ),
+          default: () =>
+            h('div', { style: 'width: 280px' }, [
+              h('div', { style: 'font-weight: 600; margin-bottom: 6px' }, `备注 · ${r.domains[0] || ''}`),
+              h(NInput, {
+                value: remarkDraft.value,
+                'onUpdate:value': (v: string) => {
+                  remarkDraft.value = v
+                },
+                type: 'textarea',
+                rows: 3,
+                maxlength: 200,
+                showCount: true,
+                placeholder: '记录证书用途、申请人等（最多 200 字）',
+              }),
+              h(NSpace, { justify: 'end', style: 'margin-top: 8px' }, {
+                default: () => [
+                  h(NButton, { size: 'tiny', onClick: () => { remarkEditId.value = null } }, { default: () => '取消' }),
+                  h(NButton, { size: 'tiny', type: 'primary', loading: remarkSaving.value, onClick: () => saveRemark(r) }, { default: () => '保存' }),
+                ],
+              }),
+            ]),
+        },
+      ),
+    ],
+  })
+}
 
 // ACME 账户列表列
 const accountColumns = computed<DataTableColumns<ACMEAccount>>(() => [
@@ -212,6 +375,105 @@ const accountSelectOptions = computed(() =>
 
 function formatDate(v: string) {
   return fmtDate(v)
+}
+
+type TagType = 'default' | 'success' | 'warning' | 'error' | 'info'
+
+// 列表与详情弹窗共用的状态标签判定（续期中/异常优先，随后按有效期判定）
+function certStatus(c: Certificate): { type: TagType; text: string } {
+  if (c.renewing) return { type: 'info', text: '续期中' }
+  if (c.last_error) return { type: 'error', text: '异常' }
+  const now = Date.now()
+  if (c.not_after && new Date(c.not_after).getTime() <= now) return { type: 'error', text: '已过期' }
+  if (c.not_before && new Date(c.not_before).getTime() > now) return { type: 'warning', text: '未生效' }
+  return { type: 'success', text: '正常' }
+}
+
+function certSourceMeta(s: NonNullable<Certificate['source']>): { type: TagType; text: string } {
+  switch (s) {
+    case 'acme':
+      return { type: 'info', text: 'ACME 自动签发' }
+    case 'manual_dns01':
+      return { type: 'warning', text: '手动 DNS-01 签发' }
+    default:
+      return { type: 'default', text: '手动上传' }
+  }
+}
+
+// 两表分页走统一 composable（AGENTS.md §8.2）：页码随行数收敛
+const { pagination: certPagination } = useTablePagination({ rowCount: computed(() => certs.value.length) })
+const { pagination: accountPagination } = useTablePagination({ rowCount: computed(() => accounts.value.length) })
+
+// ---- 证书详情弹窗 ----
+const router = useRouter()
+const showDetail = ref(false)
+const detail = ref<CertDetail | null>(null)
+const detailLoading = ref(false)
+const detailError = ref('')
+// 私钥明文：与证书链并列展示，打开详情时经显式查看端点拉取（adminOnly + 高危审计）
+const keyPEM = ref('')
+const keyError = ref('')
+
+// 有效期进度：证书生命周期内已消耗的百分比，供有效期进度条展示
+const validityPct = computed(() => {
+  const d = detail.value
+  if (!d?.not_before || !d?.not_after) return null
+  const start = new Date(d.not_before).getTime()
+  const end = new Date(d.not_after).getTime()
+  if (!isFinite(start) || !isFinite(end) || end <= start) return null
+  const pct = ((Date.now() - start) / (end - start)) * 100
+  return Math.min(100, Math.max(0, Math.round(pct)))
+})
+
+// 进度条颜色随剩余天数分档：>30 天绿、>7 天琥珀、其余红
+const validityColor = computed(() => {
+  const days = detail.value ? daysLeft(detail.value) : 0
+  if (days > 30) return '#10b981'
+  if (days > 7) return '#f59e0b'
+  return '#ef4444'
+})
+
+async function openDetail(cert: Certificate) {
+  showDetail.value = true
+  detail.value = null
+  detailError.value = ''
+  keyPEM.value = ''
+  keyError.value = ''
+  detailLoading.value = true
+  try {
+    detail.value = await getCertDetail(cert.id)
+  } catch (e: any) {
+    detailError.value = e?.message || '加载证书详情失败'
+  } finally {
+    detailLoading.value = false
+  }
+  // 私钥经显式查看端点按需拉取；失败仅提示，不影响其余详情展示。
+  if (detail.value) {
+    try {
+      keyPEM.value = await getCertKey(cert.id)
+    } catch (e: any) {
+      keyError.value = e?.message || '加载私钥失败'
+    }
+  }
+}
+
+// 通用复制：DNS TXT 记录 / 序列号 / 指纹 / 证书链共用，复制结果经全局 message 反馈
+async function copyText(text: string | undefined, label: string) {
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success(`${label}已复制到剪贴板`)
+  } catch {
+    message.error('复制失败，请手动选择文本复制')
+  }
+}
+
+async function copyChain() {
+  await copyText(detail.value?.chain_pem, '证书链')
+}
+
+async function copyKey() {
+  await copyText(keyPEM.value, '私钥')
 }
 
 async function loadConfig() {
@@ -453,15 +715,6 @@ watch(showManual, (v) => {
   if (!v) stopManualPolling()
 })
 
-async function copyText(text: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(text)
-    message.success(`${label}已复制`)
-  } catch {
-    message.warning('自动复制失败，请手动选中复制')
-  }
-}
-
 // 管理员确认已完成 DNS 解析：通知 CA 开始验证，随后轮询任务状态。
 async function confirmDNS() {
   if (!manualOrder.value) return
@@ -627,8 +880,9 @@ onUnmounted(() => {
                 :columns="certColumns"
                 :data="certs"
                 :row-key="(r: Certificate) => r.id"
-                :pagination="{ pageSize: 20 }"
+                :pagination="certPagination"
                 :bordered="false"
+                :scroll-x="1365"
                 size="small"
               />
             </NCard>
@@ -646,7 +900,7 @@ onUnmounted(() => {
                 :columns="accountColumns"
                 :data="accounts"
                 :row-key="(r: ACMEAccount) => r.id"
-                :pagination="{ pageSize: 20 }"
+                :pagination="accountPagination"
                 :bordered="false"
                 size="small"
               />
@@ -921,6 +1175,131 @@ onUnmounted(() => {
         </NSpace>
       </template>
     </NModal>
+
+    <!-- 证书详情弹窗：服务端现场解析 leaf 与链 + 用途反查，链 PEM 仅为公钥材料 -->
+    <NModal
+      v-model:show="showDetail"
+      preset="card"
+      class="cert-detail-modal"
+      :content-style="{ maxHeight: 'calc(100vh - 120px)', overflow: 'auto' }"
+      style="width: 680px; max-width: 94vw"
+    >
+      <template #header>
+        <div class="cert-detail-header">
+          <span class="cert-detail-domain">{{ detail?.domains?.[0] || '证书详情' }}</span>
+          <NTag v-if="detail" size="small" :type="certStatus(detail).type" :bordered="false">
+            {{ certStatus(detail).text }}
+          </NTag>
+        </div>
+      </template>
+      <NSpin :show="detailLoading">
+        <div class="cert-detail-body">
+          <NAlert v-if="detailError" type="error" :show-icon="true">{{ detailError }}</NAlert>
+        <template v-if="detail">
+          <NAlert v-if="detail.parse_error" type="warning" :show-icon="true" style="margin-bottom: 12px">
+            证书链解析失败：{{ detail.parse_error }}（指纹与算法区暂不可展示）
+          </NAlert>
+          <NDescriptions v-else title="指纹与算法" :column="2" bordered size="small" label-placement="left">
+            <NDescriptionsItem label="主题 (Subject)">{{ detail.subject_cn || '-' }}</NDescriptionsItem>
+            <NDescriptionsItem label="证书链">{{ detail.chain_length }} 张</NDescriptionsItem>
+            <NDescriptionsItem label="序列号" :span="2">
+              <div class="mono-row">
+                <span class="mono-val">{{ detail.serial_number || '-' }}</span>
+                <NButton
+                  v-if="detail.serial_number"
+                  size="tiny"
+                  quaternary
+                  title="复制序列号"
+                  @click="copyText(detail.serial_number, '序列号')"
+                >
+                  <template #icon><NIcon><CopyOutline /></NIcon></template>
+                </NButton>
+              </div>
+            </NDescriptionsItem>
+            <NDescriptionsItem label="SHA-256 指纹" :span="2">
+              <div class="mono-row">
+                <span class="mono-val">{{ detail.sha256_fingerprint || '-' }}</span>
+                <NButton
+                  v-if="detail.sha256_fingerprint"
+                  size="tiny"
+                  quaternary
+                  title="复制 SHA-256 指纹"
+                  @click="copyText(detail.sha256_fingerprint, 'SHA-256 指纹')"
+                >
+                  <template #icon><NIcon><CopyOutline /></NIcon></template>
+                </NButton>
+              </div>
+            </NDescriptionsItem>
+            <NDescriptionsItem label="密钥算法">{{ detail.public_key_algorithm || '-' }}</NDescriptionsItem>
+            <NDescriptionsItem label="签名算法">{{ detail.signature_algorithm || '-' }}</NDescriptionsItem>
+          </NDescriptions>
+
+          <NDescriptions title="有效期与续期" :column="2" bordered size="small" label-placement="left">
+            <NDescriptionsItem label="生效时间">
+              {{ formatDate(detail.not_before) }}
+              <NTag v-if="detail.not_yet_valid" size="small" type="warning" :bordered="false" style="margin-left: 6px">尚未生效</NTag>
+            </NDescriptionsItem>
+            <NDescriptionsItem label="到期时间">{{ formatDate(detail.not_after) }}</NDescriptionsItem>
+            <NDescriptionsItem label="剩余天数">
+              <NTag size="small" :type="daysLeft(detail) > 30 ? 'success' : daysLeft(detail) > 7 ? 'warning' : 'error'" :bordered="false">
+                {{ daysLeft(detail) > 0 ? `${daysLeft(detail)} 天后到期` : '已过期' }}
+              </NTag>
+            </NDescriptionsItem>
+            <NDescriptionsItem label="自动续期">
+              <template v-if="detail.auto_renew">
+                到期前自动续期（提前 {{ detail.auto_renew_days }} 天内触发，短期证书按有效期 1/3 收紧）
+              </template>
+              <template v-else>不自动续期，到期前经告警中心提醒一次，请手动重新签发或上传</template>
+            </NDescriptionsItem>
+            <NDescriptionsItem v-if="validityPct !== null" label="有效期进度" :span="2">
+              <div class="validity-track">
+                <div class="validity-bar">
+                  <div class="validity-fill" :style="{ width: `${validityPct}%`, background: validityColor }"></div>
+                </div>
+                <span class="validity-hint">证书生命周期已消耗 {{ validityPct }}%</span>
+              </div>
+            </NDescriptionsItem>
+          </NDescriptions>
+
+          <NDescriptions title="使用情况" :column="2" bordered size="small" label-placement="left">
+            <NDescriptionsItem label="面板 HTTPS">
+              <NTag v-if="detail.panel_bound" size="small" type="success" :bordered="false">绑定为面板证书</NTag>
+              <NTag v-else-if="detail.panel_fallback" size="small" type="info" :bordered="false">面板兜底匹配（未显式绑定）</NTag>
+              <NTag v-else size="small" :bordered="false">未使用</NTag>
+            </NDescriptionsItem>
+            <NDescriptionsItem label="使用中的应用">
+              <NSpace v-if="detail.used_by_apps?.length" :size="4">
+                <NButton
+                  v-for="app in detail.used_by_apps"
+                  :key="app.id"
+                  size="tiny"
+                  secondary
+                  @click="showDetail = false; router.push(`/apps/${app.id}`)"
+                >
+                  {{ app.name }}（{{ app.domain }}）
+                </NButton>
+              </NSpace>
+              <span v-else class="detail-muted">暂无应用使用</span>
+            </NDescriptionsItem>
+          </NDescriptions>
+
+          <NCollapse v-if="detail.chain_pem || keyPEM" :default-expanded-names="['chain', 'key']">
+            <NCollapseItem v-if="detail.chain_pem" title="证书链（公钥 PEM）" name="chain">
+              <pre class="cert-chain-pre">{{ detail.chain_pem }}</pre>
+              <NButton size="tiny" secondary @click="copyChain">复制证书链</NButton>
+            </NCollapseItem>
+            <NCollapseItem title="私钥（KEY PEM，敏感）" name="key">
+              <pre v-if="keyPEM" class="cert-chain-pre">{{ keyPEM }}</pre>
+              <NButton v-if="keyPEM" size="tiny" secondary @click="copyKey">复制私钥</NButton>
+              <span v-else-if="keyError" class="key-load-error">{{ keyError }}</span>
+              <NSpin v-else size="small" />
+              <p v-if="keyPEM" class="key-warning">私钥即站点控制权：仅复制到安全位置，切勿提交到代码仓库或发送给他人。</p>
+            </NCollapseItem>
+          </NCollapse>
+          </template>
+        </div>
+      </NSpin>
+    </NModal>
   </div>
 </template>
 
@@ -1007,5 +1386,124 @@ onUnmounted(() => {
     flex-direction: column;
     overflow: hidden;
   }
+}
+
+.mono-val {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+// 证书详情弹窗内容区：NModal teleport 到 body 后卡片根节点不带本组件 data-v 作用域，
+// 深选择器必须锚定在模板内自己渲染的 .cert-detail-body 上才能命中 Naive 内部节点。
+.cert-detail-body {
+  // 分区标题：紧凑视觉层级（Naive 默认 18px 偏大），左侧品牌色竖条作视觉锚点
+  :deep(.n-descriptions-header) {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 10px;
+
+    &::before {
+      content: '';
+      flex-shrink: 0;
+      width: 3px;
+      height: 13px;
+      border-radius: 2px;
+      background: #6366f1;
+    }
+  }
+
+  // 分区间距统一收口（取代逐个内联 margin-bottom）
+  :deep(.n-descriptions) {
+    margin-bottom: 12px;
+  }
+}
+
+// 弹窗头部：域名 + 状态标签平铺，一眼可读
+.cert-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+
+  .cert-detail-domain {
+    font-size: 15px;
+    font-weight: 600;
+    word-break: break-all;
+  }
+}
+
+// 长等宽值（序列号 / 指纹）+ 行内复制按钮
+.mono-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+
+  .mono-val {
+    flex: 1;
+    min-width: 0;
+  }
+}
+
+// 有效期进度条：填充色随剩余天数分档（绿 >30 天 / 琥珀 >7 天 / 红）
+.validity-track {
+  width: 100%;
+
+  .validity-bar {
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(128, 128, 128, 0.16);
+    overflow: hidden;
+    margin: 3px 0 5px;
+  }
+
+  .validity-fill {
+    height: 100%;
+    border-radius: 999px;
+    transition: width 0.3s ease;
+  }
+
+  .validity-hint {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+}
+
+.cert-chain-pre {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  max-height: 240px;
+  overflow: auto;
+  font-family: 'JetBrains Mono', Consolas, ui-monospace, Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--code-box-bg);
+  border: 1px solid var(--code-border);
+  border-radius: 6px;
+}
+
+.detail-muted {
+  color: #999;
+  font-size: 12px;
+}
+
+// 私钥区：拉取失败提示与安全告诫
+.key-load-error {
+  color: #d03050;
+  font-size: 12px;
+}
+
+.key-warning {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #d03050;
 }
 </style>

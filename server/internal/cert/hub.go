@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Config is the dns-mng integration settings.
@@ -47,6 +48,7 @@ type Certificate struct {
 	CreatedAt time.Time `json:"created_at"`
 	Renewing  bool      `json:"renewing,omitempty"`
 	LastError string    `json:"last_error,omitempty"`
+	Remark    string    `json:"remark,omitempty"` // admin-managed note (≤200 runes), edited via PUT /certs/:id/remark
 }
 
 // DefaultDirectoryURL is the Let's Encrypt production ACME directory.
@@ -394,7 +396,7 @@ func (h *Hub) FindByDomain(domain string) (*Certificate, bool) {
 	defer h.mu.RUnlock()
 	for _, c := range h.certs {
 		for _, san := range c.Domains {
-			if san == domain || (strings.HasPrefix(san, "*.") && strings.HasSuffix(domain, strings.TrimPrefix(san, "*"))) {
+			if domainCovers(san, domain) {
 				cp := *c
 				return &cp, true
 			}
@@ -414,6 +416,30 @@ func (h *Hub) Delete(id string) error {
 	_ = os.Remove(h.certFile(id))
 	_ = os.Remove(h.keyFile(id))
 	return h.saveCertsLocked()
+}
+
+// maxRemarkRunes caps the admin-managed certificate note.
+const maxRemarkRunes = 200
+
+// UpdateRemark edits the admin-managed note of one certificate. The remark is
+// metadata only — it never affects issuance, renewal or serving.
+func (h *Hub) UpdateRemark(id, remark string) (*Certificate, error) {
+	remark = strings.TrimSpace(remark)
+	if utf8.RuneCountInString(remark) > maxRemarkRunes {
+		return nil, fmt.Errorf("备注最长 %d 字", maxRemarkRunes)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c, ok := h.certs[id]
+	if !ok {
+		return nil, fmt.Errorf("certificate %s not found", id)
+	}
+	c.Remark = remark
+	if err := h.saveCertsLocked(); err != nil {
+		return nil, err
+	}
+	cp := *c
+	return &cp, nil
 }
 
 func (h *Hub) storeResult(id string, accountID string, domains []string, certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, autoRenew bool) error {

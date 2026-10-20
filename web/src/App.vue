@@ -74,8 +74,11 @@ const themeOverrides = computed<GlobalThemeOverrides>(() => {
     },
     DataTable: {
       borderColor: isDark ? 'rgba(255, 255, 255, 0.08)' : '#e2e8f0',
-      tdColorHover: isDark ? 'rgba(255, 255, 255, 0.04)' : '#f8fafc',
+      tdColorHover: isDark ? '#18223a' : '#f8fafc',
+      tdColor: isDark ? '#131b2e' : '#ffffff',
+      tdColorModal: isDark ? '#1a233a' : '#ffffff',
       thColor: isDark ? '#18223a' : '#f8fafc',
+      thColorHover: isDark ? '#18223a' : '#f8fafc',
       thTextColor: isDark ? '#9ca3af' : '#475569',
       thFontWeight: '600',
     },

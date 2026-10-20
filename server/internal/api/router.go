@@ -252,7 +252,27 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// sensitive, so mutations (config, issue, import, renew, delete) stay admin-only
 	// and audited; reads are open to every authenticated role.
 	if certHub != nil {
-		cert.NewHandlers(certHub).Register(
+		cert.NewHandlers(certHub,
+			// Panel usage mirrors panelsec's binding: an explicit cert id, plus
+			// the SNI fallback against the panel domain when unbound.
+			func() (string, string) {
+				p := settingsStore.PanelSecurity()
+				return p.SSLCertID, p.PanelDomain
+			},
+			// App reverse-proxy bindings pick certs per domain via
+			// hub.FindByDomain; expose every app with a bound domain so the
+			// detail endpoint can reverse that lookup.
+			func() []cert.AppDomainRef {
+				apps := appStore.ListApps()
+				out := make([]cert.AppDomainRef, 0, len(apps))
+				for _, a := range apps {
+					if a.Domain != "" {
+						out = append(out, cert.AppDomainRef{ID: a.ID, Name: a.Name, Domain: a.Domain})
+					}
+				}
+				return out
+			},
+		).Register(
 			authed.Group(""),
 			adminOnly.Group("", h.auditMutation()),
 		)
@@ -2017,6 +2037,9 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodDelete, "/api/v1/certs/manual/:id", "cert_manual_dns_cancel", "cert", "id", audit.RiskHigh, "取消手动 DNS-01 签发订单"},
 		{http.MethodPost, "/api/v1/certs/import", "cert_import", "cert", "", audit.RiskHigh, "导入已有证书"},
 		{http.MethodPost, "/api/v1/certs/:id/renew", "cert_renew", "cert", "id", audit.RiskHigh, "续期证书"},
+		// Private-key reveal in the cert detail dialog: same convention as the
+		// AI API key reveal — adminOnly + high risk, one audit row per view.
+		{http.MethodPost, "/api/v1/certs/:id/key", "cert_key_reveal", "cert", "id", audit.RiskHigh, "查看证书私钥明文"},
 		{http.MethodDelete, "/api/v1/certs/:id", "cert_delete", "cert", "id", audit.RiskHigh, "删除证书"},
 		// File management on hosts: removal is destructive.
 		{http.MethodPost, "/api/v1/hosts/:id/files/mkdir", "file_mkdir", "host", "id", "", "新建目录"},

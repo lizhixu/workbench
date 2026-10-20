@@ -216,9 +216,9 @@ func publicKeyDescription(algo x509.PublicKeyAlgorithm, key any) string {
 	}
 }
 
-// domainCovers reports whether the SAN entry san (exact or wildcard) matches
-// the normalized domain. Shared by FindByDomain and the used-by lookup so
-// both always apply the same matching rule.
-func domainCovers(san, domain string) bool {
+// DomainCovers reports whether the SAN entry san (exact or wildcard) matches
+// the normalized domain. Shared by FindByDomain, the used-by lookup and the
+// apps-side renewal re-push so every surface applies the same matching rule.
+func DomainCovers(san, domain string) bool {
 	return san == domain || (strings.HasPrefix(san, "*.") && strings.HasSuffix(domain, strings.TrimPrefix(san, "*")))
 }

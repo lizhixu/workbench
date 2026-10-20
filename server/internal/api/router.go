@@ -243,7 +243,16 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		if certHub != nil {
 			ph := apps.NewProxyHandler(reg, appStore, certHub)
 			ph.SetNetworkStore(networkStore)
+			ph.SetLogger(log)
 			ph.Register(appWrite)
+			// Renewal re-distribution: every certificate that lands in the
+			// hub (renewal, fresh issuance covering already-bound domains,
+			// manual DNS-01 confirmation, import) is re-pushed to the nginx
+			// hosts serving the covered app domains, so bound sites never
+			// serve material that went stale at expiry. Runs on its own
+			// goroutine inside the hub (notifyRenewed); system action, so
+			// logged but not operation-audited (§7).
+			certHub.SetOnRenewed(ph.RepushAppCerts)
 		}
 	}
 

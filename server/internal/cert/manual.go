@@ -43,7 +43,7 @@ const (
 	// pre-check failure (nothing sent to the CA) is retryable, while a CA
 	// terminal verdict (authorization invalid/expired) kills the order and
 	// the administrator must start a new one.
-	ManualOrderError       = "error"
+	ManualOrderError = "error"
 )
 
 // manualOrderTTL bounds how long a pending order is kept. ACME
@@ -70,9 +70,9 @@ type PendingOrder struct {
 	// invalid/expired), so the administrator has to start a new order.
 	// A non-terminal error (local pre-check, network blip, timeout) is safe
 	// to confirm again — the TXT records are unchanged.
-	Terminal    bool           `json:"terminal,omitempty"`
-	CreatedAt   time.Time      `json:"created_at"`
-	ExpiresAt   time.Time      `json:"expires_at"`
+	Terminal  bool      `json:"terminal,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // persistedPendingOrder is the on-disk form of a PendingOrder. The ACME
@@ -100,7 +100,7 @@ func (p *PendingOrder) toPersisted() *persistedPendingOrder {
 		ID: p.ID, AccountID: p.AccountID, Identifiers: p.Identifiers,
 		Records: p.Records, OrderURL: p.OrderURL, FinalizeURL: p.FinalizeURL,
 		Authz: p.Authz, Status: p.Status, CertID: p.CertID, Error: p.Error,
-		Terminal: p.Terminal,
+		Terminal:  p.Terminal,
 		CreatedAt: p.CreatedAt, ExpiresAt: p.ExpiresAt,
 	}
 }
@@ -110,7 +110,7 @@ func (pp *persistedPendingOrder) toPending() *PendingOrder {
 		ID: pp.ID, AccountID: pp.AccountID, Identifiers: pp.Identifiers,
 		Records: pp.Records, OrderURL: pp.OrderURL, FinalizeURL: pp.FinalizeURL,
 		Authz: pp.Authz, Status: pp.Status, CertID: pp.CertID, Error: pp.Error,
-		Terminal: pp.Terminal,
+		Terminal:  pp.Terminal,
 		CreatedAt: pp.CreatedAt, ExpiresAt: pp.ExpiresAt,
 	}
 }
@@ -527,6 +527,7 @@ func (h *Hub) ConfirmManualDNSOrder(id string) (*Certificate, error) {
 		// order is consumed, so a fresh order is required.
 		return fail("保存证书失败", err, true)
 	}
+	h.notifyRenewed(certID)
 
 	h.mu.Lock()
 	if cur, lerr := h.loadPending(id); lerr == nil {

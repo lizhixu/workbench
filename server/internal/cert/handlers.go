@@ -37,6 +37,7 @@ func (h *Handlers) Register(readRG, writeRG *gin.RouterGroup) {
 	readRG.GET("/certs/config", h.getConfig)
 	readRG.GET("/certs/presets", h.listPresets)
 	readRG.GET("/certs/accounts", h.listAccounts)
+	readRG.GET("/certs/cover", h.getCertCover)
 	readRG.GET("/certs", h.listCerts)
 	readRG.GET("/certs/:id", h.getCert)
 	readRG.GET("/certs/:id/detail", h.getCertDetail)
@@ -167,6 +168,57 @@ func (h *Handlers) listCerts(c *gin.Context) {
 		list = []*CertView{}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": list})
+}
+
+// getCertCover reports whether any stored certificate covers the given
+// domain, so the app create page can pre-check coverage while the domain is
+// being typed and the issuance flow can poll for completion. Matching goes
+// through hub.FindByDomain — the exact rule the reverse-proxy binding
+// applies — so the pre-check and the eventual bind can never disagree.
+// Read-only and login-accessible like the detail endpoint (exempt from
+// operation audit per §7, same example as detail/download); PEM material
+// never crosses this boundary (json:"-" on Certificate).
+func (h *Handlers) getCertCover(c *gin.Context) {
+	domain := strings.TrimSpace(strings.ToLower(c.Query("domain")))
+	if !validCoverDomain(domain) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "域名格式非法（须为主机名，通配符域名请先到证书中心签发）"})
+		return
+	}
+	crt, ok := h.hub.FindByDomain(domain)
+	if !ok {
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{"covered": false}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{
+		"covered": true,
+		"cert":    &CertView{Certificate: crt, Source: h.hub.sourceOf(crt), AccountName: h.hub.accountNameOf(crt)},
+	}})
+}
+
+// validCoverDomain mirrors the reverse-proxy domain rule (apps' strict
+// RFC-1035-ish hostname shape) so the create-page probe only green-lights
+// domains the proxy binding itself would accept. Wildcards are rejected here
+// as there: app-bound domains are plain hostnames, wildcard material must
+// be issued in the cert center first and selected explicitly.
+func validCoverDomain(d string) bool {
+	if len(d) == 0 || len(d) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(d, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (h *Handlers) getCert(c *gin.Context) {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NAlert, NAvatar, NButton, NCard, NForm, NFormItem, NGi, NGrid, NIcon, NInput, NInputNumber,
@@ -12,7 +12,11 @@ import {
   createApp, listAppCatalog, inspectImage, inspectRepo,
   type AppEntity, type AppTemplate, type ImageMetadata, type PortMapping, type RepoMetadata,
 } from '../../api/apps'
-import { bindProxy } from '../../api/certs'
+import {
+  bindProxy, getCertConfig, getCertCover, issueCert, listACMEAccounts, listCerts,
+  type ACMEAccount, type CertCover, type Certificate, type ChallengeMode, type ProxyBindRequest,
+} from '../../api/certs'
+import { fmtDate } from '../../utils/time'
 import { listHosts } from '../../api/hosts'
 import { getNetworkConfig, listNetworkNodes, probeMeshIP, type NetworkConfig } from '../../api/network'
 import { bothMeshed } from '../../utils/mesh'
@@ -156,6 +160,130 @@ const form = reactive({
   domain: '',
   proxy_mode: 'local' as 'local' | 'gateway',
   gateway_host_id: null as string | null,
+})
+
+// ---- 证书覆盖探测与签发配置（域名非空时生效） ----
+// 域名输入防抖 ~500ms 实时预检（只读覆盖端点，与服务端反代绑定同一套
+// FindByDomain 匹配规则）：已覆盖 → 绿标 + 可选「指定证书」；未覆盖 →
+// 签发配置区（ACME 账户 + challenge）。提交时按预检结果编排：已覆盖
+// 直接绑定，未覆盖先签发再绑定（见 bindDomainWithCert）。
+const certCover = ref<CertCover | null>(null)
+const certCoverLoading = ref(false)
+const certCoverError = ref('')
+// 指定证书：'' = 按域名自动匹配（提交时由服务端同源规则解析）
+const certId = ref('')
+const certOptions = ref<{ label: string; value: string }[]>([
+  { label: '按域名自动匹配', value: '' },
+])
+const acmeAccounts = ref<ACMEAccount[]>([])
+const issueAccountId = ref<string | null>(null)
+// '' 自动推荐 | 'http-01' | 'dns-01'；手动 DNS-01 两阶段不在创建页（深链证书中心）
+const issueChallenge = ref<ChallengeMode>('')
+// dns-mng 集成就绪（DNS-01 自动验证依赖；判定与证书中心同款）
+const dnsConfigReady = ref(true)
+// 提交按钮文案阶段化：签发证书中… / 绑定反代中…
+const creatingLabel = ref('')
+
+let coverSeq = 0
+let coverTimer: ReturnType<typeof setTimeout> | null = null
+let viewUnmounted = false
+
+const accountOptions = computed(() =>
+  acmeAccounts.value.map((a) => ({
+    label: a.is_default ? `${a.name}（默认）` : a.name,
+    value: a.id,
+  })),
+)
+
+// 证书支撑数据：ACME 账户（预填默认账户）、dns-mng 就绪判定、可选证书
+// 清单（用于「指定证书」）。逐项容错：任一拉取失败只影响对应交互，
+// 手动填表与创建主流程不受影响（与 AI 未配置同款降级原则）。
+async function loadCertSupport() {
+  const [accounts, cfg, certs] = await Promise.all([
+    listACMEAccounts().catch(() => [] as ACMEAccount[]),
+    getCertConfig().catch(() => null),
+    listCerts().catch(() => [] as Certificate[]),
+  ])
+  acmeAccounts.value = accounts
+  dnsConfigReady.value = !!cfg && cfg.enabled && cfg.base_url !== ''
+  certOptions.value = [
+    { label: '按域名自动匹配', value: '' },
+    ...certs.map((c) => ({
+      label: `${c.domains.join(' / ') || c.id}（至 ${fmtDate(c.not_after)}）`,
+      value: c.id,
+    })),
+  ]
+  const def = accounts.find((a) => a.is_default) || accounts[0]
+  issueAccountId.value = def ? def.id : null
+}
+
+async function probeCover() {
+  const d = form.domain.trim().toLowerCase()
+  const seq = ++coverSeq
+  if (!d) {
+    certCover.value = null
+    certCoverLoading.value = false
+    certCoverError.value = ''
+    return
+  }
+  certCoverLoading.value = true
+  try {
+    const cover = await getCertCover(d)
+    if (seq !== coverSeq) return
+    certCover.value = cover
+    certCoverError.value = ''
+  } catch {
+    if (seq !== coverSeq) return
+    // 探测失败静默降级：不阻断创建，提交时还会实测一次
+    certCover.value = null
+    certCoverError.value = '覆盖探测失败（不影响创建，提交时将再次确认）'
+  } finally {
+    if (seq === coverSeq) certCoverLoading.value = false
+  }
+}
+
+// 域名变更：防抖 500ms 探测覆盖；「指定证书」按旧域名选择不再适用，重置
+watch(() => form.domain, () => {
+  if (coverTimer) clearTimeout(coverTimer)
+  certId.value = ''
+  if (!form.domain.trim()) {
+    coverSeq++
+    certCover.value = null
+    certCoverError.value = ''
+    certCoverLoading.value = false
+    return
+  }
+  certCoverLoading.value = true
+  coverTimer = setTimeout(probeCover, 500)
+})
+
+// 签发后轮询覆盖端点直到新证书落地：5s × 24 次 ≈ 2 分钟（证书中心签发
+// 弹窗同惯例）。有界 await 轮询，视图销毁即提前终止，无遗留 interval。
+async function pollCover(domain: string): Promise<Certificate | null> {
+  for (let i = 0; i < 24; i++) {
+    await new Promise((r) => setTimeout(r, 5000))
+    if (viewUnmounted) return null
+    try {
+      const cover = await getCertCover(domain)
+      if (cover.covered && cover.cert) return cover.cert
+    } catch {
+      // 网络抖动：继续下一轮，轮询次数上限兜底
+    }
+  }
+  return null
+}
+
+onUnmounted(() => {
+  viewUnmounted = true
+  if (coverTimer) clearTimeout(coverTimer)
+})
+
+// 拓扑预览的 Nginx/SSL 节点证书状态标签：探测中/失败/未填域名时不展示
+const certStatus = computed<'' | 'covered' | 'issue' | 'selected'>(() => {
+  if (!form.domain.trim() || certCoverLoading.value || certCoverError.value) return ''
+  if (certId.value) return 'selected'
+  if (!certCover.value) return ''
+  return certCover.value.covered ? 'covered' : 'issue'
 })
 
 // 选模板后预填端口与卷，参数控件读模板 EnvFields
@@ -678,6 +806,8 @@ async function loadData() {
   } finally {
     networkConfigLoaded.value = true
   }
+  // 证书支撑数据（账户/dns-mng 就绪/可选证书）独立加载，失败不影响主流程
+  void loadCertSupport()
   // Docker 面板「部署新应用」跳转时带 host_id，直接预选目标主机
   const presetHost = typeof route.query.host_id === 'string' ? route.query.host_id : ''
   if (presetHost && hosts.value.some((h) => h.id === presetHost)) {
@@ -827,6 +957,53 @@ function validate(): string | null {
   return null
 }
 
+// 创建后的域名绑定编排（含证书签发）。任何失败都不回滚应用创建、不阻断
+// 跳转（既有降级语义）：
+// - 显式指定了证书 → 直接带 cert_id 绑定；
+// - 自动匹配 → 提交前实测覆盖端点（域名可能在输入后又被改动，预检可能过期）：
+//   已覆盖 → 绑定由服务端 FindByDomain 按同源规则解析，两处永不分叉；
+//   未覆盖且有账户 → issueCert（202 异步受理）→ 轮询覆盖端点拿新证书 id → 绑定；
+//   签发超时/失败 → 提示后跳过绑定（到详情页重试；避免后端兜底路径同步
+//   签发长阻塞请求）；
+//   未覆盖且无账户 → 直接绑定，由后端给出精确的 409 提示（先配置 ACME 账户）。
+async function bindDomainWithCert(appId: string, domain: string) {
+  const bind: ProxyBindRequest = {
+    domain,
+    mode: form.proxy_mode,
+    gateway_host_id: form.proxy_mode === 'gateway' ? form.gateway_host_id || undefined : undefined,
+    cert_id: certId.value || undefined,
+  }
+  if (!bind.cert_id) {
+    const cover = await getCertCover(domain).catch(() => null)
+    if (!cover?.covered && issueAccountId.value) {
+      creatingLabel.value = '签发证书中…'
+      let issuedId = ''
+      try {
+        await issueCert([domain], issueAccountId.value, issueChallenge.value || undefined)
+        const cert = await pollCover(domain)
+        if (cert) issuedId = cert.id
+      } catch {
+        // 受理失败：落到未完成提示并跳过绑定
+      }
+      creatingLabel.value = ''
+      if (!issuedId) {
+        message.warning('应用已创建，证书签发未完成：可到证书中心查看进度，稍后在应用详情-域名与反代中重试绑定')
+        return
+      }
+      bind.cert_id = issuedId
+    }
+  }
+  creatingLabel.value = '绑定反代中…'
+  try {
+    await bindProxy(appId, bind)
+    message.success(`域名 ${domain} 已绑定并下发反代`)
+  } catch (e: any) {
+    message.warning(`应用已创建，但域名绑定失败：${e.message || e}（可稍后在应用详情-域名与反代中重试）`)
+  } finally {
+    creatingLabel.value = ''
+  }
+}
+
 async function submit() {
   const err = validate()
   if (err) {
@@ -867,18 +1044,9 @@ async function submit() {
       container_name: form.container_name.trim() || undefined,
     })) as AppEntity
 
-    // 可选的创建时域名绑定：证书不存在时后端用默认 ACME 账户自动签发
+    // 可选的创建时域名绑定：证书编排（预签发/指定证书/自动匹配）见 bindDomainWithCert
     if (form.domain.trim()) {
-      try {
-        await bindProxy(app.id, {
-          domain: form.domain.trim(),
-          mode: form.proxy_mode,
-          gateway_host_id: form.proxy_mode === 'gateway' ? form.gateway_host_id || undefined : undefined,
-        })
-        message.success(`域名 ${form.domain.trim()} 已绑定并下发反代`)
-      } catch (e: any) {
-        message.warning(`应用已创建，但域名绑定失败：${e.message || e}（可稍后在应用详情-域名与反代中重试）`)
-      }
+      await bindDomainWithCert(app.id, form.domain.trim())
     }
 
     message.success(`应用「${app.name}」创建成功`)
@@ -1321,6 +1489,7 @@ onMounted(loadData)
             v-if="form.host_id"
             :domain="form.domain.trim()"
             :proxy-mode="form.proxy_mode"
+            :cert-status="certStatus"
             :app-name="form.name.trim()"
             :host-name="selectedHost?.hostname || ''"
             :host-online="selectedHost?.status === 'online'"
@@ -1405,6 +1574,87 @@ onMounted(loadData)
                     切换到网关模式
                   </NButton>
                 </NAlert>
+
+                <!-- 证书（HTTPS）：覆盖探测 → 已覆盖可选指定证书；未覆盖展示签发配置 -->
+                <span v-if="certCoverLoading" class="hint">正在探测覆盖该域名的证书…</span>
+                <span v-else-if="certCoverError" class="hint">{{ certCoverError }}</span>
+                <template v-else-if="certCover?.covered">
+                  <NSpace align="center" size="small">
+                    <NTag type="success" size="small">已有证书覆盖</NTag>
+                    <span v-if="certCover.cert" class="hint">
+                      {{ certCover.cert.domains.join(' / ') }} · 有效期至 {{ fmtDate(certCover.cert.not_after) }}
+                    </span>
+                  </NSpace>
+                  <NSelect
+                    v-model:value="certId"
+                    :options="certOptions"
+                    size="small"
+                    placeholder="按域名自动匹配"
+                  />
+                </template>
+                <template v-else-if="certCover">
+                  <NAlert type="info" size="small" :show-icon="true">
+                    <template #header>暂无覆盖该域名的证书</template>
+                    提交时将先签发证书再绑定反代。自动推荐：普通域名 HTTP-01 优先（需 80 端口可达），
+                    不可用时回退 DNS-01。
+                  </NAlert>
+                  <NAlert
+                    v-if="!acmeAccounts.length"
+                    type="warning"
+                    size="small"
+                    :show-icon="true"
+                  >
+                    <template #header>尚未配置 ACME 账户</template>
+                    请先到证书中心创建 ACME 账户，再回到本页提交（或创建后稍后在应用详情-域名与反代中重试绑定）。
+                    <NButton
+                      size="tiny"
+                      secondary
+                      type="primary"
+                      style="margin-left: 8px"
+                      @click="router.push('/certs')"
+                    >
+                      前往证书中心
+                    </NButton>
+                  </NAlert>
+                  <template v-else>
+                    <NSelect
+                      v-model:value="issueAccountId"
+                      :options="accountOptions"
+                      size="small"
+                      placeholder="选择 ACME 账户"
+                    />
+                    <NRadioGroup v-model:value="issueChallenge" size="small">
+                      <NSpace>
+                        <NRadio value="">自动推荐</NRadio>
+                        <NRadio value="http-01">HTTP-01</NRadio>
+                        <NRadio value="dns-01">DNS-01</NRadio>
+                      </NSpace>
+                    </NRadioGroup>
+                    <NAlert
+                      v-if="issueChallenge === 'dns-01' && !dnsConfigReady"
+                      type="warning"
+                      size="small"
+                      :show-icon="true"
+                    >
+                      <template #header>DNS-01 需要 dns-mng 集成</template>
+                      自动 DNS 验证依赖证书中心的 dns-mng 集成（自动添加/清理 TXT 解析），尚未配置。
+                      <NButton
+                        size="tiny"
+                        secondary
+                        type="primary"
+                        style="margin-left: 8px"
+                        @click="router.push('/certs')"
+                      >
+                        前往配置
+                      </NButton>
+                    </NAlert>
+                  </template>
+                  <span class="hint">
+                    通配符域名（如 *.example.com）不支持在线自动签发：请先到
+                    <a @click.prevent="router.push('/certs')">证书中心</a>
+                    手动 DNS-01 签发后，回到本页在「指定证书」中选择。
+                  </span>
+                </template>
               </template>
             </NSpace>
           </NFormItem>
@@ -1424,7 +1674,7 @@ onMounted(loadData)
         <NSpace justify="end">
           <NButton @click="router.push('/apps')">取消</NButton>
           <NButton type="primary" :loading="creating" @click="submit">
-            创建应用
+            {{ creatingLabel || '创建应用' }}
           </NButton>
         </NSpace>
       </NSpace>

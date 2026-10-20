@@ -29,6 +29,9 @@ const props = defineProps<{
   gatewayPublicIp: string
   gatewayMeshIp: string
   ports: TopologyPort[]
+  // 证书状态（HTTPS）：'covered' 已有证书覆盖 | 'issue' 提交时在线签发 |
+  // 'selected' 显式指定证书 | '' 域名未填/探测中/探测失败（不展示）
+  certStatus?: '' | 'covered' | 'issue' | 'selected'
   // composeMode 下端口来自 compose YAML 声明，绑定范围不可逐条选择，
   // 端口条带如实标注「compose 声明」而非公网/组网绑定范围。
   composeMode?: boolean
@@ -47,6 +50,17 @@ const meshLink = computed(() => bothMeshed(props.hostMeshIp, props.gatewayMeshIp
 
 // 组网转发入口到应用主机的链路：双方都在组网内走 100.x，否则直连。
 const meshForwardLink = computed(() => bothMeshed(props.hostMeshIp, props.meshForwardHostMeshIp))
+
+// Nginx/SSL 节点的证书状态标签：创建页覆盖探测结果的实时映射。
+const certTag = computed(() => {
+  if (!props.domain || !props.certStatus) return null
+  switch (props.certStatus) {
+    case 'covered': return { label: '已有证书', type: 'success' as const }
+    case 'issue': return { label: '提交时签发', type: 'warning' as const }
+    case 'selected': return { label: '指定证书', type: 'info' as const }
+  }
+  return null
+})
 
 function portBindLabel(p: TopologyPort): string {
   if (props.composeMode) {
@@ -90,6 +104,7 @@ function portBindLabel(p: TopologyPort): string {
               <NTag v-if="gatewayMeshIp" size="tiny" type="success" :bordered="false">组网 {{ gatewayMeshIp }}</NTag>
               <NTag v-else size="tiny" type="info" :bordered="false">未组网</NTag>
               <NTag v-if="gatewayPublicIp" size="tiny" type="info" :bordered="false">公网 {{ gatewayPublicIp }}</NTag>
+              <NTag v-if="certTag" size="tiny" :type="certTag.type" :bordered="false">{{ certTag.label }}</NTag>
             </div>
           </div>
           <div class="topology-arrow">{{ meshLink ? 'Tailscale 组网' : '直连' }}</div>
@@ -119,6 +134,7 @@ function portBindLabel(p: TopologyPort): string {
               </NTag>
               <NTag v-if="hostPublicIp" size="tiny" type="info" :bordered="false">公网 {{ hostPublicIp }}</NTag>
               <NTag v-else size="tiny" type="warning" :bordered="false">无公网 IP</NTag>
+              <NTag v-if="certTag" size="tiny" :type="certTag.type" :bordered="false">{{ certTag.label }}</NTag>
             </div>
           </div>
         </template>

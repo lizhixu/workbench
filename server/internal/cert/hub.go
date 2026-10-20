@@ -38,7 +38,7 @@ type Config struct {
 type Certificate struct {
 	ID        string    `json:"id"`
 	AccountID string    `json:"account_id,omitempty"` // ID of the ACMEAccount that issued this cert
-	Domains   []string  `json:"domains"`             // SANs, e.g. ["*.example.com", "example.com"]
+	Domains   []string  `json:"domains"`              // SANs, e.g. ["*.example.com", "example.com"]
 	CertPEM   string    `json:"-"`
 	KeyPEM    string    `json:"-"`
 	NotBefore time.Time `json:"not_before"`
@@ -67,6 +67,12 @@ type Hub struct {
 	// built-in default (30 days). Injected by the server entrypoint so the
 	// cert package stays decoupled from the settings store.
 	renewBeforeDays func() int
+	// onRenewed, when set, is invoked after a certificate lands in the store
+	// — new ACME issuance, renewal, manual DNS-01 confirmation and import
+	// all funnel there. Injected by the wiring layer (router) so a re-issued
+	// certificate is re-distributed to the nginx hosts serving bound app
+	// domains; see SetOnRenewed for the execution contract.
+	onRenewed func(*Certificate)
 }
 
 // SetRenewBeforeDaysProvider injects the auto-renew lead-time source.
@@ -75,6 +81,44 @@ func (h *Hub) SetRenewBeforeDaysProvider(fn func() int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.renewBeforeDays = fn
+}
+
+// SetOnRenewed injects the post-store callback fired whenever a certificate
+// is stored (renewal, fresh issuance covering already-bound domains, manual
+// DNS-01 confirmation, import). The callback runs on its own goroutine with
+// a PEM-carrying copy; it must never be required for correctness of the
+// issuance flow itself — panics are recovered and logged, a slow callback
+// cannot block Issue/Renew/Import (which may run inside synchronous HTTP
+// handlers such as the proxy bind's auto-issue fallback). A nil callback
+// disables the hook.
+func (h *Hub) SetOnRenewed(fn func(*Certificate)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onRenewed = fn
+}
+
+// notifyRenewed hands the freshly stored certificate (PEMs included) to the
+// onRenewed hook. Best-effort by design: no callback, a missing certificate
+// or a panicking hook are all tolerated silently.
+func (h *Hub) notifyRenewed(id string) {
+	h.mu.RLock()
+	fn := h.onRenewed
+	h.mu.RUnlock()
+	if fn == nil {
+		return
+	}
+	c, ok := h.Get(id)
+	if !ok {
+		return
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				h.log.Warn("证书回推回调 panic，已忽略", "cert", id, "panic", r)
+			}
+		}()
+		fn(c)
+	}()
 }
 
 func (h *Hub) renewBeforeDaysOrDefault() int {
@@ -120,9 +164,9 @@ func NewHub(dataDir string, log *slog.Logger) (*Hub, error) {
 	return h, nil
 }
 
-func (h *Hub) configPath() string   { return filepath.Join(h.dir, "hub.json") }
-func (h *Hub) accountsPath() string { return filepath.Join(h.dir, "accounts.json") }
-func (h *Hub) certIndexPath() string { return filepath.Join(h.dir, "index.json") }
+func (h *Hub) configPath() string        { return filepath.Join(h.dir, "hub.json") }
+func (h *Hub) accountsPath() string      { return filepath.Join(h.dir, "accounts.json") }
+func (h *Hub) certIndexPath() string     { return filepath.Join(h.dir, "index.json") }
 func (h *Hub) certFile(id string) string { return filepath.Join(h.dir, id+".crt") }
 func (h *Hub) keyFile(id string) string  { return filepath.Join(h.dir, id+".key") }
 
@@ -396,7 +440,7 @@ func (h *Hub) FindByDomain(domain string) (*Certificate, bool) {
 	defer h.mu.RUnlock()
 	for _, c := range h.certs {
 		for _, san := range c.Domains {
-			if domainCovers(san, domain) {
+			if DomainCovers(san, domain) {
 				cp := *c
 				return &cp, true
 			}
@@ -576,6 +620,7 @@ func (h *Hub) IssueWithChallenge(identifiers []string, accountID string, ch Chal
 	if err := h.storeResult(id, acc.ID, clean, certPEM, keyPEM, notBefore, notAfter, issuer, true); err != nil {
 		return nil, err
 	}
+	h.notifyRenewed(id)
 	c, _ := h.Get(id)
 	return c, nil
 }
@@ -621,6 +666,7 @@ func (h *Hub) Import(certPEM, keyPEM []byte) (*Certificate, error) {
 	if err := h.storeResult(id, "", domains, certPEM, keyPEM, leaf.NotBefore, leaf.NotAfter, issuer, false); err != nil {
 		return nil, err
 	}
+	h.notifyRenewed(id)
 	c, _ := h.Get(id)
 	return c, nil
 }
@@ -667,6 +713,7 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 		h.markError(id, err.Error())
 		return nil, err
 	}
+	h.notifyRenewed(id)
 	updated, _ := h.Get(id)
 	return updated, nil
 }

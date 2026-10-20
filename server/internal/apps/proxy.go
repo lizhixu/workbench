@@ -3,9 +3,12 @@ package apps
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -38,11 +41,25 @@ type ProxyHandler struct {
 	store        *Store
 	hub          *cert.Hub
 	networkStore *network.Store
+	log          *slog.Logger
+	// pushMu serializes cert/conf file pushes + nginx reloads across the
+	// bind flow and the renewal re-push. The agent-side write session is
+	// tracked per op id, so two concurrent writes to the same path could
+	// interleave chunks; every push sequence takes this lock (binds are
+	// rare user actions, re-pushes rarer still — contention is negligible).
+	pushMu sync.Mutex
 }
 
 // NewProxyHandler creates the reverse-proxy binding handlers.
 func NewProxyHandler(reg *rpc.Registry, store *Store, hub *cert.Hub) *ProxyHandler {
-	return &ProxyHandler{reg: reg, store: store, hub: hub}
+	return &ProxyHandler{reg: reg, store: store, hub: hub, log: slog.Default()}
+}
+
+// SetLogger overrides the structured logger (defaults to slog.Default()).
+func (h *ProxyHandler) SetLogger(log *slog.Logger) {
+	if log != nil {
+		h.log = log
+	}
 }
 
 // SetNetworkStore injects the overlay network store to resolve Tailscale mesh IPs.
@@ -178,40 +195,29 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		}
 	}
 
-	// 1. Push cert + key to the gateway host.
-	certBase := fmt.Sprintf("%s/%s", proxyCertDir, domain)
-	if err := writeFileOnAgent(gatewayHub, certBase+".crt", []byte(crt.CertPEM)); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "推送证书失败: " + err.Error()})
-		return
-	}
-	if err := writeFileOnAgent(gatewayHub, certBase+".key", []byte(crt.KeyPEM)); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "推送私钥失败: " + err.Error()})
-		return
-	}
-
-	// 2. Render + push the vhost config.
-	conf := renderVhost(domain, upstream, req.WebSocket)
-	confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
-	if err := writeFileOnAgent(gatewayHub, confPath, []byte(conf)); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "推送反代配置失败: " + err.Error()})
-		return
-	}
-
-	// 3. Validate and hot-reload nginx in the watchman-app-nginx container.
-	reloadScript := fmt.Sprintf(
-		`docker exec %[1]s nginx -t 2>&1 && docker exec %[1]s nginx -s reload 2>&1`,
-		nginxContainer)
-	res, err := execOnAgent(gatewayHub, "proxy-reload-"+randomToken(4), reloadScript, 30)
-	if err != nil {
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "nginx reload 超时: " + err.Error()})
-		return
-	}
-	if res.GetExitCode() != 0 {
-		out := string(res.GetStdout())
-		if out == "" {
-			out = string(res.GetStderr())
+	// 1. Push cert + key to the nginx host, 2. push the vhost config,
+	// 3. validate + hot-reload nginx. Serialized against the renewal
+	// re-push (pushMu) so two write sessions never interleave chunks on
+	// the same file path.
+	h.pushMu.Lock()
+	pushErr := func() error {
+		if err := h.pushCertFiles(gatewayHub, domain, crt); err != nil {
+			return err
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "nginx 配置校验失败: " + strings.TrimSpace(out)})
+		conf := renderVhost(domain, upstream, req.WebSocket)
+		confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
+		if err := writeFileOnAgent(gatewayHub, confPath, []byte(conf)); err != nil {
+			return fmt.Errorf("推送反代配置失败: %w", err)
+		}
+		return h.reloadNginx(gatewayHub)
+	}()
+	h.pushMu.Unlock()
+	if pushErr != nil {
+		if errors.Is(pushErr, errReloadTimeout) {
+			c.JSON(http.StatusGatewayTimeout, gin.H{"error": pushErr.Error()})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": pushErr.Error()})
+		}
 		return
 	}
 
@@ -263,9 +269,129 @@ func (h *ProxyHandler) unbindProxy(c *gin.Context) {
 		a.Domain = ""
 		a.ProxyMode = ""
 		a.ProxyUpstream = ""
+		// The gateway host must go too, or a later rebind would leave the
+		// stale gateway id behind (and the app detail would keep showing a
+		// gateway binding that no longer exists).
+		a.ProxyGatewayHostID = ""
 		return nil
 	})
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// pushCertFiles writes the certificate chain and key for one domain onto the
+// nginx host. Shared by the bind flow and the renewal re-push.
+func (h *ProxyHandler) pushCertFiles(agentHub *rpc.Hub, domain string, crt *cert.Certificate) error {
+	certBase := fmt.Sprintf("%s/%s", proxyCertDir, domain)
+	if err := writeFileOnAgent(agentHub, certBase+".crt", []byte(crt.CertPEM)); err != nil {
+		return fmt.Errorf("推送证书失败: %w", err)
+	}
+	if err := writeFileOnAgent(agentHub, certBase+".key", []byte(crt.KeyPEM)); err != nil {
+		return fmt.Errorf("推送私钥失败: %w", err)
+	}
+	return nil
+}
+
+// errReloadTimeout marks an nginx reload that never answered within the
+// deadline, so bind can answer 504 for it while config validation failures
+// stay a plain 500.
+var errReloadTimeout = errors.New("nginx reload 超时")
+
+// reloadNginx validates the pushed config (nginx -t) and hot-reloads nginx in
+// the proxy container. Shared by the bind flow and the renewal re-push.
+func (h *ProxyHandler) reloadNginx(agentHub *rpc.Hub) error {
+	script := fmt.Sprintf(
+		`docker exec %[1]s nginx -t 2>&1 && docker exec %[1]s nginx -s reload 2>&1`,
+		nginxContainer)
+	res, err := execOnAgent(agentHub, "proxy-reload-"+randomToken(4), script, 30)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errReloadTimeout, err)
+	}
+	if res.GetExitCode() != 0 {
+		out := string(res.GetStdout())
+		if out == "" {
+			out = string(res.GetStderr())
+		}
+		return fmt.Errorf("nginx 配置校验失败: %s", strings.TrimSpace(out))
+	}
+	return nil
+}
+
+// repushTarget names one app whose bound domain is covered by a freshly
+// stored certificate, plus the host its nginx runs on.
+type repushTarget struct {
+	app        *Application
+	domain     string
+	targetHost string
+}
+
+// appsCoveredByCert selects the apps a freshly stored certificate must be
+// re-distributed to: bound domain non-empty and covered by one of the
+// cert's SANs (exact or wildcard, via cert.DomainCovers — the same rule
+// FindByDomain applies when binding). nginx runs on the app host for local
+// mode and on the gateway host for gateway mode.
+func appsCoveredByCert(crt *cert.Certificate, apps []*Application) []repushTarget {
+	if crt == nil {
+		return nil
+	}
+	var out []repushTarget
+	for _, app := range apps {
+		domain := strings.TrimSpace(strings.ToLower(app.Domain))
+		if domain == "" {
+			continue
+		}
+		covered := false
+		for _, san := range crt.Domains {
+			if cert.DomainCovers(san, domain) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			continue
+		}
+		targetHost := app.HostID
+		if app.ProxyMode == "gateway" && app.ProxyGatewayHostID != "" {
+			targetHost = app.ProxyGatewayHostID
+		}
+		out = append(out, repushTarget{app: app, domain: domain, targetHost: targetHost})
+	}
+	return out
+}
+
+// RepushAppCerts re-distributes a freshly stored certificate to every nginx
+// host serving a bound app domain the certificate covers. Wired as the cert
+// hub's OnRenewed callback (see Hub.SetOnRenewed) so renewals — and any new
+// issuance or import covering bound domains — reach the serving hosts
+// instead of silently going stale at expiry. System-triggered, not a user
+// operation: per-app failures are logged and never block the remaining apps
+// or the renewal flow itself (per §7 it stays out of the operation audit).
+func (h *ProxyHandler) RepushAppCerts(crt *cert.Certificate) {
+	if crt == nil || crt.CertPEM == "" || crt.KeyPEM == "" {
+		return
+	}
+	// Wired through the router with both deps set; the nil guards keep the
+	// hub callback safe in any other wiring (tests, future callers).
+	if h.store == nil || h.reg == nil {
+		return
+	}
+	for _, t := range appsCoveredByCert(crt, h.store.ListApps()) {
+		agentHub := h.reg.Hub(t.targetHost)
+		if agentHub == nil {
+			h.log.Warn("证书回推跳过：nginx 主机 Agent 不在线", "app", t.app.Name, "host_id", t.targetHost)
+			continue
+		}
+		h.pushMu.Lock()
+		err := h.pushCertFiles(agentHub, t.domain, crt)
+		if err == nil {
+			err = h.reloadNginx(agentHub)
+		}
+		h.pushMu.Unlock()
+		if err != nil {
+			h.log.Warn("证书回推失败", "app", t.app.Name, "domain", t.domain, "error", err.Error())
+			continue
+		}
+		h.log.Info("证书回推完成", "app", t.app.Name, "domain", t.domain)
+	}
 }
 
 // defaultUpstream derives the proxy target for the app.

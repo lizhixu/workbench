@@ -102,6 +102,21 @@ export function listCerts() {
   return unwrap<{ data: Certificate[] }>(http.get('/certs')).then((r) => r.data)
 }
 
+// 覆盖探测（只读，登录即可）：该域名是否已有证书覆盖。服务端走
+// hub.FindByDomain 的同源匹配规则（精确 SAN 或通配符），与反代绑定时的
+// 证书解析完全一致——创建页输入域名实时预检、签发流程轮询终态判定都用
+// 它，预检与最终绑定永不出现规则分叉。非法/空域名返回 400。
+export interface CertCover {
+  covered: boolean
+  cert?: Certificate
+}
+
+export function getCertCover(domain: string) {
+  return unwrap<{ data: CertCover }>(
+    http.get('/certs/cover', { params: { domain } }),
+  ).then((r) => r.data)
+}
+
 export function getCertDetail(id: string) {
   return unwrap<{ data: CertDetail }>(http.get(`/certs/${id}/detail`)).then((r) => r.data)
 }

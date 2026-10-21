@@ -1,6 +1,7 @@
 package apps
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"log/slog"
@@ -19,6 +20,18 @@ type gitTokenProvider interface {
 	GetToken() (string, bool)
 }
 
+// activeDeployment tracks an in-flight deployment so an operator can abort it
+// (Engine.CancelDeployment): the cancel func tears down the run's context,
+// nextName lets cleanup remove the half-built replacement container, and hub
+// is the agent channel to send that removal over. All three are only valid
+// while the run is registered in Engine.running.
+type activeDeployment struct {
+	depID    string
+	cancel   context.CancelFunc
+	hub      *rpc.Hub
+	nextName string
+}
+
 // Engine executes build+rollout deployments on managed hosts through the
 // existing agent gRPC channel (ExecRequest / DockerOp), one deployment per
 // application at a time (Dokploy-style serial build queue).
@@ -31,7 +44,7 @@ type Engine struct {
 	log         *slog.Logger
 
 	mu      sync.Mutex
-	running map[string]bool // app_id -> a deployment is executing
+	running map[string]*activeDeployment // app_id -> in-flight deployment
 }
 
 // SetGitProvider injects a token provider (e.g. GitHub connection) for auto-cloning.
@@ -50,21 +63,13 @@ func NewEngine(reg *rpc.Registry, store *Store, vs *vault.Store, log *slog.Logge
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Engine{reg: reg, store: store, vault: vs, log: log, running: make(map[string]bool)}
+	return &Engine{reg: reg, store: store, vault: vs, log: log, running: make(map[string]*activeDeployment)}
 }
 
 // StartDeployment enqueues a deployment. It returns immediately; the caller
 // polls the deployment status. Returns the created record or nil when a
 // build is already running for this application.
 func (e *Engine) StartDeployment(app *Application, trigger, startedBy string) (*Deployment, error) {
-	e.mu.Lock()
-	if e.running[app.ID] {
-		e.mu.Unlock()
-		return nil, fmt.Errorf("another deployment is already running for this app")
-	}
-	e.running[app.ID] = true
-	e.mu.Unlock()
-
 	dep := &Deployment{
 		ID:        "dep_" + randomToken(8),
 		AppID:     app.ID,
@@ -73,12 +78,18 @@ func (e *Engine) StartDeployment(app *Application, trigger, startedBy string) (*
 		StartedBy: startedBy,
 		StartedAt: time.Now(),
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := e.registerRunning(app.ID, &activeDeployment{depID: dep.ID, cancel: cancel}); err != nil {
+		cancel()
+		return nil, err
+	}
 	if err := e.store.AddDeployment(dep); err != nil {
-		e.finishRunning(app.ID)
+		e.finishRunning(app.ID, dep.ID)
+		cancel()
 		return nil, err
 	}
 
-	go e.runWithPin(app, dep, "")
+	go e.runWithPin(ctx, app, dep, "")
 	return dep, nil
 }
 
@@ -86,14 +97,6 @@ func (e *Engine) StartDeployment(app *Application, trigger, startedBy string) (*
 // recorded commit's image is still referenced by the recorded deployment, so
 // rollback rebuilds from the checked-out commit for full auditability.
 func (e *Engine) StartRollback(app *Application, commit, startedBy string) (*Deployment, error) {
-	e.mu.Lock()
-	if e.running[app.ID] {
-		e.mu.Unlock()
-		return nil, fmt.Errorf("another deployment is already running for this app")
-	}
-	e.running[app.ID] = true
-	e.mu.Unlock()
-
 	dep := &Deployment{
 		ID:        "dep_" + randomToken(8),
 		AppID:     app.ID,
@@ -102,12 +105,18 @@ func (e *Engine) StartRollback(app *Application, commit, startedBy string) (*Dep
 		StartedBy: startedBy,
 		StartedAt: time.Now(),
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := e.registerRunning(app.ID, &activeDeployment{depID: dep.ID, cancel: cancel}); err != nil {
+		cancel()
+		return nil, err
+	}
 	if err := e.store.AddDeployment(dep); err != nil {
-		e.finishRunning(app.ID)
+		e.finishRunning(app.ID, dep.ID)
+		cancel()
 		return nil, err
 	}
 
-	go e.runWithPin(app, dep, commit)
+	go e.runWithPin(ctx, app, dep, commit)
 	return dep, nil
 }
 
@@ -115,20 +124,130 @@ func (e *Engine) StartRollback(app *Application, commit, startedBy string) (*Dep
 func (e *Engine) IsRunning(appID string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.running[appID]
+	return e.running[appID] != nil
 }
 
-func (e *Engine) finishRunning(appID string) {
+// registerRunning claims the single-slot build queue for one app: returns
+// ErrDeployInProgress when another run already holds it.
+func (e *Engine) registerRunning(appID string, active *activeDeployment) error {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.running[appID]; ok {
+		return fmt.Errorf("another deployment is already running for this app")
+	}
+	e.running[appID] = active
+	return nil
+}
+
+// activeHub records the agent channel of the in-flight run so CancelDeployment
+// can remove the half-built container over the same connection.
+func (e *Engine) activeHub(appID string, hub *rpc.Hub) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if a, ok := e.running[appID]; ok && a != nil {
+		a.hub = hub
+	}
+}
+
+// activeNextName records the replacement container name once `docker run -d`
+// has started it, so a cancel removes that container rather than the live one.
+func (e *Engine) activeNextName(appID, nextName string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if a, ok := e.running[appID]; ok && a != nil {
+		a.nextName = nextName
+	}
+}
+
+func (e *Engine) finishRunning(appID, depID string) {
+	e.mu.Lock()
+	if a, ok := e.running[appID]; ok && a != nil && (depID == "" || a.depID == depID) {
+		delete(e.running, appID)
+	}
+	e.mu.Unlock()
+}
+
+// CancelDeployment aborts the in-flight deployment for an app. The run's
+// context is cancelled, which makes every stage check in the pipeline bail
+// out at its next step boundary.
+// It immediately updates the deployment state in store to DeployCancelled,
+// tags CancelledBy with operator, asynchronously cleans up the half-built -next
+// container, and frees the engine running slot so a new deployment can run.
+// Returns false if no deployment is actively running for this app.
+func (e *Engine) CancelDeployment(appID, operator string) bool {
+	e.mu.Lock()
+	active, ok := e.running[appID]
+	if !ok || active == nil {
+		e.mu.Unlock()
+		return false
+	}
+	active.cancel()
+	depID := active.depID
+	hub := active.hub
+	nextName := active.nextName
+	// Immediately free the running slot so force-redeploy can claim it
 	delete(e.running, appID)
 	e.mu.Unlock()
+
+	now := time.Now()
+	_ = e.store.UpdateDeployment(appID, depID, func(d *Deployment) {
+		if d.Status == DeployBuilding || d.Status == DeployDeploying || d.Status == DeployQueued {
+			d.Status = DeployCancelled
+			d.FinishedAt = now
+			d.DurationMS = now.Sub(d.StartedAt).Milliseconds()
+			d.Error = "部署已被用户取消"
+			if operator != "" {
+				d.CancelledBy = operator
+			} else {
+				d.CancelledBy = "操作员"
+			}
+			d.BuildLog = d.BuildLog + "\n[CANCELLED] 部署已被取消\n"
+		}
+	})
+
+	if hub != nil && nextName != "" {
+		go e.removeContainer(hub, nextName)
+	}
+
+	e.log.Info("deployment cancelled", "app", appID, "deployment", depID, "by", operator)
+	return true
+}
+
+// cleanupCancelled removes the half-built replacement container (the live one
+// keeps serving) and finalizes the deployment record as cancelled. Called by
+// the pipeline goroutine when it observes ctx.Done() and by the handler when
+// the pipeline is wedged in an agent exec that has not yet returned.
+// operator records who aborted the run (empty when the pipeline self-observes
+// the cancel and the username is stamped by the cancel handler instead).
+func (e *Engine) cleanupCancelled(app *Application, dep *Deployment, hub *rpc.Hub, nextName, operator string, logBuf *logBuffer) {
+	if hub != nil && nextName != "" {
+		e.removeContainer(hub, nextName)
+	}
+	now := time.Now()
+	finalLog := logBuf.String() + "\n[CANCELLED] 部署已被用户取消\n"
+	_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
+		d.Status = DeployCancelled
+		d.FinishedAt = now
+		d.DurationMS = now.Sub(d.StartedAt).Milliseconds()
+		d.Error = "部署已被用户取消"
+		if operator != "" {
+			d.CancelledBy = operator
+		} else if d.CancelledBy == "" {
+			d.CancelledBy = "操作员"
+		}
+		d.BuildLog = finalLog
+	})
+	e.log.Info("deployment cancelled", "app", app.ID, "deployment", dep.ID, "by", operator)
+	e.finishRunning(app.ID, dep.ID)
 }
 
 // runWithPin executes the whole build+rollout pipeline; pin, when non-empty,
 // checks out that exact commit after fetch (rollback path). Steps log into a
 // bounded buffer that lands on the deployment record so the UI can replay it.
-func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
-	defer e.finishRunning(app.ID)
+// ctx is cancelled by Engine.CancelDeployment: every stage checks it at its
+// boundary and bails out, then finalizes the record as cancelled.
+func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployment, pin string) {
+	defer e.finishRunning(app.ID, dep.ID)
 
 	if pin != "" {
 		_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.CommitHash = pin })
@@ -139,6 +258,17 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 		msg := fmt.Sprintf(format, args...)
 		e.fail(app, dep, logBuf, msg)
 	}
+	// cancelled: observed at a stage boundary. Finalizes the run as cancelled
+	// (the -next container cleanup happens in deploySingleContainer, which
+	// owns that name) and reports true. The operator username is stamped by
+	// the cancel handler, not here.
+	cancelled := func() bool {
+		if ctx.Err() == nil {
+			return false
+		}
+		e.cleanupCancelled(app, dep, e.reg.Hub(app.HostID), "", "", logBuf)
+		return true
+	}
 
 	e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployBuilding })
 
@@ -146,6 +276,7 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 	if e.reg != nil {
 		hub = e.reg.Hub(app.HostID)
 	}
+	e.activeHub(app.ID, hub)
 	if hub == nil {
 		fail("目标主机 Agent 不在线")
 		return
@@ -195,6 +326,9 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 		b64Content := base64.StdEncoding.EncodeToString([]byte(app.ComposeContent))
 		writeScript := fmt.Sprintf(`mkdir -p %s && echo %s | base64 -d > %s`,
 			shellQuote(appDir), shellQuote(b64Content), shellQuote(composePath))
+		if cancelled() {
+			return
+		}
 		if res, err := execOnAgent(hub, "write-compose-"+randomToken(4), writeScript, 30); err != nil || res.GetExitCode() != 0 {
 			fail("写入 Compose 配置文件失败: %v", err)
 			return
@@ -203,6 +337,9 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 		composeCmd := fmt.Sprintf("docker compose -f %s -p %s up -d --remove-orphans",
 			shellQuote(composePath), shellQuote("watchman-"+app.ID))
 		logBuf.WriteString("$ " + composeCmd + "\n")
+		if cancelled() {
+			return
+		}
 		res, err := execOnAgent(hub, "compose-up-"+randomToken(4), composeCmd, buildTimeout)
 		if err != nil {
 			fail("Docker Compose 启动失败: %v", err)
@@ -213,6 +350,9 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 			fail("Docker Compose 启动失败 (exit %d)", res.GetExitCode())
 			return
 		}
+		if cancelled() {
+			return
+		}
 		e.finishDeploySuccess(app, dep, "compose", imageTag, app.ContainerName, logBuf)
 		return
 	}
@@ -221,7 +361,7 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 		if app.SourceType == "image" {
 			e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
 			logBuf.WriteString("$ deploy pre-built image\n")
-			e.deploySingleContainer(hub, app, dep, logBuf, app.Image)
+			e.deploySingleContainer(ctx, hub, app, dep, logBuf, app.Image)
 			return
 		}
 
@@ -233,7 +373,7 @@ func (e *Engine) runWithPin(app *Application, dep *Deployment, pin string) {
 			fail("解析应用模板失败: %v", err)
 			return
 		}
-		e.deploySingleContainer(hub, app, dep, logBuf, app.Image)
+		e.deploySingleContainer(ctx, hub, app, dep, logBuf, app.Image)
 		return
 	}
 
@@ -268,6 +408,9 @@ echo "WATCHMAN_COMMIT=$COMMIT"
 echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 		shellQuote(repoDir), shellQuote(app.RepoURL), shellQuote(branch), shellQuote(checkout), authArgs)
 	logBuf.WriteString("$ git fetch/checkout " + app.RepoURL + " (" + branchLabel + ")\n")
+	if cancelled() {
+		return
+	}
 	res, err := execOnAgent(hub, "git-env-"+randomToken(4), fetchScript, 300)
 	if err != nil {
 		fail("代码拉取失败: %v", err)
@@ -276,6 +419,9 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 	logBuf.WriteResult(res, redact(res.GetStdout(), authToken), res.GetStderr())
 	if res.GetExitCode() != 0 {
 		fail("代码拉取失败 (exit %d)", res.GetExitCode())
+		return
+	}
+	if cancelled() {
 		return
 	}
 	commit, message := parseCommitMeta(res.GetStdout())
@@ -302,6 +448,9 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 		composeCmd := fmt.Sprintf("docker compose -f %s -p %s up -d --build --remove-orphans",
 			shellQuote(composeFile), shellQuote("watchman-"+app.ID))
 		logBuf.WriteString("$ " + composeCmd + "\n")
+		if cancelled() {
+			return
+		}
 		res, err = execOnAgent(hub, "compose-up-"+randomToken(4),
 			fmt.Sprintf("cd %s && %s", shellQuote(repoDir), composeCmd), buildTimeout)
 		if err != nil {
@@ -313,6 +462,9 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 			fail("Docker Compose 部署失败 (exit %d)", res.GetExitCode())
 			return
 		}
+		if cancelled() {
+			return
+		}
 		e.finishDeploySuccess(app, dep, commit, imageRef, app.ContainerName, logBuf)
 		return
 	}
@@ -321,6 +473,9 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 	buildCmd := fmt.Sprintf("docker build -t %s -f %s %s",
 		shellQuote(imageRef), shellQuote(dockerfile), shellQuote(context))
 	logBuf.WriteString("$ " + buildCmd + "\n")
+	if cancelled() {
+		return
+	}
 	res, err = execOnAgent(hub, "docker-build-"+randomToken(4),
 		fmt.Sprintf("cd %s && %s", shellQuote(repoDir), buildCmd), buildTimeout)
 	if err != nil {
@@ -338,12 +493,14 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 	// Step 3: start the replacement container under a -next name, health
 	// probe, then swap. The old container keeps running the whole time so a
 	// failure leaves the previous version untouched (auto-rollback-by-design).
-	e.deploySingleContainer(hub, app, dep, logBuf, imageRef)
+	e.deploySingleContainer(ctx, hub, app, dep, logBuf, imageRef)
 }
 
 // deploySingleContainer handles the generic run-probe-swap pipeline for both
 // pre-built images (source_type=image/template) and built images (source_type=git).
-func (e *Engine) deploySingleContainer(hub *rpc.Hub, app *Application, dep *Deployment, logBuf *logBuffer, imageRef string) {
+// ctx is the run's cancellation context: it is checked before every step so an
+// operator-triggered stop bails out instead of pushing a half-built image live.
+func (e *Engine) deploySingleContainer(ctx context.Context, hub *rpc.Hub, app *Application, dep *Deployment, logBuf *logBuffer, imageRef string) {
 	fail := func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
 		e.fail(app, dep, logBuf, msg)
@@ -354,6 +511,14 @@ func (e *Engine) deploySingleContainer(hub *rpc.Hub, app *Application, dep *Depl
 		container = "watchman-app-" + app.ID
 	}
 	nextName := container + "-next"
+
+	cancelled := func() bool {
+		if ctx.Err() == nil {
+			return false
+		}
+		e.cleanupCancelled(app, dep, hub, nextName, "", logBuf)
+		return true
+	}
 
 	envArgs := e.resolveEnvArgs(app, logBuf)
 	var runArgs []string
@@ -389,6 +554,9 @@ func (e *Engine) deploySingleContainer(hub *rpc.Hub, app *Application, dep *Depl
 		runCmd := fmt.Sprintf("docker rm -f %s 2>/dev/null; docker run -d --name %s --restart unless-stopped %s %s %s",
 			shellQuote(nextName), shellQuote(nextName), strings.Join(envArgs, " "), strings.Join(runArgs, " "), shellQuote(imageRef))
 	logBuf.WriteString("$ start replacement container\n")
+	if cancelled() {
+		return
+	}
 	res, err := execOnAgent(hub, "docker-run-"+randomToken(4), runCmd, 120)
 	if err != nil {
 		fail("启动新容器失败: %v", err)
@@ -400,9 +568,15 @@ func (e *Engine) deploySingleContainer(hub *rpc.Hub, app *Application, dep *Depl
 		e.removeContainer(hub, nextName)
 		return
 	}
+	// The -next container now exists: record it so a later cancel can remove
+	// exactly this container, never the live one.
+	e.activeNextName(app.ID, nextName)
 
 	// Step 4: health probe (container state; HTTP probe if configured).
-	ok := e.probe(hub, app, nextName, logBuf)
+	if cancelled() {
+		return
+	}
+	ok := e.probe(ctx, hub, app, nextName, logBuf)
 	if !ok {
 		fail("健康检查未通过，已保留旧版本容器")
 		e.removeContainer(hub, nextName)
@@ -425,6 +599,9 @@ docker rename %[3]s %[2]s
 docker inspect --format '{{.State.Status}}' %[2]s`,
 		shellQuote(container+"-prev"), shellQuote(container), shellQuote(nextName))
 	logBuf.WriteString("$ swap containers\n")
+	if cancelled() {
+		return
+	}
 	res, err = execOnAgent(hub, "docker-swap-"+randomToken(4), swapCmd, 60)
 	if err != nil {
 		fail("容器切换失败: %v", err)
@@ -563,11 +740,15 @@ func (e *Engine) fail(app *Application, dep *Deployment, logBuf *logBuffer, msg 
 
 // probe waits for the replacement container to become healthy. With a
 // configured healthcheck URL it polls until the endpoint answers 2xx; it
-// falls back to `docker inspect` state when no URL is set.
-func (e *Engine) probe(hub *rpc.Hub, app *Application, container string, logBuf *logBuffer) bool {
+// falls back to `docker inspect` state when no URL is set. ctx aborts the
+// wait early (operator cancelled the deployment).
+func (e *Engine) probe(ctx context.Context, hub *rpc.Hub, app *Application, container string, logBuf *logBuffer) bool {
 	if app.HealthcheckURL != "" {
 		logBuf.WriteString("$ health probe " + app.HealthcheckURL + "\n")
 		for i := 0; i < 12; i++ {
+			if ctx.Err() != nil {
+				return false
+			}
 			time.Sleep(5 * time.Second)
 			res, err := execOnAgent(hub, "probe-"+randomToken(4),
 				fmt.Sprintf("curl -s -o /dev/null -w '%%{http_code}' --max-time 5 %s", shellQuote(app.HealthcheckURL)), 15)
@@ -586,6 +767,9 @@ func (e *Engine) probe(hub *rpc.Hub, app *Application, container string, logBuf 
 	// No HTTP probe configured: wait a grace period, then require the
 	// container to still be running.
 	time.Sleep(5 * time.Second)
+	if ctx.Err() != nil {
+		return false
+	}
 	res, err := execOnAgent(hub, "probe-"+randomToken(4),
 		fmt.Sprintf("docker inspect --format '{{.State.Status}}' %s", shellQuote(container)), 15)
 	if err != nil {

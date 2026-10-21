@@ -158,6 +158,15 @@
   - **防失联与紧急恢复**：若配置错误域名或无效证书导致无法登录，提供控制机命令行救援开关：`watchman-server -reset-panel-domain -data <数据目录>`（解绑面板域名；绑定即严格，解绑后恢复 IP 访问）以及 `watchman-server -reset-panel-ssl -data <数据目录>`（关闭面板 SSL 与强制 HTTPS 重定向）。
   - 独立「证书中心」（`/certs`，`CertList.vue` + `CertManager.vue`）保持作为全局基础设施，管理 ACME 自动化证书与证书凭证，供面板及各业务应用按需选用；另提供只读覆盖探测端点 `GET /certs/cover?domain=`（登录即可、免操作审计，与 `FindByDomain` 同源匹配，见 §3.7「创建时证书配置与签发编排」）。已签发证书列表每行提供「详情」弹窗：只读端点 `GET /certs/:id/detail`（登录即可、免操作审计）对存储的证书链现场解析 leaf（序列号、SHA-256 指纹、密钥算法/长度、签名算法、链张数，解析失败降级为基本元信息 + `parse_error`），并反查用途（面板证书显式绑定或按 `panel_domain` 兜底匹配 `panel_bound`/`panel_fallback`、应用按域名经 `hub.FindByDomain` 同源规则匹配 `used_by_apps`）及来源推断（`source` = acme / manual_dns01 / manual_upload）；弹窗内可展开查看并复制证书链 PEM 与私钥（2026-10-20 起「证书材料」区并列展示）：私钥明文经显式查看端点 `POST /certs/:id/key` 返回（adminOnly + 审计 `cert_key_reveal`/high，与 AI API Key 明文查看同惯例；用 POST 是因为共享审计中间件跳过 GET），打开详情弹窗时随证书链一并拉取、每次查看各落一条审计；常规响应（列表/单查/详情/下载）仍一律剥离私钥，该端点是唯一出口。证书列表「操作」列提供「下载证书」按钮：`GET /certs/:id/download`（登录即可、只读免操作审计、浏览器导航下载、JWT 走 `?token=` 查询参数——与审计导出/备份下载同惯例，鉴权中间件为无法带 header 的导航请求提供查询参数回退）以附件返回存储的公钥链，文件名取主域名 `<域名>.crt`（通配符 `*` 置换为 `_wildcard`、其余文件名不安全字符折叠为 `_`、无域名回退证书 id），下载仅公钥链、不打包私钥（私钥查看/复制走上述显式端点）。操作列「续期」按钮仅对有 ACME 账户的证书展示：手动上传（`manual_upload`）的证书无账户，服务端续期会回落到默认账户重新签发并覆盖上传材料，其续命方式应为「重新上传」，故不展示续期按钮（`manual_dns01` 两阶段证书有账户，保留续期）。（2026-10-20 详情弹窗视觉打磨）弹窗为 `NModal preset="card"` 自定义头部：主域名 + 状态标签一行可读；内容按「指纹与算法 / 有效期与续期 / 使用情况」三区展示（分区标题 13px 加品牌色强调条；原第四区「基本信息」2026-10-20 移除——来源/颁发机构/备注/SAN/最近错误与列表列及弹窗头部全重复，失败原因全文已由日志列悬停弹层承载），序列号与 SHA-256 指纹行内提供一键复制，有效期以进度条呈现（颜色随剩余天数分档：>30 天绿 / >7 天琥珀 / 其余红），PEM 折叠区冠以与三区同一视觉语言的「证书材料」分区标题（2026-10-20 补充，自渲染节点复刻 13px + 品牌色竖条样式），等宽字体 + 主题变量底色；内容区 `maxHeight calc(100vh - 120px)` 内部滚动、头部固定。注意 scoped CSS 锚定：`NModal` teleport 到 body 后卡片根节点不带组件 `data-v` 作用域，`:deep()` 必须锚定在模板内自渲染的 `.cert-detail-body` 包裹层上才能命中 Naive 内部节点。（2026-10-20）已签发证书列表为宝塔式 11 列：域名 / 其他域名 / 申请方式 / ACME 账号 / 状态 / 日志 / 颁发组织 / 备注 / 自动续签 / 过期时间 / 操作；其中「申请方式」「ACME 账号」由服务端在列表响应中派生（`source`/`account_name`，与 detail 端点同一推断规则，前端不再自行推断），「日志」列为最近一次失败原因 `last_error` 摘要（暂无逐次签发日志），悬停单元格以 `NPopover` 限宽弹层展示全文（小标题「最近一次失败原因」+ 12px 小字、`break-all` 换行、内容区 `max-width: 340px`、`max-height: 200px` 超长内部滚动，单元格内自行省略截断）——不用内置省略 tooltip（对长错误实测单行铺出 1088px 宽、溢出屏幕），「状态」在续期中/异常之外按有效期给出已过期/未生效。每张证书带管理员备注字段 `Certificate.remark`（≤200 字，仅元信息，不影响证书）；行内铅笔按钮弹层编辑，经 `PUT /certs/:id/remark` 保存（adminOnly + 审计；列表/详情/导入/签发等响应不再回显私钥的既有约束不变）。（2026-10-20）
 - **全生命周期管理**：部署历史、构建日志、健康检查探活失败自动保留旧版本（`-next`/`-prev` 滚动替换）、回滚、启停、AI 排障诊断，对所有来源的应用一致生效。
+  - **部署取消与强制重新部署（2026-10-21）**：
+    - **取消执行（Context 级全链路熔断）**：活跃部署由 `Engine` 记录其 `context.CancelFunc`、Agent 通道与正在构建的替换容器名（`-next`）。调用 `CancelDeployment` 时立即触发 context 取消，各阶段边界（代码拉取、Docker 构建、启动新容器、健康探活、swap 切换前）检测 `ctx.Done()` 并提前熔断；
+    - **安全清理（零停机保障）**：若新容器（`watchman-app-<appID>-next`）已被拉起，取消时异步调用 `removeContainer` 仅清理半拉起容器，在线服务容器全程不受影响；部署记录状态置为 `cancelled`，记录 `CancelledBy` 操作员与 `FinishedAt`；
+    - **强制重新部署（`force=true`）**：在已有部署执行时，`POST /apps/:id/deploy` 支持 `force=true`（Query 或 JSON Body），服务端自动先终止当前在途任务、释放槽位并立即启动全新部署，前端弹窗确认「当前已有部署任务正在进行中，继续将终止当前任务并启动全新部署」；
+    - **历史记录与多点控制**：顶部操作栏展示醒目「终止部署」按钮与二次确认；部署历史列表针对 `queued`/`building`/`deploying` 记录提供行内「停止」按钮；部署状态 Tag 增加「已取消」（warning 琥珀色），提交信息列展示取消人。
+  - **创建即部署（2026-10-21）**：`POST /apps` 持久化成功后立即 `engine.StartDeployment(app, "create", …)` 入队首轮部署（`Deployment.trigger` 新增 `create`，详情页展示为「创建」），响应附 `deployment`；引擎忙/启动失败不失败创建本身，仅附 `deploy_warning`（应用记录合法，可手动重试）。前端创建页提示「已创建，正在部署…」，详情页既有轮询自然展示 排队→构建→发布→成功/失败 与日志。
+  - **应用列表（2026-10-21）**：列为 应用名称 / 服务器 / 来源 / 当前版本 / 状态 / 最近部署 / 最近更新 / 操作。「服务器」由前端并行 `listHosts()` 按 `host_id → hostname` 映射（`/apps` 不 join 主机，主机接口失败不阻断应用列表）；「来源」替代原只对 Git 有意义的 `repo_url @ branch` 列（git → 仓库+自动部署标记、image → 镜像、template → 模板、raw_compose → Docker Compose）；「最近更新」取 `Application.updated_at`。右上角入口文案「创建应用」（原「链接 Git 应用」）。
+  - **`updated_at` 语义（2026-10-21）**：`Application.UpdatedAt` 在任何持久化变更时推进，写入点唯一——`Store.UpdateApp` 内统一打点（覆盖配置编辑、部署成功/失败收尾、反代绑定/解绑、组网中继同步），`PutApp` 在空值时以 `CreatedAt` 播种；时间戳单调（`nextUpdatedAt`，时钟回拨不回退）。历史 `apps.json` 缺该字段时，加载期回填 `max(CreatedAt, LastDeployAt)`，老应用不显示空白。
+  - **`PUT /apps/:id` 为部分更新（2026-10-21）**：改用独立 `updateAppReq`，全部可变字段为 `*T` 指针——未提交的键保持原值，显式 `false`/`""`/`{}` 才清空。此前复用 `createAppReq` 会无条件覆盖 `auto_deploy`/`auth_vault_id`/`healthcheck_url`/`mesh_forward_*`，导致「只保存环境变量」或「只保存 Compose」静默清空这些配置（已修复）。组网转发按「存储值 + 本次改动」的有效配置校验，且仅当请求触及任一 `mesh_forward_*` 字段时才校验（无关编辑不会因入口主机离线而失败）；`mesh_forward_enabled=false` 时坐标清空。**镜像地址仅 `source_type=image` 可改**（模板镜像由模板解析、Git/Compose 走各自构建产物，其余来源 400）；`host_id`/`source_type`/`container_name` 不可改。前端 `AppDetail.vue` 概览页签「编辑配置」弹窗（名称/镜像/健康检查/端口映射/挂载卷，仅提交差异字段，已部署应用可「保存并重新部署」），环境变量页签改为行式编辑器（支持 `{{ vault:… }}` 原文引用、模板来源提示变量会被模板参数重渲染）。
   - 实现备注（2026-09-28）：`deploySingleContainer` 的起新容器命令只清理残留的 `-next` 容器（`docker rm -f <name>-next`），旧版本容器在 swap 前全程运行、失败时原样保留——此前曾误删旧容器（`rm -f` 目标写成了正式容器名），与"探活失败自动保留旧版本"的设计相悖，已修复。
   - 实现备注（2026-09-28，发布流程 review）：git 拉取脚本必须 `set -e`——此前 `fetch` 失败会落到 `checkout --force` 用本地旧代码继续部署并上报成功；Git token 只持久化在 server 端 vault，下发时经 `git -c http.extraHeader="Authorization: Basic <base64(git:token)>"` 随单次 clone/fetch 使用，不再 `remote set-url` 写进 agent 的 `.git/config`（自动发布每次从 vault 现取，不受影响）；下发到 agent 的命令里所有用户输入变量必须 shell 转义（环境变量值曾因空格打散 `docker run` 参数）；swap 脚本 `set -e`，`docker rename` 失败不得被末尾 `docker inspect` 的退出码掩盖；镜像清理只针对 `watchman-app-*` 自建镜像、按创建时间保留最新 5 个（此前 `docker images repo:tag` 只匹配单个 tag 导致从不清，且 `head -n 6 | tail -n +6` 语义错误）；store 的 `GetApp/ListApps/FindAppByWebhookToken` 返回深拷贝——部署协程 `ResolveTemplate` 原地写 EnvVars map 时 HTTP 层正 marshal 同一对象，曾有 crash 风险；反代域名做严格 hostname 校验并检查跨应用重复绑定；网关模式上游按「组网（双方都在组网内 → 100.x）→ 直连（应用主机公网 IP → 内网 IP）」顺序解析，绝不回退 `127.0.0.1`（会指向网关自身造成流量黑洞），两条路径都拿不到才报错要求手动填 Upstream（2026-10-16 起：早期版本在拿不到 Mesh IP 时直接报错，现改为直连兜底）；`raw_compose` 每次部署快照 compose 内容到部署记录，回滚时恢复快照（此前"回滚"实际重部署了当前内容）；healer 跳过有部署在途的应用。
 - **已安装管理**：应用列表/详情支持重启、停止、启动、查看日志、删除（`watchman.app` 标签标记容器归属）。
@@ -838,6 +847,26 @@ POST   /api/v1/ai/app-draft                   # 需求描述 → 创建应用表
 POST   /api/v1/ai/app-chat                    # 创建页对话辅助（携带表单快照，可返回 form_patch 草稿）
 GET    /api/v1/ai/audit                       # AI 调用审计
 
+# 应用中心
+GET    /api/v1/apps
+POST   /api/v1/apps                       # 创建应用（创建即自动入队首轮部署）
+GET    /api/v1/apps/:id
+PUT    /api/v1/apps/:id                   # 部分更新配置
+DELETE /api/v1/apps/:id?purge=            # 删除应用（可选清除容器与镜像）
+POST   /api/v1/apps/:id/deploy?force=     # 触发部署（force=true 支持终止在途任务并重新部署）
+POST   /api/v1/apps/:id/deployments/cancel # 终止当前正在进行的部署任务
+POST   /api/v1/apps/:id/rollback          # 版本回滚
+POST   /api/v1/apps/:id/stop
+POST   /api/v1/apps/:id/start
+POST   /api/v1/apps/:id/restart
+GET    /api/v1/apps/:id/deployments
+GET    /api/v1/apps/:id/deployments/:depID
+POST   /api/v1/apps/:id/deployments/:depID/diagnose # AI 排障
+GET    /api/v1/apps/:id/status
+POST   /api/v1/apps/:id/webhook/sync
+POST   /api/v1/apps/inspect-image         # 镜像元数据免拉取只读探测
+POST   /api/v1/apps/inspect-repo          # 仓库元数据只读探测
+
 # 审计
 GET    /api/v1/audit?user=&action=&from=&to=
 
@@ -1180,7 +1209,7 @@ POST   /api/v1/apps/inspect-image          # 镜像元数据免拉取探测 {ima
 POST   /api/v1/apps/inspect-repo           # GitHub 仓库探测 {repo_url} → 默认分支/Dockerfile/Compose/.env.example 解析（只读）
 POST   /api/v1/apps                        # 创建应用 {source_type, host_id, template_id/template_params | image | compose_content | repo_url/branch, mesh_forward_enabled, mesh_forward_host_id, mesh_forward_entry_port, mesh_forward_target_port, ports[{host,container,bind_scope}], ...}
 GET    /api/v1/apps/:id                    # 应用详情
-PUT    /api/v1/apps/:id                    # 更新（如 Compose 内容）
+PUT    /api/v1/apps/:id                    # 部分更新（PATCH 语义）：未提交的键保持原值，显式 false/""/{} 才清空；可改 name/image(仅 image 来源)/healthcheck_url/env_vars/ports/volumes/compose_content/mesh_forward_*/auto_deploy/auth_vault_id 等；host_id/source_type/container_name 不可改
 DELETE /api/v1/apps/:id                    # 删除
 POST   /api/v1/apps/:id/deploy|rollback    # 部署 / 回滚
 POST   /api/v1/apps/:id/stop|start|restart

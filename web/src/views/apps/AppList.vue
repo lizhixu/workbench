@@ -8,11 +8,12 @@ import {
 import type { DataTableColumns } from 'naive-ui'
 import {
   AddCircleOutline, RocketOutline, GitCommitOutline, RefreshOutline,
-  TrashOutline, CloudUploadOutline,
+  TrashOutline,
 } from '@vicons/ionicons5'
 import {
   deleteApp, getAppStatus, listApps, type AppEntity, type AppStatus,
 } from '../../api/apps'
+import { listHosts } from '../../api/hosts'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { useAuthStore } from '../../stores/auth'
 import { fmtDateTimeMinute } from '../../utils/time'
@@ -28,17 +29,41 @@ const apps = ref<AppEntity[]>([])
 const loading = ref(false)
 const searchKeyword = ref('')
 const statuses = ref<Record<string, AppStatus>>({})
+// host_id → hostname. /apps does not join the host record; the list maps it
+// client-side from the host inventory (same pattern as AppDetail).
+const hostnameById = ref<Map<string, string>>(new Map())
 let statusTimer: ReturnType<typeof setInterval> | null = null
 
 const canWrite = computed(() => auth.role === 'admin' || auth.role === 'operator')
+
+const hostLabel = (row: AppEntity) => hostnameById.value.get(row.host_id) || row.host_id || '-'
+
+// Source cell: the old "repo_url @ branch" column rendered " @ main" for every
+// non-Git app. Show what each source actually is.
+function sourceLabel(row: AppEntity): string {
+  switch (row.source_type) {
+    case 'git':
+      return `${row.repo_url ?? ''}${row.auto_deploy ? ' · 自动部署' : ''}`
+    case 'image':
+      return row.image || '镜像'
+    case 'template':
+      return `模板 ${row.template_id ?? ''}`.trim()
+    case 'raw_compose':
+      return 'Docker Compose'
+    default:
+      return row.source_type || '-'
+  }
+}
 
 const filteredApps = computed(() => {
   const q = searchKeyword.value.trim().toLowerCase()
   if (!q) return apps.value
   return apps.value.filter((a) =>
     a.name.toLowerCase().includes(q) ||
+    hostLabel(a).toLowerCase().includes(q) ||
     (a.repo_url ?? '').toLowerCase().includes(q) ||
     (a.branch ?? '').toLowerCase().includes(q) ||
+    (a.image ?? '').toLowerCase().includes(q) ||
     (a.current_commit ?? '').toLowerCase().includes(q),
   )
 })
@@ -67,19 +92,26 @@ const stateTag = (a: AppEntity) => {
 
 const columns = computed<DataTableColumns<AppEntity>>(() => [
   {
-    title: '应用',
+    title: '应用名称',
     key: 'name',
     width: 180,
     render: (row) =>
       h('span', { style: 'font-weight: 600; cursor: pointer;', onClick: () => openDetail(row) }, row.name),
   },
   {
-    title: 'Git 仓库',
-    key: 'repo_url',
+    title: '服务器',
+    key: 'host',
+    width: 170,
+    ellipsis: { tooltip: true },
+    render: (row) => h('span', hostLabel(row)),
+  },
+  {
+    title: '来源',
+    key: 'source_type',
     ellipsis: { tooltip: true },
     render: (row) =>
       h('span', { style: 'font-size: 12px; color: var(--n-text-color-disabled, #999)' },
-        `${row.repo_url ?? ''} @ ${row.branch ?? 'main'}`),
+        sourceLabel(row)),
   },
   {
     title: '当前版本',
@@ -89,20 +121,18 @@ const columns = computed<DataTableColumns<AppEntity>>(() => [
       ? h(NTag, { size: 'small', bordered: false, type: 'info' }, { icon: () => h(NIcon, null, { default: () => h(GitCommitOutline) }), default: () => row.current_commit })
       : h('span', { style: 'color: #999' }, '-'),
   },
-  {
-    title: '自动部署',
-    key: 'auto_deploy',
-    width: 90,
-    render: (row) => row.auto_deploy
-      ? h(NIcon, { color: '#18a058' }, { default: () => h(CloudUploadOutline) })
-      : h('span', { style: 'color: #999' }, '-'),
-  },
   { title: '状态', key: 'state', width: 100, render: (row) => stateTag(row) },
   {
     title: '最近部署',
     key: 'last_deploy_at',
     width: 160,
     render: (row) => row.last_deploy_at ? formatTime(row.last_deploy_at) : '-',
+  },
+  {
+    title: '最近更新',
+    key: 'updated_at',
+    width: 160,
+    render: (row) => row.updated_at ? formatTime(row.updated_at) : (row.created_at ? formatTime(row.created_at) : '-'),
   },
   {
     title: '操作',
@@ -140,7 +170,17 @@ function formatTime(v: string) {
 async function loadData() {
   loading.value = true
   try {
-    apps.value = (await listApps()) as AppEntity[]
+    // Hosts come from the inventory in parallel: the apps response carries
+    // only host_id, and a failed host fetch must not blank the app list.
+    // listHosts() resolves the whole {data,total} envelope, unlike listApps().
+    const [appList, hostResp] = await Promise.all([
+      listApps(),
+      listHosts().catch(() => ({ data: [] as { id: string; hostname: string }[], total: 0 })),
+    ])
+    apps.value = appList
+    const map = new Map<string, string>()
+    for (const h of hostResp.data) map.set(h.id, h.hostname)
+    hostnameById.value = map
   } catch (e: any) {
     message.error(e.message || '获取应用列表失败')
   } finally {
@@ -259,7 +299,7 @@ onDeactivated(() => {
         <template #icon>
           <NIcon><AddCircleOutline /></NIcon>
         </template>
-        链接 Git 应用
+        创建应用
       </NButton>
     </div>
 
@@ -279,7 +319,7 @@ onDeactivated(() => {
       <NEmpty
         v-else
         style="flex: 1; display: flex; flex-direction: column; justify-content: center"
-        description="还没有链接任何 Git 应用">
+        description="还没有创建任何应用">
         <template #icon>
           <NIcon><RocketOutline /></NIcon>
         </template>

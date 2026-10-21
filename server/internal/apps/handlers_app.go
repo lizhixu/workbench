@@ -71,6 +71,7 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	writeRG.PUT("/apps/:id", h.updateApp)
 	writeRG.DELETE("/apps/:id", h.deleteApp)
 	writeRG.POST("/apps/:id/deploy", h.deployApp)
+	writeRG.POST("/apps/:id/deployments/cancel", h.cancelDeployment)
 	writeRG.POST("/apps/:id/rollback", h.rollbackApp)
 	writeRG.POST("/apps/:id/stop", h.stopApp)
 	writeRG.POST("/apps/:id/start", h.startApp)
@@ -305,7 +306,21 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": app})
+	// Creation is the first deployment: kick it off right away so a new app
+	// goes from form to running container without a second click. The engine
+	// returns as soon as the record is queued — the front-end already polls
+	// deploy status on the detail page. A queue/engine failure must not fail
+	// the create itself (the app record is valid and deploy can be retried).
+	resp := gin.H{"data": app}
+	if h.engine != nil {
+		dep, err := h.engine.StartDeployment(app, "create", usernameOf(c))
+		if err != nil {
+			resp["deploy_warning"] = "应用已创建，但自动部署未能启动: " + err.Error()
+		} else {
+			resp["deployment"] = dep
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (h *AppHandlers) buildWebhookURL(c *gin.Context, token string) string {
@@ -320,6 +335,40 @@ func (h *AppHandlers) buildWebhookURL(c *gin.Context, token string) string {
 	return fmt.Sprintf("%s://%s/api/v1/apps/webhook/%s", scheme, host, token)
 }
 
+// updateAppReq is the body of PUT /apps/:id. Every mutable field is a pointer
+// so an omitted key means "leave unchanged". The previous code reused
+// createAppReq, whose non-pointer fields were overwritten unconditionally:
+// saving only the env vars silently wiped auto_deploy, the Git credential,
+// the health check URL and a running mesh relay. Explicit false / "" / {}
+// still clears a field; nil means untouched.
+//
+// host_id, source_type and container_name stay immutable here (moving an app
+// to another host is a redeploy, not an edit).
+type updateAppReq struct {
+	Name        *string `json:"name"`
+	RepoURL     *string `json:"repo_url"`
+	Branch      *string `json:"branch"`
+	AuthVaultID *string `json:"auth_vault_id"`
+	AutoDeploy  *bool   `json:"auto_deploy"`
+
+	BuildType      *string `json:"build_type"`
+	Dockerfile     *string `json:"dockerfile"`
+	BuildContext   *string `json:"build_context"`
+	BuildTimeout   *int32  `json:"build_timeout_sec"`
+	ComposeContent *string `json:"compose_content"`
+	Image          *string `json:"image"`
+
+	EnvVars        *map[string]string `json:"env_vars"`
+	Ports          *[]PortMapping     `json:"ports"`
+	Volumes        *[]string          `json:"volumes"`
+	HealthcheckURL *string            `json:"healthcheck_url"`
+
+	MeshForwardEnabled    *bool   `json:"mesh_forward_enabled"`
+	MeshForwardHostID     *string `json:"mesh_forward_host_id"`
+	MeshForwardEntryPort  *int    `json:"mesh_forward_entry_port"`
+	MeshForwardTargetPort *int    `json:"mesh_forward_target_port"`
+}
+
 func (h *AppHandlers) updateApp(c *gin.Context) {
 	id := c.Param("id")
 	oldApp, ok := h.store.GetApp(id)
@@ -327,136 +376,208 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
 		return
 	}
-	var req createAppReq
+	var req updateAppReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-		// Mesh-forward rules must hold on update just like on create; host_id is
-		// immutable here, so validate against the existing app host.
-		if err := validateMeshForward(oldApp.HostID, req.MeshForwardEnabled, req.MeshForwardHostID, req.MeshForwardEntryPort, req.MeshForwardTargetPort); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+
+	if req.Name != nil && strings.TrimSpace(*req.Name) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "应用名称不能为空"})
+		return
+	}
+	if req.EnvVars != nil {
+		for k, v := range *req.EnvVars {
+			if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "环境变量名与值都不能为空"})
+				return
+			}
+		}
+	}
+	if req.Image != nil {
+		img := strings.TrimSpace(*req.Image)
+		if img == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "镜像地址不能为空"})
 			return
 		}
-		for _, pm := range req.Ports {
+		// Template images are derived from the catalog and Git/compose supply
+		// their own build output; only a pre-built image app can retag.
+		if oldApp.SourceType != "image" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "仅「镜像」来源的应用支持修改镜像地址"})
+			return
+		}
+		*req.Image = img
+	}
+	if req.Ports != nil {
+		for _, pm := range *req.Ports {
 			if pm.Host <= 0 || pm.Host > 65535 || pm.Container <= 0 || pm.Container > 65535 {
 				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("端口映射非法: %d:%d", pm.Host, pm.Container)})
 				return
 			}
 		}
-		if req.MeshForwardEnabled {
-			if h.reg.Hub(req.MeshForwardHostID) == nil {
+	}
+
+	// Mesh-forward rules are validated on the EFFECTIVE config (stored values
+	// with this request applied), and only when the request touches a relay
+	// field — an unrelated edit must not fail because the entry host went
+	// offline since the relay was configured.
+	meshTouched := req.MeshForwardEnabled != nil || req.MeshForwardHostID != nil ||
+		req.MeshForwardEntryPort != nil || req.MeshForwardTargetPort != nil
+	effMeshEnabled := oldApp.MeshForwardEnabled
+	effMeshHost := oldApp.MeshForwardHostID
+	effEntryPort := oldApp.MeshForwardEntryPort
+	effTargetPort := oldApp.MeshForwardTargetPort
+	if req.MeshForwardEnabled != nil {
+		effMeshEnabled = *req.MeshForwardEnabled
+	}
+	if req.MeshForwardHostID != nil {
+		effMeshHost = strings.TrimSpace(*req.MeshForwardHostID)
+	}
+	if req.MeshForwardEntryPort != nil {
+		effEntryPort = *req.MeshForwardEntryPort
+	}
+	if req.MeshForwardTargetPort != nil {
+		effTargetPort = *req.MeshForwardTargetPort
+	}
+	if meshTouched {
+		// host_id is immutable here, so validate against the existing app host.
+		if err := validateMeshForward(oldApp.HostID, effMeshEnabled, effMeshHost, effEntryPort, effTargetPort); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if effMeshEnabled {
+			if h.reg.Hub(effMeshHost) == nil {
 				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "组网转发入口主机 Agent 不在线"})
 				return
 			}
-			if err := h.meshForwardConflict(id, req.MeshForwardHostID, req.MeshForwardEntryPort); err != nil {
+			if err := h.meshForwardConflict(id, effMeshHost, effEntryPort); err != nil {
 				c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 				return
 			}
 		}
-		if err := h.store.UpdateApp(id, func(a *Application) error {
-			if strings.TrimSpace(req.Name) != "" {
-				a.Name = strings.TrimSpace(req.Name)
-			}
-			if strings.TrimSpace(req.RepoURL) != "" {
-				a.RepoURL = strings.TrimSpace(req.RepoURL)
-			}
-			if req.Branch != "" {
-				a.Branch = req.Branch
-			}
-			a.AuthVaultID = req.AuthVaultID
-			a.AutoDeploy = req.AutoDeploy
-			if req.Dockerfile != "" {
-				a.Dockerfile = req.Dockerfile
-			}
-			if req.BuildContext != "" {
-				a.BuildContext = req.BuildContext
-			}
-			if req.BuildTimeout > 0 {
-				a.BuildTimeout = req.BuildTimeout
-			}
-			if req.EnvVars != nil {
-				a.EnvVars = req.EnvVars
-			}
-			if req.Ports != nil {
-				a.Ports = req.Ports
-			}
-			if req.Volumes != nil {
-				a.Volumes = req.Volumes
-			}
-			if req.ComposeContent != "" {
-				a.ComposeContent = req.ComposeContent
-			}
-			a.MeshForwardEnabled = req.MeshForwardEnabled
-			if req.MeshForwardEnabled {
-				a.MeshForwardHostID = req.MeshForwardHostID
-				a.MeshForwardEntryPort = req.MeshForwardEntryPort
-				a.MeshForwardTargetPort = req.MeshForwardTargetPort
-			} else {
-				a.MeshForwardHostID = ""
-				a.MeshForwardEntryPort = 0
-				a.MeshForwardTargetPort = 0
-				a.MeshForwardTarget = ""
-			}
-			if req.BuildType != "" {
-				a.BuildType = req.BuildType
-			}
-			a.HealthcheckURL = req.HealthcheckURL
+	}
 
-			// Sync webhook if auto_deploy state or repo changed
-			if h.gitProvider != nil && strings.Contains(strings.ToLower(a.RepoURL), "github.com") {
-				if a.AutoDeploy && (!oldApp.AutoDeploy || a.RepoURL != oldApp.RepoURL || a.GitHubHookID == 0) {
-					webhookURL := h.buildWebhookURL(c, a.WebhookToken)
-					hookID, err := h.gitProvider.EnsureRepoWebhook(c.Request.Context(), a.RepoURL, webhookURL)
-					if err == nil {
-						a.WebhookAutoManaged = true
-						a.GitHubHookID = hookID
-						a.WebhookError = ""
-					} else {
-						a.WebhookAutoManaged = false
-						a.WebhookError = err.Error()
-					}
-				} else if !a.AutoDeploy && oldApp.AutoDeploy && oldApp.GitHubHookID > 0 {
-					_ = h.gitProvider.DeleteRepoWebhook(c.Request.Context(), oldApp.RepoURL, oldApp.GitHubHookID)
-					a.WebhookAutoManaged = false
-					a.GitHubHookID = 0
+	if err := h.store.UpdateApp(id, func(a *Application) error {
+		if req.Name != nil {
+			a.Name = strings.TrimSpace(*req.Name)
+		}
+		if req.RepoURL != nil {
+			a.RepoURL = strings.TrimSpace(*req.RepoURL)
+		}
+		if req.Branch != nil {
+			a.Branch = strings.TrimSpace(*req.Branch)
+		}
+		if req.AuthVaultID != nil {
+			a.AuthVaultID = *req.AuthVaultID
+		}
+		if req.AutoDeploy != nil {
+			a.AutoDeploy = *req.AutoDeploy
+		}
+		if req.Dockerfile != nil && *req.Dockerfile != "" {
+			a.Dockerfile = *req.Dockerfile
+		}
+		if req.BuildContext != nil && *req.BuildContext != "" {
+			a.BuildContext = *req.BuildContext
+		}
+		if req.BuildTimeout != nil && *req.BuildTimeout > 0 {
+			a.BuildTimeout = *req.BuildTimeout
+		}
+		if req.EnvVars != nil {
+			a.EnvVars = *req.EnvVars
+		}
+		if req.Ports != nil {
+			a.Ports = *req.Ports
+		}
+		if req.Volumes != nil {
+			a.Volumes = *req.Volumes
+		}
+		if req.ComposeContent != nil && *req.ComposeContent != "" {
+			a.ComposeContent = *req.ComposeContent
+		}
+		if req.Image != nil {
+			a.Image = *req.Image
+		}
+		if req.BuildType != nil && *req.BuildType != "" {
+			a.BuildType = *req.BuildType
+		}
+		if req.HealthcheckURL != nil {
+			a.HealthcheckURL = strings.TrimSpace(*req.HealthcheckURL)
+		}
+		if req.MeshForwardEnabled != nil {
+			a.MeshForwardEnabled = *req.MeshForwardEnabled
+		}
+		if req.MeshForwardHostID != nil {
+			a.MeshForwardHostID = strings.TrimSpace(*req.MeshForwardHostID)
+		}
+		if req.MeshForwardEntryPort != nil {
+			a.MeshForwardEntryPort = *req.MeshForwardEntryPort
+		}
+		if req.MeshForwardTargetPort != nil {
+			a.MeshForwardTargetPort = *req.MeshForwardTargetPort
+		}
+		if !a.MeshForwardEnabled {
+			// A disabled relay keeps no coordinates: leaving them behind makes
+			// the record point at a container that purge would then chase.
+			a.MeshForwardHostID = ""
+			a.MeshForwardEntryPort = 0
+			a.MeshForwardTargetPort = 0
+			a.MeshForwardTarget = ""
+		}
+
+		// Sync webhook if auto_deploy state or repo changed
+		if h.gitProvider != nil && strings.Contains(strings.ToLower(a.RepoURL), "github.com") {
+			if a.AutoDeploy && (!oldApp.AutoDeploy || a.RepoURL != oldApp.RepoURL || a.GitHubHookID == 0) {
+				webhookURL := h.buildWebhookURL(c, a.WebhookToken)
+				hookID, err := h.gitProvider.EnsureRepoWebhook(c.Request.Context(), a.RepoURL, webhookURL)
+				if err == nil {
+					a.WebhookAutoManaged = true
+					a.GitHubHookID = hookID
 					a.WebhookError = ""
+				} else {
+					a.WebhookAutoManaged = false
+					a.WebhookError = err.Error()
 				}
-			}
-			return nil
-		}); err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-			return
-		}
-		app, _ := h.store.GetApp(id)
-		resp := gin.H{"data": app}
-		if app != nil && h.engine != nil {
-			meshChanged := oldApp.MeshForwardEnabled != app.MeshForwardEnabled ||
-				oldApp.MeshForwardHostID != app.MeshForwardHostID ||
-				oldApp.MeshForwardEntryPort != app.MeshForwardEntryPort ||
-				oldApp.MeshForwardTargetPort != app.MeshForwardTargetPort
-			if meshChanged {
-				// The stored fields were overwritten/cleared: the old relay would
-				// otherwise be orphaned with nothing in the record pointing at it,
-				// and purge would never find it. Tear it down by its old location.
-				if oldApp.MeshForwardHostID != "" && oldApp.MeshForwardHostID != app.MeshForwardHostID {
-					h.engine.CleanMeshForwarder(oldApp.MeshForwardHostID, id)
-				}
-				deployed := app.ContainerName != "" || app.CurrentCommit != "" || app.SourceType == "raw_compose"
-				if deployed && app.MeshForwardEnabled {
-					// Synchronous so the user sees the relay outcome in the
-					// update response instead of a discarded goroutine error.
-					target, err := h.engine.SyncMeshForwarder(app)
-					switch {
-					case err != nil:
-						resp["mesh_forward_warning"] = "组网转发中继同步失败: " + err.Error()
-					case target != "":
-						resp["mesh_forward_target"] = target
-					}
-				}
+			} else if !a.AutoDeploy && oldApp.AutoDeploy && oldApp.GitHubHookID > 0 {
+				_ = h.gitProvider.DeleteRepoWebhook(c.Request.Context(), oldApp.RepoURL, oldApp.GitHubHookID)
+				a.WebhookAutoManaged = false
+				a.GitHubHookID = 0
+				a.WebhookError = ""
 			}
 		}
-		c.JSON(http.StatusOK, resp)
+		return nil
+	}); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	app, _ := h.store.GetApp(id)
+	resp := gin.H{"data": app}
+	if app != nil && h.engine != nil {
+		meshChanged := oldApp.MeshForwardEnabled != app.MeshForwardEnabled ||
+			oldApp.MeshForwardHostID != app.MeshForwardHostID ||
+			oldApp.MeshForwardEntryPort != app.MeshForwardEntryPort ||
+			oldApp.MeshForwardTargetPort != app.MeshForwardTargetPort
+		if meshChanged {
+			// The stored fields were overwritten/cleared: the old relay would
+			// otherwise be orphaned with nothing in the record pointing at it,
+			// and purge would never find it. Tear it down by its old location.
+			if oldApp.MeshForwardHostID != "" && oldApp.MeshForwardHostID != app.MeshForwardHostID {
+				h.engine.CleanMeshForwarder(oldApp.MeshForwardHostID, id)
+			}
+			deployed := app.ContainerName != "" || app.CurrentCommit != "" || app.SourceType == "raw_compose"
+			if deployed && app.MeshForwardEnabled {
+				// Synchronous so the user sees the relay outcome in the
+				// update response instead of a discarded goroutine error.
+				target, err := h.engine.SyncMeshForwarder(app)
+				switch {
+				case err != nil:
+					resp["mesh_forward_warning"] = "组网转发中继同步失败: " + err.Error()
+				case target != "":
+					resp["mesh_forward_target"] = target
+				}
+			}
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (h *AppHandlers) deleteApp(c *gin.Context) {
@@ -536,12 +657,44 @@ func (h *AppHandlers) deployApp(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
 		return
 	}
+	var req struct {
+		Force bool `json:"force"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	force := req.Force || c.Query("force") == "true" || c.Query("force") == "1"
+
+	if force && h.engine != nil {
+		h.engine.CancelDeployment(app.ID, usernameOf(c))
+	}
+
 	dep, err := h.engine.StartDeployment(app, "manual", usernameOf(c))
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": dep})
+}
+
+func (h *AppHandlers) cancelDeployment(c *gin.Context) {
+	app, ok := h.store.GetApp(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
+		return
+	}
+	if h.engine == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deployment engine unavailable"})
+		return
+	}
+	cancelled := h.engine.CancelDeployment(app.ID, usernameOf(c))
+	msg := "当前没有正在执行的部署任务"
+	if cancelled {
+		msg = "已成功终止部署任务"
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":        true,
+		"cancelled": cancelled,
+		"message":   msg,
+	})
 }
 
 // rollbackApp re-deploys a historical version. For git-backed apps it

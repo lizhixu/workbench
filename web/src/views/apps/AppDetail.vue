@@ -14,7 +14,7 @@ import {
   SwapHorizontalOutline,
 } from '@vicons/ionicons5'
 import {
-  deployApp, diagnoseDeployment, getApp, getAppStatus, listDeployments, restartApp,
+  cancelDeployment, deployApp, diagnoseDeployment, getApp, getAppStatus, listDeployments, restartApp,
   rollbackApp, startApp, stopApp, updateApp, syncAppWebhook, type AppEntity, type AppStatus, type Deployment,
   type AIDiagnosis,
 } from '../../api/apps'
@@ -346,6 +346,7 @@ async function loadApp() {
       composeEditContent.value = app.value.compose_content
     }
     syncForwardForm()
+    syncEnvRows()
   } catch (e: any) {
     message.error(e.message || '获取应用信息失败')
   }
@@ -367,6 +368,148 @@ async function saveAndRedeployCompose() {
     message.error(e.message || '保存失败')
   } finally {
     savingCompose.value = false
+  }
+}
+
+// ---- 应用配置编辑（概览页签的「编辑配置」弹窗）----
+// PUT /apps/:id 是部分更新：这里只提交用户真正改过的字段，避免覆盖未展示
+// 的配置（Git 凭据、自动部署、组网转发等）。已部署应用改完需重新部署生效，
+// 弹窗内提供「保存并重新部署」。
+const showEdit = ref(false)
+const savingEdit = ref(false)
+const editForm = ref({
+  name: '',
+  image: '',
+  healthcheck_url: '',
+  ports: [] as { host: number | null; container: number | null; bind_scope: 'public' | 'mesh' }[],
+  volumes_text: '',
+})
+
+function openEdit() {
+  if (!app.value) return
+  editForm.value = {
+    name: app.value.name,
+    image: app.value.image ?? '',
+    healthcheck_url: app.value.healthcheck_url ?? '',
+    ports: (app.value.ports ?? []).map((p) => ({
+      host: p.host,
+      container: p.container,
+      bind_scope: (p.bind_scope === 'mesh' ? 'mesh' : 'public') as 'public' | 'mesh',
+    })),
+    volumes_text: (app.value.volumes ?? []).join('\n'),
+  }
+  showEdit.value = true
+}
+
+const editIsDeployed = computed(() => {
+  if (!app.value) return false
+  return !!app.value.current_commit || app.value.source_type === 'raw_compose' || !!status.value?.state && status.value.state !== 'undeployed'
+})
+
+// 只发送真正改动过的字段（部分更新语义）。
+function buildEditPatch() {
+  const cur = app.value
+  if (!cur) return {}
+  const patch: Record<string, unknown> = {}
+  const name = editForm.value.name.trim()
+  if (name && name !== cur.name) patch.name = name
+  if (cur.source_type === 'image') {
+    const image = editForm.value.image.trim()
+    if (image && image !== (cur.image ?? '')) patch.image = image
+  }
+  const health = editForm.value.healthcheck_url.trim()
+  if (health !== (cur.healthcheck_url ?? '')) patch.healthcheck_url = health
+  const ports = editForm.value.ports
+    .filter((p) => (p.host ?? 0) > 0 && (p.container ?? 0) > 0)
+    .map((p) => ({ host: Number(p.host), container: Number(p.container), bind_scope: p.bind_scope }))
+  const curPorts = (cur.ports ?? []).map((p) => ({
+    host: p.host,
+    container: p.container,
+    bind_scope: p.bind_scope === 'mesh' ? 'mesh' : 'public',
+  }))
+  if (JSON.stringify(ports) !== JSON.stringify(curPorts)) patch.ports = ports
+  const volumes = editForm.value.volumes_text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+  if (JSON.stringify(volumes) !== JSON.stringify(cur.volumes ?? [])) patch.volumes = volumes
+  return patch
+}
+
+async function saveEdit(redeploy: boolean) {
+  const patch = buildEditPatch()
+  if (Object.keys(patch).length === 0) {
+    if (redeploy) await doDeploy()
+    else message.info('没有改动需要保存')
+    showEdit.value = false
+    return
+  }
+  // 端口行填写不完整（只填了 host 或 container）时提示，避免静默丢弃。
+  const incomplete = editForm.value.ports.some((p) => ((p.host ?? 0) > 0) !== ((p.container ?? 0) > 0))
+  if (incomplete) {
+    message.warning('端口映射需同时填写宿主机端口与容器端口')
+    return
+  }
+  savingEdit.value = true
+  try {
+    await updateApp(appId.value, patch)
+    message.success(redeploy ? '配置已保存，正在重新部署…' : '配置已保存')
+    showEdit.value = false
+    await loadApp()
+    if (redeploy) await doDeploy()
+  } catch (e: any) {
+    message.error(e.message || '保存失败')
+  } finally {
+    savingEdit.value = false
+  }
+}
+
+// ---- 环境变量编辑 ----
+// 行式编辑器，保留插入顺序；key 为空的行忽略。Vault 引用
+// （{{ vault:<id>:<key> }}）按原文编辑，部署时由服务端解析。
+const envRows = ref<{ key: string; value: string }[]>([])
+const savingEnv = ref(false)
+
+function syncEnvRows() {
+  envRows.value = Object.entries(app.value?.env_vars ?? {}).map(([key, value]) => ({ key, value }))
+}
+
+function addEnvRow() {
+  envRows.value.push({ key: '', value: '' })
+}
+
+function removeEnvRow(idx: number) {
+  envRows.value.splice(idx, 1)
+}
+
+function collectEnvVars(): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const row of envRows.value) {
+    const k = row.key.trim()
+    if (!k) continue
+    out[k] = row.value
+  }
+  return out
+}
+
+async function saveEnv(redeploy: boolean) {
+  const vars = collectEnvVars()
+  for (const [k, v] of Object.entries(vars)) {
+    if (!v.trim()) {
+      message.warning(`环境变量「${k}」的值不能为空`)
+      return
+    }
+  }
+  savingEnv.value = true
+  try {
+    await updateApp(appId.value, { env_vars: vars })
+    message.success(redeploy ? '环境变量已保存，正在重新部署…' : '环境变量已保存')
+    await loadApp()
+    if (redeploy) await doDeploy()
+  } catch (e: any) {
+    message.error(e.message || '保存失败')
+  } finally {
+    savingEnv.value = false
   }
 }
 
@@ -395,16 +538,31 @@ async function refreshAll() {
   await Promise.all([loadApp(), loadStatus(), loadDeployments()])
 }
 
-async function doDeploy() {
+const cancellingDeploy = ref(false)
+
+async function doDeploy(force = false) {
   acting.value = true
   try {
-    await deployApp(appId.value)
-    message.success('已开始部署')
+    await deployApp(appId.value, force)
+    message.success(force ? '已终止当前任务并重新启动部署' : '已开始部署')
     await Promise.all([loadStatus(), loadDeployments()])
   } catch (e: any) {
     message.error(e.message || '触发部署失败')
   } finally {
     acting.value = false
+  }
+}
+
+async function doCancelDeploy() {
+  cancellingDeploy.value = true
+  try {
+    const res = await cancelDeployment(appId.value)
+    message.success(res.message || '部署任务已终止')
+    await Promise.all([loadStatus(), loadDeployments()])
+  } catch (e: any) {
+    message.error(e.message || '终止部署失败')
+  } finally {
+    cancellingDeploy.value = false
   }
 }
 
@@ -462,13 +620,13 @@ function openLog(dep: Deployment) {
 }
 
 const depStatusTag = (s: string) => {
-  const type = s === 'success' ? 'success' : s === 'failed' ? 'error' : 'info'
-  const label = s === 'success' ? '成功' : s === 'failed' ? '失败' : s === 'queued' ? '排队' : s === 'building' ? '构建中' : s === 'deploying' ? '发布中' : s
+  const type = s === 'success' ? 'success' : s === 'failed' ? 'error' : s === 'cancelled' ? 'warning' : 'info'
+  const label = s === 'success' ? '成功' : s === 'failed' ? '失败' : s === 'cancelled' ? '已取消' : s === 'queued' ? '排队' : s === 'building' ? '构建中' : s === 'deploying' ? '发布中' : s
   return h(NTag, { size: 'small', type, bordered: false }, { default: () => label })
 }
 
 const triggerLabel = (t: string) =>
-  t === 'webhook' ? 'Git 推送' : t === 'rollback' ? '回滚' : '手动'
+  t === 'create' ? '创建' : t === 'webhook' ? 'Git 推送' : t === 'rollback' ? '回滚' : '手动'
 
 const columns = computed<DataTableColumns<Deployment>>(() => [
   { title: '状态', key: 'status', width: 90, render: (r) => depStatusTag(r.status) },
@@ -485,7 +643,13 @@ const columns = computed<DataTableColumns<Deployment>>(() => [
     title: '提交信息',
     key: 'commit_message',
     ellipsis: { tooltip: true },
-    render: (r) => r.commit_message || (r.error ?? '-'),
+    render: (r) => {
+      if (r.status === 'cancelled') {
+        const who = r.cancelled_by ? ` (由 ${r.cancelled_by} 取消)` : ''
+        return (r.commit_message ? `${r.commit_message} · ` : '') + (r.error || '部署已取消') + who
+      }
+      return r.commit_message || (r.error ?? '-')
+    },
   },
   {
     title: '耗时',
@@ -509,6 +673,28 @@ const columns = computed<DataTableColumns<Deployment>>(() => [
           const btns = [
             h(NButton, { size: 'tiny', secondary: true, onClick: () => openLog(r) }, { default: () => '日志' }),
           ]
+          if (canWrite.value && (r.status === 'queued' || r.status === 'building' || r.status === 'deploying')) {
+            btns.push(
+              h(
+                NPopconfirm,
+                { onPositiveClick: () => doCancelDeploy() },
+                {
+                  trigger: () =>
+                    h(
+                      NButton,
+                      {
+                        size: 'tiny',
+                        secondary: true,
+                        type: 'error',
+                        loading: cancellingDeploy.value,
+                      },
+                      { default: () => '停止' },
+                    ),
+                  default: () => '确定终止当前正在进行的部署任务？已拉起的临时资源将被安全清理。',
+                },
+              ),
+            )
+          }
           if (r.status === 'failed') {
             btns.push(
               h(
@@ -607,12 +793,34 @@ onDeactivated(() => {
         </NTag>
       </NSpace>
       <NSpace v-if="canWrite">
-        <NButton size="small" type="primary" :loading="acting || deploying" @click="doDeploy">
+        <NPopconfirm v-if="deploying" @positive-click="doDeploy(true)">
+          <template #trigger>
+            <NButton size="small" type="primary" :loading="acting">
+              <template #icon>
+                <NIcon><CloudUploadOutline /></NIcon>
+              </template>
+              重新部署
+            </NButton>
+          </template>
+          当前已有部署任务正在进行中，继续将终止当前任务并启动全新部署。是否继续？
+        </NPopconfirm>
+        <NButton v-else size="small" type="primary" :loading="acting" @click="doDeploy(false)">
           <template #icon>
             <NIcon><CloudUploadOutline /></NIcon>
           </template>
-          部署
+          {{ status?.state === 'undeployed' ? '部署' : '重新部署' }}
         </NButton>
+        <NPopconfirm v-if="deploying" @positive-click="doCancelDeploy">
+          <template #trigger>
+            <NButton size="small" type="error" :loading="cancellingDeploy">
+              <template #icon>
+                <NIcon><StopOutline /></NIcon>
+              </template>
+              终止部署
+            </NButton>
+          </template>
+          确定终止当前部署任务？半拉起的临时容器将被清理，不影响在线服务。
+        </NPopconfirm>
         <NPopconfirm @positive-click="doRollback()">
           <template #trigger>
             <NButton size="small" :loading="acting || deploying" :disabled="deploying">
@@ -649,6 +857,11 @@ onDeactivated(() => {
       <NTabs v-model:value="activeTab" type="line" style="height: 100%; display: flex; flex-direction: column">
         <NTabPane name="overview" tab="概览">
           <div class="overview-scroll">
+            <NSpace justify="end" style="margin-bottom: 10px">
+              <NButton v-if="canWrite" size="small" secondary @click="openEdit">
+                编辑配置
+              </NButton>
+            </NSpace>
             <NDescriptions :column="2" bordered size="small" label-placement="left">
               <NDescriptionsItem label="部署来源">
                 <NTag size="small" :bordered="false">
@@ -1003,13 +1216,26 @@ onDeactivated(() => {
 
         <NTabPane name="env" tab="环境变量">
           <div class="overview-scroll">
-            <template v-if="app.env_vars && Object.keys(app.env_vars).length > 0">
-              <div v-for="(v, k) in app.env_vars" :key="k" class="env-row">
-                <NTag size="small" bordered>{{ k }}</NTag>
-                <span class="mono env-value">{{ v.includes('vault:') ? '••••（Vault 引用）' : v }}</span>
+            <NAlert v-if="app.source_type === 'template'" type="info" :show-icon="false" style="margin-bottom: 12px">
+              该应用来自内置模板：部署时模板参数会重新渲染对应变量，此处的手动修改可能被覆盖。
+            </NAlert>
+            <template v-if="envRows.length > 0">
+              <div v-for="(row, idx) in envRows" :key="idx" class="env-edit-row">
+                <NInput v-model:value="row.key" placeholder="变量名" style="width: 220px" :disabled="!canWrite" />
+                <NInput v-model:value="row.value" placeholder="变量值（支持 {{ vault:<id>:<key> }} 引用）" :disabled="!canWrite" />
+                <NButton v-if="canWrite" size="small" quaternary type="error" @click="removeEnvRow(idx)">
+                  删除
+                </NButton>
               </div>
             </template>
             <NAlert v-else type="default" :show-icon="false">未配置环境变量</NAlert>
+            <NSpace v-if="canWrite" justify="end" style="margin-top: 12px">
+              <NButton size="small" secondary @click="addEnvRow">添加变量</NButton>
+              <NButton size="small" :loading="savingEnv" @click="saveEnv(false)">保存</NButton>
+              <NButton size="small" type="primary" :loading="savingEnv || deploying" @click="saveEnv(true)">
+                保存并重新部署
+              </NButton>
+            </NSpace>
           </div>
         </NTabPane>
       </NTabs>
@@ -1031,6 +1257,62 @@ onDeactivated(() => {
 
     <!-- 运维隧道一键入口（kubectl port-forward 式） -->
     <OpsTunnelModal v-model:show="showTunnel" :prefill="tunnelPrefill" />
+
+    <!-- 应用配置编辑（部分更新：只提交改动字段） -->
+    <NModal
+      v-model:show="showEdit"
+      preset="card"
+      title="编辑应用配置"
+      style="width: 640px; max-width: 94vw"
+    >
+      <NForm label-placement="top" size="small">
+        <NFormItem label="应用名称">
+          <NInput v-model:value="editForm.name" placeholder="应用名称" />
+        </NFormItem>
+        <NFormItem v-if="app?.source_type === 'image'" label="镜像地址">
+          <NInput v-model:value="editForm.image" placeholder="nginx:alpine" />
+        </NFormItem>
+        <NFormItem label="健康检查 URL">
+          <NInput v-model:value="editForm.healthcheck_url" placeholder="http://127.0.0.1:8080/healthz（留空则不检查）" />
+        </NFormItem>
+        <NFormItem label="端口映射">
+          <div style="width: 100%">
+            <div v-for="(p, idx) in editForm.ports" :key="idx" class="port-edit-row">
+              <NInputNumber v-model:value="p.host" placeholder="宿主端口" :min="1" :max="65535" style="width: 130px" />
+              <span class="mono">:</span>
+              <NInputNumber v-model:value="p.container" placeholder="容器端口" :min="1" :max="65535" style="width: 130px" />
+              <NSelect
+                v-model:value="p.bind_scope"
+                :options="[{ label: '公网开放', value: 'public' }, { label: '仅异地组网', value: 'mesh' }]"
+                style="width: 140px"
+              />
+              <NButton size="tiny" quaternary type="error" @click="editForm.ports.splice(idx, 1)">删除</NButton>
+            </div>
+            <NButton size="tiny" secondary @click="editForm.ports.push({ host: null, container: null, bind_scope: 'public' })">
+              添加端口
+            </NButton>
+          </div>
+        </NFormItem>
+        <NFormItem label="挂载卷（每行 host:container）">
+          <NInput
+            v-model:value="editForm.volumes_text"
+            type="textarea"
+            :autosize="{ minRows: 2, maxRows: 5 }"
+            placeholder="/opt/data:/data"
+          />
+        </NFormItem>
+      </NForm>
+      <NAlert v-if="editIsDeployed" type="warning" :show-icon="false" style="margin-bottom: 12px">
+        配置改动需重新部署后生效；可点「保存并重新部署」一次完成。
+      </NAlert>
+      <NSpace justify="end">
+        <NButton @click="showEdit = false">取消</NButton>
+        <NButton :loading="savingEdit" @click="saveEdit(false)">保存</NButton>
+        <NButton type="primary" :loading="savingEdit || deploying" @click="saveEdit(true)">
+          保存并重新部署
+        </NButton>
+      </NSpace>
+    </NModal>
 
     <!-- AI 部署排障诊断弹窗 -->
     <NModal
@@ -1200,6 +1482,22 @@ onDeactivated(() => {
   .env-value {
     color: var(--n-text-color);
   }
+}
+
+/* 环境变量行式编辑器：变量名固定宽，值占满剩余，删除按钮贴右 */
+.env-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+/* 端口映射行编辑：宿主:容器 + 绑定范围 + 删除 */
+.port-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
 }
 
 .log-body {

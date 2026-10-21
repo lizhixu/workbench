@@ -64,6 +64,15 @@ func (s *Store) loadApps() error {
 		return nil
 	}
 	for _, a := range list {
+		// Records written before UpdatedAt existed have no stamp; backfill from
+		// the newest known activity so the list column is never blank for
+		// pre-existing apps.
+		if a.UpdatedAt.IsZero() {
+			a.UpdatedAt = a.CreatedAt
+			if a.LastDeployAt.After(a.UpdatedAt) {
+				a.UpdatedAt = a.LastDeployAt
+			}
+		}
 		s.apps[a.ID] = a
 	}
 	return nil
@@ -207,11 +216,17 @@ func (s *Store) GetApp(id string) (*Application, bool) {
 func (s *Store) PutApp(a *Application) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if a.UpdatedAt.IsZero() {
+		a.UpdatedAt = a.CreatedAt
+	}
 	s.apps[a.ID] = a
 	return s.saveAppsLocked()
 }
 
 // UpdateApp mutates one application under the write lock and persists.
+// Every persisted mutation advances UpdatedAt here — the single write point,
+// so config edits, deploy results, proxy binds and relay syncs all surface in
+// the list's 最近更新 column without each call site remembering to stamp it.
 func (s *Store) UpdateApp(id string, mutate func(*Application) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -219,10 +234,22 @@ func (s *Store) UpdateApp(id string, mutate func(*Application) error) error {
 	if !ok {
 		return fmt.Errorf("app %s not found", id)
 	}
+	prev := a.UpdatedAt
 	if err := mutate(a); err != nil {
 		return err
 	}
+	a.UpdatedAt = nextUpdatedAt(prev, time.Now())
 	return s.saveAppsLocked()
+}
+
+// nextUpdatedAt keeps the timestamp monotonic: a clock that steps backwards
+// (NTP correction) must not make a fresh edit look older than the record it
+// replaced.
+func nextUpdatedAt(prev, now time.Time) time.Time {
+	if now.After(prev) {
+		return now
+	}
+	return prev
 }
 
 // DeleteApp removes one application (its deployment history is kept for audit).

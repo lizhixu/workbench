@@ -48,6 +48,8 @@ export interface AppEntity {
   current_commit?: string
   last_deploy_at?: string
   created_at: string
+  /** Advances on every persisted mutation (config edit, deploy, proxy bind). */
+  updated_at?: string
 }
 
 export interface Deployment {
@@ -55,9 +57,10 @@ export interface Deployment {
   app_id: string
   commit_hash?: string
   commit_message?: string
-  trigger: 'webhook' | 'manual' | 'rollback'
-  status: 'queued' | 'building' | 'deploying' | 'success' | 'failed'
+  trigger: 'create' | 'webhook' | 'manual' | 'rollback'
+  status: 'queued' | 'building' | 'deploying' | 'success' | 'failed' | 'cancelled'
   started_by?: string
+  cancelled_by?: string
   started_at: string
   finished_at?: string
   duration_ms?: number
@@ -151,8 +154,16 @@ export function deleteApp(id: string, purge = false) {
   )
 }
 
-export function deployApp(id: string) {
-  return unwrap<{ data: Deployment }>(http.post(`/apps/${id}/deploy`)).then((r) => r.data)
+export function deployApp(id: string, force = false) {
+  return unwrap<{ data: Deployment }>(
+    http.post(`/apps/${id}/deploy`, { force }),
+  ).then((r) => r.data)
+}
+
+export function cancelDeployment(id: string) {
+  return unwrap<{ ok: boolean; cancelled: boolean; message: string }>(
+    http.post(`/apps/${id}/deployments/cancel`),
+  )
 }
 
 export function rollbackApp(id: string, deploymentId?: string) {

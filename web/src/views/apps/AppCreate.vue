@@ -1049,7 +1049,7 @@ async function submit() {
       await bindDomainWithCert(app.id, form.domain.trim())
     }
 
-    message.success(`应用「${app.name}」创建成功`)
+    message.success(`应用「${app.name}」已创建，正在部署…`)
     workspace.openTab({
       key: `/apps/${app.id}`,
       title: `应用 ${app.name}`,

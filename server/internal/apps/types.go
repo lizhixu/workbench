@@ -64,6 +64,10 @@ type Application struct {
 	CurrentCommit string    `json:"current_commit,omitempty"`
 	LastDeployAt  time.Time `json:"last_deploy_at,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
+	// UpdatedAt advances on every persisted mutation (config edit, deploy
+	// result, proxy bind/unbind, mesh forward sync). Store.UpdateApp is the
+	// single write point, so no call site can forget it.
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 // PortMapping is one published container port.
@@ -82,6 +86,10 @@ const (
 	DeployDeploying = "deploying"
 	DeploySuccess   = "success"
 	DeployFailed    = "failed"
+	// DeployCancelled marks a run aborted by an operator via the cancel
+	// endpoint: distinct from DeployFailed (a pipeline error) so the UI and
+	// alerts can tell "the user stopped it" from "the build broke".
+	DeployCancelled = "cancelled"
 )
 
 // Deployment records one build+rollout attempt of an application.
@@ -90,7 +98,7 @@ type Deployment struct {
 	AppID         string    `json:"app_id"`
 	CommitHash    string    `json:"commit_hash,omitempty"`
 	CommitMessage string    `json:"commit_message,omitempty"`
-	Trigger       string    `json:"trigger"` // "webhook" | "manual" | "rollback"
+	Trigger       string    `json:"trigger"` // "create" | "webhook" | "manual" | "rollback"
 	Status        string    `json:"status"`
 	StartedBy     string    `json:"started_by,omitempty"`
 	StartedAt     time.Time `json:"started_at"`
@@ -105,4 +113,7 @@ type Deployment struct {
 	// "raw_compose" deployments, so rollback can restore exactly this
 	// version. Older records predate the snapshot and cannot be rolled back.
 	ComposeContent string `json:"compose_content,omitempty"`
+	// CancelledBy records the username that aborted this run (only set when
+	// Status == DeployCancelled).
+	CancelledBy string `json:"cancelled_by,omitempty"`
 }

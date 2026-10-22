@@ -10,6 +10,7 @@ import {
 import type { DataTableColumns } from 'naive-ui'
 import {
   ArrowBackOutline, BuildOutline, CloudUploadOutline, CopyOutline,
+  DownloadOutline,
   GitCommitOutline, PlayOutline, RefreshOutline, SparklesOutline, StopOutline,
   SwapHorizontalOutline,
 } from '@vicons/ionicons5'
@@ -17,10 +18,11 @@ import {
   cancelDeployment, deployApp, diagnoseDeployment, getApp, getAppStatus, listDeployments, restartApp,
   rollbackApp, startApp, stopApp, updateApp, syncAppWebhook, type AppEntity, type AppStatus, type Deployment,
   type AIDiagnosis,
+  backupAppVolumes, listVolumeBackups, restoreVolumeArchive, deleteVolumeArchive, type VolumeArchive,
 } from '../../api/apps'
 import { bindProxy, unbindProxy, type Certificate } from '../../api/certs'
 import { listCerts } from '../../api/certs'
-import { listHosts } from '../../api/hosts'
+import { listHosts, fileDownloadUrl } from '../../api/hosts'
 import { listNetworkNodes } from '../../api/network'
 import { bothMeshed } from '../../utils/mesh'
 import { copyToClipboard } from '../../utils/clipboard'
@@ -535,7 +537,7 @@ async function loadDeployments() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadApp(), loadStatus(), loadDeployments()])
+  await Promise.all([loadApp(), loadStatus(), loadDeployments(), loadVolumeBackups()])
 }
 
 const cancellingDeploy = ref(false)
@@ -578,6 +580,222 @@ async function doRollback(dep?: Deployment) {
     acting.value = false
   }
 }
+
+// ---- 数据卷备份与恢复 ----
+// 备份把卷数据目录打成 tar.gz 直存应用主机（/var/backups/watchman/apps/<appID>/），
+// 元数据在服务端；下载走宿主文件下载端点。恢复语义：自动停机 → 安全副本 →
+// 解压覆盖 → 重启容器（stop 失败则中止，绝不在线覆盖运行中的数据）。
+const volumeBackups = ref<VolumeArchive[]>([])
+const volumeBackupTotal = ref(0)
+const volBackupNote = ref('')
+const selectedVolumeSpecs = ref<string[]>([])
+const backingVolumes = ref(false)
+const restoringArchive = ref('')
+
+interface ParsedVolume {
+  spec: string
+  src: string
+  dst: string
+  mode: string
+  bind: boolean
+}
+
+// 与后端 parseVolumeSpec 同规则解析展示：Windows 盘符（C:\data:/data）不切开。
+const parsedVolumes = computed<ParsedVolume[]>(() => {
+  const out: ParsedVolume[] = []
+  for (const spec of app.value?.volumes ?? []) {
+    const parts = spec.split(':')
+    const mode = parts.length >= 3 && (parts[parts.length - 1] === 'ro' || parts[parts.length - 1] === 'rw')
+      ? parts[parts.length - 1] : ''
+    const dst = parts.length >= 2 ? parts[parts.length - 1] : ''
+    const src = parts.slice(0, Math.max(parts.length - 1, 1)).join(':')
+    if (!src || !dst) continue
+    out.push({ spec, src, dst, mode, bind: src.startsWith('/') || /^[A-Za-z]:[\\/]/.test(src) })
+  }
+  return out
+})
+
+// Compose 应用的挂载卷在编排文件中声明，应用级备份不覆盖（后端同款 400）。
+const volumeBackupSupported = computed(() => {
+  const a = app.value
+  if (!a) return false
+  if (a.source_type === 'raw_compose') return false
+  if (a.source_type === 'git' && (a.build_type ?? '').toLowerCase() === 'compose') return false
+  return true
+})
+
+async function loadVolumeBackups() {
+  if (!app.value) return
+  try {
+    const res = await listVolumeBackups(appId.value, { page_size: 100 })
+    volumeBackups.value = res.data
+    volumeBackupTotal.value = res.total
+  } catch (e: any) {
+    message.error(e.message || '获取备份归档失败')
+  }
+}
+
+const volumeBackupRunning = computed(() => volumeBackups.value.some((a) => a.status === 'running'))
+
+async function doBackupVolumes() {
+  backingVolumes.value = true
+  try {
+    const note = volBackupNote.value.trim()
+    const payload = selectedVolumeSpecs.value.length > 0
+      ? { volumes: selectedVolumeSpecs.value, note }
+      : { note }
+    await backupAppVolumes(appId.value, payload)
+    message.success('备份任务已开始，完成后归档会出现在下方列表')
+    await loadVolumeBackups()
+  } catch (e: any) {
+    message.error(e.message || '启动备份失败')
+  } finally {
+    backingVolumes.value = false
+  }
+}
+
+async function doRestoreArchive(a: VolumeArchive) {
+  restoringArchive.value = a.id
+  try {
+    const res = await restoreVolumeArchive(appId.value, a.id)
+    message.success(res.message || '恢复任务已开始')
+    await loadVolumeBackups()
+  } catch (e: any) {
+    message.error(e.message || '恢复失败')
+  } finally {
+    restoringArchive.value = ''
+  }
+}
+
+async function doDeleteArchive(a: VolumeArchive) {
+  try {
+    await deleteVolumeArchive(appId.value, a.id)
+    message.success('归档已删除')
+    await loadVolumeBackups()
+  } catch (e: any) {
+    message.error(e.message || '删除归档失败')
+  }
+}
+
+function downloadArchive(a: VolumeArchive) {
+  if (!app.value) return
+  // 归档在应用主机上：直连宿主文件下载端点（JWT 走 ?token=，由
+  // fileDownloadUrl 拼好），不经控制端中转。
+  const url = fileDownloadUrl(app.value.host_id, a.file_path)
+  window.open(url, '_blank')
+}
+
+const volArchiveStatusTag = (s: string) => {
+  if (s === 'running') return h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '备份中' })
+  if (s === 'failed') return h(NTag, { size: 'small', type: 'error', bordered: false }, { default: () => '失败' })
+  return h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => '成功' })
+}
+
+function formatBytes(b: number) {
+  if (b <= 0) return '0 B'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.min(Math.floor(Math.log(b) / Math.log(k)), sizes.length - 1)
+  return `${(b / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`
+}
+
+const volumeColumns = computed<DataTableColumns<ParsedVolume>>(() => [
+  {
+    title: '挂载规格', key: 'spec', ellipsis: { tooltip: true },
+    render: (r) => h('span', { class: 'mono' }, r.spec),
+  },
+  {
+    title: '类型', key: 'bind', width: 120,
+    render: (r) => h(
+      NTag,
+      { size: 'small', bordered: false, type: r.bind ? 'info' : 'success' },
+      { default: () => (r.bind ? '宿主机目录' : 'Docker 具名卷') },
+    ),
+  },
+  {
+    title: '宿主机路径 / 卷名', key: 'src', ellipsis: { tooltip: true },
+    render: (r) => h('span', { class: 'mono' }, r.src),
+  },
+  {
+    title: '容器内路径', key: 'dst', ellipsis: { tooltip: true },
+    render: (r) => h('span', { class: 'mono' }, r.dst),
+  },
+  {
+    title: '模式', key: 'mode', width: 80,
+    render: (r) => (r.mode === 'ro' ? '只读' : '读写'),
+  },
+])
+
+const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
+  {
+    title: '时间', key: 'created_at', width: 170,
+    render: (r) => formatTime(r.created_at),
+  },
+  {
+    title: '挂载卷', key: 'volume_spec', ellipsis: { tooltip: true },
+    render: (r) => h('span', { class: 'mono' }, r.volume_spec),
+  },
+  { title: '大小', key: 'size', width: 110, render: (r) => formatBytes(r.size) },
+  { title: '状态', key: 'status', width: 90, render: (r) => volArchiveStatusTag(r.status) },
+  {
+    title: '备注 / 错误', key: 'note', ellipsis: { tooltip: true },
+    render: (r) => {
+      if (r.status === 'failed' && r.error) {
+        return h('span', { style: 'color: var(--n-error-color)' }, r.error)
+      }
+      return r.note || '-'
+    },
+  },
+  {
+    title: 'SHA256', key: 'sha256', width: 130, ellipsis: { tooltip: true },
+    render: (r) => h(
+      'span',
+      { class: 'mono', style: 'font-size: 12px; color: var(--n-text-color-3)' },
+      r.sha256 ? `${r.sha256.slice(0, 12)}…` : '-',
+    ),
+  },
+  {
+    title: '操作', key: 'actions', width: 240,
+    render: (r) => h(NSpace, { size: 4 }, () => [
+      r.status === 'success'
+        ? h(
+          NPopconfirm,
+          { onPositiveClick: () => doRestoreArchive(r) },
+          {
+            trigger: () => h(
+              NButton,
+              { size: 'tiny', secondary: true, type: 'warning', loading: restoringArchive.value === r.id },
+              { default: () => '恢复' },
+            ),
+            default: () => '恢复将自动停止应用容器，用该归档覆盖卷数据（覆盖前保留当前状态安全副本），完成后自动重启容器。确认继续？',
+          },
+        )
+        : null,
+      r.status === 'success'
+        ? h(
+          NButton,
+          { size: 'tiny', secondary: true, onClick: () => downloadArchive(r) },
+          {
+            default: () => '下载',
+            icon: () => h(NIcon, null, { default: () => h(DownloadOutline) }),
+          },
+        )
+        : null,
+      h(
+        NPopconfirm,
+        { onPositiveClick: () => doDeleteArchive(r) },
+        {
+          trigger: () => h(
+            NButton,
+            { size: 'tiny', secondary: true, type: 'error' },
+            { default: () => '删除' },
+          ),
+          default: () => '删除归档（含主机上的 tar.gz 文件）？此操作不可恢复。',
+        },
+      ),
+    ].filter(Boolean) as any),
+  },
+])
 
 async function doAction(op: 'stop' | 'start' | 'restart') {
   acting.value = true
@@ -756,6 +974,8 @@ onMounted(() => {
     if (route.name === 'app-detail') {
       loadStatus()
       if (deploying.value) loadDeployments()
+      // 备份归档里的 running 记录由异步 agent tar 推进，轮询直到落终态。
+      if (volumeBackupRunning.value) loadVolumeBackups()
     }
   }, 5000)
 })
@@ -958,6 +1178,94 @@ onDeactivated(() => {
                 </NButton>
               </div>
             </NAlert>
+          </div>
+        </NTabPane>
+
+        <NTabPane name="volumes" tab="数据卷备份">
+          <div class="overview-scroll">
+            <NAlert v-if="!volumeBackupSupported" type="warning" style="margin-bottom: 12px">
+              <template #header>Compose 应用的挂载卷在编排文件中声明</template>
+              应用级备份只覆盖应用声明的挂载卷；Compose 服务的卷请在「快照备份」中按目录或 Docker 卷备份。
+              <NButton size="tiny" secondary style="margin-left: 8px" @click="$router.push('/snapshots')">
+                前往快照备份
+              </NButton>
+            </NAlert>
+            <NAlert v-else-if="parsedVolumes.length === 0" type="default" :show-icon="false" style="margin-bottom: 12px">
+              该应用未配置挂载卷。挂载卷可在「编辑配置」中添加（宿主路径:容器路径），保存并重新部署后生效。
+            </NAlert>
+            <template v-else>
+              <NAlert type="info" style="margin-bottom: 12px">
+                备份将卷数据目录打包为 tar.gz，直存应用主机 <code>/var/backups/watchman/apps/{{ app.id }}/</code>，
+                每卷保留最近 5 份归档。恢复时会<strong>自动停止应用容器</strong>、保留当前状态安全副本后解压覆盖，
+                完成后自动重启容器。
+              </NAlert>
+
+              <!-- 应用挂载卷清单 -->
+              <div style="margin-bottom: 16px">
+                <div style="font-weight: 600; margin-bottom: 8px">应用挂载卷</div>
+                <NDataTable
+                  :columns="volumeColumns"
+                  :data="parsedVolumes"
+                  size="small"
+                  :bordered="false"
+                  :single-line="false"
+                />
+              </div>
+
+              <!-- 发起备份 -->
+              <div v-if="canWrite" style="margin-bottom: 16px">
+                <div style="font-weight: 600; margin-bottom: 8px">发起备份</div>
+                <NSpace vertical>
+                  <NSelect
+                    v-model:value="selectedVolumeSpecs"
+                    multiple
+                    clearable
+                    :options="parsedVolumes.map((v) => ({ label: v.spec, value: v.spec }))"
+                    placeholder="全部挂载卷（不选则备份所有）"
+                  />
+                  <NSpace>
+                    <NInput
+                      v-model:value="volBackupNote"
+                      placeholder="备注（可选）"
+                      style="width: 320px"
+                      :maxlength="200"
+                    />
+                    <NButton
+                      type="primary"
+                      size="small"
+                      :loading="backingVolumes"
+                      @click="doBackupVolumes"
+                    >
+                      <template #icon>
+                        <NIcon><CloudUploadOutline /></NIcon>
+                      </template>
+                      开始备份
+                    </NButton>
+                  </NSpace>
+                </NSpace>
+              </div>
+
+              <!-- 归档历史 -->
+              <div>
+                <div style="font-weight: 600; margin-bottom: 8px">
+                  备份归档
+                  <span v-if="volumeBackupTotal > 0" style="color: var(--n-text-color-3); font-weight: 400">
+                    （共 {{ volumeBackupTotal }} 份）
+                  </span>
+                </div>
+                <NDataTable
+                  :columns="volArchiveColumns"
+                  :data="volumeBackups"
+                  size="small"
+                  :bordered="false"
+                  :single-line="false"
+                >
+                  <template #empty>
+                    <NEmpty description="暂无备份归档" size="small" />
+                  </template>
+                </NDataTable>
+              </div>
+            </template>
           </div>
         </NTabPane>
 

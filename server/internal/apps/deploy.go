@@ -41,10 +41,18 @@ type Engine struct {
 	vault       *vault.Store
 	networkStore *network.Store
 	gitProvider gitTokenProvider
-	log         *slog.Logger
+	// vols stores app volume backup/restore archive metadata (volbackup.go);
+	// nil until wired, in which case volume work reports a clear error.
+	vols *VolumeStore
+	log  *slog.Logger
 
 	mu      sync.Mutex
 	running map[string]*activeDeployment // app_id -> in-flight deployment
+
+	// volMu/volBusy serialize volume backup+restore per app: two concurrent
+	// agent scripts over the same data dir would interleave tar with untar.
+	volMu   sync.Mutex
+	volBusy map[string]bool
 }
 
 // SetGitProvider injects a token provider (e.g. GitHub connection) for auto-cloning.
@@ -63,7 +71,8 @@ func NewEngine(reg *rpc.Registry, store *Store, vs *vault.Store, log *slog.Logge
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Engine{reg: reg, store: store, vault: vs, log: log, running: make(map[string]*activeDeployment)}
+	return &Engine{reg: reg, store: store, vault: vs, log: log,
+		running: make(map[string]*activeDeployment), volBusy: make(map[string]bool)}
 }
 
 // StartDeployment enqueues a deployment. It returns immediately; the caller

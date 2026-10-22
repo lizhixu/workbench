@@ -167,6 +167,15 @@
   - **应用列表（2026-10-21）**：列为 应用名称 / 服务器 / 来源 / 当前版本 / 状态 / 最近部署 / 最近更新 / 操作。「服务器」由前端并行 `listHosts()` 按 `host_id → hostname` 映射（`/apps` 不 join 主机，主机接口失败不阻断应用列表）；「来源」替代原只对 Git 有意义的 `repo_url @ branch` 列（git → 仓库+自动部署标记、image → 镜像、template → 模板、raw_compose → Docker Compose）；「最近更新」取 `Application.updated_at`。右上角入口文案「创建应用」（原「链接 Git 应用」）。
   - **`updated_at` 语义（2026-10-21）**：`Application.UpdatedAt` 在任何持久化变更时推进，写入点唯一——`Store.UpdateApp` 内统一打点（覆盖配置编辑、部署成功/失败收尾、反代绑定/解绑、组网中继同步），`PutApp` 在空值时以 `CreatedAt` 播种；时间戳单调（`nextUpdatedAt`，时钟回拨不回退）。历史 `apps.json` 缺该字段时，加载期回填 `max(CreatedAt, LastDeployAt)`，老应用不显示空白。
   - **`PUT /apps/:id` 为部分更新（2026-10-21）**：改用独立 `updateAppReq`，全部可变字段为 `*T` 指针——未提交的键保持原值，显式 `false`/`""`/`{}` 才清空。此前复用 `createAppReq` 会无条件覆盖 `auto_deploy`/`auth_vault_id`/`healthcheck_url`/`mesh_forward_*`，导致「只保存环境变量」或「只保存 Compose」静默清空这些配置（已修复）。组网转发按「存储值 + 本次改动」的有效配置校验，且仅当请求触及任一 `mesh_forward_*` 字段时才校验（无关编辑不会因入口主机离线而失败）；`mesh_forward_enabled=false` 时坐标清空。**镜像地址仅 `source_type=image` 可改**（模板镜像由模板解析、Git/Compose 走各自构建产物，其余来源 400）；`host_id`/`source_type`/`container_name` 不可改。前端 `AppDetail.vue` 概览页签「编辑配置」弹窗（名称/镜像/健康检查/端口映射/挂载卷，仅提交差异字段，已部署应用可「保存并重新部署」），环境变量页签改为行式编辑器（支持 `{{ vault:… }}` 原文引用、模板来源提示变量会被模板参数重渲染）。
+  - **挂载卷备份与恢复（2026-10-22）**：应用声明的挂载卷（`Application.Volumes`，`host:container[:ro]`）此前只在 purge 时被区分对待（bind mount 绝不删），既不能备份也不能找回，本条目补齐卷数据生命周期。实现位于 `server/internal/apps/volbackup.go`（引擎与 `VolumeStore`）与 `handlers_volbackup.go`（HTTP 面）：
+    - **卷形态覆盖**：bind mount（`/opt/apps/xxx/data:/data`）直接 tar 宿主机路径；Docker 具名卷（`volname:/data`）先 `docker volume inspect --format '{{.Mountpoint}}'` 解析挂载点再 tar（与 purge.go「src 含 `/` 即宿主机目录」的区分规则同源）。`parseVolumeSpec` 按 `:` 切分并把容器路径前的段落重新 join，兼容 Windows 盘符路径（`C:\data:/data`）；`..` 穿越与空路径一律拒绝。
+    - **归档直存被管主机**：tar.gz 落在应用主机的 `/var/backups/watchman/apps/<appID>/`（与快照引擎同一根目录、同一 direct-to-storage 原则——GB 级归档过控制端会打满上行带宽，且数据留在数据所在主机）；元数据（`VolumeArchive`：`volume_spec`/`host_path`/`file_path`/`size`/`sha256`/`status`/`note` 等）落控制端 `app_volume_archives.json`，原子全量重写（记录会 running→success/failed 迁移，非追加型 JSONL），每应用上限 100 条。
+    - **保留策略**：每卷保留最新 5 份（`volumeRetention`），超出后先删宿主文件再删元数据（与快照 engine 默认保留同款语义，防归档无限堆积）。
+    - **恢复语义（安全停机→安全副本→解压→重启）**：先 `docker inspect -f '{{.State.Running}}'` 判断容器运行态；运行中先 `docker stop`（stop 失败即中止恢复，绝不在线覆盖运行中的数据，杜绝文件锁与写盘竞态），恢复脚本先做 `<file>.pre-restore.tar.gz` 安全副本（尽力而为，空目录不阻断）再 `tar -xzf` 覆盖，**`defer` 保证无论恢复成败都把容器拉回原状态**（先停必起，不把在线服务留在停止态）。
+    - **同应用串行**：`volMu/volBusy` 按 `appID` 互斥，第二个备份/恢复请求返回 409「该应用已有备份或恢复任务在执行」——两条 agent 脚本交错操作同一数据目录只会互相污染。
+    - **边界约束**：Compose 来源（`raw_compose` / git+compose）的卷在编排 YAML 内声明、记录不持有，明确 400 拒绝并引导「快照备份」；Windows 主机前置 400（脚本为 POSIX `tar`/`set -e` 语义，与反代绑定的 Windows 前置拒绝同款因果）；备份只接受应用已声明的卷规格（防「备份 + 宿主下载」链路被用于打包任意宿主机目录）；恢复要求应用已部署（有 `ContainerName`）。
+    - **下载与入口**：归档下载走既有 `GET /api/v1/hosts/:id/files/download?path=`（前端 `fileDownloadUrl` 拼 `?token=` 导航回退），零新增下载端点；详情页新增「数据卷备份」页签（应用挂载卷清单表 + 备份范围多选/备注 + 归档历史表：时间/卷/大小/状态/备注/错误/SHA256 截断，操作列恢复（NPopconfirm 高危文案明示自动停机重启）、下载、删除；有 `running` 归档时 5s 轮询直至落终态）。
+    - **审计与互斥**：备份/恢复/删除归档均为 admin+operator 写操作并落审计——`app_volume_backup`（medium）/`app_volume_restore`（high，恢复覆盖在线数据）/`app_volume_backup_delete`（high）；预检顺序为「忙（409）→ 在线（503）」再受理，在途即忙故 409 比 503 更准确。同时补齐了上轮遗漏的 `POST /apps/:id/deployments/cancel` 审计条目（`app_deploy_cancel`/high）。
   - 实现备注（2026-09-28）：`deploySingleContainer` 的起新容器命令只清理残留的 `-next` 容器（`docker rm -f <name>-next`），旧版本容器在 swap 前全程运行、失败时原样保留——此前曾误删旧容器（`rm -f` 目标写成了正式容器名），与"探活失败自动保留旧版本"的设计相悖，已修复。
   - 实现备注（2026-09-28，发布流程 review）：git 拉取脚本必须 `set -e`——此前 `fetch` 失败会落到 `checkout --force` 用本地旧代码继续部署并上报成功；Git token 只持久化在 server 端 vault，下发时经 `git -c http.extraHeader="Authorization: Basic <base64(git:token)>"` 随单次 clone/fetch 使用，不再 `remote set-url` 写进 agent 的 `.git/config`（自动发布每次从 vault 现取，不受影响）；下发到 agent 的命令里所有用户输入变量必须 shell 转义（环境变量值曾因空格打散 `docker run` 参数）；swap 脚本 `set -e`，`docker rename` 失败不得被末尾 `docker inspect` 的退出码掩盖；镜像清理只针对 `watchman-app-*` 自建镜像、按创建时间保留最新 5 个（此前 `docker images repo:tag` 只匹配单个 tag 导致从不清，且 `head -n 6 | tail -n +6` 语义错误）；store 的 `GetApp/ListApps/FindAppByWebhookToken` 返回深拷贝——部署协程 `ResolveTemplate` 原地写 EnvVars map 时 HTTP 层正 marshal 同一对象，曾有 crash 风险；反代域名做严格 hostname 校验并检查跨应用重复绑定；网关模式上游按「组网（双方都在组网内 → 100.x）→ 直连（应用主机公网 IP → 内网 IP）」顺序解析，绝不回退 `127.0.0.1`（会指向网关自身造成流量黑洞），两条路径都拿不到才报错要求手动填 Upstream（2026-10-16 起：早期版本在拿不到 Mesh IP 时直接报错，现改为直连兜底）；`raw_compose` 每次部署快照 compose 内容到部署记录，回滚时恢复快照（此前"回滚"实际重部署了当前内容）；healer 跳过有部署在途的应用。
 - **已安装管理**：应用列表/详情支持重启、停止、启动、查看日志、删除（`watchman.app` 标签标记容器归属）。
@@ -866,6 +875,10 @@ GET    /api/v1/apps/:id/status
 POST   /api/v1/apps/:id/webhook/sync
 POST   /api/v1/apps/inspect-image         # 镜像元数据免拉取只读探测
 POST   /api/v1/apps/inspect-repo          # 仓库元数据只读探测
+GET    /api/v1/apps/:id/volume-backups?volume=&offset=&page_size=  # 挂载卷备份归档列表（登录即可）
+POST   /api/v1/apps/:id/volume-backups    # 备份挂载卷（body {volumes?: string[], note?}，202 异步；仅已声明卷）
+POST   /api/v1/apps/:id/volume-backups/:archiveID/restore  # 恢复归档（自动停机→安全副本→解压→重启）
+DELETE /api/v1/apps/:id/volume-backups/:archiveID          # 删除归档（含宿主 tar.gz 文件）
 
 # 审计
 GET    /api/v1/audit?user=&action=&from=&to=

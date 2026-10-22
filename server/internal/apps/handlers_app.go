@@ -60,6 +60,9 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	readRG.GET("/apps/:id/deployments/:depID", h.getDeployment)
 	readRG.POST("/apps/:id/deployments/:depID/diagnose", h.diagnoseDeployment)
 	readRG.GET("/apps/:id/status", h.appStatus)
+	// App volume backup/restore: archive listing is a read (the download itself
+	// goes through the existing host file endpoint).
+	readRG.GET("/apps/:id/volume-backups", h.listVolumeBackups)
 
 	// Image / repository metadata probing: read-only ground-truth fetchers used
 	// by the create-form auto-fill hints and the AI app assistant. No state is
@@ -77,6 +80,12 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	writeRG.POST("/apps/:id/start", h.startApp)
 	writeRG.POST("/apps/:id/restart", h.restartApp)
 	writeRG.POST("/apps/:id/webhook/sync", h.syncAppWebhook)
+	// Volume backup/restore mutates host data (tar over live volume dirs) and
+	// a restore stops/restarts the app container, so these ride the audited
+	// write group.
+	writeRG.POST("/apps/:id/volume-backups", h.createVolumeBackup)
+	writeRG.POST("/apps/:id/volume-backups/:archiveID/restore", h.restoreVolumeBackup)
+	writeRG.DELETE("/apps/:id/volume-backups/:archiveID", h.deleteVolumeBackup)
 
 	// Git provider webhooks: no JWT, token-in-path authentication.
 	public.POST("/apps/webhook/:token", h.webhook)

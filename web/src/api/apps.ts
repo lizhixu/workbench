@@ -166,6 +166,53 @@ export function cancelDeployment(id: string) {
   )
 }
 
+/** 应用挂载卷备份归档（volbackup.go 的 HTTP 面） */
+export interface VolumeArchive {
+  id: string
+  app_id: string
+  host_id: string
+  /** 原始 docker -v 规格，如 "/opt/apps/redis/data:/data" */
+  volume_spec: string
+  /** 解析后的宿主机数据目录（bind 路径或 Docker 具名卷挂载点） */
+  host_path: string
+  /** 容器内路径 */
+  container_path: string
+  /** 归档在被管主机上的路径 /var/backups/watchman/apps/<appID>/<id>.tar.gz */
+  file_path: string
+  size: number
+  sha256?: string
+  /** running | success | failed */
+  status: string
+  error?: string
+  note?: string
+  created_at: string
+}
+
+export interface VolumeBackupListResp {
+  data: VolumeArchive[]
+  total: number
+  offset: number
+  page_size: number
+}
+
+export function listVolumeBackups(id: string, params?: { volume?: string; offset?: number; page_size?: number }) {
+  return unwrap<VolumeBackupListResp>(http.get(`/apps/${id}/volume-backups`, { params }))
+}
+
+export function backupAppVolumes(id: string, req: { volumes?: string[]; note?: string }) {
+  return unwrap<{ ok: boolean; message: string }>(http.post(`/apps/${id}/volume-backups`, req))
+}
+
+export function restoreVolumeArchive(id: string, archiveId: string) {
+  return unwrap<{ ok: boolean; message: string }>(
+    http.post(`/apps/${id}/volume-backups/${archiveId}/restore`),
+  )
+}
+
+export function deleteVolumeArchive(id: string, archiveId: string) {
+  return unwrap<{ ok: boolean }>(http.delete(`/apps/${id}/volume-backups/${archiveId}`))
+}
+
 export function rollbackApp(id: string, deploymentId?: string) {
   const q = deploymentId ? `?deployment_id=${encodeURIComponent(deploymentId)}` : ''
   return unwrap<{ data: Deployment }>(http.post(`/apps/${id}/rollback${q}`)).then((r) => r.data)

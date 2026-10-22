@@ -317,6 +317,17 @@ func main() {
 	appEngine := apps.NewEngine(reg, appStore, vaultStore, log)
 	appEngine.SetNetworkStore(networkStore)
 
+	// App volume backup/restore archive metadata (volbackup.go). Host-side
+	// archives live under /var/backups/watchman/apps/<appID>/; this store only
+	// keeps the records the detail view lists, restores and deletes.
+	volumeStore, err := apps.NewVolumeStore(appStore.Dir(), log)
+	if err != nil {
+		log.Error("volume backup store init", "err", err)
+		os.Exit(1)
+	}
+	appEngine.SetVolumeStore(volumeStore)
+	log.Info("volume backup store ready", "apps", len(appStore.ListApps()))
+
 	// Git provider integration (GitHub authorization & repo selector).
 	gitProviderStore, err := gitprovider.NewStore(*dataDir, log)
 	if err != nil {

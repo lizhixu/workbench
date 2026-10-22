@@ -50,6 +50,10 @@ func NewStore(dataDir string, log *slog.Logger) (*Store, error) {
 	return s, nil
 }
 
+// Dir exposes the store's data directory so sibling stores (e.g. the volume
+// backup archive metadata) share one layout under the same root.
+func (s *Store) Dir() string { return s.dir }
+
 func (s *Store) loadApps() error {
 	b, err := os.ReadFile(filepath.Join(s.dir, appsFile))
 	if err != nil {

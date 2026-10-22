@@ -2028,11 +2028,18 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodPut, "/api/v1/apps/:id", "app_update", "app", "id", "", "更新应用配置"},
 		{http.MethodDelete, "/api/v1/apps/:id", "app_delete", "app", "id", audit.RiskHigh, "删除应用"},
 		{http.MethodPost, "/api/v1/apps/:id/deploy", "app_deploy", "app", "id", audit.RiskHigh, "部署应用"},
+		{http.MethodPost, "/api/v1/apps/:id/deployments/cancel", "app_deploy_cancel", "app", "id", audit.RiskHigh, "终止进行中的部署任务"},
 		{http.MethodPost, "/api/v1/apps/:id/rollback", "app_rollback", "app", "id", audit.RiskHigh, "回滚应用到上一版本"},
 		{http.MethodPost, "/api/v1/apps/:id/stop", "app_stop", "app", "id", audit.RiskHigh, "停止应用"},
 		{http.MethodPost, "/api/v1/apps/:id/start", "app_start", "app", "id", audit.RiskHigh, "启动应用"},
 		{http.MethodPost, "/api/v1/apps/:id/restart", "app_restart", "app", "id", audit.RiskHigh, "重启应用"},
 		{http.MethodPost, "/api/v1/apps/:id/webhook/sync", "app_webhook_sync", "app", "id", audit.RiskHigh, "同步应用 Webhook 自动部署"},
+		// App volume backup/restore: a restore stops the app container and
+		// overwrites live volume data, so it is high-risk like the container
+		// lifecycle actions above.
+		{http.MethodPost, "/api/v1/apps/:id/volume-backups", "app_volume_backup", "app", "id", "", "备份应用挂载卷数据"},
+		{http.MethodPost, "/api/v1/apps/:id/volume-backups/:archiveID/restore", "app_volume_restore", "app", "id", audit.RiskHigh, "恢复应用挂载卷数据"},
+		{http.MethodDelete, "/api/v1/apps/:id/volume-backups/:archiveID", "app_volume_backup_delete", "app", "id", audit.RiskHigh, "删除应用挂载卷备份归档"},
 		// Reverse-proxy domain binding: traffic-affecting, high-risk.
 		{http.MethodPut, "/api/v1/apps/:id/proxy", "app_proxy_bind", "app", "id", audit.RiskHigh, "绑定反代域名"},
 		{http.MethodDelete, "/api/v1/apps/:id/proxy", "app_proxy_unbind", "app", "id", audit.RiskHigh, "解绑反代域名"},

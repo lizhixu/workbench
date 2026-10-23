@@ -1,6 +1,6 @@
 import { http, unwrap } from './http'
 
-export type JobKind = 'dir' | 'volume' | 'database'
+export type JobKind = 'dir' | 'volume' | 'database' | 'app_volume'
 
 export interface S3Target {
   id: string
@@ -23,6 +23,7 @@ export interface BackupJob {
   host_id: string
   kind: JobKind
   target: string
+  app_id?: string
   db_type?: string
   db_name?: string
   storage_target?: string // "default" | "local" | "s3_xxxx"
@@ -48,6 +49,15 @@ export interface Archive {
   size: number
   sha256?: string
   created_at: string
+  // app_volume 归档专用：任务记录带生命周期（running/success/failed）与冻结的
+  // S3 目标名，其余类型只在成功终态落一条记录。
+  storage_target_name?: string
+  status?: 'running' | 'success' | 'failed'
+  error?: string
+  note?: string
+  last_restore_at?: string
+  last_restore_status?: string
+  last_restore_error?: string
 }
 
 export interface CreateJobReq {
@@ -55,6 +65,7 @@ export interface CreateJobReq {
   host_id: string
   kind: JobKind
   target: string
+  app_id?: string
   db_type?: string
   db_name?: string
   storage_target?: string

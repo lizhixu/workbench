@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onActivated, onMounted, reactive, ref } from 'vue'
+import { computed, h, onActivated, onMounted, reactive, ref, watch } from 'vue'
 import {
   NAlert, NButton, NCard, NDataTable, NForm, NFormItem, NIcon, NInput,
   NInputNumber, NModal, NPopconfirm, NRadio, NRadioGroup, NSelect,
@@ -18,6 +18,7 @@ import {
   type Archive, type BackupJob, type CreateJobReq, type S3Target,
 } from '../../api/snapshots'
 import { listHosts } from '../../api/hosts'
+import { listApps, type AppEntity } from '../../api/apps'
 import { fmtDateTimeMinute } from '../../utils/time'
 
 defineOptions({ name: 'SnapshotList' })
@@ -69,6 +70,45 @@ interface HostOption {
 }
 const hostOptions = ref<{ label: string; value: string }[]>([])
 
+// ---- 应用数据卷（app_volume）任务 ----
+const apps = ref<AppEntity[]>([])
+// NSelect 空值必须用 null（AGENTS.md §8.3.1），'' 会渲染幽灵选中态。
+const selectedAppID = ref<string | null>(null)
+const selectedAppVolume = ref<string | null>(null)
+
+const selectedApp = computed(() => apps.value.find((a) => a.id === selectedAppID.value) || null)
+const defaultS3 = computed(() => s3Targets.value.find((t) => t.is_default) || null)
+
+// Compose 应用的卷在编排 YAML 内声明，引擎拒绝卷备份；无声明卷的应用也无可备份对象。
+const appOptions = computed(() =>
+  apps.value
+    .filter((a) => {
+      if (a.source_type === 'raw_compose') return false
+      if (a.source_type === 'git' && a.build_type === 'compose') return false
+      return (a.volumes?.length ?? 0) > 0
+    })
+    .map((a) => {
+      const host = hostOptions.value.find((o) => o.value === a.host_id)
+      return { label: host ? `${a.name} · ${host.label}` : a.name, value: a.id }
+    }),
+)
+
+const appVolumeOptions = computed(() =>
+  (selectedApp.value?.volumes ?? []).map((v) => ({ label: v, value: v })),
+)
+
+// 应用数据卷归档仅支持 S3：不提供「本地主机」选项，也给不出默认目标时引导去配置。
+const appVolumeStorageOptions = computed(() => {
+  const opts: { label: string; value: string }[] = []
+  if (defaultS3.value) {
+    opts.push({ label: `默认 S3 目标 (${defaultS3.value.name} - ${defaultS3.value.bucket})`, value: 'default' })
+  }
+  for (const t of s3Targets.value) {
+    opts.push({ label: `S3: ${t.name} (${t.bucket})`, value: t.id })
+  }
+  return opts
+})
+
 const form = reactive<CreateJobReq>({
   name: '',
   host_id: '',
@@ -82,7 +122,17 @@ const form = reactive<CreateJobReq>({
   enabled: true,
 })
 
+watch(() => form.kind, (kind) => {
+  if (kind !== 'app_volume') return
+  // 「本地主机」对 app_volume 不可用，切过来时校正到默认或首个 S3 目标。
+  const valid = form.storage_target === 'default'
+    ? Boolean(defaultS3.value)
+    : s3Targets.value.some((t) => t.id === form.storage_target)
+  if (!valid) form.storage_target = defaultS3.value ? 'default' : (s3Targets.value[0]?.id ?? 'default')
+})
+
 const kindOptions = [
+  { label: '应用数据卷（应用中心应用）', value: 'app_volume' },
   { label: '数据库热备 (MySQL / Postgres / Redis / Mongo)', value: 'database' },
   { label: 'Docker 命名卷 (Volume)', value: 'volume' },
   { label: '主机目录 (Directory)', value: 'dir' },
@@ -149,11 +199,33 @@ const columns = computed<DataTableColumns<BackupJob>>(() => [
     key: 'kind',
     width: 130,
     render: (r) => {
-      const label = r.kind === 'database' ? `DB (${r.db_type?.toUpperCase()})` : r.kind === 'volume' ? 'Docker 卷' : '主机目录'
-      return h(NTag, { size: 'small', bordered: false, type: 'info' }, { default: () => label })
+      const label = r.kind === 'app_volume'
+        ? '应用数据卷'
+        : r.kind === 'database' ? `DB (${r.db_type?.toUpperCase()})` : r.kind === 'volume' ? 'Docker 卷' : '主机目录'
+      return h(NTag, {
+        size: 'small',
+        bordered: false,
+        type: r.kind === 'app_volume' ? 'success' : 'info',
+      }, { default: () => label })
     },
   },
-  { title: '目标对象', key: 'target', ellipsis: { tooltip: true }, render: (r) => r.target + (r.db_name ? ` / ${r.db_name}` : '') },
+  {
+    title: '目标对象',
+    key: 'target',
+    ellipsis: { tooltip: true },
+    render: (r) => {
+      if (r.kind === 'app_volume') {
+        const app = apps.value.find((a) => a.id === r.app_id)
+        return h(NSpace, { size: 6, align: 'center' }, {
+          default: () => [
+            h('span', { style: 'font-weight: 500' }, app?.name || r.app_id || '应用已删除'),
+            h('span', { class: 'mono-font', style: { fontSize: '11px' } }, r.target),
+          ],
+        })
+      }
+      return r.target + (r.db_name ? ` / ${r.db_name}` : '')
+    },
+  },
   {
     title: '存储位置',
     key: 'storage_target',
@@ -161,13 +233,17 @@ const columns = computed<DataTableColumns<BackupJob>>(() => [
     render: (r) => {
       const st = r.storage_target
       if (!st || st === 'default') {
-        const def = s3Targets.value.find((t) => t.is_default)
-        return def
-          ? h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => `S3: ${def.name}` })
+        if (defaultS3.value) {
+          return h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => `S3: ${defaultS3.value!.name}` })
+        }
+        return r.kind === 'app_volume'
+          ? h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => '未配置默认 S3' })
           : h(NTag, { size: 'small', bordered: false }, { default: () => '本地主机' })
       }
       if (st === 'local') {
-        return h(NTag, { size: 'small', bordered: false }, { default: () => '本地主机' })
+        return r.kind === 'app_volume'
+          ? h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => '仅支持 S3' })
+          : h(NTag, { size: 'small', bordered: false }, { default: () => '本地主机' })
       }
       const target = s3Targets.value.find((t) => t.id === st)
       return target
@@ -282,13 +358,54 @@ const s3Columns = computed<DataTableColumns<S3Target>>(() => [
   },
 ])
 
-const archiveColumns = computed<DataTableColumns<Archive>>(() => [
-  { title: '归档编号', key: 'id', ellipsis: { tooltip: true } },
-  {
+function archiveStatusTag(status?: string) {
+  // 旧类型归档只在成功终态落记录，status 字段缺省视为成功。
+  if (!status || status === 'success') {
+    return h(NTag, { size: 'tiny', type: 'success', bordered: false }, { default: () => '成功' })
+  }
+  if (status === 'running') {
+    return h(NTag, { size: 'tiny', type: 'info', bordered: false }, { default: () => '执行中' })
+  }
+  return h(NTag, { size: 'tiny', type: 'error', bordered: false }, { default: () => '失败' })
+}
+
+const archiveColumns = computed<DataTableColumns<Archive>>(() => {
+  const appVolume = selectedJob.value?.kind === 'app_volume'
+  const cols: DataTableColumns<Archive> = [
+    {
+      title: '归档编号',
+      key: 'id',
+      width: 190,
+      ellipsis: { tooltip: true },
+      render: (r) => h('span', { class: 'mono-font', style: { fontSize: '12px' } }, r.id),
+    },
+  ]
+  if (appVolume) {
+    cols.push({
+      title: '备份卷',
+      key: 'target',
+      width: 170,
+      ellipsis: { tooltip: true },
+      render: (r) => h('span', { class: 'mono-font', style: { fontSize: '11px' } }, r.target),
+    })
+    cols.push({
+      title: '状态',
+      key: 'status',
+      width: 82,
+      render: (r) => archiveStatusTag(r.status),
+    })
+  }
+  cols.push({
     title: '存储位置',
     key: 'storage_target',
-    width: 140,
+    width: 160,
     render: (r) => {
+      // app_volume 归档冻结了备份时的 S3 目标名，切换默认目标后仍按记录展示。
+      if (r.storage_target_name) {
+        return h(NTag, { size: 'small', type: 'success', bordered: false }, {
+          default: () => `S3: ${r.storage_target_name}`,
+        })
+      }
       const st = r.storage_target
       if (!st || st === 'local') {
         return h(NTag, { size: 'small', bordered: false }, { default: () => '本地主机' })
@@ -298,54 +415,105 @@ const archiveColumns = computed<DataTableColumns<Archive>>(() => [
         default: () => target ? `S3: ${target.name}` : 'S3 远端',
       })
     },
-  },
-  {
+  })
+  cols.push({
     title: '大小',
     key: 'size',
-    width: 110,
-    render: (r) => formatBytes(r.size),
-  },
-  {
+    width: 96,
+    render: (r) => (r.size > 0 ? formatBytes(r.size) : '—'),
+  })
+  cols.push({
     title: 'SHA256 校验和',
     key: 'sha256',
-    width: 140,
-    render: (r) => r.sha256 ? h('code', { style: 'font-size: 11px' }, r.sha256.slice(0, 12) + '...') : '-',
-  },
-  {
+    width: 130,
+    render: (r) => r.sha256
+      ? h('span', { class: 'mono-font', style: { fontSize: '11px' }, title: r.sha256 }, r.sha256.slice(0, 12) + '…')
+      : '—',
+  })
+  cols.push({
     title: '创建时间',
     key: 'created_at',
-    width: 160,
+    width: 150,
     render: (r) => formatTime(r.created_at),
-  },
-  {
+  })
+  if (appVolume) {
+    cols.push({
+      title: '最近恢复',
+      key: 'last_restore_at',
+      width: 170,
+      render: (r) => {
+        if (!r.last_restore_at) return '—'
+        const ok = r.last_restore_status === 'success'
+        return h('div', null, [
+          h(NSpace, { size: 4, align: 'center' }, {
+            default: () => [
+              h(NTag, { size: 'tiny', type: ok ? 'success' : 'error', bordered: false }, {
+                default: () => (ok ? '成功' : '失败'),
+              }),
+              h('span', { class: 'mono-font', style: { fontSize: '11px' } }, formatTime(r.last_restore_at)),
+            ],
+          }),
+          !ok && r.last_restore_error
+            ? h('div', { style: { fontSize: '11px', color: 'var(--error-color, #d03050)', marginTop: '2px' } }, r.last_restore_error)
+            : null,
+        ])
+      },
+    })
+    cols.push({
+      title: '错误信息',
+      key: 'error',
+      ellipsis: { tooltip: true },
+      render: (r) => (r.error
+        ? h('span', { style: { fontSize: '12px', color: 'var(--error-color, #d03050)' } }, r.error)
+        : '—'),
+    })
+  }
+  cols.push({
     title: '操作',
     key: 'actions',
     width: 150,
-    render: (r) =>
-      h(NSpace, { size: 6 }, {
+    fixed: 'right' as const,
+    render: (r) => {
+      const running = r.status === 'running'
+      const canRestore = !appVolume || r.status === 'success'
+      return h(NSpace, { size: 6 }, {
         default: () => [
           h(
             NPopconfirm,
-            { onPositiveClick: () => doRestore(r) },
+            { onPositiveClick: () => doRestore(r), disabled: !canRestore },
             {
-              trigger: () => h(NButton, { size: 'tiny', secondary: true, type: 'warning' }, { default: () => '恢复' }),
-              default: () => `确定从该归档恢复？恢复前会自动在主机生成现场快照（SafetyCopy）。`,
+              trigger: () => h(NButton, {
+                size: 'tiny',
+                secondary: true,
+                type: 'warning',
+                disabled: !canRestore,
+              }, { default: () => '恢复' }),
+              default: () => appVolume
+                ? '确定恢复该数据卷归档？系统会先停机应用容器，校验 SHA256 后覆盖数据并自动重启。'
+                : `确定从该归档恢复？恢复前会自动在主机生成现场快照（SafetyCopy）。`,
             },
           ),
           h(
             NPopconfirm,
-            { onPositiveClick: () => doDeleteArchive(r) },
+            { onPositiveClick: () => doDeleteArchive(r), disabled: running },
             {
-              trigger: () => h(NButton, { size: 'tiny', secondary: true, type: 'error' }, {
+              trigger: () => h(NButton, {
+                size: 'tiny',
+                secondary: true,
+                type: 'error',
+                disabled: running,
+              }, {
                 icon: () => h(NIcon, null, { default: () => h(TrashOutline) }),
               }),
-              default: () => '确定删除此归档记录？',
+              default: () => (running ? '备份任务执行中，不能删除该归档。' : '确定删除此归档记录？'),
             },
           ),
         ],
-      }),
-  },
-])
+      })
+    },
+  })
+  return cols
+})
 
 function formatTime(v?: string) {
   if (!v) return '-'
@@ -393,6 +561,20 @@ async function loadHosts() {
   } catch {
     hostOptions.value = []
   }
+}
+
+async function loadApps() {
+  try {
+    apps.value = await listApps()
+  } catch {
+    apps.value = []
+  }
+}
+
+function openCreateJob() {
+  selectedAppID.value = null
+  selectedAppVolume.value = null
+  showCreate.value = true
 }
 
 function openCreateS3() {
@@ -487,18 +669,43 @@ async function submitCreate() {
     message.warning('请填写任务名称')
     return
   }
-  if (!form.host_id) {
-    message.warning('请选择目标主机')
-    return
-  }
-  if (!form.target.trim()) {
-    message.warning('请填写备份目标对象')
-    return
+  let payload: CreateJobReq
+  if (form.kind === 'app_volume') {
+    if (!selectedAppID.value) {
+      message.warning('请选择要备份的应用')
+      return
+    }
+    if (!selectedAppVolume.value) {
+      message.warning('请选择要备份的挂载卷')
+      return
+    }
+    if (!s3Targets.value.length) {
+      message.warning('应用数据卷归档仅支持 S3 存储，请先在「S3 异地存储配置」添加存储桶')
+      return
+    }
+    payload = {
+      ...form,
+      host_id: '',
+      app_id: selectedAppID.value,
+      target: selectedAppVolume.value,
+      db_type: '',
+      db_name: '',
+    }
+  } else {
+    if (!form.host_id) {
+      message.warning('请选择目标主机')
+      return
+    }
+    if (!form.target.trim()) {
+      message.warning('请填写备份目标对象')
+      return
+    }
+    payload = { ...form, app_id: '' }
   }
   creating.value = true
   try {
-    await createBackupJob({ ...form })
-    message.success('备份任务已创建')
+    await createBackupJob(payload)
+    message.success(form.kind === 'app_volume' ? '应用数据卷备份任务已创建' : '备份任务已创建')
     showCreate.value = false
     await loadData()
   } catch (e: any) {
@@ -554,6 +761,10 @@ async function doRestore(arch: Archive) {
   try {
     const res = await restoreArchive(selectedJob.value.id, arch.id)
     message.success(res.message || '已开始恢复任务')
+    // app_volume 恢复为异步任务（停机→校验→解压→重启），稍后刷新结果列。
+    if (selectedJob.value.kind === 'app_volume') {
+      setTimeout(fetchArchives, 4000)
+    }
   } catch (e: any) {
     message.error(e.message || '恢复失败')
   }
@@ -574,11 +785,13 @@ onMounted(() => {
   loadData()
   loadS3()
   loadHosts()
+  loadApps()
 })
 
 onActivated(() => {
   loadData()
   loadS3()
+  loadApps()
 })
 </script>
 
@@ -603,7 +816,7 @@ onActivated(() => {
             </template>
             添加 S3 存储桶
           </NButton>
-          <NButton v-else type="primary" @click="showCreate = true">
+          <NButton v-else type="primary" @click="openCreateJob">
             <template #icon>
               <NIcon><AddCircleOutline /></NIcon>
             </template>
@@ -666,17 +879,6 @@ onActivated(() => {
         <NFormItem label="任务名称" required>
           <NInput v-model:value="form.name" placeholder="如 mysql-prod-daily" />
         </NFormItem>
-        <NFormItem label="目标主机" required>
-          <NSelect v-model:value="form.host_id" :options="hostOptions" placeholder="选择受管主机" filterable />
-        </NFormItem>
-
-        <NFormItem label="备份存储位置 (可独立配置)" required>
-          <NSelect
-            v-model:value="form.storage_target"
-            :options="storageTargetOptions"
-            placeholder="选择备份归档存放目标"
-          />
-        </NFormItem>
 
         <NFormItem label="备份类型" required>
           <NRadioGroup v-model:value="form.kind">
@@ -684,6 +886,46 @@ onActivated(() => {
               <NRadio v-for="opt in kindOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</NRadio>
             </NSpace>
           </NRadioGroup>
+        </NFormItem>
+
+        <template v-if="form.kind === 'app_volume'">
+          <NSpace>
+            <NFormItem label="应用" required style="flex: 1">
+              <NSelect
+                v-model:value="selectedAppID"
+                :options="appOptions"
+                placeholder="选择已声明挂载卷的应用"
+                filterable
+                @update:value="selectedAppVolume = null"
+              />
+            </NFormItem>
+            <NFormItem label="挂载卷" required style="flex: 1">
+              <NSelect
+                v-model:value="selectedAppVolume"
+                :options="appVolumeOptions"
+                :disabled="!selectedAppID"
+                placeholder="选择要备份的卷"
+              />
+            </NFormItem>
+          </NSpace>
+          <NAlert v-if="!appOptions.length" type="info" :show-icon="true" style="margin-bottom: 12px">
+            暂无可备份的应用：仅支持已声明挂载卷的非 Compose 应用（Compose 卷在编排 YAML 内声明，请使用快照备份的其他类型）。
+          </NAlert>
+          <NAlert v-if="!s3Targets.length" type="warning" :show-icon="true" style="margin-bottom: 12px">
+            应用数据卷归档仅支持 S3 存储。请先到「S3 异地存储配置」添加存储桶。
+          </NAlert>
+        </template>
+
+        <NFormItem v-if="form.kind !== 'app_volume'" label="目标主机" required>
+          <NSelect v-model:value="form.host_id" :options="hostOptions" placeholder="选择受管主机" filterable />
+        </NFormItem>
+
+        <NFormItem label="备份存储位置 (可独立配置)" required>
+          <NSelect
+            v-model:value="form.storage_target"
+            :options="form.kind === 'app_volume' ? appVolumeStorageOptions : storageTargetOptions"
+            placeholder="选择备份归档存放目标"
+          />
         </NFormItem>
 
         <template v-if="form.kind === 'database'">
@@ -706,7 +948,7 @@ onActivated(() => {
           </NFormItem>
         </template>
 
-        <template v-else>
+        <template v-else-if="form.kind === 'dir'">
           <NFormItem label="绝对目录路径" required>
             <NInput v-model:value="form.target" placeholder="/opt/apps/myapp/data" />
           </NFormItem>
@@ -806,11 +1048,17 @@ onActivated(() => {
     >
       <div style="height: 480px; display: flex; flex-direction: column">
         <NAlert type="info" :show-icon="true" style="margin-bottom: 10px; flex-shrink: 0">
-          归档保存在本地主机或 S3 存储桶中。执行恢复前系统会自动为当前状态创建临时安全副本（SafetyCopy）。
+          <template v-if="selectedJob?.kind === 'app_volume'">
+            数据卷归档保存在 S3。恢复会先停机应用容器、校验 SHA256 后覆盖数据并自动重启；备份为在线文件级快照，数据库类卷建议停写后备份。
+          </template>
+          <template v-else>
+            归档保存在本地主机或 S3 存储桶中。执行恢复前系统会自动为当前状态创建临时安全副本（SafetyCopy）。
+          </template>
         </NAlert>
         <div style="flex: 1; min-height: 0">
           <NDataTable
             flex-height
+            :scroll-x="1180"
             :columns="archiveColumns"
             :data="archives"
             :loading="loadingArchives"
@@ -825,6 +1073,12 @@ onActivated(() => {
           />
         </div>
       </div>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton :loading="loadingArchives" @click="fetchArchives">刷新</NButton>
+          <NButton type="primary" @click="showArchives = false">关闭</NButton>
+        </NSpace>
+      </template>
     </NModal>
   </div>
 </template>

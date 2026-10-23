@@ -60,9 +60,10 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	readRG.GET("/apps/:id/deployments/:depID", h.getDeployment)
 	readRG.POST("/apps/:id/deployments/:depID/diagnose", h.diagnoseDeployment)
 	readRG.GET("/apps/:id/status", h.appStatus)
-	// App volume backup/restore: archive listing is a read (the download itself
-	// goes through the existing host file endpoint).
+	// App volume backup/restore: archive listing and download are reads (the
+	// download 302s to a pre-signed S3 GET).
 	readRG.GET("/apps/:id/volume-backups", h.listVolumeBackups)
+	readRG.GET("/apps/:id/volume-backups/:archiveID/download", h.downloadVolumeBackup)
 
 	// Image / repository metadata probing: read-only ground-truth fetchers used
 	// by the create-form auto-fill hints and the AI app assistant. No state is

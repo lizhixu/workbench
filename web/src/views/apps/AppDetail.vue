@@ -3,7 +3,7 @@ import { computed, h, onActivated, onDeactivated, onMounted, ref, watch } from '
 import { useRoute } from 'vue-router'
 import {
   NAlert, NButton, NCode, NDataTable, NDescriptions, NDescriptionsItem,
-  NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPopconfirm, NRadio, NRadioGroup,
+  NEmpty, NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPopconfirm, NRadio, NRadioGroup,
   NSelect, NSpace, NSwitch, NTabPane, NTabs,
   NTag, useMessage,
 } from 'naive-ui'
@@ -12,17 +12,19 @@ import {
   ArrowBackOutline, BuildOutline, CloudUploadOutline, CopyOutline,
   DownloadOutline,
   GitCommitOutline, PlayOutline, RefreshOutline, SparklesOutline, StopOutline,
-  SwapHorizontalOutline,
+  SwapHorizontalOutline, TrashOutline,
 } from '@vicons/ionicons5'
+import { useTablePagination } from '../../composables/useTablePagination'
 import {
   cancelDeployment, deployApp, diagnoseDeployment, getApp, getAppStatus, listDeployments, restartApp,
   rollbackApp, startApp, stopApp, updateApp, syncAppWebhook, type AppEntity, type AppStatus, type Deployment,
   type AIDiagnosis,
-  backupAppVolumes, listVolumeBackups, restoreVolumeArchive, deleteVolumeArchive, type VolumeArchive,
+  backupAppVolumes, listVolumeBackups, restoreVolumeArchive, deleteVolumeArchive,
+  volumeArchiveDownloadUrl, type VolumeArchive, type VolumeS3Status,
 } from '../../api/apps'
 import { bindProxy, unbindProxy, type Certificate } from '../../api/certs'
 import { listCerts } from '../../api/certs'
-import { listHosts, fileDownloadUrl } from '../../api/hosts'
+import { listHosts } from '../../api/hosts'
 import { listNetworkNodes } from '../../api/network'
 import { bothMeshed } from '../../utils/mesh'
 import { copyToClipboard } from '../../utils/clipboard'
@@ -582,15 +584,35 @@ async function doRollback(dep?: Deployment) {
 }
 
 // ---- 数据卷备份与恢复 ----
-// 备份把卷数据目录打成 tar.gz 直存应用主机（/var/backups/watchman/apps/<appID>/），
-// 元数据在服务端；下载走宿主文件下载端点。恢复语义：自动停机 → 安全副本 →
-// 解压覆盖 → 重启容器（stop 失败则中止，绝不在线覆盖运行中的数据）。
+// 备份把卷数据目录打成 tar.gz 后直传 S3 默认存储目标（走快照备份的 S3 配置），
+// 元数据在服务端；下载由服务端 302 到短期 S3 预签名 URL。恢复语义：下载并校验
+// SHA256 → 自动停机 → 安全副本 → 解压覆盖 → 重启容器（stop 失败则中止，绝不在线
+// 覆盖运行中的数据）。
 const volumeBackups = ref<VolumeArchive[]>([])
 const volumeBackupTotal = ref(0)
+const volumeS3 = ref<VolumeS3Status>({ ready: false })
 const volBackupNote = ref('')
 const selectedVolumeSpecs = ref<string[]>([])
 const backingVolumes = ref(false)
 const restoringArchive = ref('')
+const volumeListLoading = ref(false)
+// 归档体量有界（每卷保留 5 份成功归档），仅在行数超过一屏时启用分页，
+// 避免少量归档也常驻一条分页栏。
+const volumeArchiveRowCount = computed(() => volumeBackups.value.length)
+const { pagination: volumeArchivePagination } = useTablePagination({
+  pageSize: 10,
+  pageSizes: [10, 20, 50],
+  rowCount: volumeArchiveRowCount,
+})
+const volumeArchiveTablePagination = computed(
+  () => (volumeArchiveRowCount.value > 10 ? volumeArchivePagination : false),
+)
+// 备份/恢复都是 202 受理的异步 agent 任务，没有推送通道，只能轮询归档列表。
+// 备份的 running 记录可能晚于 202 几百毫秒才落库、恢复只在终态回写归档，因此
+// 用一个有界轮询窗口覆盖「已受理但记录尚未反映」的空窗，而不是只看 running。
+const volumePollUntil = ref(0)
+const restoringArchiveID = ref('')
+const restoreBaseline = ref('')
 
 interface ParsedVolume {
   spec: string
@@ -605,11 +627,13 @@ const parsedVolumes = computed<ParsedVolume[]>(() => {
   const out: ParsedVolume[] = []
   for (const spec of app.value?.volumes ?? []) {
     const parts = spec.split(':')
-    const mode = parts.length >= 3 && (parts[parts.length - 1] === 'ro' || parts[parts.length - 1] === 'rw')
-      ? parts[parts.length - 1] : ''
-    const dst = parts.length >= 2 ? parts[parts.length - 1] : ''
-    const src = parts.slice(0, Math.max(parts.length - 1, 1)).join(':')
-    if (!src || !dst) continue
+    const hasMode = parts.length >= 3 && (parts[parts.length - 1] === 'ro' || parts[parts.length - 1] === 'rw')
+    const mode = hasMode ? parts[parts.length - 1] : ''
+    // 先摘掉 ro/rw 再取容器路径，否则 "/opt/data:/data:ro" 的 dst 会渲染成 "ro"。
+    const body = hasMode ? parts.slice(0, -1) : parts
+    const dst = body.length >= 2 ? body[body.length - 1] : ''
+    const src = body.slice(0, Math.max(body.length - 1, 1)).join(':')
+    if (!src || !dst.startsWith('/')) continue
     out.push({ spec, src, dst, mode, bind: src.startsWith('/') || /^[A-Za-z]:[\\/]/.test(src) })
   }
   return out
@@ -625,19 +649,76 @@ const volumeBackupSupported = computed(() => {
 })
 
 async function loadVolumeBackups() {
-  if (!app.value) return
+  // 不依赖 app.value：首屏 refreshAll 与 loadApp 并行，应用详情尚未返回时
+  // 归档列表同样可以加载（只需路由里的 appId）。
   try {
     const res = await listVolumeBackups(appId.value, { page_size: 100 })
     volumeBackups.value = res.data
     volumeBackupTotal.value = res.total
+    volumeS3.value = res.s3 ?? { ready: false }
+    if (volumeBackupRunning.value) {
+      // 备份仍在进行：保持轮询。
+      volumePollUntil.value = Math.max(volumePollUntil.value, Date.now() + 60_000)
+    } else if (restoringArchiveID.value) {
+      // 恢复结束会回写 last_restore_at；一旦变化即停止窗口与按钮 loading。
+      const target = volumeBackups.value.find((a) => a.id === restoringArchiveID.value)
+      if (target && (target.last_restore_at || '') !== restoreBaseline.value) {
+        restoringArchiveID.value = ''
+        restoreBaseline.value = ''
+        volumePollUntil.value = 0
+      }
+    }
   } catch (e: any) {
     message.error(e.message || '获取备份归档失败')
   }
 }
 
 const volumeBackupRunning = computed(() => volumeBackups.value.some((a) => a.status === 'running'))
+const volumeBusy = computed(() => volumeBackupRunning.value || !!restoringArchiveID.value)
+
+async function refreshVolumeBackups() {
+  volumeListLoading.value = true
+  try {
+    await loadVolumeBackups()
+  } finally {
+    volumeListLoading.value = false
+  }
+}
+
+// 归档时间按「日期 / 时刻」两行排版：日期弱化，时刻保持等宽可扫读。
+function formatShortTime(v?: string) {
+  if (!v) return { date: '—', clock: '' }
+  const d = new Date(v)
+  if (Number.isNaN(d.getTime())) return { date: '—', clock: '' }
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return {
+    date: `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
+    clock: `${pad(d.getHours())}:${pad(d.getMinutes())}`,
+  }
+}
+
+// render 生成的节点由 NDataTable 渲染，拿不到本组件的 scoped 作用域，
+// 因此单元格样式只走内联 style 与全局 .mono-font（global.scss）。
+function renderVolTime(v?: string) {
+  const t = formatShortTime(v)
+  return h('div', { style: 'display:flex;flex-direction:column;line-height:1.4' }, [
+    h('span', { style: 'font-size:12px;color:var(--n-text-color-3)' }, t.date),
+    h('span', { class: 'mono-font' }, t.clock || '—'),
+  ])
+}
+
+const renderVolDash = () => h('span', { style: 'color: var(--n-text-color-3)' }, '—')
+
+async function copyArchiveSHA(sha: string) {
+  const ok = await copyToClipboard(sha)
+  ok ? message.success('SHA256 已复制') : message.warning('复制失败，请手动复制')
+}
 
 async function doBackupVolumes() {
+  if (!volumeS3.value.ready) {
+    message.warning('未配置默认 S3 存储目标，请先在「快照备份 → S3 存储」中添加并设为默认')
+    return
+  }
   backingVolumes.value = true
   try {
     const note = volBackupNote.value.trim()
@@ -645,6 +726,7 @@ async function doBackupVolumes() {
       ? { volumes: selectedVolumeSpecs.value, note }
       : { note }
     await backupAppVolumes(appId.value, payload)
+    volumePollUntil.value = Date.now() + 30 * 60_000
     message.success('备份任务已开始，完成后归档会出现在下方列表')
     await loadVolumeBackups()
   } catch (e: any) {
@@ -656,11 +738,16 @@ async function doBackupVolumes() {
 
 async function doRestoreArchive(a: VolumeArchive) {
   restoringArchive.value = a.id
+  restoringArchiveID.value = a.id
+  restoreBaseline.value = a.last_restore_at || ''
   try {
     const res = await restoreVolumeArchive(appId.value, a.id)
+    volumePollUntil.value = Date.now() + 30 * 60_000
     message.success(res.message || '恢复任务已开始')
     await loadVolumeBackups()
   } catch (e: any) {
+    restoringArchiveID.value = ''
+    restoreBaseline.value = ''
     message.error(e.message || '恢复失败')
   } finally {
     restoringArchive.value = ''
@@ -678,11 +765,9 @@ async function doDeleteArchive(a: VolumeArchive) {
 }
 
 function downloadArchive(a: VolumeArchive) {
-  if (!app.value) return
-  // 归档在应用主机上：直连宿主文件下载端点（JWT 走 ?token=，由
-  // fileDownloadUrl 拼好），不经控制端中转。
-  const url = fileDownloadUrl(app.value.host_id, a.file_path)
-  window.open(url, '_blank')
+  // 服务端校验后 302 到短期 S3 预签名 URL，字节从 S3 直达浏览器
+  // （JWT 走 ?token=，由 volumeArchiveDownloadUrl 拼好）。
+  window.open(volumeArchiveDownloadUrl(appId.value, a.id), '_blank')
 }
 
 const volArchiveStatusTag = (s: string) => {
@@ -702,7 +787,7 @@ function formatBytes(b: number) {
 const volumeColumns = computed<DataTableColumns<ParsedVolume>>(() => [
   {
     title: '挂载规格', key: 'spec', ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'mono' }, r.spec),
+    render: (r) => h('span', { class: 'mono-font' }, r.spec),
   },
   {
     title: '类型', key: 'bind', width: 120,
@@ -714,49 +799,100 @@ const volumeColumns = computed<DataTableColumns<ParsedVolume>>(() => [
   },
   {
     title: '宿主机路径 / 卷名', key: 'src', ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'mono' }, r.src),
+    render: (r) => h('span', { class: 'mono-font' }, r.src),
   },
   {
     title: '容器内路径', key: 'dst', ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'mono' }, r.dst),
+    render: (r) => h('span', { class: 'mono-font' }, r.dst),
   },
   {
     title: '模式', key: 'mode', width: 80,
-    render: (r) => (r.mode === 'ro' ? '只读' : '读写'),
+    render: (r) => h(
+      'span',
+      { style: r.mode === 'ro' ? 'color: var(--n-text-color-3)' : '' },
+      r.mode === 'ro' ? '只读' : '读写',
+    ),
   },
 ])
 
 const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
+  { title: '时间', key: 'created_at', width: 80, render: (r) => renderVolTime(r.created_at) },
   {
-    title: '时间', key: 'created_at', width: 170,
-    render: (r) => formatTime(r.created_at),
+    title: '挂载卷', key: 'volume_spec', minWidth: 170, ellipsis: { tooltip: true },
+    render: (r) => h('span', { class: 'mono-font' }, r.volume_spec),
   },
   {
-    title: '挂载卷', key: 'volume_spec', ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'mono' }, r.volume_spec),
+    // S3 去向：目标名弱化前置，对象键等宽承接；完整「目标 · 键」由单元格 tooltip 给出。
+    title: '存储位置（S3）', key: 'storage_path', minWidth: 200, ellipsis: { tooltip: true },
+    render: (r) => (r.storage_path
+      ? h('span', { class: 'mono-font' }, [
+        h('span', { style: 'color: var(--n-text-color-3)' }, `${r.storage_target_name || r.storage_target} · `),
+        r.storage_path,
+      ])
+      : renderVolDash()),
   },
-  { title: '大小', key: 'size', width: 110, render: (r) => formatBytes(r.size) },
-  { title: '状态', key: 'status', width: 90, render: (r) => volArchiveStatusTag(r.status) },
   {
-    title: '备注 / 错误', key: 'note', ellipsis: { tooltip: true },
+    title: '大小', key: 'size', width: 88,
+    render: (r) => h('span', { class: 'mono-font', style: 'font-size: 12px' }, r.size > 0 ? formatBytes(r.size) : '—'),
+  },
+  { title: '状态', key: 'status', width: 84, render: (r) => volArchiveStatusTag(r.status) },
+  {
+    title: '最近恢复', key: 'last_restore', width: 148,
+    render: (r) => {
+      if (!r.last_restore_at) return renderVolDash()
+      const failed = r.last_restore_status === 'failed'
+      const cell = [
+        h('div', { style: 'display:flex;align-items:center;gap:6px' }, [
+          h(
+            NTag,
+            { size: 'small', bordered: false, type: failed ? 'error' : 'success' },
+            { default: () => (failed ? '失败' : '成功') },
+          ),
+          h('span', { class: 'mono-font', style: 'font-size: 12px' }, formatTime(r.last_restore_at)),
+        ]),
+      ]
+      // 失败原因只在失败时出现，成功行保持单行高度、列表可扫读。
+      if (failed && r.last_restore_error) {
+        cell.push(h(
+          'div',
+          {
+            style: 'margin-top:2px;font-size:11px;line-height:1.35;color:var(--n-error-color);'
+              + 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap',
+            title: r.last_restore_error,
+          },
+          r.last_restore_error,
+        ))
+      }
+      return h('div', { style: 'min-width:0' }, cell)
+    },
+  },
+  {
+    title: '备注 / 错误', key: 'note', minWidth: 130, ellipsis: { tooltip: true },
     render: (r) => {
       if (r.status === 'failed' && r.error) {
         return h('span', { style: 'color: var(--n-error-color)' }, r.error)
       }
-      return r.note || '-'
+      return r.note || renderVolDash()
     },
   },
   {
-    title: 'SHA256', key: 'sha256', width: 130, ellipsis: { tooltip: true },
-    render: (r) => h(
-      'span',
-      { class: 'mono', style: 'font-size: 12px; color: var(--n-text-color-3)' },
-      r.sha256 ? `${r.sha256.slice(0, 12)}…` : '-',
-    ),
+    title: 'SHA256', key: 'sha256', width: 132,
+    render: (r) => {
+      const sha = r.sha256
+      if (!sha) return renderVolDash()
+      return h('div', { style: 'display:flex;align-items:center;gap:4px' }, [
+        h('span', { class: 'mono-font', style: 'font-size: 12px; color: var(--n-text-color-3)' }, sha.slice(0, 12)),
+        h(
+          NButton,
+          { text: true, size: 'tiny', title: '复制完整 SHA256', onClick: () => copyArchiveSHA(sha) },
+          { icon: () => h(NIcon, null, { default: () => h(CopyOutline) }) },
+        ),
+      ])
+    },
   },
   {
-    title: '操作', key: 'actions', width: 240,
-    render: (r) => h(NSpace, { size: 4 }, () => [
+    title: '操作', key: 'actions', width: 208, fixed: 'right',
+    render: (r) => h(NSpace, { size: 6, wrap: false }, () => [
       r.status === 'success'
         ? h(
           NPopconfirm,
@@ -764,8 +900,15 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
           {
             trigger: () => h(
               NButton,
-              { size: 'tiny', secondary: true, type: 'warning', loading: restoringArchive.value === r.id },
-              { default: () => '恢复' },
+              {
+                size: 'tiny', secondary: true, type: 'warning',
+                loading: restoringArchive.value === r.id || restoringArchiveID.value === r.id,
+                disabled: deploying.value || (volumeBusy.value && restoringArchiveID.value !== r.id),
+              },
+              {
+                default: () => '恢复',
+                icon: () => h(NIcon, null, { default: () => h(SwapHorizontalOutline) }),
+              },
             ),
             default: () => '恢复将自动停止应用容器，用该归档覆盖卷数据（覆盖前保留当前状态安全副本），完成后自动重启容器。确认继续？',
           },
@@ -787,10 +930,16 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
         {
           trigger: () => h(
             NButton,
-            { size: 'tiny', secondary: true, type: 'error' },
-            { default: () => '删除' },
+            {
+              size: 'tiny', secondary: true, type: 'error',
+              disabled: r.status === 'running' || volumeBusy.value,
+            },
+            {
+              default: () => '删除',
+              icon: () => h(NIcon, null, { default: () => h(TrashOutline) }),
+            },
           ),
-          default: () => '删除归档（含主机上的 tar.gz 文件）？此操作不可恢复。',
+          default: () => '删除归档（含 S3 上的归档对象）？此操作不可恢复。',
         },
       ),
     ].filter(Boolean) as any),
@@ -967,22 +1116,31 @@ watch(page, () => {
   loadDeployments()
 })
 
-onMounted(() => {
-  refreshAll()
-  loadProxyData()
+function startPolling() {
+  if (pollTimer) return
   pollTimer = setInterval(() => {
     if (route.name === 'app-detail') {
       loadStatus()
       if (deploying.value) loadDeployments()
-      // 备份归档里的 running 记录由异步 agent tar 推进，轮询直到落终态。
-      if (volumeBackupRunning.value) loadVolumeBackups()
+      // 备份归档里的 running 记录由异步 agent tar 推进，轮询直到落终态；
+      // 恢复只在终态回写归档，故用受理后开启的有界窗口兜底。
+      if (volumeBackupRunning.value || Date.now() < volumePollUntil.value) loadVolumeBackups()
     }
   }, 5000)
+}
+
+onMounted(() => {
+  refreshAll()
+  loadProxyData()
+  startPolling()
 })
 
 onActivated(() => {
   refreshAll()
   loadProxyData()
+  // 页签切走期间轮询窗口可能已过期，仍在执行的任务需要重新开启观察。
+  if (volumeBusy.value) volumePollUntil.value = Date.now() + 60_000
+  startPolling()
 })
 
 onDeactivated(() => {
@@ -1194,28 +1352,41 @@ onDeactivated(() => {
               该应用未配置挂载卷。挂载卷可在「编辑配置」中添加（宿主路径:容器路径），保存并重新部署后生效。
             </NAlert>
             <template v-else>
-              <NAlert type="info" style="margin-bottom: 12px">
-                备份将卷数据目录打包为 tar.gz，直存应用主机 <code>/var/backups/watchman/apps/{{ app.id }}/</code>，
-                每卷保留最近 5 份归档。恢复时会<strong>自动停止应用容器</strong>、保留当前状态安全副本后解压覆盖，
-                完成后自动重启容器。
+              <NAlert v-if="!volumeS3.ready" type="warning" style="margin-bottom: 12px">
+                <template #header>未配置 S3 存储目标</template>
+                数据卷归档统一存放在 S3（不在应用主机留存），请先在「快照备份 → S3 存储」中添加存储目标并设为默认。
+                <NButton size="tiny" secondary style="margin-left: 8px" @click="$router.push('/snapshots')">
+                  前往 S3 存储配置
+                </NButton>
+              </NAlert>
+              <NAlert v-else type="info" style="margin-bottom: 12px">
+                备份将卷数据目录打包为 tar.gz，直传 S3 存储目标
+                <strong>{{ volumeS3.target_name || volumeS3.target_id }}</strong>
+                <template v-if="volumeS3.bucket">（存储桶 <code>{{ volumeS3.bucket }}</code>）</template>，
+                每卷保留最近 5 份成功归档。备份在容器运行中直接打包，属于在线文件快照——数据库等对跨文件一致性敏感的
+                应用建议选业务低峰期执行。恢复时会先下载归档并校验 SHA256，<strong>自动停止应用容器</strong>、
+                保留当前状态安全副本后解压覆盖，完成后自动重启容器。
+                <br />
+                需要定时自动备份？到
+                <NButton text type="primary" size="tiny" @click="$router.push('/snapshots')">快照备份</NButton>
+                新建「应用数据卷」任务：调度与保留份数由快照模块管理，归档与本页共用同一份记录。
               </NAlert>
 
-              <!-- 应用挂载卷清单 -->
-              <div style="margin-bottom: 16px">
-                <div style="font-weight: 600; margin-bottom: 8px">应用挂载卷</div>
+              <!-- 应用挂载卷清单（数据量 = 应用声明的卷数，天然有限，属 §8.2 例外：不分页） -->
+              <div class="vol-section">
+                <div class="vol-section-title">应用挂载卷</div>
                 <NDataTable
                   :columns="volumeColumns"
                   :data="parsedVolumes"
                   size="small"
                   :bordered="false"
-                  :single-line="false"
                 />
               </div>
 
               <!-- 发起备份 -->
-              <div v-if="canWrite" style="margin-bottom: 16px">
-                <div style="font-weight: 600; margin-bottom: 8px">发起备份</div>
-                <NSpace vertical>
+              <div v-if="canWrite" class="vol-section">
+                <div class="vol-section-title">发起备份</div>
+                <NSpace vertical :size="10">
                   <NSelect
                     v-model:value="selectedVolumeSpecs"
                     multiple
@@ -1223,45 +1394,63 @@ onDeactivated(() => {
                     :options="parsedVolumes.map((v) => ({ label: v.spec, value: v.spec }))"
                     placeholder="全部挂载卷（不选则备份所有）"
                   />
-                  <NSpace>
+                  <div class="vol-backup-row">
                     <NInput
                       v-model:value="volBackupNote"
                       placeholder="备注（可选）"
                       style="width: 320px"
                       :maxlength="200"
+                      show-count
                     />
                     <NButton
                       type="primary"
                       size="small"
                       :loading="backingVolumes"
+                      :disabled="!volumeS3.ready || volumeBusy || deploying"
                       @click="doBackupVolumes"
                     >
                       <template #icon>
                         <NIcon><CloudUploadOutline /></NIcon>
                       </template>
-                      开始备份
+                      {{ volumeBusy ? '任务执行中' : '开始备份' }}
                     </NButton>
-                  </NSpace>
+                    <span v-if="volumeBusy" class="vol-busy-hint">
+                      <NIcon><RefreshOutline /></NIcon>
+                      归档状态每 5 秒自动刷新
+                    </span>
+                  </div>
                 </NSpace>
               </div>
 
               <!-- 归档历史 -->
-              <div>
-                <div style="font-weight: 600; margin-bottom: 8px">
-                  备份归档
-                  <span v-if="volumeBackupTotal > 0" style="color: var(--n-text-color-3); font-weight: 400">
-                    （共 {{ volumeBackupTotal }} 份）
+              <div class="vol-section">
+                <div class="vol-section-title">
+                  <span>
+                    备份归档
+                    <span v-if="volumeBackupTotal > 0" class="vol-count">（共 {{ volumeBackupTotal }} 份）</span>
                   </span>
+                  <NButton size="tiny" secondary :loading="volumeListLoading" @click="refreshVolumeBackups">
+                    <template #icon>
+                      <NIcon><RefreshOutline /></NIcon>
+                    </template>
+                    刷新
+                  </NButton>
                 </div>
                 <NDataTable
                   :columns="volArchiveColumns"
                   :data="volumeBackups"
                   size="small"
                   :bordered="false"
-                  :single-line="false"
+                  :loading="volumeListLoading"
+                  :pagination="volumeArchiveTablePagination"
+                  :scroll-x="1240"
+                  :row-key="(r: VolumeArchive) => r.id"
                 >
                   <template #empty>
-                    <NEmpty description="暂无备份归档" size="small" />
+                    <NEmpty
+                      :description="volumeS3.ready ? '暂无备份归档，选好挂载卷后点「开始备份」' : '暂无备份归档'"
+                      size="small"
+                    />
                   </template>
                 </NDataTable>
               </div>
@@ -1696,7 +1885,11 @@ onDeactivated(() => {
   overflow: hidden;
 }
 
+/* 必须显式撑满页签高度：父级 .n-tab-pane 是固定高、.detail-body 又是
+   overflow: hidden，子容器高度按内容自长时滚动条永不出现、底部内容被裁掉。 */
 .overview-scroll {
+  height: 100%;
+  min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 8px 4px;
@@ -1712,6 +1905,46 @@ onDeactivated(() => {
 .mono {
   font-family: 'JetBrains Mono', Consolas, monospace;
   font-size: 12px;
+}
+
+/* 数据卷备份页签：三个子区块共用同一标题层级，归档表宽度由 scroll-x 兜住 */
+.vol-section {
+  margin-bottom: 18px;
+}
+
+.vol-section:last-child {
+  margin-bottom: 0;
+}
+
+.vol-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.vol-count {
+  margin-left: 4px;
+  font-weight: 400;
+  color: var(--n-text-color-3, var(--text-secondary));
+}
+
+.vol-backup-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.vol-busy-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--n-text-color-3, var(--text-secondary));
 }
 
 .topology-box {

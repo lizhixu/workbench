@@ -1,6 +1,8 @@
 package apps
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"watchman/server/internal/snapshots"
 )
 
 // ---- parseVolumeSpec ----
@@ -31,6 +34,10 @@ func TestParseVolumeSpec(t *testing.T) {
 		{spec: ":/data", ok: false},
 		{spec: "/data:", ok: false},
 		{spec: "/a/../b:/data", ok: false},
+		{spec: "/opt/data:data", ok: false},  // container path must be absolute
+		{spec: "volname:data", ok: false},    // same for named volumes
+		{spec: "/opt/data:/data:z", ok: false}, // unknown third segment is not a mode
+		{spec: "/opt/data:/data:ro:rw", ok: false},
 	}
 	for _, tc := range cases {
 		src, dst, mode, ok := parseVolumeSpec(tc.spec)
@@ -85,8 +92,9 @@ func TestVolumeResolveMountpointScript(t *testing.T) {
 }
 
 func TestVolumeRestoreScript(t *testing.T) {
-	script := volumeRestoreScript("/opt/data", "/var/backups/watchman/apps/app1/vbk_x.tar.gz")
-	if !strings.Contains(script, ".pre-restore.tar.gz") {
+	script := volumeRestoreScript("/opt/data", "/var/backups/watchman/apps/app1/vbk_x.tar.gz",
+		"/var/backups/watchman/apps/app1/vbk_x.pre-restore.tar.gz")
+	if !strings.Contains(script, "/var/backups/watchman/apps/app1/vbk_x.pre-restore.tar.gz") {
 		t.Errorf("restore script missing safety copy:\n%s", script)
 	}
 	if !strings.Contains(script, `tar -C '/opt/data' -xzf '/var/backups/watchman/apps/app1/vbk_x.tar.gz'`) {
@@ -94,6 +102,28 @@ func TestVolumeRestoreScript(t *testing.T) {
 	}
 	if !strings.Contains(script, "[ -f ") || !strings.Contains(script, "归档文件不存在") {
 		t.Errorf("restore script must check the archive exists:\n%s", script)
+	}
+}
+
+func TestVolumeUploadScript(t *testing.T) {
+	script := volumeUploadScript("/var/backups/watchman/apps/app1/vbk_x.tar.gz",
+		"https://s3.example.com/bucket/apps/app1/vbk_x.tar.gz?X-Amz-Signature=abc")
+	if !strings.Contains(script, "curl -fsSL") || !strings.Contains(script, "-X PUT -T '/var/backups/watchman/apps/app1/vbk_x.tar.gz'") {
+		t.Errorf("upload script must PUT the staged archive:\n%s", script)
+	}
+	if !strings.Contains(script, "'https://s3.example.com/bucket/apps/app1/vbk_x.tar.gz?X-Amz-Signature=abc'") {
+		t.Errorf("upload script must carry the pre-signed URL intact:\n%s", script)
+	}
+}
+
+func TestVolumeDownloadScript(t *testing.T) {
+	script := volumeDownloadScript("https://s3.example.com/bucket/apps/app1/vbk_x.tar.gz?X-Amz-Signature=abc",
+		"/var/backups/watchman/apps/app1/vbk_x.restore.tar.gz")
+	if !strings.Contains(script, "curl -fsSL") || !strings.Contains(script, "-o '/var/backups/watchman/apps/app1/vbk_x.restore.tar.gz'") {
+		t.Errorf("download script must write the archive to the staging path:\n%s", script)
+	}
+	if !strings.Contains(script, "[ -s ") || !strings.Contains(script, "归档下载为空") {
+		t.Errorf("download script must reject an empty body:\n%s", script)
 	}
 }
 
@@ -169,16 +199,86 @@ func TestVolumeStoreRoundTrip(t *testing.T) {
 		t.Fatalf("reload after PutArchive: %+v", got)
 	}
 
+	// Records are deep copies: HTTP handlers marshal them while the engine
+	// mutates status/size, so a shared pointer would be a data race.
+	got.Status = VolumeBackupFailed
+	got.LastRestoreAt = &now
+	if again, _ := s2.GetArchive("app1", "vbk_1"); again.Status != VolumeBackupSuccess || again.LastRestoreAt != nil {
+		t.Fatalf("GetArchive leaked the stored pointer: %+v", again)
+	}
+	listed := s2.ListArchives("app1")
+	listed[0].Status = "mutated"
+	if again, _ := s2.GetArchive("app1", listed[0].ID); again.Status == "mutated" {
+		t.Fatal("ListArchives leaked the stored pointer")
+	}
+
 	// Other apps' records are untouched by an app-scoped list.
 	if got := s2.ListArchives("other"); len(got) != 0 {
 		t.Fatalf("ListArchives leaked cross-app records: %+v", got)
 	}
 
-	if err := s.DeleteArchive("app1", "vbk_1"); err != nil {
+	if err := s2.DeleteArchive("app1", "vbk_1"); err != nil {
 		t.Fatalf("DeleteArchive: %v", err)
 	}
-	if _, ok := s.GetArchive("app1", "vbk_1"); ok {
+	if _, ok := s2.GetArchive("app1", "vbk_1"); ok {
 		t.Fatal("archive still present after delete")
+	}
+
+	if err := s2.DeleteAppArchives("app1"); err != nil {
+		t.Fatalf("DeleteAppArchives: %v", err)
+	}
+	if len(s2.ListArchives("app1")) != 0 {
+		t.Fatal("archives still present after DeleteAppArchives")
+	}
+}
+
+func TestVolumeStoreReconcilesInterruptedRunning(t *testing.T) {
+	dir := t.TempDir()
+	doc := `{"archives":[{"id":"vbk_1","app_id":"app1","status":"running","created_at":"2026-10-22T00:00:00Z"}]}`
+	if err := os.WriteFile(filepath.Join(dir, appVolumeArchivesFile), []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewVolumeStore(dir, nil)
+	if err != nil {
+		t.Fatalf("NewVolumeStore: %v", err)
+	}
+	got, ok := s.GetArchive("app1", "vbk_1")
+	if !ok || got.Status != VolumeBackupFailed || !strings.Contains(got.Error, "中断") {
+		t.Fatalf("running record not reconciled: %+v", got)
+	}
+	// The reconciliation is persisted, so a second restart does not flip it again.
+	s2, err := NewVolumeStore(dir, nil)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if got, _ := s2.GetArchive("app1", "vbk_1"); got.Status != VolumeBackupFailed {
+		t.Fatalf("reconciled status not persisted: %+v", got)
+	}
+}
+
+func TestStaleVolumeArchivesCountsOnlySuccess(t *testing.T) {
+	now := time.Now()
+	all := make([]*VolumeArchive, 0, 10)
+	for i := 0; i < 7; i++ {
+		all = append(all, &VolumeArchive{
+			ID: fmt.Sprintf("ok%d", i), VolumeSpec: "/a:/a", Status: VolumeBackupSuccess,
+			CreatedAt: now.Add(-time.Duration(i) * time.Minute),
+		})
+	}
+	all = append(all,
+		&VolumeArchive{ID: "failed", VolumeSpec: "/a:/a", Status: VolumeBackupFailed, CreatedAt: now.Add(-time.Hour)},
+		&VolumeArchive{ID: "other", VolumeSpec: "/b:/b", Status: VolumeBackupSuccess, CreatedAt: now.Add(-time.Hour)},
+	)
+	stale := staleVolumeArchives(all, "/a:/a", volumeRetention)
+	if len(stale) != 2 || stale[0].ID != "ok5" || stale[1].ID != "ok6" {
+		t.Fatalf("stale = %+v, want [ok5 ok6] (failed records must not consume retention)", stale)
+	}
+	if got := staleVolumeArchives(all, "/b:/b", volumeRetention); len(got) != 0 {
+		t.Fatalf("other spec must keep its only archive, got %+v", got)
+	}
+	// A snapshot job's retention count overrides the package default.
+	if got := staleVolumeArchives(all, "/a:/a", 2); len(got) != 5 {
+		t.Fatalf("keep=2 stale = %d records, want 5", len(got))
 	}
 }
 
@@ -198,6 +298,41 @@ func TestVolumeStoreCorruptFileStartsEmpty(t *testing.T) {
 
 // ---- engine boundaries ----
 
+// fakeS3TargetStore implements S3TargetStore for tests. The target points at an
+// httptest server so delete calls have somewhere to go (204).
+type fakeS3TargetStore struct {
+	def     *snapshots.S3Target
+	targets map[string]*snapshots.S3Target
+}
+
+func (f *fakeS3TargetStore) GetDefaultS3Target() (*snapshots.S3Target, bool) {
+	if f == nil || f.def == nil {
+		return nil, false
+	}
+	return f.def, true
+}
+
+func (f *fakeS3TargetStore) GetS3Target(id string) (*snapshots.S3Target, bool) {
+	if f == nil {
+		return nil, false
+	}
+	t, ok := f.targets[id]
+	return t, ok
+}
+
+func newFakeS3TargetStore(t *testing.T) *fakeS3TargetStore {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	target := &snapshots.S3Target{
+		ID: "s3_test", Name: "测试存储", Endpoint: srv.URL, Region: "auto",
+		Bucket: "bucket", AccessKey: "ak", SecretKey: "sk", IsDefault: true,
+	}
+	return &fakeS3TargetStore{def: target, targets: map[string]*snapshots.S3Target{target.ID: target}}
+}
+
 func newVolumeTestEngine(t *testing.T) (*Engine, *Store, *VolumeStore) {
 	t.Helper()
 	store, err := NewStore(t.TempDir(), nil)
@@ -210,7 +345,35 @@ func newVolumeTestEngine(t *testing.T) (*Engine, *Store, *VolumeStore) {
 	}
 	e := NewEngine(nil, store, nil, nil)
 	e.SetVolumeStore(vols)
+	e.SetS3TargetStore(newFakeS3TargetStore(t))
 	return e, store, vols
+}
+
+func TestBackupAppVolumesNoS3Target(t *testing.T) {
+	e, store, _ := newVolumeTestEngine(t)
+	// Simulate an unconfigured snapshot module (no default S3 target).
+	e.SetS3TargetStore(&fakeS3TargetStore{})
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image", Volumes: []string{"/opt/a:/a"}}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.BackupAppVolumes(app, nil, ""); err == nil || !strings.Contains(err.Error(), "未配置默认 S3 存储目标") {
+		t.Fatalf("want missing-S3 error, got %v", err)
+	}
+	if e.VolumeBusy(app.ID) {
+		t.Fatal("rejected backup must not leak the volume slot")
+	}
+	if e.S3Status().Ready {
+		t.Fatal("S3Status must report unready without a default target")
+	}
+}
+
+func TestS3StatusReportsDefaultTarget(t *testing.T) {
+	e, _, _ := newVolumeTestEngine(t)
+	got := e.S3Status()
+	if !got.Ready || got.TargetID != "s3_test" || got.TargetName != "测试存储" || got.Bucket != "bucket" {
+		t.Fatalf("S3Status = %+v", got)
+	}
 }
 
 func TestBackupAppVolumesNoVolumes(t *testing.T) {
@@ -256,19 +419,146 @@ func TestBackupAppVolumesBusyConflict(t *testing.T) {
 	}
 }
 
-func TestRestoreAppVolumeRequiresContainer(t *testing.T) {
+func TestRestoreAppVolumeOfflineFirst(t *testing.T) {
 	e, store, vols := newVolumeTestEngine(t)
 	app := &Application{ID: "app1", HostID: "h1", SourceType: "image"}
 	if err := store.PutApp(app); err != nil {
 		t.Fatal(err)
 	}
-	arch := &VolumeArchive{ID: "vbk_x", AppID: app.ID, HostID: app.HostID, FilePath: "/var/backups/watchman/apps/app1/vbk_x.tar.gz", HostPath: "/opt/a", Status: VolumeBackupSuccess}
+	arch := &VolumeArchive{ID: "vbk_x", AppID: app.ID, HostID: app.HostID,
+		StorageTarget: "s3_test", StoragePath: "apps/app1/vbk_x.tar.gz", HostPath: "/opt/a", Status: VolumeBackupSuccess}
 	if err := vols.AddArchive(arch); err != nil {
 		t.Fatal(err)
 	}
-	// Registry is nil, so the hub check fires first.
+	// Registry is nil (host offline), so the hub check fires before the
+	// container-name guard; the restore must not touch the archive record.
 	if _, err := e.RestoreAppVolume(app, arch); err == nil || !strings.Contains(err.Error(), "Agent 不在线") {
 		t.Fatalf("want offline error, got %v", err)
+	}
+	got, ok := vols.GetArchive(app.ID, arch.ID)
+	if !ok || got.LastRestoreStatus != VolumeRestoreFailed || !strings.Contains(got.LastRestoreError, "Agent 不在线") {
+		t.Fatalf("offline restore outcome not recorded: %+v", got)
+	}
+}
+
+func TestCheckAppVolumeRestoreSentinels(t *testing.T) {
+	e, store, vols := newVolumeTestEngine(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image", Volumes: []string{"/opt/a:/a"}}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	arch := &VolumeArchive{ID: "vbk_x", AppID: app.ID, HostID: app.HostID,
+		StorageTarget: "s3_test", StoragePath: "apps/app1/vbk_x.tar.gz", HostPath: "/opt/a", Status: VolumeBackupSuccess}
+	if err := vols.AddArchive(arch); err != nil {
+		t.Fatal(err)
+	}
+	// Registry nil -> offline sentinel, reported before anything runs.
+	if err := e.CheckAppVolumeRestore(app.ID); !errors.Is(err, snapshots.ErrVolumeRestoreOffline) {
+		t.Fatalf("want offline sentinel, got %v", err)
+	}
+	if err := e.CheckAppVolumeRestore("nope"); err == nil {
+		t.Fatal("missing app must be rejected")
+	}
+	// Busy slot -> busy sentinel.
+	e.acquireVolumeSlot(app.ID)
+	if err := e.CheckAppVolumeRestore(app.ID); !errors.Is(err, snapshots.ErrVolumeRestoreBusy) {
+		t.Fatalf("want busy sentinel, got %v", err)
+	}
+	e.releaseVolumeSlot(app.ID)
+	// Deployment in flight -> deploying sentinel.
+	if err := e.registerRunning(app.ID, &activeDeployment{depID: "dep_x", cancel: func() {}}); err != nil {
+		t.Fatal(err)
+	}
+	defer e.finishRunning(app.ID, "dep_x")
+	if err := e.CheckAppVolumeRestore(app.ID); !errors.Is(err, snapshots.ErrVolumeRestoreDeploying) {
+		t.Fatalf("want deploying sentinel, got %v", err)
+	}
+}
+
+func TestRestoreAppVolumeByIDRecordsPreflightFailure(t *testing.T) {
+	e, store, vols := newVolumeTestEngine(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image", Volumes: []string{"/opt/a:/a"}}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	arch := &VolumeArchive{ID: "vbk_x", AppID: app.ID, HostID: app.HostID,
+		StorageTarget: "s3_test", StoragePath: "apps/app1/vbk_x.tar.gz", HostPath: "/opt/a", Status: VolumeBackupSuccess}
+	if err := vols.AddArchive(arch); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the race the HTTP layer cannot see: its synchronous preflight
+	// passed, then a backup claimed the slot before the goroutine ran.
+	e.acquireVolumeSlot(app.ID)
+	if err := e.RestoreAppVolumeByID(app.ID, arch.ID); !errors.Is(err, snapshots.ErrVolumeRestoreBusy) {
+		t.Fatalf("want busy sentinel, got %v", err)
+	}
+	e.releaseVolumeSlot(app.ID)
+	got, ok := vols.GetArchive(app.ID, arch.ID)
+	if !ok || got.LastRestoreStatus != VolumeRestoreFailed || got.LastRestoreAt == nil {
+		t.Fatalf("preflight rejection must be recorded on the archive: %+v", got)
+	}
+	if !strings.Contains(got.LastRestoreError, "已有备份或恢复任务在执行") {
+		t.Fatalf("recorded error must explain the rejection: %q", got.LastRestoreError)
+	}
+}
+
+func TestDeleteAppVolumeArchiveBusy(t *testing.T) {
+	e, store, vols := newVolumeTestEngine(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image"}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	arch := &VolumeArchive{ID: "vbk_x", AppID: app.ID, HostID: app.HostID,
+		StorageTarget: "s3_test", StoragePath: "apps/app1/vbk_x.tar.gz", HostPath: "/opt/a", Status: VolumeBackupSuccess}
+	if err := vols.AddArchive(arch); err != nil {
+		t.Fatal(err)
+	}
+	e.acquireVolumeSlot(app.ID)
+	if err := e.DeleteAppVolumeArchive(app, arch); err == nil || !strings.Contains(err.Error(), "已有备份或恢复任务在执行") {
+		t.Fatalf("want busy conflict, got %v", err)
+	}
+	e.releaseVolumeSlot(app.ID)
+	// Host offline: metadata deletion is authoritative and must go through.
+	if err := e.DeleteAppVolumeArchive(app, arch); err != nil {
+		t.Fatalf("DeleteAppVolumeArchive: %v", err)
+	}
+	if _, ok := vols.GetArchive(app.ID, arch.ID); ok {
+		t.Fatal("archive still present after delete")
+	}
+}
+
+func TestDeploymentRejectedWhileVolumeBusy(t *testing.T) {
+	e, store, _ := newVolumeTestEngine(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image"}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	e.acquireVolumeSlot(app.ID)
+	defer e.releaseVolumeSlot(app.ID)
+	if _, err := e.StartDeployment(app, "manual", "tester"); !errors.Is(err, errVolumeOpInProgress) {
+		t.Fatalf("want volume conflict, got %v", err)
+	}
+	if e.IsRunning(app.ID) {
+		t.Fatal("rejected deployment must not leak the running slot")
+	}
+}
+
+func TestVolumeBackupRejectedWhileDeploying(t *testing.T) {
+	e, store, _ := newVolumeTestEngine(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image", Volumes: []string{"/opt/a:/a"}}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.registerRunning(app.ID, &activeDeployment{depID: "dep_x", cancel: func() {}}); err != nil {
+		t.Fatal(err)
+	}
+	defer e.finishRunning(app.ID, "dep_x")
+	if _, err := e.BackupAppVolumes(app, nil, ""); err == nil || !strings.Contains(err.Error(), "正在部署") {
+		t.Fatalf("want deploying conflict, got %v", err)
+	}
+	// The wrapper releases its own volume slot on the early return.
+	if e.VolumeBusy(app.ID) {
+		t.Fatal("rejected backup must not leak the volume slot")
 	}
 }
 
@@ -292,30 +582,30 @@ func TestVolumeBackupSupported(t *testing.T) {
 
 // ---- HTTP handlers ----
 
-func newVolumeTestRouter(t *testing.T) (*gin.Engine, *Store) {
+func newVolumeTestRouter(t *testing.T) (*gin.Engine, *Store, *VolumeStore) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	e, store, _ := newVolumeTestEngine(t)
+	e, store, vols := newVolumeTestEngine(t)
 	h := NewAppHandlers(nil, store, e)
 	r := gin.New()
 	h.RegisterAppRoutes(r.Group(""), r.Group(""), r.Group(""))
-	return r, store
+	return r, store, vols
 }
 
 func TestVolumeBackupHandlers(t *testing.T) {
-	r, store := newVolumeTestRouter(t)
+	r, store, _ := newVolumeTestRouter(t)
 	app := &Application{ID: "app1", HostID: "h1", SourceType: "image"}
 	if err := store.PutApp(app); err != nil {
 		t.Fatal(err)
 	}
 
-	// List on an app without archives: 200, empty page.
+	// List on an app without archives: 200, empty page, S3 destination exposed.
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/apps/app1/volume-backups", nil))
 	if w.Code != http.StatusOK {
 		t.Fatalf("list: code=%d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), `"total":0`) {
+	if !strings.Contains(w.Body.String(), `"total":0`) || !strings.Contains(w.Body.String(), `"s3":{"ready":true`) {
 		t.Fatalf("list: body=%s", w.Body.String())
 	}
 
@@ -349,7 +639,7 @@ func TestVolumeBackupHandlers(t *testing.T) {
 }
 
 func TestVolumeBackupRejectsUndeclaredSpec(t *testing.T) {
-	r, store := newVolumeTestRouter(t)
+	r, store, _ := newVolumeTestRouter(t)
 	app := &Application{ID: "app1", HostID: "h1", SourceType: "image", Volumes: []string{"/opt/a:/a"}}
 	if err := store.PutApp(app); err != nil {
 		t.Fatal(err)
@@ -364,7 +654,7 @@ func TestVolumeBackupRejectsUndeclaredSpec(t *testing.T) {
 }
 
 func TestVolumeBackupRejectsComposeApp(t *testing.T) {
-	r, store := newVolumeTestRouter(t)
+	r, store, _ := newVolumeTestRouter(t)
 	app := &Application{ID: "app1", HostID: "h1", SourceType: "raw_compose", ComposeContent: "services: {}"}
 	if err := store.PutApp(app); err != nil {
 		t.Fatal(err)
@@ -397,10 +687,9 @@ func TestVolumeBackupBusyPreflight(t *testing.T) {
 	e.releaseVolumeSlot(app.ID)
 }
 
-func TestVolumeBackupArchiveListingAfterAsyncRun(t *testing.T) {
-	// An offline hub makes the async backup fail fast, but the running record
-	// is written before the agent call, proving the listing surface shows
-	// in-flight work (the UI polls on it).
+func TestVolumeBackupListingAndDelete(t *testing.T) {
+	// Listing surface: order, field passthrough, per-volume filter, and delete
+	// (host offline -> metadata deletion is authoritative).
 	gin.SetMode(gin.TestMode)
 	e, store, vols := newVolumeTestEngine(t)
 	h := NewAppHandlers(nil, store, e)
@@ -413,7 +702,8 @@ func TestVolumeBackupArchiveListingAfterAsyncRun(t *testing.T) {
 
 	// Pre-seed one finished archive to prove listing order and fields.
 	arch := &VolumeArchive{ID: "vbk_done", AppID: app.ID, HostID: app.HostID, VolumeSpec: "/opt/a:/a",
-		HostPath: "/opt/a", ContainerPath: "/a", FilePath: "/var/backups/watchman/apps/app1/vbk_done.tar.gz",
+		HostPath: "/opt/a", ContainerPath: "/a",
+		StorageTarget: "s3_test", StorageTargetName: "测试存储", StoragePath: "apps/app1/vbk_done.tar.gz",
 		Status: VolumeBackupSuccess, Size: 99, CreatedAt: time.Now()}
 	if err := vols.AddArchive(arch); err != nil {
 		t.Fatal(err)
@@ -445,5 +735,168 @@ func TestVolumeBackupArchiveListingAfterAsyncRun(t *testing.T) {
 	}
 	if _, ok := vols.GetArchive(app.ID, "vbk_done"); ok {
 		t.Fatal("archive still present after delete")
+	}
+}
+
+func TestVolumeRestoreRejectsUnsuccessfulArchive(t *testing.T) {
+	r, store, vols := newVolumeTestRouter(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image", ContainerName: "app1"}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []string{VolumeBackupFailed, VolumeBackupRunning} {
+		arch := &VolumeArchive{ID: "vbk_" + status, AppID: app.ID, HostID: app.HostID,
+			StorageTarget: "s3_test", StoragePath: "apps/app1/x.tar.gz", HostPath: "/opt/a", Status: status}
+		if err := vols.AddArchive(arch); err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/apps/app1/volume-backups/"+arch.ID+"/restore", nil))
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "不能用于恢复") {
+			t.Fatalf("restore %s archive: code=%d body=%s", status, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestVolumeArchiveDownloadRedirect(t *testing.T) {
+	r, store, vols := newVolumeTestRouter(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image"}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	arch := &VolumeArchive{ID: "vbk_dl", AppID: app.ID, HostID: app.HostID, VolumeSpec: "/opt/a:/a",
+		HostPath: "/opt/a", StorageTarget: "s3_test", StoragePath: "apps/app1/vbk_dl.tar.gz",
+		Status: VolumeBackupSuccess, Size: 1, CreatedAt: time.Now()}
+	if err := vols.AddArchive(arch); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/apps/app1/volume-backups/vbk_dl/download", nil))
+	if w.Code != http.StatusFound {
+		t.Fatalf("download: code=%d body=%s", w.Code, w.Body.String())
+	}
+	loc := w.Header().Get("Location")
+	for _, want := range []string{"/bucket/apps/app1/vbk_dl.tar.gz", "X-Amz-Signature=", "X-Amz-Expires=900"} {
+		if !strings.Contains(loc, want) {
+			t.Fatalf("download redirect missing %q: %s", want, loc)
+		}
+	}
+
+	// An archive that never finished has no downloadable object: 400.
+	arch.Status = VolumeBackupFailed
+	arch.Error = "boom"
+	if err := vols.PutArchive(arch); err != nil {
+		t.Fatal(err)
+	}
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/apps/app1/volume-backups/vbk_dl/download", nil))
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "无法下载") {
+		t.Fatalf("download failed archive: code=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestVolumeArchiveDownloadGoneTarget(t *testing.T) {
+	r, store, vols := newVolumeTestRouter(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image"}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	// Storage target was deleted from the snapshot module after the backup.
+	arch := &VolumeArchive{ID: "vbk_gone", AppID: app.ID, HostID: app.HostID, VolumeSpec: "/opt/a:/a",
+		StorageTarget: "s3_deleted", StoragePath: "apps/app1/vbk_gone.tar.gz",
+		Status: VolumeBackupSuccess, CreatedAt: time.Now()}
+	if err := vols.AddArchive(arch); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/apps/app1/volume-backups/vbk_gone/download", nil))
+	if w.Code != http.StatusGone || !strings.Contains(w.Body.String(), "存储目标已不存在") {
+		t.Fatalf("download with gone target: code=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestVolumeBackupRejectsWithoutS3Target(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	e, store, _ := newVolumeTestEngine(t)
+	e.SetS3TargetStore(&fakeS3TargetStore{})
+	h := NewAppHandlers(nil, store, e)
+	r := gin.New()
+	h.RegisterAppRoutes(r.Group(""), r.Group(""), r.Group(""))
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image", Volumes: []string{"/opt/a:/a"}}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/apps/app1/volume-backups", nil))
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "未配置默认 S3 存储目标") {
+		t.Fatalf("no-S3 backup: code=%d body=%s", w.Code, w.Body.String())
+	}
+	if e.VolumeBusy(app.ID) {
+		t.Fatal("rejected backup must not leak the volume slot")
+	}
+}
+
+func TestVolumeDeleteRunningArchiveConflict(t *testing.T) {
+	r, store, vols := newVolumeTestRouter(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image"}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	arch := &VolumeArchive{ID: "vbk_running", AppID: app.ID, HostID: app.HostID, Status: VolumeBackupRunning}
+	if err := vols.AddArchive(arch); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/apps/app1/volume-backups/vbk_running", nil))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "执行中") {
+		t.Fatalf("delete running archive: code=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestVolumeBackupNoteLengthLimit(t *testing.T) {
+	r, store, _ := newVolumeTestRouter(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image", Volumes: []string{"/opt/a:/a"}}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"note":"` + strings.Repeat("长", 201) + `"}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/apps/app1/volume-backups", strings.NewReader(body)))
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "200") {
+		t.Fatalf("over-long note: code=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// fakeSnapshotJobStore records which app's scheduled backup jobs were dropped.
+type fakeSnapshotJobStore struct{ deleted []string }
+
+func (f *fakeSnapshotJobStore) DeleteJobsByApp(appID string) int {
+	f.deleted = append(f.deleted, appID)
+	return 1
+}
+
+func TestPurgeVolumeArchivesDropsSnapshotJobs(t *testing.T) {
+	store, err := NewStore(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image"}
+
+	// Volume store deliberately unwired: the archives may already be gone while
+	// the app's snapshot jobs still exist, and those must not outlive the app.
+	jobs := &fakeSnapshotJobStore{}
+	e := NewEngine(nil, store, nil, nil)
+	e.SetSnapshotJobStore(jobs)
+	if err := e.PurgeVolumeArchives(app); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if len(jobs.deleted) != 1 || jobs.deleted[0] != app.ID {
+		t.Fatalf("snapshot job cleanup = %v, want [app1]", jobs.deleted)
+	}
+
+	// Unwired cleaner (unit tests, store-less engines) must stay harmless.
+	if err := NewEngine(nil, store, nil, nil).PurgeVolumeArchives(app); err != nil {
+		t.Fatalf("purge without cleanup hook: %v", err)
 	}
 }

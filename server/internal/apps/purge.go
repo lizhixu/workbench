@@ -19,6 +19,15 @@ func (h *AppHandlers) purgeAppResources(app *Application) ([]string, error) {
 	if hub == nil {
 		return nil, fmt.Errorf("Agent 离线，无法清理应用「%s」的容器/数据卷等内容；可先只删除记录，或等待 Agent 上线后重试", app.Name)
 	}
+	// A backup/restore is tarring the data dir this purge is about to touch.
+	// Holding the slot for the whole purge also stops a new backup from
+	// re-creating archive metadata after it is dropped below.
+	if h.engine != nil {
+		if !h.engine.acquireVolumeSlot(app.ID) {
+			return nil, fmt.Errorf("应用正在执行数据卷备份或恢复，请稍后再删除")
+		}
+		defer h.engine.releaseVolumeSlot(app.ID)
+	}
 
 	var warnings []string
 	warn := func(format string, args ...any) {
@@ -105,38 +114,46 @@ func (h *AppHandlers) purgeAppResources(app *Application) ([]string, error) {
 		warn("删除应用工作目录失败")
 	}
 
-		// 6. Reverse-proxy vhost configs on the app host (+ gateway host).
-		if app.Domain != "" {
-			targets := []string{app.HostID}
-			if app.ProxyMode == "gateway" && app.ProxyGatewayHostID != "" {
-				targets = append(targets, app.ProxyGatewayHostID)
-			}
-			confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
-			for _, hostID := range dedupe(targets) {
-				phub := h.reg.Hub(hostID)
-				if phub == nil {
-					warn("主机 %s 离线，代理配置未清理", hostID)
-					continue
-				}
-				_, _ = execOnAgent(phub, "purge-proxy-"+randomToken(4),
-					fmt.Sprintf("rm -f %s && docker exec %s nginx -s reload 2>/dev/null || true",
-						confPath, nginxContainer), 30)
-			}
+	// 6. Volume archives (host directory + metadata). Deleting the app must not
+	//    leave GB-scale tar.gz files behind with no record pointing at them.
+	if h.engine != nil {
+		if err := h.engine.PurgeVolumeArchives(app); err != nil {
+			warn("清理数据卷备份归档失败: %v", err)
 		}
+	}
 
-		// 7. Companion mesh forwarder container on the entry host. The gate is
-		// the recorded entry host alone (not MeshForwardEnabled) so legacy rows
-		// whose fields were cleared inconsistently can still be recovered.
-		if app.MeshForwardHostID != "" {
-			fwdHub := h.reg.Hub(app.MeshForwardHostID)
-			if fwdHub == nil {
-				warn("组网转发入口主机 %s 离线，中继容器未清理", app.MeshForwardHostID)
-			} else {
-				fwdContainer := "watchman-fwd-" + app.ID
-				_, _ = execOnAgent(fwdHub, "purge-fwd-"+randomToken(4),
-					"docker rm -f "+shellQuote(fwdContainer), 30)
-			}
+	// 7. Reverse-proxy vhost configs on the app host (+ gateway host).
+	if app.Domain != "" {
+		targets := []string{app.HostID}
+		if app.ProxyMode == "gateway" && app.ProxyGatewayHostID != "" {
+			targets = append(targets, app.ProxyGatewayHostID)
 		}
+		confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
+		for _, hostID := range dedupe(targets) {
+			phub := h.reg.Hub(hostID)
+			if phub == nil {
+				warn("主机 %s 离线，代理配置未清理", hostID)
+				continue
+			}
+			_, _ = execOnAgent(phub, "purge-proxy-"+randomToken(4),
+				fmt.Sprintf("rm -f %s && docker exec %s nginx -s reload 2>/dev/null || true",
+					confPath, nginxContainer), 30)
+		}
+	}
 
-		return warnings, nil
+	// 8. Companion mesh forwarder container on the entry host. The gate is
+	// the recorded entry host alone (not MeshForwardEnabled) so legacy rows
+	// whose fields were cleared inconsistently can still be recovered.
+	if app.MeshForwardHostID != "" {
+		fwdHub := h.reg.Hub(app.MeshForwardHostID)
+		if fwdHub == nil {
+			warn("组网转发入口主机 %s 离线，中继容器未清理", app.MeshForwardHostID)
+		} else {
+			fwdContainer := "watchman-fwd-" + app.ID
+			_, _ = execOnAgent(fwdHub, "purge-fwd-"+randomToken(4),
+				"docker rm -f "+shellQuote(fwdContainer), 30)
+		}
+	}
+
+	return warnings, nil
 }

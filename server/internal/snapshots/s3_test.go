@@ -1,6 +1,9 @@
 package snapshots
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +47,30 @@ func TestS3Presign(t *testing.T) {
 	}
 	if !strings.Contains(getURL, "X-Amz-Signature=") || !strings.Contains(getURL, "my-bucket") {
 		t.Fatalf("malformed presigned GET URL: %s", getURL)
+	}
+}
+
+func TestS3DeleteObjectStatuses(t *testing.T) {
+	status := http.StatusNoContent
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+	}))
+	defer srv.Close()
+	target := &S3Target{Endpoint: srv.URL, Bucket: "b", AccessKey: "ak", SecretKey: "sk", Region: "auto"}
+	client := NewS3Client(target)
+
+	// 204 is success; 404 means already gone and must not strand metadata.
+	for _, code := range []int{http.StatusNoContent, http.StatusNotFound} {
+		status = code
+		if err := client.DeleteObject(context.Background(), "apps/a/vbk.tar.gz"); err != nil {
+			t.Fatalf("status %d: unexpected error %v", code, err)
+		}
+	}
+
+	// Any other status must surface: callers keep the metadata record for retry.
+	status = http.StatusInternalServerError
+	if err := client.DeleteObject(context.Background(), "apps/a/vbk.tar.gz"); err == nil || !strings.Contains(err.Error(), "500") {
+		t.Fatalf("status 500: want error containing 500, got %v", err)
 	}
 }
 

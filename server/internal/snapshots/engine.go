@@ -1,6 +1,7 @@
 package snapshots
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -16,11 +17,78 @@ import (
 // uplink (the design doc's direct-to-storage principle).
 const backupRoot = "/var/backups/watchman"
 
+// appVolumeStatusRunning/Success mirror the app engine's archive lifecycle
+// states. The snapshot package deliberately keeps no dependency on apps types.
+const (
+	appVolumeStatusRunning = "running"
+	appVolumeStatusSuccess = "success"
+)
+
+// AppVolumeTarget describes an app-center application whose declared volumes
+// can be archived. Resolved on every create/update/run so a job never acts on
+// a stale allowlist (the operator may have removed a volume since).
+type AppVolumeTarget struct {
+	AppID   string
+	Name    string
+	HostID  string
+	Volumes []string
+}
+
+// AppVolumeArchive is one application-volume archive as seen by the snapshot
+// module. The record lives in the app engine's app_volume_archives.json; this
+// is a detached read view for the unified history and restore surface.
+type AppVolumeArchive struct {
+	ID                string
+	HostID            string
+	VolumeSpec        string
+	StorageTarget     string
+	StorageTargetName string
+	StoragePath       string
+	Size              int64
+	SHA256            string
+	Status            string
+	Error             string
+	Note              string
+	CreatedAt         time.Time
+	LastRestoreAt     *time.Time
+	LastRestoreStatus string
+	LastRestoreError  string
+}
+
+// AppVolumeHost is implemented by the app engine (apps.Engine). The snapshot
+// module owns the job definition, cron scheduling, retention count and the
+// unified archive history; execution semantics (declared-volume allowlist,
+// S3-only archives, SHA-verified stop/restore/start) stay in the app engine.
+// Declaring the contract here avoids an apps -> snapshots -> apps import cycle.
+type AppVolumeHost interface {
+	ResolveAppVolume(appID string) (*AppVolumeTarget, error)
+	// CheckAppVolumeRestore reports why a restore cannot start right now
+	// (missing app, busy slot, deployment in flight, agent offline, ...)
+	// without doing any work. Retryable conflicts return one of the
+	// ErrVolumeRestore* sentinels below so the HTTP layer can answer 409/503
+	// synchronously, mirroring the app-detail restore endpoint.
+	CheckAppVolumeRestore(appID string) error
+	RunAppVolumeBackup(appID, spec, note, storageTarget string, retention int) error
+	ListAppVolumeArchives(appID, spec string) []*AppVolumeArchive
+	RestoreAppVolumeByID(appID, archiveID string) error
+	DeleteAppVolumeByID(appID, archiveID string) error
+}
+
+// Restore preflight conflicts returned (possibly wrapped) by
+// AppVolumeHost.CheckAppVolumeRestore and RestoreAppVolumeByID.
+var (
+	ErrVolumeRestoreBusy      = errors.New("该应用已有备份或恢复任务在执行")
+	ErrVolumeRestoreDeploying = errors.New("应用正在部署，暂不能恢复数据卷")
+	ErrVolumeRestoreOffline   = errors.New("目标主机 Agent 不在线")
+)
+
 // Engine executes backup jobs on managed hosts through the agent channel.
 type Engine struct {
 	reg   *rpc.Registry
 	store *Store
 	log   *slog.Logger
+	// appVols executes kind=app_volume jobs; nil until wired in main.
+	appVols AppVolumeHost
 }
 
 // NewEngine creates the backup execution engine.
@@ -29,6 +97,20 @@ func NewEngine(reg *rpc.Registry, store *Store, log *slog.Logger) *Engine {
 		log = slog.Default()
 	}
 	return &Engine{reg: reg, store: store, log: log}
+}
+
+// SetAppVolumeHost injects the app engine bridge for kind=app_volume jobs.
+func (e *Engine) SetAppVolumeHost(h AppVolumeHost) {
+	e.appVols = h
+}
+
+// ResolveAppVolume exposes the bridge's allowlist for job create/update
+// validation (declared volumes, host id, compose/windows rejection).
+func (e *Engine) ResolveAppVolume(appID string) (*AppVolumeTarget, error) {
+	if e.appVols == nil {
+		return nil, fmt.Errorf("应用数据卷备份引擎未启用")
+	}
+	return e.appVols.ResolveAppVolume(appID)
 }
 
 // archiveID builds a filesystem-safe, sortable archive identifier.
@@ -40,6 +122,9 @@ func archiveID(jobID string, ts time.Time) string {
 // result. The whole pipeline runs as a single agent script so the archive and
 // its sha256 are produced atomically on the host.
 func (e *Engine) Run(job *Job) (*Archive, error) {
+	if job.Kind == KindAppVolume {
+		return e.runAppVolumeJob(job)
+	}
 	hub := e.reg.Hub(job.HostID)
 	if hub == nil {
 		return nil, fmt.Errorf("目标主机 Agent 不在线")
@@ -130,6 +215,72 @@ func (e *Engine) Run(job *Job) (*Archive, error) {
 		return nil
 	})
 	return arch, nil
+}
+
+// runAppVolumeJob delegates one app_volume job to the app engine. The app
+// engine writes the archive record (so it shows in both the app detail tab and
+// this job's history); the snapshot job only tracks last-run state.
+func (e *Engine) runAppVolumeJob(job *Job) (*Archive, error) {
+	if e.appVols == nil {
+		err := fmt.Errorf("应用数据卷备份引擎未启用")
+		e.recordFailure(job, err.Error())
+		return nil, err
+	}
+	if job.AppID == "" {
+		err := fmt.Errorf("任务缺少应用 ID")
+		e.recordFailure(job, err.Error())
+		return nil, err
+	}
+	if err := e.appVols.RunAppVolumeBackup(job.AppID, job.Target, "", job.StorageTarget, job.Retention); err != nil {
+		e.recordFailure(job, err.Error())
+		return nil, err
+	}
+	_ = e.store.UpdateJob(job.ID, func(j *Job) error {
+		j.LastRun = time.Now()
+		j.LastError = ""
+		return nil
+	})
+	return nil, nil
+}
+
+// AppVolumeArchives maps one app_volume job's archives into the snapshot
+// Archive shape, paged with the same offset/page_size contract as the store.
+func (e *Engine) AppVolumeArchives(job *Job, offset, pageSize int) ([]*Archive, int) {
+	if e.appVols == nil || job == nil {
+		return nil, 0
+	}
+	raw := e.appVols.ListAppVolumeArchives(job.AppID, job.Target)
+	total := len(raw)
+	if offset >= total {
+		return nil, total
+	}
+	end := total
+	if pageSize > 0 && offset+pageSize < total {
+		end = offset + pageSize
+	}
+	out := make([]*Archive, 0, end-offset)
+	for _, a := range raw[offset:end] {
+		out = append(out, &Archive{
+			ID:                a.ID,
+			JobID:             job.ID,
+			HostName:          job.HostID,
+			Kind:              KindAppVolume,
+			Target:            a.VolumeSpec,
+			StorageTarget:     a.StorageTarget,
+			StorageTargetName: a.StorageTargetName,
+			StoragePath:       a.StoragePath,
+			Size:              a.Size,
+			SHA256:            a.SHA256,
+			Status:            a.Status,
+			Error:             a.Error,
+			Note:              a.Note,
+			LastRestoreAt:     a.LastRestoreAt,
+			LastRestoreStatus: a.LastRestoreStatus,
+			LastRestoreError:  a.LastRestoreError,
+			CreatedAt:         a.CreatedAt,
+		})
+	}
+	return out, total
 }
 
 func (e *Engine) recordFailure(job *Job, msg string) {

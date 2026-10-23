@@ -259,7 +259,16 @@ func (c *S3Client) DeleteObject(ctx context.Context, key string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	return nil
+	// S3 answers 204 on success. A 404 means the object is already gone, which
+	// is the desired end state for every caller (retention prune, archive
+	// delete, purge), so it is treated as success. Everything else must surface:
+	// silently claiming deletion would drop the metadata record while the object
+	// stays in the bucket.
+	if resp.StatusCode/100 == 2 || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return fmt.Errorf("S3 DeleteObject %s: %d %s", key, resp.StatusCode, string(body))
 }
 
 // TestBucket probes bucket connectivity by uploading and immediately deleting a 0-byte probe object.

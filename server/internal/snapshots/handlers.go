@@ -3,6 +3,7 @@ package snapshots
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -48,7 +49,9 @@ func (h *Handlers) Register(readRG, writeRG *gin.RouterGroup) {
 type jobReq struct {
 	Name          string `json:"name"`
 	HostID        string `json:"host_id"`
-	Kind          string `json:"kind"` // dir | volume | database
+	Kind          string `json:"kind"` // dir | volume | database | app_volume
+	// AppID is required for kind=app_volume; HostID is derived from it.
+	AppID         string `json:"app_id"`
 	Target        string `json:"target"`
 	DBType        string `json:"db_type"`
 	DBName        string `json:"db_name"`
@@ -58,11 +61,28 @@ type jobReq struct {
 	Enabled       bool   `json:"enabled"`
 }
 
+// updateJobReq is the PUT /backups/jobs/:id body. Every mutable field is a
+// pointer so a partial update keeps omitted keys instead of blanking them
+// (same contract as PUT /apps/:id / updateAppReq): nil keeps the stored value,
+// an explicit ""/0/false writes through — cron "" means "manual runs only",
+// db_name "" means "all databases".
+type updateJobReq struct {
+	Name          *string `json:"name"`
+	Target        *string `json:"target"`
+	DBType        *string `json:"db_type"`
+	DBName        *string `json:"db_name"`
+	StorageTarget *string `json:"storage_target"`
+	Retention     *int    `json:"retention"`
+	Cron          *string `json:"cron"`
+	Enabled       *bool   `json:"enabled"`
+}
+
 func (r *jobReq) validate() error {
 	if strings.TrimSpace(r.Name) == "" {
 		return fmt.Errorf("任务名称不能为空")
 	}
-	if r.HostID == "" {
+	// app_volume jobs are bound to an application and derive their host from it.
+	if r.HostID == "" && JobKind(r.Kind) != KindAppVolume {
 		return fmt.Errorf("必须选择目标主机")
 	}
 	switch JobKind(r.Kind) {
@@ -86,8 +106,15 @@ func (r *jobReq) validate() error {
 		default:
 			return fmt.Errorf("数据库类型必须是 mysql/postgres/redis/mongo")
 		}
+	case KindAppVolume:
+		if strings.TrimSpace(r.AppID) == "" {
+			return fmt.Errorf("应用数据卷备份必须选择应用")
+		}
+		if strings.TrimSpace(r.Target) == "" {
+			return fmt.Errorf("应用数据卷备份必须选择挂载卷")
+		}
 	default:
-		return fmt.Errorf("备份类型必须是 dir/volume/database")
+		return fmt.Errorf("备份类型必须是 dir/volume/database/app_volume")
 	}
 	if r.Retention < 0 || r.Retention > 100 {
 		return fmt.Errorf("保留份数必须在 0-100 之间")
@@ -105,7 +132,18 @@ func (h *Handlers) createJob(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if h.reg.Hub(req.HostID) == nil {
+	hostID := req.HostID
+	appID := ""
+	if JobKind(req.Kind) == KindAppVolume {
+		target, err := h.resolveAppVolumeJob(req.AppID, req.Target, req.StorageTarget)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		hostID = target.HostID
+		appID = target.AppID
+	}
+	if h.reg.Hub(hostID) == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "目标主机 Agent 不在线"})
 		return
 	}
@@ -113,20 +151,21 @@ func (h *Handlers) createJob(c *gin.Context) {
 	if retention == 0 {
 		retention = 7
 	}
-		job := &Job{
-			ID:            "bk_" + randomToken(8),
-			Name:          strings.TrimSpace(req.Name),
-			HostID:        req.HostID,
-			Kind:          JobKind(req.Kind),
-			Target:        strings.TrimSpace(req.Target),
-			DBType:        strings.ToLower(req.DBType),
-			DBName:        strings.TrimSpace(req.DBName),
-			StorageTarget: strings.TrimSpace(req.StorageTarget),
-			Retention:     retention,
-			Schedule:      Schedule{Cron: strings.TrimSpace(req.Cron)},
-			Enabled:       req.Enabled,
-			CreatedAt:     time.Now(),
-		}
+	job := &Job{
+		ID:            "bk_" + randomToken(8),
+		Name:          strings.TrimSpace(req.Name),
+		HostID:        hostID,
+		Kind:          JobKind(req.Kind),
+		AppID:         appID,
+		Target:        strings.TrimSpace(req.Target),
+		DBType:        strings.ToLower(req.DBType),
+		DBName:        strings.TrimSpace(req.DBName),
+		StorageTarget: strings.TrimSpace(req.StorageTarget),
+		Retention:     retention,
+		Schedule:      Schedule{Cron: strings.TrimSpace(req.Cron)},
+		Enabled:       req.Enabled,
+		CreatedAt:     time.Now(),
+	}
 	if err := h.store.PutJob(job); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -135,29 +174,85 @@ func (h *Handlers) createJob(c *gin.Context) {
 }
 
 func (h *Handlers) updateJob(c *gin.Context) {
-	var req jobReq
+	var req updateJobReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	existing, ok := h.store.GetJob(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+		return
+	}
+	// Effective values after the partial merge, used both for validation and
+	// the mutation below. Only explicitly provided fields are validated
+	// (same "validate what changes" rule as PUT /apps/:id).
+	target := existing.Target
+	if req.Target != nil {
+		target = strings.TrimSpace(*req.Target)
+		if target == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "备份目标不能为空"})
+			return
+		}
+		if existing.Kind == KindDir && (strings.Contains(target, "..") || !strings.HasPrefix(target, "/")) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "目录必须是绝对路径且不能包含 .."})
+			return
+		}
+	}
+	name := existing.Name
+	if req.Name != nil {
+		name = strings.TrimSpace(*req.Name)
+		if name == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "任务名称不能为空"})
+			return
+		}
+	}
+	if req.DBType != nil && existing.Kind == KindDatabase {
+		switch strings.ToLower(strings.TrimSpace(*req.DBType)) {
+		case "mysql", "postgres", "redis", "mongo":
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "数据库类型必须是 mysql/postgres/redis/mongo"})
+			return
+		}
+	}
+	if req.Retention != nil && (*req.Retention < 0 || *req.Retention > 100) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "保留份数必须在 0-100 之间"})
+		return
+	}
+	storageTarget := existing.StorageTarget
+	if req.StorageTarget != nil {
+		storageTarget = strings.TrimSpace(*req.StorageTarget)
+	}
+	if existing.Kind == KindAppVolume {
+		// Re-check the allowlist: an app edit may have removed the volume, and
+		// the destination must stay an existing S3 target (archives are S3-only).
+		if _, err := h.resolveAppVolumeJob(existing.AppID, target, storageTarget); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
 	if err := h.store.UpdateJob(c.Param("id"), func(j *Job) error {
-		if strings.TrimSpace(req.Name) != "" {
-			j.Name = strings.TrimSpace(req.Name)
+		j.Name = name
+		j.Target = target
+		if req.DBType != nil {
+			j.DBType = strings.ToLower(strings.TrimSpace(*req.DBType))
 		}
-		j.Target = strings.TrimSpace(req.Target)
-		j.DBType = strings.ToLower(req.DBType)
-		j.DBName = strings.TrimSpace(req.DBName)
-		if req.StorageTarget != "" {
-			j.StorageTarget = req.StorageTarget
+		if req.DBName != nil {
+			j.DBName = strings.TrimSpace(*req.DBName)
 		}
-		if req.Retention > 0 {
-			j.Retention = req.Retention
+		j.StorageTarget = storageTarget
+		if req.Retention != nil {
+			j.Retention = *req.Retention
 		}
-		j.Schedule = Schedule{Cron: strings.TrimSpace(req.Cron)}
-		j.Enabled = req.Enabled
+		if req.Cron != nil {
+			j.Schedule = Schedule{Cron: strings.TrimSpace(*req.Cron)}
+		}
+		if req.Enabled != nil {
+			j.Enabled = *req.Enabled
+		}
 		return nil
 	}); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	job, _ := h.store.GetJob(c.Param("id"))
@@ -199,16 +294,80 @@ func (h *Handlers) runJob(c *gin.Context) {
 }
 
 func (h *Handlers) listArchives(c *gin.Context) {
+	job, ok := h.store.GetJob(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+		return
+	}
 	offset := intQuery(c, "offset", 0)
 	pageSize := intQuery(c, "page_size", 20)
 	if pageSize <= 0 || pageSize > 100 {
 		pageSize = 20
 	}
-	list, total := h.store.ListArchives(c.Param("id"), offset, pageSize)
+	var list []*Archive
+	var total int
+	if job.Kind == KindAppVolume {
+		// App-volume records live in the app engine's store; the job only
+		// narrows them to its own volume spec.
+		list, total = h.engine.AppVolumeArchives(job, offset, pageSize)
+	} else {
+		list, total = h.store.ListArchives(job.ID, offset, pageSize)
+	}
 	if list == nil {
 		list = []*Archive{}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": list, "total": total, "offset": offset, "page_size": pageSize})
+}
+
+// resolveAppVolumeJob validates an app_volume job request against the app
+// engine: the target must be one of the app's declared volumes and the
+// destination must be an existing S3 target (these archives are S3-only).
+func (h *Handlers) resolveAppVolumeJob(appID, spec, storageTarget string) (*AppVolumeTarget, error) {
+	target, err := h.engine.ResolveAppVolume(strings.TrimSpace(appID))
+	if err != nil {
+		return nil, err
+	}
+	spec = strings.TrimSpace(spec)
+	declared := false
+	for _, v := range target.Volumes {
+		if strings.TrimSpace(v) == spec {
+			declared = true
+			break
+		}
+	}
+	if !declared {
+		return nil, fmt.Errorf("只能选择应用已声明的挂载卷: %s", spec)
+	}
+	switch strings.TrimSpace(storageTarget) {
+	case "":
+		// Empty means "follow the default target" (the job record keeps the
+		// empty ref so a later default switch applies to new runs).
+		if _, ok := h.store.GetDefaultS3Target(); !ok {
+			return nil, fmt.Errorf("未配置默认 S3 存储目标，请先在「S3 存储」中添加目标并设为默认")
+		}
+	case "default":
+		if _, ok := h.store.GetDefaultS3Target(); !ok {
+			return nil, fmt.Errorf("未配置默认 S3 存储目标，请先在「S3 存储」中添加目标并设为默认")
+		}
+	case "local":
+		return nil, fmt.Errorf("应用数据卷归档仅支持 S3 存储，请选择默认或指定 S3 目标")
+	default:
+		if _, ok := h.store.GetS3Target(strings.TrimSpace(storageTarget)); !ok {
+			return nil, fmt.Errorf("所选 S3 存储目标不存在")
+		}
+	}
+	return target, nil
+}
+
+// findAppVolumeArchive locates one archive in a job's history.
+func (h *Handlers) findAppVolumeArchive(job *Job, archiveID string) *Archive {
+	list, _ := h.engine.AppVolumeArchives(job, 0, 0)
+	for _, a := range list {
+		if a.ID == archiveID {
+			return a
+		}
+	}
+	return nil
 }
 
 // restoreArchive restores one archive. Restoring overwrites live data, so it
@@ -218,6 +377,44 @@ func (h *Handlers) restoreArchive(c *gin.Context) {
 	job, ok := h.store.GetJob(c.Param("id"))
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+		return
+	}
+	if job.Kind == KindAppVolume {
+		if h.engine.appVols == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "应用数据卷备份引擎未启用"})
+			return
+		}
+		target := h.findAppVolumeArchive(job, c.Param("archiveID"))
+		if target == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "archive not found"})
+			return
+		}
+		if target.Status != appVolumeStatusSuccess {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "归档未成功完成，不能用于恢复"})
+			return
+		}
+		// Synchronous preflight: reject the restore up front (409/503, same
+		// contract as the app-detail endpoint) instead of answering 202 and
+		// silently logging why nothing happened. State may still change after
+		// this check; those races are caught inside RestoreAppVolumeByID,
+		// which records the failure on the archive's last_restore_* fields.
+		if err := h.engine.appVols.CheckAppVolumeRestore(job.AppID); err != nil {
+			code := http.StatusBadRequest
+			if errors.Is(err, ErrVolumeRestoreBusy) || errors.Is(err, ErrVolumeRestoreDeploying) {
+				code = http.StatusConflict
+			} else if errors.Is(err, ErrVolumeRestoreOffline) {
+				code = http.StatusServiceUnavailable
+			}
+			c.JSON(code, gin.H{"error": err.Error()})
+			return
+		}
+		go func() {
+			if err := h.engine.appVols.RestoreAppVolumeByID(job.AppID, target.ID); err != nil {
+				h.engine.log.Warn("scheduled app volume restore failed", "job", job.ID, "archive", target.ID, "err", err)
+			}
+		}()
+		c.JSON(http.StatusAccepted, gin.H{"ok": true,
+			"message": "恢复任务已开始：将自动停机、恢复数据并在完成后重启应用容器"})
 		return
 	}
 	archives, _ := h.store.ListArchives(job.ID, 0, 0)
@@ -242,7 +439,33 @@ func (h *Handlers) restoreArchive(c *gin.Context) {
 }
 
 func (h *Handlers) deleteArchive(c *gin.Context) {
-	if err := h.store.DeleteArchive(c.Param("id"), c.Param("archiveID")); err != nil {
+	job, ok := h.store.GetJob(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+		return
+	}
+	if job.Kind == KindAppVolume {
+		if h.engine.appVols == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "应用数据卷备份引擎未启用"})
+			return
+		}
+		target := h.findAppVolumeArchive(job, c.Param("archiveID"))
+		if target == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "archive not found"})
+			return
+		}
+		if target.Status == appVolumeStatusRunning {
+			c.JSON(http.StatusConflict, gin.H{"error": "备份任务执行中，不能删除该归档"})
+			return
+		}
+		if err := h.engine.appVols.DeleteAppVolumeByID(job.AppID, target.ID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+		return
+	}
+	if err := h.store.DeleteArchive(job.ID, c.Param("archiveID")); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}

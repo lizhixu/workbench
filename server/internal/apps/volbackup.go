@@ -4,21 +4,26 @@ package apps
 //
 // 每个应用声明的卷（Application.Volumes，docker -v 规格）是业务数据的落点，
 // 平台此前只有删除应用时才接触它们（purge 时区分 bind mount 与具名卷），既不能
-// 备份也不能找回。本文件补齐卷数据生命周期：把卷的数据目录打成 tar.gz 归档，
-// 直存应用所在主机的 /var/backups/watchman/apps/<appID>/（与快照引擎同一根目录、
-// 同一 direct-to-storage 原则——GB 级归档过控制端会打满上行带宽），元数据落控制端
-// dataDir 下的 app_volume_archives.json，供详情页列举、恢复与删除。
+// 备份也不能找回。本文件补齐卷数据生命周期：把卷的数据目录打成 tar.gz，直传
+// S3 默认存储目标（与快照引擎同一 direct-to-storage 原则——GB 级归档过控制端会
+// 打满上行带宽），元数据落控制端 dataDir 下的 app_volume_archives.json，供详情页
+// 列举、下载、恢复与删除。被管主机只承担 tar / curl 的临时暂存，归档本身不落在
+// 主机磁盘上（恢复时的安全副本除外）。
 //
 // 卷规格两种形态都支持：
 //   - bind mount：/opt/apps/xxx/data:/data —— 直接 tar 宿主机路径；
 //   - Docker 具名卷：volname:/data —— 先 docker volume inspect 解析挂载点再 tar
 //     （与 purge.go「src 含 / 即宿主机目录，绝不误删」的区分规则同源）。
 //
-// 恢复遵循安全停机语义：先 docker stop 应用容器防止在线写盘与文件锁，安全副本
-// 后解压覆盖，最后无论成败都把容器拉回原状态（先停必起，绝不在线服务停在停止态）。
+// 恢复遵循安全停机语义：先把归档从 S3 下载到主机临时路径并校验 SHA256，再
+// docker stop 应用容器防止在线写盘与文件锁，安全副本后解压覆盖，出错路径由
+// defer 统一把容器拉回运行态（控制端进程在停机与重启之间崩溃时容器会留在停止态，
+// 需人工启动，见 AGENTS.md §3.7）。
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -31,21 +36,31 @@ import (
 	"time"
 
 	"watchman/server/internal/rpc"
+	"watchman/server/internal/snapshots"
 )
 
-const (
-	// volumeBackupRoot is where app volume archives live on the managed host.
-	// Same root as the snapshot engine (/var/backups/watchman) so operators
-	// look in one place; per-app sub-dirs keep archive names from colliding.
-	volumeBackupRoot = "/var/backups/watchman/apps"
+// errVolumeOpInProgress rejects a deployment while a volume backup/restore is
+// running; the reverse direction uses "应用正在部署" errors from the engine.
+var errVolumeOpInProgress = errors.New("该应用正在执行数据卷备份或恢复，请稍后再试")
 
-	// volumeRetention keeps the newest N archives per volume spec (host files
-	// plus their metadata). Mirrors the snapshot engine's default so the two
-	// backup surfaces behave alike.
+// errVolumeS3TargetMissing means the recorded S3 destination no longer exists
+// (deleted in the snapshot module). The object is unreachable, so retention /
+// delete drop the metadata instead of retrying forever.
+var errVolumeS3TargetMissing = errors.New("归档的 S3 存储目标已不存在")
+
+const (
+	// volumeStagingRoot is scratch space on the managed host: tar output before
+	// the S3 upload, archives downloaded for a restore, and the pre-restore
+	// safety copy. Archives themselves live in S3, not here.
+	volumeStagingRoot = "/var/backups/watchman/apps"
+
+	// volumeRetention keeps the newest N successful archives per volume spec
+	// (S3 objects plus their metadata). Mirrors the snapshot engine's default
+	// so the two backup surfaces behave alike.
 	volumeRetention = 5
 
-	// volumeArchiveMetaCap bounds stored metadata per application; the host
-	// retention prune keeps this far below the cap in normal operation.
+	// volumeArchiveMetaCap bounds stored metadata per application; retention
+	// pruning keeps this far below the cap in normal operation.
 	volumeArchiveMetaCap = 100
 
 	// appVolumeArchivesFile persists archive metadata under the data dir. A
@@ -54,14 +69,25 @@ const (
 	appVolumeArchivesFile = "app_volume_archives.json"
 
 	// Archive lifecycle states. Running is visible to the UI (polled while the
-	// agent tar runs); failed keeps its record so the operator can see why.
+	// agent tar + upload runs); failed keeps its record so the operator can see
+	// why.
 	VolumeBackupRunning = "running"
 	VolumeBackupSuccess = "success"
 	VolumeBackupFailed  = "failed"
+
+	// Restore outcome recorded on the archive itself: a restore is an async
+	// agent run like a backup, so without this the operator only saw a 202 and
+	// had no way to learn the result from the panel.
+	VolumeRestoreSuccess = "success"
+	VolumeRestoreFailed  = "failed"
+
+	// volumeS3OpTimeout bounds the tar/upload/download agent scripts. Large
+	// volumes can take a while; the agent exec timeout adds its own margin.
+	volumeS3OpTimeout = int32(1800)
 )
 
-// VolumeArchive is one tar.gz backup of an application volume's data directory
-// on the application host. ID carries the "vbk_" prefix.
+// VolumeArchive is one tar.gz backup of an application volume. The object is
+// stored in S3; ID carries the "vbk_" prefix.
 type VolumeArchive struct {
 	ID            string    `json:"id"`
 	AppID         string    `json:"app_id"`
@@ -69,13 +95,48 @@ type VolumeArchive struct {
 	VolumeSpec    string    `json:"volume_spec"`    // original "host:container[:ro]" spec
 	HostPath      string    `json:"host_path"`      // resolved data dir (bind path or volume mountpoint)
 	ContainerPath string    `json:"container_path"` // path inside the container
-	FilePath      string    `json:"file_path"`      // /var/backups/watchman/apps/<appID>/<id>.tar.gz
-	Size          int64     `json:"size"`           // bytes
-	SHA256        string    `json:"sha256,omitempty"`
-	Status        string    `json:"status"` // running | success | failed
-	Error         string    `json:"error,omitempty"`
-	Note          string    `json:"note,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
+	// StorageTarget/StorageTargetName are frozen at backup time: switching the
+	// default target later must not orphan older archives.
+	StorageTarget     string    `json:"storage_target"`
+	StorageTargetName string    `json:"storage_target_name,omitempty"`
+	StoragePath       string    `json:"storage_path"` // full S3 object key, target prefix included
+	Size              int64     `json:"size"`         // bytes
+	SHA256            string    `json:"sha256,omitempty"`
+	Status            string    `json:"status"` // running | success | failed
+	Error             string    `json:"error,omitempty"`
+	Note              string    `json:"note,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+
+	// Restore outcome lives on the archive so the panel can show whether the
+	// last restore from this archive succeeded without a separate history.
+	LastRestoreAt     *time.Time `json:"last_restore_at,omitempty"`
+	LastRestoreStatus string     `json:"last_restore_status,omitempty"` // success | failed
+	LastRestoreError  string     `json:"last_restore_error,omitempty"`
+}
+
+// S3TargetStore resolves configured S3 destinations (implemented by
+// snapshots.Store). A narrow interface keeps the engine testable and makes the
+// dependency explicit.
+type S3TargetStore interface {
+	GetDefaultS3Target() (*snapshots.S3Target, bool)
+	GetS3Target(id string) (*snapshots.S3Target, bool)
+}
+
+// SnapshotJobStore drops the scheduled app_volume backup jobs that point at an
+// application being deleted (implemented by snapshots.Store). Without it the
+// cron sweep keeps firing jobs whose application is gone, writing a failing
+// archive record every run.
+type SnapshotJobStore interface {
+	DeleteJobsByApp(appID string) int
+}
+
+// S3DestinationStatus is the read-only S3 readiness block the UI uses to show
+// where archives go and to gate the backup button.
+type S3DestinationStatus struct {
+	Ready      bool   `json:"ready"`
+	TargetID   string `json:"target_id,omitempty"`
+	TargetName string `json:"target_name,omitempty"`
+	Bucket     string `json:"bucket,omitempty"`
 }
 
 // appVolumeArchives is the on-disk shape of app_volume_archives.json.
@@ -110,27 +171,56 @@ func NewVolumeStore(dataDir string, log *slog.Logger) (*VolumeStore, error) {
 	}
 	var doc appVolumeArchives
 	if err := json.Unmarshal(b, &doc); err != nil {
-		// Corrupt metadata must not block booting: start empty, the host-side
-		// archives remain discoverable through the detail view's next backup.
+		// Corrupt metadata must not block booting: start empty, the S3 objects
+		// remain discoverable through the bucket's own listing.
 		s.log.Warn("app_volume_archives.json corrupted, starting empty", "err", err)
 		return s, nil
 	}
+	// A "running" record cannot survive a control-plane restart: the agent run
+	// belonged to the old process and will never report back. Leaving it
+	// running would make the UI poll forever and keep the archive unrestorable.
+	stale := false
 	for _, a := range doc.Archives {
 		if a == nil || a.ID == "" {
 			continue
 		}
-		s.byID[a.AppID+"|"+a.ID] = a
+		if a.Status == VolumeBackupRunning {
+			a.Status = VolumeBackupFailed
+			a.Error = "控制端重启，任务已中断"
+			stale = true
+		}
+		s.byID[volumeArchiveKey(a.AppID, a.ID)] = a
+	}
+	if stale {
+		if err := s.saveLocked(); err != nil {
+			s.log.Warn("reconcile interrupted volume archives failed", "err", err)
+		}
 	}
 	return s, nil
 }
 
 func volumeArchiveKey(appID, id string) string { return appID + "|" + id }
 
+// cloneArchive detaches a record from the store's map. Records are handed to
+// the HTTP layer (JSON marshaling on another goroutine) and to the engine
+// (which mutates status/size in place); shared pointers would let those race.
+func cloneArchive(a *VolumeArchive) *VolumeArchive {
+	if a == nil {
+		return nil
+	}
+	c := *a
+	if a.LastRestoreAt != nil {
+		t := *a.LastRestoreAt
+		c.LastRestoreAt = &t
+	}
+	return &c
+}
+
 // AddArchive records a freshly created archive (status running).
 func (s *VolumeStore) AddArchive(a *VolumeArchive) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.byID[volumeArchiveKey(a.AppID, a.ID)] = a
+	s.byID[volumeArchiveKey(a.AppID, a.ID)] = cloneArchive(a)
 	return s.saveLocked()
 }
 
@@ -138,7 +228,7 @@ func (s *VolumeStore) AddArchive(a *VolumeArchive) error {
 func (s *VolumeStore) PutArchive(a *VolumeArchive) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.byID[volumeArchiveKey(a.AppID, a.ID)] = a
+	s.byID[volumeArchiveKey(a.AppID, a.ID)] = cloneArchive(a)
 	return s.saveLocked()
 }
 
@@ -147,7 +237,10 @@ func (s *VolumeStore) GetArchive(appID, id string) (*VolumeArchive, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	a, ok := s.byID[volumeArchiveKey(appID, id)]
-	return a, ok
+	if !ok {
+		return nil, false
+	}
+	return cloneArchive(a), true
 }
 
 // ListArchives returns an application's archives, newest first.
@@ -157,7 +250,7 @@ func (s *VolumeStore) ListArchives(appID string) []*VolumeArchive {
 	out := make([]*VolumeArchive, 0, 8)
 	for _, a := range s.byID {
 		if a.AppID == appID {
-			out = append(out, a)
+			out = append(out, cloneArchive(a))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
@@ -172,6 +265,18 @@ func (s *VolumeStore) DeleteArchive(appID, id string) error {
 	return s.saveLocked()
 }
 
+// DeleteAppArchives drops every archive record of an application (purge).
+func (s *VolumeStore) DeleteAppArchives(appID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, a := range s.byID {
+		if a.AppID == appID {
+			delete(s.byID, k)
+		}
+	}
+	return s.saveLocked()
+}
+
 func (s *VolumeStore) saveLocked() error {
 	doc := appVolumeArchives{Archives: make([]*VolumeArchive, 0, len(s.byID))}
 	for _, a := range s.byID {
@@ -179,12 +284,15 @@ func (s *VolumeStore) saveLocked() error {
 	}
 	sort.Slice(doc.Archives, func(i, j int) bool { return doc.Archives[i].CreatedAt.After(doc.Archives[j].CreatedAt) })
 	// Metadata cap per app: drop the oldest overflow so a long-lived app cannot
-	// grow the file without bound (host archives are pruned separately).
+	// grow the file without bound (S3 objects are pruned separately).
 	perApp := make(map[string]int)
 	kept := make([]*VolumeArchive, 0, len(doc.Archives))
 	for _, a := range doc.Archives {
 		perApp[a.AppID]++
 		if perApp[a.AppID] > volumeArchiveMetaCap {
+			// Drop it from memory too, otherwise the map regains its old size on
+			// the next save and the cap only ever trims the file.
+			delete(s.byID, volumeArchiveKey(a.AppID, a.ID))
 			continue
 		}
 		kept = append(kept, a)
@@ -192,6 +300,9 @@ func (s *VolumeStore) saveLocked() error {
 	doc.Archives = kept
 	b, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return err
 	}
 	tmp := filepath.Join(s.dir, appVolumeArchivesFile+".tmp")
@@ -210,7 +321,7 @@ func (s *VolumeStore) saveLocked() error {
 //
 // Everything before the last container segment rejoins with ':' so a drive
 // letter does not get mistaken for a separator. ok is false for a spec without
-// a container path or a traversing source.
+// an absolute container path, a traversing source, or a bogus mode segment.
 func parseVolumeSpec(spec string) (src, dst, mode string, ok bool) {
 	s := strings.TrimSpace(spec)
 	if s == "" {
@@ -227,6 +338,11 @@ func parseVolumeSpec(spec string) (src, dst, mode string, ok bool) {
 	dst = strings.TrimSpace(parts[len(parts)-1])
 	src = strings.TrimSpace(strings.Join(parts[:len(parts)-1], ":"))
 	if src == "" || dst == "" {
+		return "", "", "", false
+	}
+	// Docker requires an absolute container path; anything else (including a
+	// third segment that is not ro/rw) is a malformed spec, not a mount.
+	if !strings.HasPrefix(dst, "/") {
 		return "", "", "", false
 	}
 	// Same traversal guard as the snapshot engine's dir jobs.
@@ -250,6 +366,33 @@ func volumeIsBindMount(src string) bool {
 	return false
 }
 
+// ---- host paths ----
+
+func volumeStagingDir(appID string) string {
+	return path.Join(volumeStagingRoot, appID)
+}
+
+// volumeStagingPath is where the tar output waits for its S3 upload.
+func volumeStagingPath(appID, archiveID string) string {
+	return path.Join(volumeStagingDir(appID), archiveID+".tar.gz")
+}
+
+// volumeRestorePath is where an archive is downloaded before unpacking.
+func volumeRestorePath(appID, archiveID string) string {
+	return path.Join(volumeStagingDir(appID), archiveID+".restore.tar.gz")
+}
+
+// volumeSafetyPath keeps the pre-restore state of the volume. It is a local
+// recovery aid, not an archive: it is removed together with its archive.
+func volumeSafetyPath(appID, archiveID string) string {
+	return path.Join(volumeStagingDir(appID), archiveID+".pre-restore.tar.gz")
+}
+
+// volumeObjectKey computes the S3 key for an archive, target prefix included.
+func volumeObjectKey(target *snapshots.S3Target, appID, archiveID string) string {
+	return snapshots.NewS3Client(target).ObjectKey(path.Join("apps", appID, archiveID+".tar.gz"))
+}
+
 // ---- agent-side scripts ----
 
 // volumeResolveMountpointScript prints a Docker volume's host mountpoint, then
@@ -259,9 +402,9 @@ func volumeResolveMountpointScript(name string) string {
 docker volume inspect --format '{{.Mountpoint}}' %s`, shellQuote(name))
 }
 
-// volumeBackupScript packs the volume's data dir into one tar.gz on the host,
-// then prints the size/sha markers the engine parses (same contract as the
-// snapshot engine's buildScript).
+// volumeBackupScript packs the volume's data dir into one tar.gz in the host's
+// staging area, then prints the size/sha markers the engine parses (same
+// contract as the snapshot engine's buildScript).
 func volumeBackupScript(hostDir, archivePath string) string {
 	return fmt.Sprintf(`set -e
 mkdir -p %s
@@ -274,18 +417,40 @@ echo "WATCHMAN_SHA256=$SHA"`,
 		shellQuote(archivePath), shellQuote(archivePath), shellQuote(archivePath))
 }
 
+// volumeUploadScript streams the staged archive to a pre-signed S3 PUT URL.
+// Direct-to-storage: the bytes never traverse the control plane.
+func volumeUploadScript(localPath, putURL string) string {
+	return fmt.Sprintf("curl -fsSL --connect-timeout 15 -X PUT -T %s %s",
+		shellQuote(localPath), shellQuote(putURL))
+}
+
+// volumeDownloadScript fetches an archive from a pre-signed S3 GET URL into
+// the host's staging area and rejects an empty body.
+func volumeDownloadScript(getURL, localPath string) string {
+	return fmt.Sprintf(`set -e
+mkdir -p %s
+curl -fsSL --connect-timeout 15 -o %s %s
+[ -s %s ] || { echo "归档下载为空" >&2; exit 1; }`,
+		shellQuote(path.Dir(localPath)), shellQuote(localPath), shellQuote(getURL), shellQuote(localPath))
+}
+
+// volumeSHA256Script prints the downloaded archive's digest for verification.
+func volumeSHA256Script(localPath string) string {
+	return fmt.Sprintf("sha256sum %s | awk '{print $1}'", shellQuote(localPath))
+}
+
 // volumeRestoreScript takes a safety copy of the current data, then unpacks the
 // archive over it. The safety copy is best-effort (a fresh volume has nothing
 // to preserve but the restore itself must not be blocked by that).
-func volumeRestoreScript(hostDir, archivePath string) string {
+func volumeRestoreScript(hostDir, archivePath, safetyPath string) string {
 	return fmt.Sprintf(`set -e
 [ -f %s ] || { echo "归档文件不存在: %s" >&2; exit 1; }
 mkdir -p %s
-tar -C %s -czf %s.pre-restore.tar.gz . 2>/dev/null || true
+tar -C %s -czf %s . 2>/dev/null || true
 tar -C %s -xzf %s`,
 		shellQuote(archivePath), archivePath,
 		shellQuote(hostDir),
-		shellQuote(hostDir), shellQuote(archivePath),
+		shellQuote(hostDir), shellQuote(safetyPath),
 		shellQuote(hostDir), shellQuote(archivePath))
 }
 
@@ -296,7 +461,7 @@ func volumeContainerStateScript(container string) string {
 		shellQuote(container))
 }
 
-// volumeRemoveScript deletes archive files from the host (best effort).
+// volumeRemoveScript deletes staging files from the host (best effort).
 func volumeRemoveScript(paths []string) string {
 	quoted := make([]string, 0, len(paths))
 	for _, p := range paths {
@@ -327,14 +492,112 @@ func parseVolumeArchiveMeta(stdout []byte) (size int64, sha string) {
 	return
 }
 
+// ---- S3 ----
+
+// SetS3TargetStore injects the S3 destination store (snapshots.Store).
+func (e *Engine) SetS3TargetStore(s S3TargetStore) {
+	e.s3 = s
+}
+
+// SetSnapshotJobStore injects the snapshot job cleanup hook (snapshots.Store).
+func (e *Engine) SetSnapshotJobStore(s SnapshotJobStore) {
+	e.snapJobs = s
+}
+
+// defaultS3Target resolves the destination every new archive is written to.
+// Volume backups are S3-only: falling back to host-local files would contradict
+// the archive location shown in the UI and leave data behind on app hosts.
+func (e *Engine) defaultS3Target() (*snapshots.S3Target, error) {
+	if e.s3 != nil {
+		if t, ok := e.s3.GetDefaultS3Target(); ok && t != nil {
+			return t, nil
+		}
+	}
+	return nil, fmt.Errorf("未配置默认 S3 存储目标，请先在「快照备份 → S3 存储」中添加目标并设为默认")
+}
+
+// S3Status reports whether volume backups have a destination, for the UI.
+func (e *Engine) S3Status() S3DestinationStatus {
+	if e.s3 == nil {
+		return S3DestinationStatus{}
+	}
+	t, ok := e.s3.GetDefaultS3Target()
+	if !ok || t == nil {
+		return S3DestinationStatus{}
+	}
+	return S3DestinationStatus{Ready: true, TargetID: t.ID, TargetName: t.Name, Bucket: t.Bucket}
+}
+
+func (e *Engine) s3TargetByID(id string) (*snapshots.S3Target, error) {
+	if e.s3 == nil || id == "" {
+		return nil, errVolumeS3TargetMissing
+	}
+	t, ok := e.s3.GetS3Target(id)
+	if !ok || t == nil {
+		return nil, errVolumeS3TargetMissing
+	}
+	return t, nil
+}
+
+// deleteVolumeObject removes one archive's S3 object. A record created before
+// the S3 migration (empty path) has nothing to delete.
+func (e *Engine) deleteVolumeObject(arch *VolumeArchive) error {
+	if arch == nil || arch.StoragePath == "" {
+		return nil
+	}
+	target, err := e.s3TargetByID(arch.StorageTarget)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := snapshots.NewS3Client(target).DeleteObject(ctx, arch.StoragePath); err != nil {
+		return fmt.Errorf("删除 S3 归档对象失败: %w", err)
+	}
+	return nil
+}
+
+// VolumeArchiveDownloadURL presigns a GET so the browser can fetch the archive
+// straight from S3 (the control plane only issues the redirect).
+func (e *Engine) VolumeArchiveDownloadURL(arch *VolumeArchive, expires time.Duration) (string, error) {
+	if arch == nil || arch.StoragePath == "" {
+		return "", fmt.Errorf("归档缺少 S3 存储信息")
+	}
+	target, err := e.s3TargetByID(arch.StorageTarget)
+	if err != nil {
+		return "", err
+	}
+	u, err := snapshots.NewS3Client(target).PresignGet(arch.StoragePath, expires)
+	if err != nil {
+		return "", fmt.Errorf("生成 S3 下载地址失败: %w", err)
+	}
+	return u, nil
+}
+
+// cleanupHostPaths removes staging files best-effort; a failure only wastes a
+// little disk on the host and must never fail the operation itself.
+func (e *Engine) cleanupHostPaths(hub *rpc.Hub, paths ...string) {
+	if hub == nil {
+		return
+	}
+	if _, err := execOnAgent(hub, "volclean-"+randomToken(4), volumeRemoveScript(paths), 60); err != nil {
+		e.log.Warn("volume staging cleanup failed", "paths", paths, "err", err)
+	}
+}
+
 // ---- engine ----
 
 // backupAppVolume archives one volume spec of an application synchronously and
-// returns the stored record. Called on a goroutine by the HTTP handler.
-func (e *Engine) backupAppVolume(hub *rpc.Hub, app *Application, spec, note string) (*VolumeArchive, error) {
+// returns the stored record. target is resolved by the caller: the manual
+// backup path follows the default S3 target, while a snapshot job may pin a
+// specific one.
+func (e *Engine) backupAppVolume(hub *rpc.Hub, app *Application, spec, note string, target *snapshots.S3Target) (*VolumeArchive, error) {
 	src, dst, _, ok := parseVolumeSpec(spec)
 	if !ok {
 		return nil, fmt.Errorf("挂载卷格式非法: %s（应为 宿主路径:容器路径）", spec)
+	}
+	if target == nil {
+		return nil, fmt.Errorf("未配置 S3 存储目标")
 	}
 	hostDir := src
 	if !volumeIsBindMount(src) {
@@ -356,26 +619,29 @@ func (e *Engine) backupAppVolume(hub *rpc.Hub, app *Application, spec, note stri
 
 	archiveID := "vbk_" + randomToken(8)
 	arch := &VolumeArchive{
-		ID:            archiveID,
-		AppID:         app.ID,
-		HostID:        app.HostID,
-		VolumeSpec:    spec,
-		HostPath:      hostDir,
-		ContainerPath: dst,
-		FilePath:      path.Join(volumeBackupRoot, app.ID, archiveID+".tar.gz"),
-		Note:          note,
-		Status:        VolumeBackupRunning,
-		CreatedAt:     time.Now(),
+		ID:                archiveID,
+		AppID:             app.ID,
+		HostID:            app.HostID,
+		VolumeSpec:        spec,
+		HostPath:          hostDir,
+		ContainerPath:     dst,
+		StorageTarget:     target.ID,
+		StorageTargetName: target.Name,
+		StoragePath:       volumeObjectKey(target, app.ID, archiveID),
+		Note:              note,
+		Status:            VolumeBackupRunning,
+		CreatedAt:         time.Now(),
 	}
+	staging := volumeStagingPath(app.ID, archiveID)
 	if e.vols != nil {
 		if err := e.vols.AddArchive(arch); err != nil {
 			return nil, fmt.Errorf("记录备份元数据失败: %v", err)
 		}
 	}
 
-	res, err := execOnAgent(hub, "volbk-"+arch.ID, volumeBackupScript(hostDir, arch.FilePath), 1800)
+	res, err := execOnAgent(hub, "volbk-"+arch.ID, volumeBackupScript(hostDir, staging), volumeS3OpTimeout)
 	if err != nil {
-		e.failVolumeArchive(arch, err.Error())
+		e.failVolumeArchive(hub, arch, staging, err.Error())
 		return arch, fmt.Errorf("备份执行失败: %v", err)
 	}
 	if res.GetExitCode() != 0 {
@@ -383,37 +649,94 @@ func (e *Engine) backupAppVolume(hub *rpc.Hub, app *Application, spec, note stri
 		if msg == "" {
 			msg = fmt.Sprintf("备份失败 (exit %d)", res.GetExitCode())
 		}
-		e.failVolumeArchive(arch, msg)
+		e.failVolumeArchive(hub, arch, staging, msg)
 		return arch, fmt.Errorf("%s", msg)
 	}
 	size, sha := parseVolumeArchiveMeta(res.GetStdout())
 	arch.Size = size
 	arch.SHA256 = sha
+
+	putURL, err := snapshots.NewS3Client(target).PresignPut(arch.StoragePath, 2*time.Hour)
+	if err != nil {
+		e.failVolumeArchive(hub, arch, staging, "生成 S3 上传地址失败: "+err.Error())
+		return arch, fmt.Errorf("生成 S3 上传地址失败: %v", err)
+	}
+	upRes, upErr := execOnAgent(hub, "volup-"+arch.ID, volumeUploadScript(staging, putURL), volumeS3OpTimeout)
+	// The staged tar has served its purpose whether or not the upload worked.
+	e.cleanupHostPaths(hub, staging)
+	if upErr != nil {
+		e.failVolumeArchive(hub, arch, "", "上传归档到 S3 失败: "+upErr.Error())
+		return arch, fmt.Errorf("上传归档到 S3 失败: %v", upErr)
+	}
+	if upRes.GetExitCode() != 0 {
+		msg := strings.TrimSpace(string(upRes.GetStderr()))
+		if msg == "" {
+			msg = fmt.Sprintf("上传归档到 S3 失败 (exit %d)", upRes.GetExitCode())
+		}
+		e.failVolumeArchive(hub, arch, "", msg)
+		return arch, fmt.Errorf("%s", msg)
+	}
 	arch.Status = VolumeBackupSuccess
 	if e.vols != nil {
-		_ = e.vols.PutArchive(arch)
+		if err := e.vols.PutArchive(arch); err != nil {
+			// The object is already in S3 but the authoritative record cannot be
+			// written; drop the object rather than leave it unreferenced.
+			e.failVolumeArchive(hub, arch, "", "记录备份元数据失败: "+err.Error())
+			return arch, fmt.Errorf("记录备份元数据失败: %v", err)
+		}
 	}
-	e.log.Info("volume backup completed", "app", app.ID, "spec", spec, "archive", arch.ID, "bytes", size)
+	e.log.Info("volume backup completed", "app", app.ID, "spec", spec, "archive", arch.ID,
+		"bytes", size, "s3_target", target.Name, "key", arch.StoragePath)
 	return arch, nil
 }
 
-// failVolumeArchive marks an in-flight record failed (kept for forensics).
-func (e *Engine) failVolumeArchive(arch *VolumeArchive, msg string) {
+// failVolumeArchive marks an in-flight record failed (kept for forensics),
+// drops a possibly partially uploaded object, and removes staging files.
+func (e *Engine) failVolumeArchive(hub *rpc.Hub, arch *VolumeArchive, staging, msg string) {
 	arch.Status = VolumeBackupFailed
 	arch.Error = msg
 	if e.vols != nil {
 		_ = e.vols.PutArchive(arch)
 	}
+	if err := e.deleteVolumeObject(arch); err != nil && !errors.Is(err, errVolumeS3TargetMissing) {
+		e.log.Warn("failed volume archive S3 cleanup failed", "app", arch.AppID, "archive", arch.ID, "err", err)
+	}
+	if staging != "" {
+		e.cleanupHostPaths(hub, staging)
+	}
 }
 
 // BackupAppVolumes archives one or more volumes of an application. specs empty
 // means every declared volume. Volumes run serially: each holds a busy slot on
-// the host's disk and a parallel tar of the same app adds no value.
+// the host's staging area and a parallel tar of the same app adds no value.
 func (e *Engine) BackupAppVolumes(app *Application, specs []string, note string) ([]*VolumeArchive, error) {
 	if !e.acquireVolumeSlot(app.ID) {
 		return nil, fmt.Errorf("该应用已有备份或恢复任务在执行")
 	}
 	defer e.releaseVolumeSlot(app.ID)
+	return e.runBackupAppVolumes(app, specs, note)
+}
+
+// runBackupAppVolumes assumes the caller already holds the app's volume slot.
+// The HTTP front door acquires it synchronously so a double-clicked request is
+// rejected with 409 instead of two goroutines racing for the slot.
+func (e *Engine) runBackupAppVolumes(app *Application, specs []string, note string) ([]*VolumeArchive, error) {
+	target, err := e.defaultS3Target()
+	if err != nil {
+		return nil, err
+	}
+	return e.runBackupAppVolumesWith(app, specs, note, target, volumeRetention)
+}
+
+// runBackupAppVolumesWith backs the same flow with an explicit S3 target and
+// retention count, which is what a snapshot job provides. The caller must hold
+// the app's volume slot.
+func (e *Engine) runBackupAppVolumesWith(app *Application, specs []string, note string, target *snapshots.S3Target, keep int) ([]*VolumeArchive, error) {
+	// A deployment is rewriting the container and may be about to recreate the
+	// volume mounts; tarring concurrently produces an inconsistent archive.
+	if e.IsRunning(app.ID) {
+		return nil, fmt.Errorf("应用正在部署，暂不能备份数据卷")
+	}
 
 	list := make([]string, 0, len(specs))
 	if len(specs) == 0 {
@@ -434,6 +757,10 @@ func (e *Engine) BackupAppVolumes(app *Application, specs []string, note string)
 	if len(deduped) == 0 {
 		return nil, fmt.Errorf("应用未配置任何挂载卷")
 	}
+	// Fail before any agent work when there is nowhere to store the archive.
+	if target == nil {
+		return nil, fmt.Errorf("未配置默认 S3 存储目标，请先在「快照备份 → S3 存储」中添加目标并设为默认")
+	}
 
 	hub := e.volumeHub(app)
 	if hub == nil {
@@ -442,7 +769,7 @@ func (e *Engine) BackupAppVolumes(app *Application, specs []string, note string)
 	out := make([]*VolumeArchive, 0, len(deduped))
 	var firstErr error
 	for _, spec := range deduped {
-		arch, err := e.backupAppVolume(hub, app, spec, note)
+		arch, err := e.backupAppVolume(hub, app, spec, note, target)
 		if arch != nil {
 			out = append(out, arch)
 		}
@@ -454,44 +781,53 @@ func (e *Engine) BackupAppVolumes(app *Application, specs []string, note string)
 		return out, firstErr
 	}
 	// Retention prune per volume spec: older successful archives beyond the
-	// keep-count lose both host files and metadata.
+	// keep-count lose both their S3 objects and metadata.
 	for _, spec := range deduped {
-		e.pruneVolumeArchives(hub, app.ID, spec)
+		e.pruneVolumeArchives(hub, app.ID, spec, keep)
 	}
 	return out, nil
 }
 
-// pruneVolumeArchives keeps the newest volumeRetention archives of one spec and
-// deletes the rest (host files first, then metadata).
-func (e *Engine) pruneVolumeArchives(hub *rpc.Hub, appID, spec string) {
-	if e.vols == nil {
-		return
+// staleVolumeArchives returns the successful archives of one spec beyond the
+// keep count. Failed records stay put: they are small metadata the operator
+// may still inspect, and they must not evict a restorable archive.
+func staleVolumeArchives(all []*VolumeArchive, spec string, keep int) []*VolumeArchive {
+	if keep <= 0 {
+		keep = volumeRetention
 	}
-	all := e.vols.ListArchives(appID)
+	kept := 0
 	var stale []*VolumeArchive
-	seen := 0
-	for _, a := range all {
-		if a.VolumeSpec != spec {
+	for _, a := range all { // ListArchives is newest first
+		if a.VolumeSpec != spec || a.Status != VolumeBackupSuccess {
 			continue
 		}
-		seen++
-		if seen > volumeRetention {
+		kept++
+		if kept > keep {
 			stale = append(stale, a)
 		}
 	}
-	if len(stale) == 0 {
+	return stale
+}
+
+// pruneVolumeArchives keeps the newest keep successful archives of one spec and
+// deletes the rest. Metadata is only dropped after the S3 object is gone (or
+// its destination no longer exists): a transient S3 failure must not orphan an
+// object that no record points at any more.
+func (e *Engine) pruneVolumeArchives(hub *rpc.Hub, appID, spec string, keep int) {
+	if e.vols == nil {
 		return
 	}
-	if hub != nil {
-		paths := make([]string, 0, len(stale))
-		for _, a := range stale {
-			paths = append(paths, a.FilePath)
-		}
-		if _, err := execOnAgent(hub, "volrm-"+randomToken(4), volumeRemoveScript(paths), 60); err != nil {
-			e.log.Warn("volume archive prune failed", "app", appID, "spec", spec, "err", err)
-		}
-	}
+	stale := staleVolumeArchives(e.vols.ListArchives(appID), spec, keep)
 	for _, a := range stale {
+		err := e.deleteVolumeObject(a)
+		if err != nil && !errors.Is(err, errVolumeS3TargetMissing) {
+			e.log.Warn("volume archive prune skipped: S3 delete failed", "app", appID, "spec", spec, "archive", a.ID, "err", err)
+			continue
+		}
+		if err != nil {
+			e.log.Warn("volume archive prune drops record of deleted S3 target", "app", appID, "archive", a.ID)
+		}
+		e.cleanupHostPaths(hub, volumeStagingPath(appID, a.ID), volumeRestorePath(appID, a.ID), volumeSafetyPath(appID, a.ID))
 		if err := e.vols.DeleteArchive(appID, a.ID); err != nil {
 			e.log.Warn("volume archive metadata delete failed", "app", appID, "archive", a.ID, "err", err)
 		}
@@ -504,23 +840,87 @@ func (e *Engine) pruneVolumeArchives(hub *rpc.Hub, appID, spec string) {
 // restore so live data is never overwritten underneath a running service.
 func (e *Engine) RestoreAppVolume(app *Application, arch *VolumeArchive) (restarted bool, err error) {
 	if !e.acquireVolumeSlot(app.ID) {
-		return false, fmt.Errorf("该应用已有备份或恢复任务在执行")
+		return false, snapshots.ErrVolumeRestoreBusy
 	}
 	defer e.releaseVolumeSlot(app.ID)
+	return e.runRestoreAppVolume(app, arch)
+}
+
+// runRestoreAppVolume assumes the caller already holds the app's volume slot.
+func (e *Engine) runRestoreAppVolume(app *Application, arch *VolumeArchive) (restarted bool, err error) {
+	// Record the outcome on the archive: the HTTP layer answers 202 and the
+	// operator's only way to learn the result is polling this record.
+	if arch != nil && e.vols != nil {
+		defer func() {
+			now := time.Now()
+			arch.LastRestoreAt = &now
+			if err != nil {
+				arch.LastRestoreStatus = VolumeRestoreFailed
+				arch.LastRestoreError = err.Error()
+			} else {
+				arch.LastRestoreStatus = VolumeRestoreSuccess
+				arch.LastRestoreError = ""
+			}
+			if perr := e.vols.PutArchive(arch); perr != nil {
+				e.log.Warn("record volume restore result failed", "app", app.ID, "archive", arch.ID, "err", perr)
+			}
+		}()
+	}
 
 	hub := e.volumeHub(app)
 	if hub == nil {
-		return false, fmt.Errorf("目标主机 Agent 不在线")
+		return false, snapshots.ErrVolumeRestoreOffline
+	}
+	if arch == nil || arch.StoragePath == "" || arch.HostPath == "" {
+		return false, fmt.Errorf("归档记录不完整（缺少 S3 存储信息）")
+	}
+	if arch.Status != VolumeBackupSuccess {
+		return false, fmt.Errorf("归档未成功完成，不能用于恢复")
+	}
+	if arch.HostID != app.HostID {
+		return false, fmt.Errorf("归档所属主机与应用不一致")
+	}
+	// The deployment pipeline recreates the container; stopping it underneath
+	// the pipeline would make both operations fight over the same app.
+	if e.IsRunning(app.ID) {
+		return false, snapshots.ErrVolumeRestoreDeploying
 	}
 	container := app.ContainerName
 	if container == "" {
 		return false, fmt.Errorf("应用尚未部署过，无法恢复数据卷")
 	}
-	if arch == nil || arch.FilePath == "" || arch.HostPath == "" {
-		return false, fmt.Errorf("归档记录不完整")
+	target, err := e.s3TargetByID(arch.StorageTarget)
+	if err != nil {
+		return false, fmt.Errorf("归档的 S3 存储目标已不存在，无法下载归档")
 	}
-	if arch.HostID != app.HostID {
-		return false, fmt.Errorf("归档所属主机与应用不一致")
+	getURL, err := snapshots.NewS3Client(target).PresignGet(arch.StoragePath, 2*time.Hour)
+	if err != nil {
+		return false, fmt.Errorf("生成 S3 下载地址失败: %v", err)
+	}
+
+	// Download and verify before touching the container: a missing or corrupt
+	// object must not cost any downtime.
+	staging := volumeRestorePath(app.ID, arch.ID)
+	defer e.cleanupHostPaths(hub, staging)
+	dlRes, dlErr := execOnAgent(hub, "voldl-"+arch.ID, volumeDownloadScript(getURL, staging), volumeS3OpTimeout)
+	if dlErr != nil {
+		return false, fmt.Errorf("从 S3 下载归档失败: %v", dlErr)
+	}
+	if dlRes.GetExitCode() != 0 {
+		msg := strings.TrimSpace(string(dlRes.GetStderr()))
+		if msg == "" {
+			msg = fmt.Sprintf("从 S3 下载归档失败 (exit %d)", dlRes.GetExitCode())
+		}
+		return false, fmt.Errorf("%s", msg)
+	}
+	if arch.SHA256 != "" {
+		shaRes, shaErr := execOnAgent(hub, "volsha-"+arch.ID, volumeSHA256Script(staging), 120)
+		if shaErr != nil {
+			return false, fmt.Errorf("校验下载归档失败: %v", shaErr)
+		}
+		if got := strings.TrimSpace(string(shaRes.GetStdout())); got != arch.SHA256 {
+			return false, fmt.Errorf("归档校验失败：SHA256 不匹配（期望 %s，实际 %s）", arch.SHA256, got)
+		}
 	}
 
 	stateRes, serr := execOnAgent(hub, "volst-"+randomToken(4), volumeContainerStateScript(container), 30)
@@ -537,20 +937,25 @@ func (e *Engine) RestoreAppVolume(app *Application, arch *VolumeArchive) (restar
 		if stopRes.GetExitCode() != 0 {
 			return false, fmt.Errorf("停止应用容器失败(exit %d): %s", stopRes.GetExitCode(), strings.TrimSpace(string(stopRes.GetStderr())))
 		}
+		// Structural guarantee: once stopped, every return path below restarts
+		// the container before the slot is released (a process crash between
+		// the two calls can still leave it stopped — documented in AGENTS.md).
+		defer func() {
+			startRes, startErr := execOnAgent(hub, "volstart-"+randomToken(4), "docker start "+shellQuote(container), 120)
+			if startErr != nil {
+				e.log.Error("volume restore: container restart failed", "app", app.ID, "container", container, "err", startErr)
+				return
+			}
+			if startRes.GetExitCode() != 0 {
+				e.log.Error("volume restore: container restart exited non-zero", "app", app.ID, "container", container, "exit", startRes.GetExitCode())
+				return
+			}
+			restarted = true
+		}()
 	}
 
-	// Restore, then always bring the container back to the state it was in.
-	res, rerr := execOnAgent(hub, "volre-"+arch.ID, volumeRestoreScript(arch.HostPath, arch.FilePath), 1800)
-	if wasRunning {
-		startRes, startErr := execOnAgent(hub, "volstart-"+randomToken(4), "docker start "+shellQuote(container), 120)
-		if startErr != nil {
-			e.log.Error("volume restore: container restart failed", "app", app.ID, "container", container, "err", startErr)
-		} else if startRes.GetExitCode() != 0 {
-			e.log.Error("volume restore: container restart exited non-zero", "app", app.ID, "container", container, "exit", startRes.GetExitCode())
-		} else {
-			restarted = true
-		}
-	}
+	res, rerr := execOnAgent(hub, "volre-"+arch.ID,
+		volumeRestoreScript(arch.HostPath, staging, volumeSafetyPath(app.ID, arch.ID)), volumeS3OpTimeout)
 	if rerr != nil {
 		return restarted, fmt.Errorf("恢复执行失败: %v", rerr)
 	}
@@ -561,26 +966,90 @@ func (e *Engine) RestoreAppVolume(app *Application, arch *VolumeArchive) (restar
 	return restarted, nil
 }
 
-// DeleteAppVolumeArchive removes an archive's host files (best effort — the
-// host may be offline) and its metadata. Metadata deletion is authoritative:
-// an unreachable host's leftovers are cleaned by the operator or the host's
-// own backup retention.
+// DeleteAppVolumeArchive removes an archive's S3 object and metadata, plus the
+// host-side staging/safety files when the agent is reachable. A transient S3
+// failure keeps the record so the operator can retry; a deleted S3 target
+// cannot ever be cleaned, so its record is dropped with a warning.
 func (e *Engine) DeleteAppVolumeArchive(app *Application, arch *VolumeArchive) error {
+	if !e.acquireVolumeSlot(app.ID) {
+		return fmt.Errorf("该应用已有备份或恢复任务在执行")
+	}
+	defer e.releaseVolumeSlot(app.ID)
+	return e.deleteAppVolumeArchive(app, arch)
+}
+
+// deleteAppVolumeArchive assumes the caller already holds the app's volume slot.
+func (e *Engine) deleteAppVolumeArchive(app *Application, arch *VolumeArchive) error {
 	if arch == nil {
 		return fmt.Errorf("归档记录不存在")
 	}
-	hub := e.volumeHub(app)
-	if hub != nil && arch.FilePath != "" {
-		if _, err := execOnAgent(hub, "voldel-"+arch.ID,
-			volumeRemoveScript([]string{arch.FilePath, arch.FilePath + ".pre-restore.tar.gz"}), 120); err != nil {
-			// Not fatal: the record is dropped either way.
-			e.log.Warn("volume archive host file delete failed", "app", app.ID, "archive", arch.ID, "err", err)
-		}
+	err := e.deleteVolumeObject(arch)
+	if err != nil && !errors.Is(err, errVolumeS3TargetMissing) {
+		return err
+	}
+	if err != nil {
+		e.log.Warn("volume archive S3 target gone, dropping record", "app", app.ID, "archive", arch.ID)
+	}
+	if hub := e.volumeHub(app); hub != nil {
+		e.cleanupHostPaths(hub,
+			volumeStagingPath(app.ID, arch.ID),
+			volumeRestorePath(app.ID, arch.ID),
+			volumeSafetyPath(app.ID, arch.ID),
+		)
 	}
 	if e.vols == nil {
 		return nil
 	}
 	return e.vols.DeleteArchive(app.ID, arch.ID)
+}
+
+// PurgeVolumeArchives removes an application's S3 objects, host staging
+// directory and all of its metadata. Called from the purge flow (host already
+// proven online). Every object is attempted; metadata goes either way because
+// the owning application is being deleted.
+func (e *Engine) PurgeVolumeArchives(app *Application) error {
+	// Scheduled app_volume jobs live in the snapshot module; with the app gone
+	// each cron sweep would fail on 「应用不存在」and append a failing archive
+	// record forever, so drop them together with the archives.
+	if e.snapJobs != nil {
+		if n := e.snapJobs.DeleteJobsByApp(app.ID); n > 0 {
+			e.log.Info("dropped app_volume snapshot jobs with the application", "app", app.ID, "jobs", n)
+		}
+	}
+	if e.vols == nil {
+		return nil
+	}
+	var firstErr error
+	for _, a := range e.vols.ListArchives(app.ID) {
+		err := e.deleteVolumeObject(a)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, errVolumeS3TargetMissing) {
+			e.log.Warn("volume archive S3 target gone during purge", "app", app.ID, "archive", a.ID)
+			continue
+		}
+		if firstErr == nil {
+			firstErr = fmt.Errorf("删除 S3 归档对象 %s 失败: %v", a.ID, err)
+		}
+	}
+	if hub := e.volumeHub(app); hub != nil {
+		dir := volumeStagingDir(app.ID)
+		res, err := execOnAgent(hub, "volpurge-"+randomToken(4), "rm -rf "+shellQuote(dir), 60)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("清理数据卷暂存目录失败: %v", err)
+			}
+		} else if res.GetExitCode() != 0 {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("清理数据卷暂存目录失败(exit %d): %s", res.GetExitCode(), strings.TrimSpace(string(res.GetStderr())))
+			}
+		}
+	}
+	if err := e.vols.DeleteAppArchives(app.ID); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
 }
 
 // volumeHub resolves the app host's agent channel. e.reg may be nil in unit
@@ -640,4 +1109,241 @@ func (e *Engine) GetVolumeArchive(appID, archiveID string) (*VolumeArchive, bool
 		return nil, false
 	}
 	return e.vols.GetArchive(appID, archiveID)
+}
+
+// ---- snapshot job bridge (snapshots.AppVolumeHost) ----
+//
+// 快照备份的 app_volume 任务把「定义 / 定时 / 保留份数 / 统一归档历史」交给快照
+// 模块，执行语义仍在本引擎：声明卷白名单、S3 唯一存储、SHA 校验与安全停机恢复。
+// 同一条归档记录（VolumeStore）同时出现在应用详情页与快照任务历史里。
+
+// ResolveAppVolume returns the application's backupable volumes for snapshot
+// job create/update validation.
+func (e *Engine) ResolveAppVolume(appID string) (*snapshots.AppVolumeTarget, error) {
+	app, ok := e.store.GetApp(appID)
+	if !ok {
+		return nil, fmt.Errorf("应用不存在")
+	}
+	if !volumeBackupSupported(app) {
+		return nil, fmt.Errorf("Compose 应用的挂载卷在编排文件中声明，暂不支持应用级备份")
+	}
+	if e.hostIsWindows(app.HostID) {
+		return nil, fmt.Errorf("数据卷备份暂仅支持 Linux 主机")
+	}
+	vols := make([]string, 0, len(app.Volumes))
+	for _, v := range app.Volumes {
+		if v = strings.TrimSpace(v); v != "" {
+			vols = append(vols, v)
+		}
+	}
+	if len(vols) == 0 {
+		return nil, fmt.Errorf("应用未配置任何挂载卷")
+	}
+	return &snapshots.AppVolumeTarget{AppID: app.ID, Name: app.Name, HostID: app.HostID, Volumes: vols}, nil
+}
+
+// RunAppVolumeBackup executes one snapshot job run. Preflight order mirrors the
+// HTTP front door: volume slot (synchronous) → deploy check → agent online.
+func (e *Engine) RunAppVolumeBackup(appID, spec, note, storageTarget string, retention int) error {
+	app, ok := e.store.GetApp(appID)
+	if !ok {
+		return fmt.Errorf("应用不存在")
+	}
+	if !volumeBackupSupported(app) {
+		return fmt.Errorf("Compose 应用的挂载卷在编排文件中声明，暂不支持应用级备份")
+	}
+	if e.hostIsWindows(app.HostID) {
+		return fmt.Errorf("数据卷备份暂仅支持 Linux 主机")
+	}
+	spec = strings.TrimSpace(spec)
+	declared := false
+	for _, v := range app.Volumes {
+		if strings.TrimSpace(v) == spec {
+			declared = true
+			break
+		}
+	}
+	if !declared {
+		return fmt.Errorf("只能备份应用已声明的挂载卷: %s", spec)
+	}
+	target, err := e.s3TargetForRef(storageTarget)
+	if err != nil {
+		return err
+	}
+	if !e.acquireVolumeSlot(app.ID) {
+		return fmt.Errorf("该应用已有备份或恢复任务在执行")
+	}
+	defer e.releaseVolumeSlot(app.ID)
+	if e.IsRunning(app.ID) {
+		return fmt.Errorf("应用正在部署，暂不能备份数据卷")
+	}
+	if e.volumeHub(app) == nil {
+		return fmt.Errorf("目标主机 Agent 不在线")
+	}
+	if retention <= 0 {
+		retention = volumeRetention
+	}
+	_, err = e.runBackupAppVolumesWith(app, []string{spec}, note, target, retention)
+	return err
+}
+
+// ListAppVolumeArchives exposes one app's archive records to the snapshot job
+// history (filtered by the job's volume spec).
+func (e *Engine) ListAppVolumeArchives(appID, spec string) []*snapshots.AppVolumeArchive {
+	if e.vols == nil {
+		return nil
+	}
+	spec = strings.TrimSpace(spec)
+	out := make([]*snapshots.AppVolumeArchive, 0, 8)
+	for _, a := range e.vols.ListArchives(appID) {
+		if spec != "" && a.VolumeSpec != spec {
+			continue
+		}
+		out = append(out, &snapshots.AppVolumeArchive{
+			ID:                a.ID,
+			HostID:            a.HostID,
+			VolumeSpec:        a.VolumeSpec,
+			StorageTarget:     a.StorageTarget,
+			StorageTargetName: a.StorageTargetName,
+			StoragePath:       a.StoragePath,
+			Size:              a.Size,
+			SHA256:            a.SHA256,
+			Status:            a.Status,
+			Error:             a.Error,
+			Note:              a.Note,
+			CreatedAt:         a.CreatedAt,
+			LastRestoreAt:     a.LastRestoreAt,
+			LastRestoreStatus: a.LastRestoreStatus,
+			LastRestoreError:  a.LastRestoreError,
+		})
+	}
+	return out
+}
+
+// recordVolumeRestoreFailure stamps a failed outcome onto the archive and
+// returns err unchanged. The snapshot history answers 202 before the restore
+// runs, so without this write-back a preflight rejection (busy/deploying/
+// offline) would vanish into the server log while the panel showed nothing.
+func (e *Engine) recordVolumeRestoreFailure(arch *VolumeArchive, err error) error {
+	if arch != nil && e.vols != nil {
+		now := time.Now()
+		arch.LastRestoreAt = &now
+		arch.LastRestoreStatus = VolumeRestoreFailed
+		arch.LastRestoreError = err.Error()
+		if perr := e.vols.PutArchive(arch); perr != nil {
+			e.log.Warn("record volume restore result failed", "archive", arch.ID, "err", perr)
+		}
+	}
+	return err
+}
+
+// CheckAppVolumeRestore reports why a restore cannot start right now without
+// doing any work (snapshots.AppVolumeHost). The snapshot history HTTP layer
+// calls it synchronously so a doomed restore is rejected up front (409/503)
+// instead of answering 202 and silently logging the failure later. Retryable
+// conflicts return the snapshots.ErrVolumeRestore* sentinels.
+func (e *Engine) CheckAppVolumeRestore(appID string) error {
+	app, ok := e.store.GetApp(strings.TrimSpace(appID))
+	if !ok {
+		return fmt.Errorf("应用不存在")
+	}
+	if !volumeBackupSupported(app) {
+		return fmt.Errorf("Compose 应用的挂载卷在编排文件中声明，暂不支持应用级备份")
+	}
+	if e.hostIsWindows(app.HostID) {
+		return fmt.Errorf("数据卷恢复暂仅支持 Linux 主机")
+	}
+	if e.VolumeBusy(app.ID) {
+		return snapshots.ErrVolumeRestoreBusy
+	}
+	if e.IsRunning(app.ID) {
+		return snapshots.ErrVolumeRestoreDeploying
+	}
+	if e.volumeHub(app) == nil {
+		return snapshots.ErrVolumeRestoreOffline
+	}
+	return nil
+}
+
+// RestoreAppVolumeByID restores an archive chosen from the snapshot history.
+func (e *Engine) RestoreAppVolumeByID(appID, archiveID string) error {
+	app, ok := e.store.GetApp(appID)
+	if !ok {
+		return fmt.Errorf("应用不存在")
+	}
+	if !volumeBackupSupported(app) {
+		return fmt.Errorf("Compose 应用的挂载卷在编排文件中声明，暂不支持应用级备份")
+	}
+	if e.hostIsWindows(app.HostID) {
+		return fmt.Errorf("数据卷恢复暂仅支持 Linux 主机")
+	}
+	arch, ok := e.GetVolumeArchive(appID, archiveID)
+	if !ok {
+		return fmt.Errorf("归档记录不存在")
+	}
+	if arch.Status != VolumeBackupSuccess {
+		return fmt.Errorf("归档未成功完成，不能用于恢复")
+	}
+	// Preflight rejections below are recorded on the archive too: the HTTP
+	// layer may have raced (state changed between its synchronous check and
+	// this goroutine) and the operator must see why nothing happened.
+	if !e.acquireVolumeSlot(app.ID) {
+		return e.recordVolumeRestoreFailure(arch, snapshots.ErrVolumeRestoreBusy)
+	}
+	defer e.releaseVolumeSlot(app.ID)
+	if e.IsRunning(app.ID) {
+		return e.recordVolumeRestoreFailure(arch, snapshots.ErrVolumeRestoreDeploying)
+	}
+	if e.volumeHub(app) == nil {
+		return e.recordVolumeRestoreFailure(arch, snapshots.ErrVolumeRestoreOffline)
+	}
+	_, err := e.runRestoreAppVolume(app, arch)
+	return err
+}
+
+// DeleteAppVolumeByID removes an archive chosen from the snapshot history.
+func (e *Engine) DeleteAppVolumeByID(appID, archiveID string) error {
+	app, ok := e.store.GetApp(appID)
+	if !ok {
+		return fmt.Errorf("应用不存在")
+	}
+	arch, ok := e.GetVolumeArchive(appID, archiveID)
+	if !ok {
+		return fmt.Errorf("归档记录不存在")
+	}
+	if arch.Status == VolumeBackupRunning {
+		return fmt.Errorf("备份任务执行中，不能删除该归档")
+	}
+	if !e.acquireVolumeSlot(app.ID) {
+		return fmt.Errorf("该应用已有备份或恢复任务在执行")
+	}
+	defer e.releaseVolumeSlot(app.ID)
+	return e.deleteAppVolumeArchive(app, arch)
+}
+
+// s3TargetForRef maps a snapshot job's storage_target to a destination. App
+// volume archives are S3-only (the host keeps no copy), so "local" is rejected.
+func (e *Engine) s3TargetForRef(ref string) (*snapshots.S3Target, error) {
+	switch strings.TrimSpace(ref) {
+	case "", "default":
+		return e.defaultS3Target()
+	case "local":
+		return nil, fmt.Errorf("应用数据卷归档仅支持 S3 存储，请选择默认或指定 S3 目标")
+	default:
+		t, err := e.s3TargetByID(strings.TrimSpace(ref))
+		if err != nil {
+			return nil, fmt.Errorf("所选 S3 存储目标不存在")
+		}
+		return t, nil
+	}
+}
+
+// hostIsWindows mirrors the HTTP front door's check: the volume scripts are
+// POSIX (tar / set -e).
+func (e *Engine) hostIsWindows(hostID string) bool {
+	if e.reg == nil {
+		return false
+	}
+	ag := e.reg.GetAgent(hostID)
+	return ag != nil && strings.EqualFold(ag.OS, "windows")
 }

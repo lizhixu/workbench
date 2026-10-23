@@ -28,6 +28,11 @@ const (
 	// KindDatabase hot-dumps a database running in a container
 	// (mysql / postgres / redis / mongo).
 	KindDatabase JobKind = "database"
+	// KindAppVolume archives one declared volume of an application managed by
+	// the app center. The app engine owns the semantics (declared-volume
+	// allowlist, S3-only archives, SHA-verified restore with container
+	// stop/start); this module owns the job, schedule and unified history.
+	KindAppVolume JobKind = "app_volume"
 )
 
 // Schedule describes when a job runs. Cron is a 5-field expression; an empty
@@ -43,7 +48,11 @@ type Job struct {
 	Name   string  `json:"name"`
 	HostID string  `json:"host_id"`
 	Kind   JobKind `json:"kind"`
-	// Target: dir path, volume name, or container name (database).
+	// AppID binds kind=app_volume jobs to an app-center application. HostID is
+	// derived from the app at creation time.
+	AppID string `json:"app_id,omitempty"`
+	// Target: dir path, volume name, container name (database), or the
+	// application's volume spec "src:dst" (app_volume).
 	Target string `json:"target"`
 	// DBType for KindDatabase: mysql | postgres | redis | mongo.
 	DBType string `json:"db_type,omitempty"`
@@ -69,10 +78,21 @@ type Archive struct {
 	Kind          JobKind   `json:"kind"`
 	Target        string    `json:"target"`
 	StorageTarget string    `json:"storage_target,omitempty"` // "local" | "s3_xxxx"
-	StoragePath   string    `json:"storage_path,omitempty"`   // S3 key or host path
-	Size          int64     `json:"size"`                     // bytes
-	SHA256        string    `json:"sha256,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
+	// StorageTargetName/Status/Error/Note/LastRestore* are populated for
+	// app_volume archives only: those have a lifecycle (running -> success /
+	// failed) and a frozen S3 target name, while the other kinds only ever
+	// record a successful final state.
+	StorageTargetName string     `json:"storage_target_name,omitempty"`
+	StoragePath       string     `json:"storage_path,omitempty"` // S3 key or host path
+	Size              int64      `json:"size"`                   // bytes
+	SHA256            string     `json:"sha256,omitempty"`
+	Status            string     `json:"status,omitempty"`
+	Error             string     `json:"error,omitempty"`
+	Note              string     `json:"note,omitempty"`
+	LastRestoreAt     *time.Time `json:"last_restore_at,omitempty"`
+	LastRestoreStatus string     `json:"last_restore_status,omitempty"`
+	LastRestoreError  string     `json:"last_restore_error,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
 }
 
 // Store persists backup jobs, archive metadata and S3 storage targets.
@@ -205,6 +225,33 @@ func (s *Store) DeleteJob(id string) error {
 	}
 	delete(s.jobs, id)
 	return s.saveJobsLocked()
+}
+
+// DeleteJobsByApp removes the app_volume jobs bound to one application and
+// returns how many were dropped. The scheduler re-reads ListJobs every minute,
+// so deleting here is enough to stop the cron entries from firing against an
+// application that no longer exists. Their archives live in the apps volume
+// store and are purged with the application.
+func (s *Store) DeleteJobsByApp(appID string) int {
+	if appID == "" {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for id, j := range s.jobs {
+		if j.Kind == KindAppVolume && j.AppID == appID {
+			delete(s.jobs, id)
+			n++
+		}
+	}
+	if n == 0 {
+		return 0
+	}
+	if err := s.saveJobsLocked(); err != nil {
+		s.log.Warn("persist app_volume job cleanup failed", "app", appID, "err", err)
+	}
+	return n
 }
 
 // AddArchive records a completed archive (JSONL append).

@@ -344,6 +344,15 @@ func main() {
 		os.Exit(1)
 	}
 	snapshotEngine := snapshots.NewEngine(reg, snapshotStore, log)
+	// App volume archives are stored in the snapshot module's default S3
+	// target; the store also resolves each archive's frozen target on restore.
+	appEngine.SetS3TargetStore(snapshotStore)
+	// Purging an application also drops its app_volume snapshot jobs, so the
+	// scheduler never fires against a deleted app.
+	appEngine.SetSnapshotJobStore(snapshotStore)
+	// Snapshot jobs of kind=app_volume delegate execution (declared-volume
+	// allowlist, S3-only archives, stop/restore/start) to the app engine.
+	snapshotEngine.SetAppVolumeHost(appEngine)
 	log.Info("snapshot store ready", "jobs", len(snapshotStore.ListJobs()))
 
 	// AI diagnostics assistant (runtime configurable via settings).

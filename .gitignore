@@ -5,6 +5,7 @@
 260814094426488/
 tmp/
 reports/
+.codebuddy/
 
 # Build outputs
 bin/

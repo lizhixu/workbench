@@ -44,7 +44,13 @@ type Engine struct {
 	// vols stores app volume backup/restore archive metadata (volbackup.go);
 	// nil until wired, in which case volume work reports a clear error.
 	vols *VolumeStore
-	log  *slog.Logger
+	// s3 resolves the S3 destination volume archives are uploaded to/downloaded
+	// from (implemented by snapshots.Store).
+	s3 S3TargetStore
+	// snapJobs cleans up the snapshot backup jobs bound to an app that is being
+	// purged (implemented by snapshots.Store).
+	snapJobs SnapshotJobStore
+	log      *slog.Logger
 
 	mu      sync.Mutex
 	running map[string]*activeDeployment // app_id -> in-flight deployment
@@ -87,10 +93,22 @@ func (e *Engine) StartDeployment(app *Application, trigger, startedBy string) (*
 		StartedBy: startedBy,
 		StartedAt: time.Now(),
 	}
+	// A volume backup/restore owns the app's data dir; deploying would recreate
+	// the container underneath it. Checked before registering and again after
+	// (see registerRunning) to close the race with a volume op starting in
+	// between.
+	if e.VolumeBusy(app.ID) {
+		return nil, errVolumeOpInProgress
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := e.registerRunning(app.ID, &activeDeployment{depID: dep.ID, cancel: cancel}); err != nil {
 		cancel()
 		return nil, err
+	}
+	if e.VolumeBusy(app.ID) {
+		e.finishRunning(app.ID, dep.ID)
+		cancel()
+		return nil, errVolumeOpInProgress
 	}
 	if err := e.store.AddDeployment(dep); err != nil {
 		e.finishRunning(app.ID, dep.ID)
@@ -114,10 +132,18 @@ func (e *Engine) StartRollback(app *Application, commit, startedBy string) (*Dep
 		StartedBy: startedBy,
 		StartedAt: time.Now(),
 	}
+	if e.VolumeBusy(app.ID) {
+		return nil, errVolumeOpInProgress
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := e.registerRunning(app.ID, &activeDeployment{depID: dep.ID, cancel: cancel}); err != nil {
 		cancel()
 		return nil, err
+	}
+	if e.VolumeBusy(app.ID) {
+		e.finishRunning(app.ID, dep.ID)
+		cancel()
+		return nil, errVolumeOpInProgress
 	}
 	if err := e.store.AddDeployment(dep); err != nil {
 		e.finishRunning(app.ID, dep.ID)

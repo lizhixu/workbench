@@ -166,7 +166,7 @@ export function cancelDeployment(id: string) {
   )
 }
 
-/** 应用挂载卷备份归档（volbackup.go 的 HTTP 面） */
+/** 应用挂载卷备份归档（volbackup.go 的 HTTP 面，归档存 S3） */
 export interface VolumeArchive {
   id: string
   app_id: string
@@ -177,8 +177,11 @@ export interface VolumeArchive {
   host_path: string
   /** 容器内路径 */
   container_path: string
-  /** 归档在被管主机上的路径 /var/backups/watchman/apps/<appID>/<id>.tar.gz */
-  file_path: string
+  /** 归档写入的 S3 存储目标（备份时冻结，切换默认目标不影响旧归档） */
+  storage_target: string
+  storage_target_name?: string
+  /** S3 对象键（含目标前缀），如 "apps/app1/vbk_x.tar.gz" */
+  storage_path: string
   size: number
   sha256?: string
   /** running | success | failed */
@@ -186,6 +189,18 @@ export interface VolumeArchive {
   error?: string
   note?: string
   created_at: string
+  /** 最近一次从该归档恢复的时间/结果（success | failed）与失败原因 */
+  last_restore_at?: string
+  last_restore_status?: string
+  last_restore_error?: string
+}
+
+/** 卷备份的 S3 去向状态：ready=false 时不能发起备份 */
+export interface VolumeS3Status {
+  ready: boolean
+  target_id?: string
+  target_name?: string
+  bucket?: string
 }
 
 export interface VolumeBackupListResp {
@@ -193,6 +208,7 @@ export interface VolumeBackupListResp {
   total: number
   offset: number
   page_size: number
+  s3: VolumeS3Status
 }
 
 export function listVolumeBackups(id: string, params?: { volume?: string; offset?: number; page_size?: number }) {
@@ -211,6 +227,13 @@ export function restoreVolumeArchive(id: string, archiveId: string) {
 
 export function deleteVolumeArchive(id: string, archiveId: string) {
   return unwrap<{ ok: boolean }>(http.delete(`/apps/${id}/volume-backups/${archiveId}`))
+}
+
+/** 归档下载地址：服务端校验后 302 到短期 S3 预签名 URL；导航下载走 ?token= */
+export function volumeArchiveDownloadUrl(id: string, archiveId: string) {
+  const token = localStorage.getItem('watchman_token') || ''
+  const tokParam = token ? `?token=${encodeURIComponent(token)}` : ''
+  return `/api/v1/apps/${id}/volume-backups/${archiveId}/download${tokParam}`
 }
 
 export function rollbackApp(id: string, deploymentId?: string) {

@@ -1,12 +1,19 @@
 package apps
 
 import (
+	"errors"
+	"io"
 	"net/http"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"watchman/server/internal/rpc"
 )
+
+// volumeNoteMaxRunes bounds the free-form note stored on each archive record.
+const volumeNoteMaxRunes = 200
 
 // ---- 应用挂载卷备份与恢复（volbackup.go 的 HTTP 面）----
 //
@@ -86,7 +93,12 @@ func (h *AppHandlers) listVolumeBackups(c *gin.Context) {
 	if page == nil {
 		page = []*VolumeArchive{}
 	}
-	c.JSON(http.StatusOK, gin.H{"data": page, "total": total, "offset": offset, "page_size": pageSize})
+	// The s3 block tells the UI where new archives would go and whether the
+	// backup button can work at all (no default target -> 400 on POST).
+	c.JSON(http.StatusOK, gin.H{
+		"data": page, "total": total, "offset": offset, "page_size": pageSize,
+		"s3": h.engine.S3Status(),
+	})
 }
 
 func (h *AppHandlers) createVolumeBackup(c *gin.Context) {
@@ -103,7 +115,10 @@ func (h *AppHandlers) createVolumeBackup(c *gin.Context) {
 		Volumes []string `json:"volumes"`
 		Note    string   `json:"note"`
 	}
-	_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体格式错误"})
+		return
+	}
 
 	if !volumeBackupSupported(app) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Compose 应用的挂载卷在编排文件中声明，暂不支持应用级备份；可前往「快照备份」按目录或 Docker 卷备份"})
@@ -138,21 +153,39 @@ func (h *AppHandlers) createVolumeBackup(c *gin.Context) {
 		}
 		specs = append(specs, s)
 	}
-	// Pre-flight the busy check before the online check: an in-flight run means
-	// the host was just reachable, so "busy" is the more accurate answer than
-	// "offline" (and a double-clicked 开始备份 must not silently no-op).
-	if h.engine.VolumeBusy(app.ID) {
+	note := strings.TrimSpace(req.Note)
+	if utf8.RuneCountInString(note) > volumeNoteMaxRunes {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "备注不能超过 200 个字符"})
+		return
+	}
+	// Archives live in S3 only; without a default target there is nowhere to
+	// upload them, so reject before any agent work.
+	if !h.engine.S3Status().Ready {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "未配置默认 S3 存储目标，请先在「快照备份 → S3 存储」中添加目标并设为默认"})
+		return
+	}
+	// Acquire the slot synchronously: a check-then-goroutine race would answer
+	// 202 to a double-clicked request whose actual backup then silently no-ops.
+	if !h.engine.acquireVolumeSlot(app.ID) {
 		c.JSON(http.StatusConflict, gin.H{"error": "该应用已有备份或恢复任务在执行"})
 		return
 	}
+	// Busy is checked before offline: an in-flight run means the host was just
+	// reachable, so "busy" is the more accurate answer than "offline".
+	if h.engine.IsRunning(app.ID) {
+		h.engine.releaseVolumeSlot(app.ID)
+		c.JSON(http.StatusConflict, gin.H{"error": "应用正在部署，暂不能备份数据卷"})
+		return
+	}
 	if h.appHub(app.HostID) == nil {
+		h.engine.releaseVolumeSlot(app.ID)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "目标主机 Agent 不在线"})
 		return
 	}
 
-	note := strings.TrimSpace(req.Note)
 	go func() {
-		if _, err := h.engine.BackupAppVolumes(app, specs, note); err != nil {
+		defer h.engine.releaseVolumeSlot(app.ID)
+		if _, err := h.engine.runBackupAppVolumes(app, specs, note); err != nil {
 			h.engine.log.Warn("volume backup failed", "app", app.ID, "err", err)
 		}
 	}()
@@ -178,17 +211,29 @@ func (h *AppHandlers) restoreVolumeBackup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "数据卷恢复暂仅支持 Linux 主机"})
 		return
 	}
-	// Same pre-flight order as backup: busy before offline (see above).
-	if h.engine.VolumeBusy(app.ID) {
+	if arch.Status != VolumeBackupSuccess {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "归档未成功完成，不能用于恢复"})
+		return
+	}
+	// Same pre-flight order as backup: atomic slot, then deploy check, then
+	// offline (see above).
+	if !h.engine.acquireVolumeSlot(app.ID) {
 		c.JSON(http.StatusConflict, gin.H{"error": "该应用已有备份或恢复任务在执行"})
 		return
 	}
+	if h.engine.IsRunning(app.ID) {
+		h.engine.releaseVolumeSlot(app.ID)
+		c.JSON(http.StatusConflict, gin.H{"error": "应用正在部署，暂不能恢复数据卷"})
+		return
+	}
 	if h.appHub(app.HostID) == nil {
+		h.engine.releaseVolumeSlot(app.ID)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "目标主机 Agent 不在线"})
 		return
 	}
 	go func() {
-		if _, err := h.engine.RestoreAppVolume(app, arch); err != nil {
+		defer h.engine.releaseVolumeSlot(app.ID)
+		if _, err := h.engine.runRestoreAppVolume(app, arch); err != nil {
 			h.engine.log.Warn("volume restore failed", "app", app.ID, "archive", arch.ID, "err", err)
 		}
 	}()
@@ -210,9 +255,53 @@ func (h *AppHandlers) deleteVolumeBackup(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "归档记录不存在"})
 		return
 	}
-	if err := h.engine.DeleteAppVolumeArchive(app, arch); err != nil {
+	if arch.Status == VolumeBackupRunning {
+		c.JSON(http.StatusConflict, gin.H{"error": "备份任务执行中，不能删除该归档"})
+		return
+	}
+	if !h.engine.acquireVolumeSlot(app.ID) {
+		c.JSON(http.StatusConflict, gin.H{"error": "该应用已有备份或恢复任务在执行"})
+		return
+	}
+	defer h.engine.releaseVolumeSlot(app.ID)
+	if err := h.engine.deleteAppVolumeArchive(app, arch); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// downloadVolumeBackup redirects the browser to a short-lived pre-signed S3
+// GET: the archive bytes flow from S3 to the client without traversing the
+// control plane (same direct-to-storage principle as the upload). Read-only,
+// so no audit entry; the JWT can arrive as ?token= for navigation downloads.
+func (h *AppHandlers) downloadVolumeBackup(c *gin.Context) {
+	app, ok := h.store.GetApp(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
+		return
+	}
+	if h.engine == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deployment engine unavailable"})
+		return
+	}
+	arch, ok := h.engine.GetVolumeArchive(app.ID, c.Param("archiveID"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "归档记录不存在"})
+		return
+	}
+	if arch.Status != VolumeBackupSuccess {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "归档未成功完成，无法下载"})
+		return
+	}
+	url, err := h.engine.VolumeArchiveDownloadURL(arch, 15*time.Minute)
+	if err != nil {
+		if errors.Is(err, errVolumeS3TargetMissing) {
+			c.JSON(http.StatusGone, gin.H{"error": "归档的 S3 存储目标已不存在，无法下载"})
+			return
+		}
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.Redirect(http.StatusFound, url)
 }

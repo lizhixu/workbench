@@ -1864,7 +1864,7 @@ onDeactivated(() => {
   gap: 10px;
 }
 .app-detail-view {
-  gap: 10px;
+  gap: 12px;
 }
 
 .detail-header {
@@ -1872,6 +1872,11 @@ onDeactivated(() => {
   display: flex;
   align-items: center;
   gap: 12px;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: var(--shadow-sm);
+  padding: 10px 16px;
 }
 
 .app-title {
@@ -1882,6 +1887,13 @@ onDeactivated(() => {
 .detail-body {
   flex: 1;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: var(--shadow-sm);
+  padding: var(--card-padding);
   overflow: hidden;
 }
 
@@ -1892,7 +1904,7 @@ onDeactivated(() => {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 8px 4px;
+  padding: 10px 2px 0 0;
 }
 
 .deployments-pane {
@@ -1900,6 +1912,7 @@ onDeactivated(() => {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  padding-top: 10px;
 }
 
 .mono {

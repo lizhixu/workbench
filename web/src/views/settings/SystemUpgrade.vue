@@ -883,12 +883,6 @@ onMounted(async () => {
     }
   }
 
-  .online-upgrade-dialog {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-
   .version-desc-grid {
     background: var(--n-color-modal);
     padding: 10px 16px;
@@ -970,125 +964,136 @@ onMounted(async () => {
       }
     }
   }
+}
 
-  .upload-dialog-content {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
+/* NModal 的内容会被 teleport 到 body,不再位于 .system-upgrade-card 之下,
+   因此下面这些弹窗内的样式必须在顶层声明(编译为 .xxx[data-v-xxx])才能命中,
+   嵌套在 .system-upgrade-card 里的同名规则对弹窗永远不会生效。 */
+.online-upgrade-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
 
-    .file-picked-info {
-      font-size: 12.5px;
-      color: var(--text-secondary);
+.upload-dialog-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+
+  .file-picked-info {
+    font-size: 12.5px;
+    color: var(--text-secondary);
+  }
+}
+
+.batch-upgrade-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* 收紧弹窗文字的字符间距,避免 CJK 默认渲染偏松 */
+  letter-spacing: -0.2px;
+
+  .dialog-prompt {
+    font-size: 14px;
+    line-height: 1.6;
+
+    .highlight-count {
+      color: var(--warning-color, #f59e0b);
+      font-weight: 700;
     }
   }
 
-  .batch-upgrade-dialog {
+  .target-version-banner {
     display: flex;
-    flex-direction: column;
-    gap: 12px;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    background: rgba(99, 102, 241, 0.06);
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid rgba(99, 102, 241, 0.15);
 
-    .dialog-prompt {
-      font-size: 14px;
-      line-height: 1.6;
-
-      .highlight-count {
-        color: var(--warning-color, #f59e0b);
-        font-weight: 700;
-      }
+    .banner-label {
+      color: var(--n-text-color-2);
+      font-weight: 600;
     }
 
-    .target-version-banner {
+    .force-hint {
+      color: var(--text-secondary);
+      font-size: 12px;
+    }
+  }
+
+  .hosts-preview-box {
+    border: 1px solid var(--n-border-color);
+    border-radius: 6px;
+    background: var(--n-color-modal);
+    overflow: hidden;
+
+    .hosts-preview-header {
       display: flex;
+      justify-content: space-between;
       align-items: center;
-      gap: 8px;
-      font-size: 13px;
-      background: rgba(99, 102, 241, 0.06);
       padding: 8px 12px;
-      border-radius: 6px;
-      border: 1px solid rgba(99, 102, 241, 0.15);
-
-      .banner-label {
-        color: var(--n-text-color-2);
-        font-weight: 600;
-      }
-
-      .force-hint {
-        color: var(--text-secondary);
-        font-size: 12px;
-      }
+      background: rgba(125, 125, 125, 0.06);
+      border-bottom: 1px solid var(--n-border-color);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-secondary);
     }
 
-    .hosts-preview-box {
-      border: 1px solid var(--n-border-color);
-      border-radius: 6px;
-      background: var(--n-color-modal);
-      overflow: hidden;
+    .hosts-preview-list {
+      max-height: 200px;
+      overflow-y: auto;
 
-      .hosts-preview-header {
+      .host-preview-item {
         display: flex;
         justify-content: space-between;
         align-items: center;
         padding: 8px 12px;
-        background: rgba(125, 125, 125, 0.06);
-        border-bottom: 1px solid var(--n-border-color);
-        font-size: 12px;
-        font-weight: 600;
-        color: var(--text-secondary);
-      }
+        transition: background-color 0.15s ease;
 
-      .hosts-preview-list {
-        max-height: 200px;
-        overflow-y: auto;
+        &:not(:last-child) {
+          border-bottom: 1px dashed var(--n-border-color);
+        }
 
-        .host-preview-item {
+        &:hover {
+          background: rgba(99, 102, 241, 0.06);
+        }
+
+        .host-info {
           display: flex;
-          justify-content: space-between;
           align-items: center;
-          padding: 8px 12px;
-          transition: background-color 0.15s ease;
+          gap: 10px;
 
-          &:not(:last-child) {
-            border-bottom: 1px dashed var(--n-border-color);
+          .host-name {
+            font-weight: 600;
+            font-size: 13px;
           }
 
-          &:hover {
-            background: rgba(99, 102, 241, 0.06);
+          .host-ip {
+            font-size: 12px;
+            color: var(--text-secondary);
           }
+        }
 
-          .host-info {
-            display: flex;
-            align-items: center;
-            gap: 10px;
+        .host-version-change {
+          display: flex;
+          align-items: center;
+          gap: 6px;
 
-            .host-name {
-              font-weight: 600;
-              font-size: 13px;
-            }
-
-            .host-ip {
-              font-size: 12px;
-              color: var(--text-secondary);
-            }
-          }
-
-          .host-version-change {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-
-            .arrow {
-              color: var(--text-secondary);
-              font-size: 12px;
-            }
+          .arrow {
+            color: var(--text-secondary);
+            font-size: 12px;
           }
         }
       }
     }
+  }
 
-    .maintenance-alert {
-      font-size: 12.5px;
-      line-height: 1.5;
-    }
+  .maintenance-alert {
+    font-size: 12.5px;
+    line-height: 1.5;
   }
 }
 </style>

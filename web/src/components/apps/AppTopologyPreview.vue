@@ -16,7 +16,8 @@ export interface TopologyPort {
 }
 
 const props = defineProps<{
-  domain: string
+  domain?: string
+  domains?: string[]
   proxyMode: 'local' | 'gateway'
   appName: string
   hostName: string
@@ -51,9 +52,18 @@ const meshLink = computed(() => bothMeshed(props.hostMeshIp, props.gatewayMeshIp
 // 组网转发入口到应用主机的链路：双方都在组网内走 100.x，否则直连。
 const meshForwardLink = computed(() => bothMeshed(props.hostMeshIp, props.meshForwardHostMeshIp))
 
+const displayDomain = computed(() => {
+  if (props.domains && props.domains.length > 0) {
+    return props.domains.join(', ')
+  }
+  return props.domain || ''
+})
+
+const hasDomain = computed(() => Boolean(displayDomain.value))
+
 // Nginx/SSL 节点的证书状态标签：创建页覆盖探测结果的实时映射。
 const certTag = computed(() => {
-  if (!props.domain || !props.certStatus) return null
+  if (!hasDomain.value || !props.certStatus) return null
   switch (props.certStatus) {
     case 'covered': return { label: '已有证书', type: 'success' as const }
     case 'issue': return { label: '提交时签发', type: 'warning' as const }
@@ -87,9 +97,9 @@ function portBindLabel(p: TopologyPort): string {
 
     <div class="topology-box">
       <div class="topology-line">
-        <div class="topology-node" :class="{ dim: !domain }">
+        <div class="topology-node" :class="{ dim: !hasDomain }">
           <div class="topology-label">公网用户</div>
-          <div class="topology-value">{{ domain || '未绑定域名' }}</div>
+          <div class="topology-value">{{ displayDomain || '未绑定域名' }}</div>
         </div>
         <div class="topology-arrow">-&gt;</div>
 
@@ -125,7 +135,7 @@ function portBindLabel(p: TopologyPort): string {
         </template>
 
         <template v-else>
-          <div class="topology-node" :class="{ dim: !hostOnline || (!!domain && !hostPublicIp) }">
+          <div class="topology-node" :class="{ dim: !hostOnline || (hasDomain && !hostPublicIp) }">
             <div class="topology-label">应用主机（Nginx / SSL 终止）</div>
             <div class="topology-value">{{ hostName || '未选择主机' }}</div>
             <div class="topo-meta">

@@ -337,7 +337,7 @@ func TestPrecheckMigrationMeshEntryWarns(t *testing.T) {
 func TestPrecheckMigrationGatewayWarns(t *testing.T) {
 	engine, store := newMigrateTestEngine(t, nil)
 	app := putMigrateApp(t, store, &Application{
-		Domain:             "app.example.com",
+		ProxyDomains:       []DomainBinding{{Domain: "app.example.com", CertID: "crt1"}},
 		ProxyMode:          "gateway",
 		ProxyGatewayHostID: "host_dst",
 	})

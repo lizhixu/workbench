@@ -122,8 +122,9 @@ func (h *AppHandlers) purgeAppResources(app *Application) ([]string, error) {
 		}
 	}
 
-	// 7. Reverse-proxy vhost configs on the app host (+ gateway host).
-	if app.Domain != "" {
+	// 7. Reverse-proxy vhost configs + per-domain cert files on the app host
+	//    (+ gateway host).
+	if len(app.ProxyDomains) > 0 {
 		targets := []string{app.HostID}
 		if app.ProxyMode == "gateway" && app.ProxyGatewayHostID != "" {
 			targets = append(targets, app.ProxyGatewayHostID)
@@ -136,8 +137,8 @@ func (h *AppHandlers) purgeAppResources(app *Application) ([]string, error) {
 				continue
 			}
 			_, _ = execOnAgent(phub, "purge-proxy-"+randomToken(4),
-				fmt.Sprintf("rm -f %s && docker exec %s nginx -s reload 2>/dev/null || true",
-					confPath, nginxContainer), 30)
+				fmt.Sprintf("rm -f %s %s && docker exec %s nginx -s reload 2>/dev/null || true",
+					confPath, proxyCleanupCertGlob(app), nginxContainer), 30)
 		}
 	}
 

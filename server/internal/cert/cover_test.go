@@ -176,3 +176,120 @@ func TestNotifyRenewedCallback(t *testing.T) {
 		t.Fatalf("Import with nil hook: %v", err)
 	}
 }
+
+// TestFindByDomainRanking locks the deterministic selection rules:
+// 1. exact SAN > wildcard
+// 2. wildcard with more labels wins
+// 3. longer remaining validity wins
+// 4. certificate ID as tie-breaker
+func TestFindByDomainRanking(t *testing.T) {
+	h, err := NewHub(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM := makeTestCertPEM(t)
+	now := time.Now()
+
+	// 1. exact vs wildcard
+	_ = h.storeResult("c_wild", "", []string{"*.example.com"}, certPEM, keyPEM, now, now.Add(90*24*time.Hour), "test", false)
+	_ = h.storeResult("c_exact", "", []string{"api.example.com"}, certPEM, keyPEM, now, now.Add(30*24*time.Hour), "test", false)
+	best, ok := h.FindByDomain("api.example.com")
+	if !ok || best.ID != "c_exact" {
+		t.Fatalf("exact must win over wildcard regardless of expiry: got %v", best)
+	}
+
+	// 2. wildcard with more labels wins
+	_ = h.storeResult("c_wild_broad", "", []string{"*.shop.org"}, certPEM, keyPEM, now, now.Add(90*24*time.Hour), "test", false)
+	_ = h.storeResult("c_wild_specific", "", []string{"*.sub.shop.org"}, certPEM, keyPEM, now, now.Add(30*24*time.Hour), "test", false)
+	best, ok = h.FindByDomain("api.sub.shop.org")
+	if !ok || best.ID != "c_wild_specific" {
+		t.Fatalf("more specific wildcard must win: got %v", best)
+	}
+
+	// 3. longer remaining validity wins between equal wildcards
+	_ = h.storeResult("c_w1", "", []string{"*.domain.com"}, certPEM, keyPEM, now, now.Add(30*24*time.Hour), "test", false)
+	_ = h.storeResult("c_w2", "", []string{"*.domain.com"}, certPEM, keyPEM, now, now.Add(60*24*time.Hour), "test", false)
+	best, ok = h.FindByDomain("test.domain.com")
+	if !ok || best.ID != "c_w2" {
+		t.Fatalf("longer validity must win: got %v", best)
+	}
+}
+
+// TestStoreResultPreservesRemark proves that re-storing a certificate (renewal)
+// retains the admin-managed remark.
+func TestStoreResultPreservesRemark(t *testing.T) {
+	h, err := NewHub(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM := makeTestCertPEM(t)
+	now := time.Now()
+	if err := h.storeResult("c_rem", "", []string{"remark.example.com"}, certPEM, keyPEM, now, now.Add(30*24*time.Hour), "test", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.UpdateRemark("c_rem", "生产环境核心证书"); err != nil {
+		t.Fatal(err)
+	}
+	// Renewal arrives with updated expiry:
+	if err := h.storeResult("c_rem", "", []string{"remark.example.com"}, certPEM, keyPEM, now, now.Add(90*24*time.Hour), "test", false); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := h.Get("c_rem")
+	if !ok {
+		t.Fatal("c_rem missing")
+	}
+	if got.Remark != "生产环境核心证书" {
+		t.Fatalf("expected remark preserved, got %q", got.Remark)
+	}
+}
+
+// TestDeleteCertGuardedByApps: deleting a certificate bound to an app returns
+// 409 Conflict, but force=true clears the bindings and succeeds.
+func TestDeleteCertGuardedByApps(t *testing.T) {
+	h, err := NewHub(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM := makeTestCertPEM(t)
+	now := time.Now()
+	_ = h.storeResult("crt_bound", "", []string{"app.example.com"}, certPEM, keyPEM, now, now.Add(30*24*time.Hour), "test", false)
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	clearedID := ""
+	handlers := NewHandlers(h, nil, func() []AppDomainRef {
+		return []AppDomainRef{
+			{ID: "app1", Name: "WebApp", Domain: "app.example.com", CertID: "crt_bound"},
+		}
+	})
+	handlers.SetAppCertBindingClearer(func(certID string) []string {
+		clearedID = certID
+		return []string{"WebApp"}
+	})
+	handlers.Register(r.Group(""), r.Group(""))
+
+	// Normal delete -> 409 Conflict
+	req := httptest.NewRequest(http.MethodDelete, "/certs/crt_bound", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("code = %d, want 409, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "WebApp") {
+		t.Fatalf("expected error mentioning WebApp, got %s", w.Body.String())
+	}
+
+	// Force delete -> 200 OK + callback called
+	reqForce := httptest.NewRequest(http.MethodDelete, "/certs/crt_bound?force=true", nil)
+	wForce := httptest.NewRecorder()
+	r.ServeHTTP(wForce, reqForce)
+	if wForce.Code != http.StatusOK {
+		t.Fatalf("force delete code = %d, want 200, body = %s", wForce.Code, wForce.Body.String())
+	}
+	if clearedID != "crt_bound" {
+		t.Fatalf("expected clearedID = crt_bound, got %q", clearedID)
+	}
+	if _, ok := h.Get("crt_bound"); ok {
+		t.Fatal("certificate should be deleted after force delete")
+	}
+}

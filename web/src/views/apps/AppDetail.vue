@@ -22,8 +22,7 @@ import {
   backupAppVolumes, listVolumeBackups, restoreVolumeArchive, deleteVolumeArchive,
   volumeArchiveDownloadUrl, type VolumeArchive, type VolumeS3Status,
 } from '../../api/apps'
-import { bindProxy, unbindProxy, type Certificate } from '../../api/certs'
-import { listCerts } from '../../api/certs'
+import { bindProxy, unbindProxy, listCerts, type Certificate } from '../../api/certs'
 import { listHosts } from '../../api/hosts'
 import { listNetworkNodes } from '../../api/network'
 import { bothMeshed } from '../../utils/mesh'
@@ -127,17 +126,36 @@ const hostOptions = computed(() => {
 })
 // 网关主机必须自身已加入组网（网关需经组网访问应用主机），据此标注/禁用选项
 const meshIPById = ref<Map<string, string>>(new Map())
+interface ProxyDomainRow {
+  domain: string
+  cert_id: string
+}
+
 const proxyForm = ref({
-  domain: '',
+  domains: [] as ProxyDomainRow[],
   mode: 'local' as 'local' | 'gateway',
   // NSelect 绑定字段空值用 null：空串会被 naive-ui fallbackOption 合成空 label 选项，
   // 让 select 自认为已选中、占位符永不渲染。
   gateway_host_id: null as string | null,
   upstream: '',
-  cert_id: '',
   websocket: true,
 })
 const savingProxy = ref(false)
+
+function syncProxyForm() {
+  if (app.value) {
+    if (app.value.proxy_domains && app.value.proxy_domains.length > 0) {
+      proxyForm.value.domains = app.value.proxy_domains.map((d) => ({ domain: d.domain, cert_id: d.cert_id }))
+    } else if (app.value.domain) {
+      proxyForm.value.domains = [{ domain: app.value.domain, cert_id: '' }]
+    } else {
+      proxyForm.value.domains = []
+    }
+    proxyForm.value.mode = (app.value.proxy_mode as 'local' | 'gateway') ?? 'local'
+    proxyForm.value.gateway_host_id = app.value.proxy_gateway_host_id ?? null
+    proxyForm.value.upstream = app.value.proxy_upstream ?? ''
+  }
+}
 
 async function loadProxyData() {
   try {
@@ -159,17 +177,42 @@ async function loadProxyData() {
   } catch {
     hostsList.value = []
   }
-  if (app.value) {
-    proxyForm.value.domain = app.value.domain ?? ''
-    proxyForm.value.mode = (app.value.proxy_mode as 'local' | 'gateway') ?? 'local'
-    proxyForm.value.upstream = app.value.proxy_upstream ?? ''
-  }
+  syncProxyForm()
 }
 
-const certOptions = computed(() => [
-  { label: '按域名自动匹配', value: '' },
-  ...certs.value.map((c) => ({ label: c.domains.join(', '), value: c.id })),
-])
+function certDaysRemaining(notAfter: string): number {
+  const diff = new Date(notAfter).getTime() - Date.now()
+  return Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)))
+}
+
+const certMap = computed(() => new Map(certs.value.map((c) => [c.id, c])))
+
+const certOptions = computed(() => {
+  return certs.value.map((c) => {
+    const sans = c.domains.join(', ') || c.id
+    const issuer = c.issuer || (c.source === 'manual_upload' ? '手动上传' : c.account_name || 'ACME')
+    const days = certDaysRemaining(c.not_after)
+    return {
+      label: `${sans} · ${issuer} · 剩余 ${days} 天`,
+      value: c.id,
+    }
+  })
+})
+
+const boundDomains = computed<string[]>(() => {
+  if (app.value?.proxy_domains && app.value.proxy_domains.length > 0) {
+    return app.value.proxy_domains.map((b) => b.domain)
+  }
+  return app.value?.domain ? [app.value.domain] : []
+})
+
+function addProxyDomain() {
+  proxyForm.value.domains.push({ domain: '', cert_id: certs.value[0]?.id || '' })
+}
+
+function removeProxyDomain(index: number) {
+  proxyForm.value.domains.splice(index, 1)
+}
 
 // 拓扑展示用：应用所在主机与网关主机的名称
 const hostnameById = ref<Map<string, string>>(new Map())
@@ -283,10 +326,36 @@ async function doSaveForward() {
 }
 
 async function doBindProxy() {
-  if (!proxyForm.value.domain.trim()) {
-    message.warning('请填写域名')
+  if (proxyForm.value.domains.length === 0) {
+    message.warning('请至少添加一个域名绑定')
     return
   }
+  for (let i = 0; i < proxyForm.value.domains.length; i++) {
+    const r = proxyForm.value.domains[i]
+    const d = r.domain.trim()
+    if (!d) {
+      message.warning(`第 ${i + 1} 行域名不能为空`)
+      return
+    }
+    if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(d)) {
+      message.warning(`第 ${i + 1} 行域名格式不正确: ${d}`)
+      return
+    }
+    if (!r.cert_id) {
+      message.warning(`请为域名 ${d} 选择覆盖证书`)
+      return
+    }
+  }
+  const domainSet = new Set<string>()
+  for (const r of proxyForm.value.domains) {
+    const d = r.domain.trim().toLowerCase()
+    if (domainSet.has(d)) {
+      message.warning(`域名重复: ${d}`)
+      return
+    }
+    domainSet.add(d)
+  }
+
   if (proxyForm.value.mode === 'gateway') {
     if (!proxyForm.value.gateway_host_id) {
       message.warning('网关模式需选择网关主机')
@@ -300,11 +369,13 @@ async function doBindProxy() {
   savingProxy.value = true
   try {
     await bindProxy(appId.value, {
-      domain: proxyForm.value.domain.trim(),
+      domains: proxyForm.value.domains.map((r) => ({
+        domain: r.domain.trim().toLowerCase(),
+        cert_id: r.cert_id,
+      })),
       mode: proxyForm.value.mode,
       gateway_host_id: proxyForm.value.gateway_host_id || undefined,
       upstream: proxyForm.value.upstream.trim() || undefined,
-      cert_id: proxyForm.value.cert_id || undefined,
       websocket: proxyForm.value.websocket,
     })
     message.success('反代配置已下发')
@@ -321,7 +392,7 @@ async function doUnbindProxy() {
   try {
     await unbindProxy(appId.value)
     message.success('已解除域名绑定')
-    proxyForm.value.domain = ''
+    proxyForm.value.domains = []
     await loadApp()
   } catch (e: any) {
     message.error(e.message || '解绑失败')
@@ -361,6 +432,7 @@ async function loadApp() {
       composeEditContent.value = app.value.compose_content
     }
     syncForwardForm()
+    syncProxyForm()
     syncEnvRows()
   } catch (e: any) {
     message.error(e.message || '获取应用信息失败')
@@ -1339,8 +1411,10 @@ onDeactivated(() => {
               <NDescriptionsItem label="挂载卷">
                 <span class="mono">{{ (app.volumes ?? []).join(', ') || '-' }}</span>
               </NDescriptionsItem>
-              <NDescriptionsItem v-if="app.domain" label="域名">
-                <NTag size="small" type="success" :bordered="false">{{ app.domain }}</NTag>
+              <NDescriptionsItem v-if="boundDomains.length" label="域名">
+                <NSpace :size="6" :wrap="true">
+                  <NTag v-for="d in boundDomains" :key="d" size="small" type="success" :bordered="false">{{ d }}</NTag>
+                </NSpace>
               </NDescriptionsItem>
             </NDescriptions>
 
@@ -1523,12 +1597,28 @@ onDeactivated(() => {
         <NTabPane name="proxy" tab="域名与反代">
           <div class="overview-scroll">
             <NAlert
-              v-if="app.domain"
+              v-if="boundDomains.length"
               type="success"
               :show-icon="true"
               style="margin-bottom: 14px"
             >
-              <template #header>已绑定 {{ app.domain }}</template>
+              <template #header>已绑定 {{ boundDomains.length }} 个域名</template>
+              <div style="margin-bottom: 6px">
+                <NSpace :size="6" :wrap="true">
+                  <NTag
+                    v-for="b in (app.proxy_domains || [{ domain: app.domain || '', cert_id: '' }])"
+                    :key="b.domain"
+                    size="small"
+                    type="success"
+                    :bordered="false"
+                  >
+                    {{ b.domain }}
+                    <span v-if="b.cert_id && certMap.get(b.cert_id)" style="opacity: 0.8; margin-left: 4px">
+                      ({{ certMap.get(b.cert_id)?.domains.join(', ') || b.cert_id }})
+                    </span>
+                  </NTag>
+                </NSpace>
+              </div>
               反代模式：{{ app.proxy_mode === 'gateway' ? '网关统一入口' : '节点本地' }}，上游：{{ app.proxy_upstream }}
             </NAlert>
             <NAlert
@@ -1537,15 +1627,15 @@ onDeactivated(() => {
               :show-icon="false"
               style="margin-bottom: 14px"
             >
-              尚未绑定域名。绑定后 Watchman 会自动把证书与 Nginx 反代配置下发到网关主机并热加载。
+              尚未绑定域名。绑定后 Watchman 会自动把证书与 Nginx 反代配置下发到目标主机并热加载。
             </NAlert>
 
             <!-- 流量拓扑：让用户直观看到公网流量如何到达内网应用 -->
-            <div v-if="app.domain" class="topology-box">
+            <div v-if="boundDomains.length" class="topology-box">
               <div class="topology-line">
                 <div class="topology-node">
                   <div class="topology-label">公网用户</div>
-                  <div class="topology-value">{{ app.domain }}</div>
+                  <div class="topology-value">{{ boundDomains.join(', ') }}</div>
                 </div>
                 <div class="topology-arrow">-&gt;</div>
                 <div class="topology-node">
@@ -1574,9 +1664,40 @@ onDeactivated(() => {
               </div>
             </div>
 
-            <NForm label-placement="top" style="max-width: 640px">
-              <NFormItem label="域名" required>
-                <NInput v-model:value="proxyForm.domain" placeholder="api.example.com" />
+            <NForm label-placement="top" style="max-width: 680px">
+              <NFormItem label="域名与证书绑定（多域名独立选择证书）" required>
+                <div style="width: 100%">
+                  <NSpace vertical style="width: 100%">
+                    <div
+                      v-for="(row, idx) in proxyForm.domains"
+                      :key="idx"
+                      style="display: flex; gap: 8px; align-items: center; margin-bottom: 8px"
+                    >
+                      <NInput
+                        v-model:value="row.domain"
+                        placeholder="api.example.com"
+                        style="flex: 1"
+                      />
+                      <NSelect
+                        v-model:value="row.cert_id"
+                        :options="certOptions"
+                        placeholder="选择覆盖证书"
+                        filterable
+                        style="flex: 1.5"
+                      />
+                      <NButton
+                        type="error"
+                        quaternary
+                        @click="removeProxyDomain(idx)"
+                      >
+                        删除
+                      </NButton>
+                    </div>
+                    <NButton dashed @click="addProxyDomain" style="width: 100%">
+                      + 添加域名
+                    </NButton>
+                  </NSpace>
+                </div>
               </NFormItem>
               <NFormItem label="反代模式">
                 <NSpace vertical style="width: 100%">
@@ -1596,9 +1717,6 @@ onDeactivated(() => {
                   </span>
                 </NSpace>
               </NFormItem>
-              <NFormItem label="证书">
-                <NSelect v-model:value="proxyForm.cert_id" :options="certOptions" />
-              </NFormItem>
               <NFormItem label="上游地址（可选，默认自动计算）">
                 <NInput v-model:value="proxyForm.upstream" placeholder="127.0.0.1:8080" />
               </NFormItem>
@@ -1609,11 +1727,11 @@ onDeactivated(() => {
                 <NButton type="primary" :loading="savingProxy" @click="doBindProxy">
                   下发并绑定
                 </NButton>
-                <NPopconfirm v-if="app.domain" @positive-click="doUnbindProxy">
+                <NPopconfirm v-if="boundDomains.length" @positive-click="doUnbindProxy">
                   <template #trigger>
                     <NButton secondary type="error" :loading="savingProxy">解除绑定</NButton>
                   </template>
-                  确定解除 {{ app.domain }} 的反代绑定？
+                  确定解除 {{ boundDomains.join(', ') }} 的反代绑定？
                 </NPopconfirm>
               </NSpace>
             </NForm>

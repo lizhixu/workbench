@@ -116,28 +116,28 @@ func TestValidProxyDomain(t *testing.T) {
 	}
 }
 
-// TestAppsCoveredByCert: renewal re-push target selection — a freshly stored
-// certificate must reach every app whose bound domain it covers (exact or
-// wildcard SAN, the same cert.DomainCovers rule FindByDomain applies when
-// binding), and the nginx host is resolved per proxy mode: local → the app
-// host, gateway → the recorded gateway host (app host as fallback).
-func TestAppsCoveredByCert(t *testing.T) {
-	crt := &cert.Certificate{Domains: []string{"api.example.com", "*.shop.org"}}
+// TestAppsForCertPush: renewal re-push target selection — identity first:
+// an app binding whose CertID matches the renewed cert is always re-pushed.
+// Legacy entries (empty CertID) fall back to deterministic FindByDomain.
+// Target host is resolved per proxy mode: local → the app host, gateway → the recorded gateway host.
+func TestAppsForCertPush(t *testing.T) {
+	crt := &cert.Certificate{ID: "crt_target", Domains: []string{"api.example.com", "*.shop.org"}}
 	apps := []*Application{
-		{ID: "a1", Name: "local", HostID: "h1", Domain: "api.example.com", ProxyMode: "local"},
-		{ID: "a2", Name: "gateway", HostID: "h2", Domain: "www.shop.org", ProxyMode: "gateway", ProxyGatewayHostID: "gw1"},
-		{ID: "a3", Name: "unbound", HostID: "h3", Domain: "", ProxyMode: "local"},
-		{ID: "a4", Name: "unrelated", HostID: "h4", Domain: "other.org", ProxyMode: "local"},
-		{ID: "a5", Name: "wildcard-apex", HostID: "h5", Domain: "shop.org", ProxyMode: "local"},
-		{ID: "a6", Name: "gateway-no-host", HostID: "h6", Domain: "api.example.com", ProxyMode: "gateway", ProxyGatewayHostID: ""},
+		{ID: "a1", Name: "local", HostID: "h1", ProxyDomains: []DomainBinding{{Domain: "api.example.com", CertID: "crt_target"}}, ProxyMode: "local"},
+		{ID: "a2", Name: "gateway", HostID: "h2", ProxyDomains: []DomainBinding{{Domain: "www.shop.org", CertID: "crt_target"}}, ProxyMode: "gateway", ProxyGatewayHostID: "gw1"},
+		{ID: "a3", Name: "unbound", HostID: "h3", ProxyDomains: nil, ProxyMode: "local"},
+		{ID: "a4", Name: "unrelated", HostID: "h4", ProxyDomains: []DomainBinding{{Domain: "other.org", CertID: "crt_other"}}, ProxyMode: "local"},
+		{ID: "a5", Name: "wildcard-other-cert", HostID: "h5", ProxyDomains: []DomainBinding{{Domain: "shop.org", CertID: "crt_other"}}, ProxyMode: "local"},
+		{ID: "a6", Name: "gateway-no-host", HostID: "h6", ProxyDomains: []DomainBinding{{Domain: "api.example.com", CertID: "crt_target"}}, ProxyMode: "gateway", ProxyGatewayHostID: ""},
 	}
-	got := appsCoveredByCert(crt, apps)
+	ph := NewProxyHandler(nil, nil, nil)
+	got := ph.appsForCertPush(crt, apps)
 	if len(got) != 3 {
 		t.Fatalf("selected %d apps, want 3: %+v", len(got), got)
 	}
 	byID := map[string]repushTarget{}
-	for _, t := range got {
-		byID[t.app.ID] = t
+	for _, tr := range got {
+		byID[tr.app.ID] = tr
 	}
 	if byID["a1"].targetHost != "h1" {
 		t.Errorf("local mode must target the app host, got %q", byID["a1"].targetHost)
@@ -145,19 +145,19 @@ func TestAppsCoveredByCert(t *testing.T) {
 	if byID["a2"].targetHost != "gw1" {
 		t.Errorf("gateway mode must target the gateway host, got %q", byID["a2"].targetHost)
 	}
-	if byID["a2"].domain != "www.shop.org" {
-		t.Errorf("domain must be normalized as bound, got %q", byID["a2"].domain)
+	if len(byID["a2"].bindings) != 1 || byID["a2"].bindings[0].Domain != "www.shop.org" {
+		t.Errorf("domain must be normalized as bound, got %+v", byID["a2"].bindings)
 	}
 	if byID["a6"].targetHost != "h6" {
 		t.Errorf("gateway without a recorded host falls back to the app host, got %q", byID["a6"].targetHost)
 	}
 	for _, id := range []string{"a3", "a4", "a5"} {
 		if _, ok := byID[id]; ok {
-			t.Errorf("app %s must not be selected (empty/unrelated/wildcard-apex domain)", id)
+			t.Errorf("app %s must not be selected (empty/unrelated/different cert)", id)
 		}
 	}
 	// A nil certificate selects nothing.
-	if appsCoveredByCert(nil, apps) != nil {
+	if ph.appsForCertPush(nil, apps) != nil {
 		t.Error("nil certificate must select no apps")
 	}
 }
@@ -182,7 +182,7 @@ func TestUnbindProxyClearsGatewayHostID(t *testing.T) {
 		ID:                 "app_gw",
 		Name:               "demo",
 		HostID:             "h1",
-		Domain:             "www.example.com",
+		ProxyDomains:       []DomainBinding{{Domain: "www.example.com", CertID: "crt1"}},
 		ProxyMode:          "gateway",
 		ProxyUpstream:      "127.0.0.1:8080",
 		ProxyGatewayHostID: "gw1",
@@ -209,7 +209,7 @@ func TestUnbindProxyClearsGatewayHostID(t *testing.T) {
 	if !ok {
 		t.Fatal("app disappeared on unbind")
 	}
-	if got.Domain != "" || got.ProxyMode != "" || got.ProxyUpstream != "" || got.ProxyGatewayHostID != "" {
+	if len(got.ProxyDomains) != 0 || got.ProxyMode != "" || got.ProxyUpstream != "" || got.ProxyGatewayHostID != "" {
 		t.Fatalf("unbind must clear the whole binding incl. gateway host: %+v", got)
 	}
 }
@@ -406,18 +406,24 @@ func TestBindProxyRejectsWindowsHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if err := store.PutApp(&Application{
-		ID: "app_win", Name: "demo", HostID: regResp.GetAgentId(),
-		Ports: []PortMapping{{Host: 8080, Container: 80}},
-	}); err != nil {
-		t.Fatalf("PutApp: %v", err)
-	}
+		if err := store.PutApp(&Application{
+			ID: "app_win", Name: "demo", HostID: regResp.GetAgentId(),
+			Ports: []PortMapping{{Host: 8080, Container: 80}},
+		}); err != nil {
+			t.Fatalf("PutApp: %v", err)
+		}
 
-	gin.SetMode(gin.TestMode)
-	r := gin.New()
-	NewProxyHandler(reg, store, nil).Register(r.Group(""))
-	req := httptest.NewRequest(http.MethodPut, "/apps/app_win/proxy",
-		strings.NewReader(`{"domain":"x.example.com","mode":"local"}`))
+		hub, err := cert.NewHub(t.TempDir(), nil)
+		if err != nil {
+			t.Fatalf("NewHub: %v", err)
+		}
+		_ = hub.StoreCertForTest("c1", []string{"x.example.com"}, "mock-cert", "mock-key")
+
+		gin.SetMode(gin.TestMode)
+		r := gin.New()
+		NewProxyHandler(reg, store, hub).Register(r.Group(""))
+		req := httptest.NewRequest(http.MethodPut, "/apps/app_win/proxy",
+			strings.NewReader(`{"domains":[{"domain":"x.example.com","cert_id":"c1"}],"mode":"local"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -426,5 +432,158 @@ func TestBindProxyRejectsWindowsHost(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "Linux") {
 		t.Errorf("error must state the Linux-only limitation, body %s", w.Body.String())
+	}
+}
+
+// TestBindProxyValidation: bind requires explicit cert selection and rejects
+// missing certs, non-covering certs, or duplicate domains in the request.
+func TestBindProxyValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := newTestStore(t)
+	hub, err := cert.NewHub(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewHub: %v", err)
+	}
+	_ = hub.StoreCertForTest("crt_example", []string{"example.com", "*.example.com"}, "mock-cert", "mock-key")
+	_ = hub.StoreCertForTest("crt_nokey", []string{"nokey.com"}, "mock-cert", "")
+
+	app := &Application{
+		ID:     "app1",
+		Name:   "app-one",
+		HostID: "h1",
+		Ports:  []PortMapping{{Host: 8080, Container: 80}},
+	}
+	if err := store.PutApp(app); err != nil {
+		t.Fatalf("PutApp: %v", err)
+	}
+
+	reg := rpc.NewRegistry(t.TempDir(), nil)
+	ph := NewProxyHandler(reg, store, hub)
+	r := gin.New()
+	ph.Register(r.Group(""))
+
+	cases := []struct {
+		name       string
+		body       string
+		wantCode   int
+		wantSubstr string
+	}{
+		{
+			name:       "empty domains",
+			body:       `{"domains":[]}`,
+			wantCode:   http.StatusBadRequest,
+			wantSubstr: "至少绑定一个域名",
+		},
+		{
+			name:       "missing cert_id",
+			body:       `{"domains":[{"domain":"sub.example.com","cert_id":""}]}`,
+			wantCode:   http.StatusBadRequest,
+			wantSubstr: "未选择证书",
+		},
+		{
+			name:       "duplicate domain in request",
+			body:       `{"domains":[{"domain":"sub.example.com","cert_id":"crt_example"},{"domain":"sub.example.com","cert_id":"crt_example"}]}`,
+			wantCode:   http.StatusBadRequest,
+			wantSubstr: "在请求中重复",
+		},
+		{
+			name:       "cert does not exist",
+			body:       `{"domains":[{"domain":"sub.example.com","cert_id":"nonexistent"}]}`,
+			wantCode:   http.StatusBadRequest,
+			wantSubstr: "指定的证书不存在",
+		},
+		{
+			name:       "cert does not cover domain",
+			body:       `{"domains":[{"domain":"other.org","cert_id":"crt_example"}]}`,
+			wantCode:   http.StatusBadRequest,
+			wantSubstr: "所选证书不覆盖域名",
+		},
+		{
+			name:       "cert missing key material",
+			body:       `{"domains":[{"domain":"nokey.com","cert_id":"crt_nokey"}]}`,
+			wantCode:   http.StatusConflict,
+			wantSubstr: "证书材料缺失",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/apps/app1/proxy", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != tc.wantCode {
+				t.Fatalf("code = %d, want %d, body = %s", w.Code, tc.wantCode, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), tc.wantSubstr) {
+				t.Fatalf("body %s does not contain %q", w.Body.String(), tc.wantSubstr)
+			}
+		})
+	}
+}
+
+// TestBindProxyCrossAppConflict: binding a domain already bound by another app
+// must return 409 Conflict.
+func TestBindProxyCrossAppConflict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := newTestStore(t)
+	_ = store.PutApp(&Application{
+		ID:           "app_existing",
+		Name:         "ExistingApp",
+		HostID:       "h1",
+		ProxyDomains: []DomainBinding{{Domain: "clash.example.com", CertID: "crt1"}},
+	})
+	_ = store.PutApp(&Application{
+		ID:     "app_new",
+		Name:   "NewApp",
+		HostID: "h1",
+	})
+	reg := rpc.NewRegistry(t.TempDir(), nil)
+	hub, err := cert.NewHub(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewHub: %v", err)
+	}
+	_ = hub.StoreCertForTest("crt1", []string{"clash.example.com"}, "mock-cert", "mock-key")
+
+	ph := NewProxyHandler(reg, store, hub)
+	r := gin.New()
+	ph.Register(r.Group(""))
+
+	req := httptest.NewRequest(http.MethodPut, "/apps/app_new/proxy",
+		strings.NewReader(`{"domains":[{"domain":"clash.example.com","cert_id":"crt1"}],"mode":"local"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("code = %d, want 409, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "ExistingApp") {
+		t.Fatalf("expected conflict message mentioning ExistingApp, got %s", w.Body.String())
+	}
+}
+
+// TestRenderVhosts: renderVhosts generates an 80 redirect and 443 proxy server
+// block for each domain.
+func TestRenderVhosts(t *testing.T) {
+	bindings := []DomainBinding{
+		{Domain: "a.example.com", CertID: "c1"},
+		{Domain: "b.example.com", CertID: "c2"},
+	}
+	conf := renderVhosts(bindings, "127.0.0.1:8080", true)
+	for _, d := range []string{"a.example.com", "b.example.com"} {
+		if !strings.Contains(conf, "server_name "+d+";") {
+			t.Errorf("conf must declare server_name %s:\n%s", d, conf)
+		}
+		if !strings.Contains(conf, proxyCertDir+"/"+d+".crt;") {
+			t.Errorf("conf must reference cert for %s:\n%s", d, conf)
+		}
+		if !strings.Contains(conf, proxyCertDir+"/"+d+".key;") {
+			t.Errorf("conf must reference key for %s:\n%s", d, conf)
+		}
+	}
+	if !strings.Contains(conf, "proxy_pass http://127.0.0.1:8080;") {
+		t.Errorf("conf must proxy_pass to upstream:\n%s", conf)
+	}
+	if !strings.Contains(conf, "Upgrade $http_upgrade;") {
+		t.Errorf("websocket enabled must include Upgrade header:\n%s", conf)
 	}
 }

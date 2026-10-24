@@ -127,15 +127,17 @@ func TestStoreDeploymentJSONLResilience(t *testing.T) {
 // (ResolveTemplate) while HTTP handlers marshal the same app.
 func TestCloneApplicationDeepCopy(t *testing.T) {
 	orig := &Application{
-		ID:      "app_x",
-		EnvVars: map[string]string{"A": "1"},
-		Ports:   []PortMapping{{Host: 8080, Container: 80}},
-		Volumes: []string{"/d:/d"},
+		ID:           "app_x",
+		EnvVars:      map[string]string{"A": "1"},
+		Ports:        []PortMapping{{Host: 8080, Container: 80}},
+		Volumes:      []string{"/d:/d"},
+		ProxyDomains: []DomainBinding{{Domain: "x.com", CertID: "crt_1"}},
 	}
 	cp := cloneApplication(orig)
 	cp.EnvVars["B"] = "2"
 	cp.Ports[0].Host = 9090
 	cp.Volumes[0] = "/e:/e"
+	cp.ProxyDomains[0].Domain = "y.com"
 	if _, ok := orig.EnvVars["B"]; ok {
 		t.Error("EnvVars map shared with original")
 	}
@@ -145,7 +147,39 @@ func TestCloneApplicationDeepCopy(t *testing.T) {
 	if orig.Volumes[0] != "/d:/d" {
 		t.Error("Volumes slice shared with original")
 	}
+	if orig.ProxyDomains[0].Domain != "x.com" {
+		t.Error("ProxyDomains slice shared with original")
+	}
 	if cloneApplication(nil) != nil {
 		t.Error("cloneApplication(nil) should be nil")
+	}
+}
+
+func TestStoreLegacyDomainMigration(t *testing.T) {
+	dir := t.TempDir()
+	// Write legacy apps.json with Domain field.
+	legacyJSON := `[{"id":"app_legacy","name":"Legacy App","domain":"OLD.Example.com"}]`
+	if err := os.WriteFile(filepath.Join(dir, "apps.json"), []byte(legacyJSON), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	s, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	app, ok := s.GetApp("app_legacy")
+	if !ok {
+		t.Fatal("app_legacy not found")
+	}
+	if len(app.ProxyDomains) != 1 {
+		t.Fatalf("expected 1 ProxyDomains, got %d", len(app.ProxyDomains))
+	}
+	if app.ProxyDomains[0].Domain != "old.example.com" {
+		t.Errorf("expected normalized domain old.example.com, got %s", app.ProxyDomains[0].Domain)
+	}
+	if app.ProxyDomains[0].CertID != "" {
+		t.Errorf("expected empty certID for legacy un-frozen migration, got %s", app.ProxyDomains[0].CertID)
+	}
+	if app.Domain != "" {
+		t.Errorf("app.Domain should be cleared after migration, got %s", app.Domain)
 	}
 }

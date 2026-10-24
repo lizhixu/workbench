@@ -433,20 +433,74 @@ func (h *Hub) Get(id string) (*Certificate, bool) {
 	return &cp, true
 }
 
-// FindByDomain returns the first certificate covering domain.
+// FindByDomain returns the best certificate covering domain. With several
+// certificates covering the same name (multiple CA vendors, wildcard plus
+// exact) the pick must be deterministic — cover probe, panel SNI fallback and
+// legacy binding resolution all share this function, and a map-iteration
+// order would let two calls disagree. Ranking: exact SAN beats wildcard;
+// among wildcards more labels win; then the longest remaining validity;
+// finally the certificate ID keeps the order stable across restarts.
 func (h *Hub) FindByDomain(domain string) (*Certificate, bool) {
 	domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	var best *Certificate
+	bestRank := certMatchRank{}
 	for _, c := range h.certs {
+		// A certificate's rank is governed by its best covering SAN, not the
+		// first one found (a cert may carry both `*.example.com` and an exact
+		// entry for the very domain being resolved).
+		found := false
+		certBest := certMatchRank{}
 		for _, san := range c.Domains {
-			if DomainCovers(san, domain) {
-				cp := *c
-				return &cp, true
+			if !DomainCovers(san, domain) {
+				continue
+			}
+			if r := rankCertMatch(san, c); !found || r.betterThan(certBest) {
+				found, certBest = true, r
 			}
 		}
+		if found && (best == nil || certBest.betterThan(bestRank)) {
+			best, bestRank = c, certBest
+		}
 	}
-	return nil, false
+	if best == nil {
+		return nil, false
+	}
+	cp := *best
+	return &cp, true
+}
+
+// certMatchRank scores how well one SAN entry covers a domain: exact matches
+// outrank wildcards, and deeper wildcards (more labels) outrank shallower
+// ones (`*.a.example.com` > `*.example.com`).
+type certMatchRank struct {
+	exact   bool
+	labels  int
+	notAfter time.Time
+	id      string
+}
+
+func rankCertMatch(san string, c *Certificate) certMatchRank {
+	exact := !strings.HasPrefix(san, "*.")
+	labels := strings.Count(san, ".")
+	if !exact {
+		labels = strings.Count(strings.TrimPrefix(san, "*."), ".")
+	}
+	return certMatchRank{exact: exact, labels: labels, notAfter: c.NotAfter, id: c.ID}
+}
+
+func (r certMatchRank) betterThan(o certMatchRank) bool {
+	if r.exact != o.exact {
+		return r.exact
+	}
+	if r.labels != o.labels {
+		return r.labels > o.labels
+	}
+	if !r.notAfter.Equal(o.notAfter) {
+		return r.notAfter.After(o.notAfter)
+	}
+	return r.id > o.id
 }
 
 // Delete removes one certificate from the hub.
@@ -495,6 +549,12 @@ func (h *Hub) storeResult(id string, accountID string, domains []string, certPEM
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// A renewal rebuilds the record in place (same ID); the admin-managed
+	// remark predates it and must survive the re-issue.
+	var remark string
+	if prev, ok := h.certs[id]; ok {
+		remark = prev.Remark
+	}
 	h.certs[id] = &Certificate{
 		ID:        id,
 		AccountID: accountID,
@@ -506,8 +566,15 @@ func (h *Hub) storeResult(id string, accountID string, domains []string, certPEM
 		Issuer:    issuer,
 		AutoRenew: autoRenew,
 		CreatedAt: time.Now(),
+		Remark:    remark,
 	}
 	return h.saveCertsLocked()
+}
+
+// StoreCertForTest injects a certificate directly into the hub storage.
+// Used by tests across packages (e.g. apps proxy tests).
+func (h *Hub) StoreCertForTest(id string, domains []string, certPEM, keyPEM string) error {
+	return h.storeResult(id, "", domains, []byte(certPEM), []byte(keyPEM), time.Now(), time.Now().Add(90*24*time.Hour), "test", false)
 }
 
 func (h *Hub) markError(id, msg string) {

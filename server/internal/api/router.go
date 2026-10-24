@@ -267,27 +267,50 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// sensitive, so mutations (config, issue, import, renew, delete) stay admin-only
 	// and audited; reads are open to every authenticated role.
 	if certHub != nil {
-		cert.NewHandlers(certHub,
+		certHandlers := cert.NewHandlers(certHub,
 			// Panel usage mirrors panelsec's binding: an explicit cert id, plus
 			// the SNI fallback against the panel domain when unbound.
 			func() (string, string) {
 				p := settingsStore.PanelSecurity()
 				return p.SSLCertID, p.PanelDomain
 			},
-			// App reverse-proxy bindings pick certs per domain via
-			// hub.FindByDomain; expose every app with a bound domain so the
-			// detail endpoint can reverse that lookup.
+			// App reverse-proxy bindings carry their explicit CertID; one ref
+			// per domain binding so the detail endpoint and the delete guard
+			// can reverse both directions.
 			func() []cert.AppDomainRef {
 				apps := appStore.ListApps()
 				out := make([]cert.AppDomainRef, 0, len(apps))
 				for _, a := range apps {
-					if a.Domain != "" {
-						out = append(out, cert.AppDomainRef{ID: a.ID, Name: a.Name, Domain: a.Domain})
+					for _, b := range a.ProxyDomains {
+						if b.Domain == "" {
+							continue
+						}
+						out = append(out, cert.AppDomainRef{ID: a.ID, Name: a.Name, Domain: b.Domain, CertID: b.CertID})
 					}
 				}
 				return out
 			},
-		).Register(
+		)
+		certHandlers.SetAppCertBindingClearer(func(certID string) []string {
+			var names []string
+			for _, a := range appStore.ListApps() {
+				cleared := false
+				_ = appStore.UpdateApp(a.ID, func(x *apps.Application) error {
+					for i := range x.ProxyDomains {
+						if x.ProxyDomains[i].CertID == certID {
+							x.ProxyDomains[i].CertID = ""
+							cleared = true
+						}
+					}
+					return nil
+				})
+				if cleared {
+					names = append(names, a.Name)
+				}
+			}
+			return names
+		})
+		certHandlers.Register(
 			authed.Group(""),
 			adminOnly.Group("", h.auditMutation()),
 		)

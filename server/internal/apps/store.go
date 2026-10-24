@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -76,6 +77,18 @@ func (s *Store) loadApps() error {
 			if a.LastDeployAt.After(a.UpdatedAt) {
 				a.UpdatedAt = a.LastDeployAt
 			}
+		}
+		// Migrate the legacy single-domain proxy binding into the multi-domain
+		// list. CertID stays empty — a "legacy entry" resolved deterministically
+		// and frozen back on first use (see proxy.go resolveBindingCert). The
+		// legacy field is cleared so it never round-trips into new saves.
+		if a.Domain != "" {
+			if len(a.ProxyDomains) == 0 {
+				a.ProxyDomains = []DomainBinding{{
+					Domain: strings.ToLower(strings.TrimSpace(a.Domain)),
+				}}
+			}
+			a.Domain = ""
 		}
 		s.apps[a.ID] = a
 	}
@@ -190,6 +203,9 @@ func cloneApplication(a *Application) *Application {
 	}
 	if a.Volumes != nil {
 		cp.Volumes = append([]string(nil), a.Volumes...)
+	}
+	if a.ProxyDomains != nil {
+		cp.ProxyDomains = append([]DomainBinding(nil), a.ProxyDomains...)
 	}
 	return &cp
 }

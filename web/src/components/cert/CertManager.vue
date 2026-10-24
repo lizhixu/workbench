@@ -4,7 +4,7 @@ import {
   NAlert, NButton, NCard, NCollapse, NCollapseItem, NDataTable,
   NDescriptions, NDescriptionsItem, NForm, NFormItem, NIcon, NInput,
   NModal, NPopconfirm, NPopover, NRadio, NRadioGroup, NSelect, NSpace, NSpin,
-  NSwitch, NTabPane, NTabs, NTag, useMessage,
+  NSwitch, NTabPane, NTabs, NTag, useDialog, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import {
@@ -27,6 +27,7 @@ import { fmtDate } from '../../utils/time'
 defineOptions({ name: 'CertManager' })
 
 const message = useMessage()
+const dialog = useDialog()
 
 const activeMainTab = ref<'certs' | 'accounts'>('certs')
 
@@ -785,7 +786,26 @@ async function doDelete(cert: Certificate) {
     message.success('证书已删除')
     await loadCerts()
   } catch (e: any) {
-    message.error(e.message || '删除失败')
+    const msg = e.message || ''
+    if (msg.includes('force=true') || msg.includes('已被以下应用绑定') || msg.includes('已被应用绑定') || msg.includes('仍被应用')) {
+      dialog.warning({
+        title: '证书正在使用中',
+        content: `${msg}。是否强制删除？（强制删除将解除相关应用的显式证书绑定）`,
+        positiveText: '强制删除',
+        negativeText: '取消',
+        onPositiveClick: async () => {
+          try {
+            await deleteCert(cert.id, true)
+            message.success('证书已强制删除并解除相关应用绑定')
+            await loadCerts()
+          } catch (err: any) {
+            message.error(err.message || '强制删除失败')
+          }
+        },
+      })
+    } else {
+      message.error(msg || '删除失败')
+    }
   }
 }
 

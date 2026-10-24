@@ -120,7 +120,7 @@ func (e *Engine) PrecheckMigration(app *Application, targetHostID string) (*Migr
 	if app.MeshForwardEnabled && app.MeshForwardHostID == targetHostID {
 		resp.Warnings = append(resp.Warnings, "组网转发入口主机即目标主机,迁移后入口不再可行,需重新配置入口主机")
 	}
-	if app.Domain != "" && app.ProxyMode == "gateway" && app.ProxyGatewayHostID == targetHostID {
+	if len(app.ProxyDomains) > 0 && app.ProxyMode == "gateway" && app.ProxyGatewayHostID == targetHostID {
 		resp.Warnings = append(resp.Warnings, "网关主机即目标主机,迁移后网关上游客即目标主机自身,建议更换网关主机")
 	}
 
@@ -257,7 +257,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 			return nil
 		})
 		app.HostID = oldHostID
-		if e.proxy != nil && app.Domain != "" {
+		if e.proxy != nil && len(app.ProxyDomains) > 0 {
 			if err := e.proxy.SyncProxyForHost(app, targetHostID); err != nil {
 				logBuf.WriteString(fmt.Sprintf("WARN: 回滚反向代理失败: %v\n", err))
 			} else {
@@ -420,7 +420,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 	})
 	app.HostID = targetHostID
 
-	if e.proxy != nil && app.Domain != "" {
+	if e.proxy != nil && len(app.ProxyDomains) > 0 {
 		if err := e.proxy.SyncProxyForHost(app, oldHostID); err != nil {
 			logBuf.WriteString(fmt.Sprintf("WARN: 同步反向代理失败: %v\n", err))
 		} else {

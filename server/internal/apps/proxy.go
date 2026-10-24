@@ -80,19 +80,37 @@ func (h *ProxyHandler) Register(writeRG *gin.RouterGroup) {
 	writeRG.DELETE("/apps/:id/proxy", h.unbindProxy)
 }
 
-type proxyBindReq struct {
-	// Domain is the public hostname for this app, e.g. "api.example.com".
+// proxyDomainReq is one domain of a bind request: the hostname plus the
+// certificate that serves it. CertID is mandatory — there is no auto-match
+// and no auto-issue on the bind path.
+type proxyDomainReq struct {
 	Domain string `json:"domain"`
+	CertID string `json:"cert_id"`
+}
+
+type proxyBindReq struct {
+	// Domains is the complete binding set (full-replace semantics: what is
+	// submitted is what the app serves afterwards).
+	Domains []proxyDomainReq `json:"domains"`
+	// Legacy single-domain fields for pre multi-domain clients; parsed into a
+	// one-element Domains list. CertID is required here too.
+	Domain string `json:"domain"`
+	CertID string `json:"cert_id"`
 	// Mode: "local" (nginx runs on the app host) | "gateway".
 	Mode string `json:"mode"`
 	// GatewayHostID names the nginx gateway host (required for mode=gateway).
 	GatewayHostID string `json:"gateway_host_id"`
 	// Upstream overrides the computed target, e.g. "127.0.0.1:8080" or a mesh IP.
 	Upstream string `json:"upstream"`
-	// CertID selects a certificate from the hub. Empty = auto-match by domain.
-	CertID string `json:"cert_id"`
 	// WebSocket support adds the Upgrade/Connection proxy headers.
 	WebSocket bool `json:"websocket"`
+}
+
+// domainCertPair is one resolved (binding, certificate) pair, normalized to
+// the lowercase hostname that lands in the vhost.
+type domainCertPair struct {
+	binding DomainBinding
+	crt     *cert.Certificate
 }
 
 func (h *ProxyHandler) bindProxy(c *gin.Context) {
@@ -106,25 +124,83 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	domain := strings.TrimSpace(strings.ToLower(req.Domain))
-	if domain == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "域名不能为空"})
+	// Legacy single-domain requests become a one-element list.
+	if len(req.Domains) == 0 && req.Domain != "" {
+		req.Domains = []proxyDomainReq{{Domain: req.Domain, CertID: req.CertID}}
+	}
+	if len(req.Domains) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "至少绑定一个域名"})
 		return
 	}
-	// The domain is interpolated verbatim into an nginx server block that is
-	// written as root on the gateway host. A strict hostname check keeps
-	// metacharacters (`;{}#$\n` …) from breaking out of the server_name
-	// directive — `nginx -t` only validates syntax, not intent.
-	if !validProxyDomain(domain) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "域名格式非法：仅允许小写字母、数字、连字符与点分隔"})
-		return
+
+	// Normalize + validate every domain up front.
+	domains := make([]DomainBinding, 0, len(req.Domains))
+	seen := make(map[string]bool, len(req.Domains))
+	for i := range req.Domains {
+		domain := strings.TrimSpace(strings.ToLower(req.Domains[i].Domain))
+		if domain == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "域名不能为空"})
+			return
+		}
+		// The domain is interpolated verbatim into an nginx server block that
+		// is written as root on the gateway host. A strict hostname check keeps
+		// metacharacters (`;{}#$\n` …) from breaking out of the server_name
+		// directive — `nginx -t` only validates syntax, not intent.
+		if !validProxyDomain(domain) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("域名 %s 格式非法：仅允许小写字母、数字、连字符与点分隔", domain)})
+			return
+		}
+		if seen[domain] {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("域名 %s 在请求中重复", domain)})
+			return
+		}
+		seen[domain] = true
+		certID := strings.TrimSpace(req.Domains[i].CertID)
+		if certID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("域名 %s 未选择证书：请先在证书中心签发或选择覆盖该域名的证书，再进行绑定", domain)})
+			return
+		}
+		domains = append(domains, DomainBinding{Domain: domain, CertID: certID})
 	}
+
+	// Resolve every binding's certificate up front — explicit CertID only,
+	// no auto-match and no auto-issue. Nothing is pushed to any host before
+	// the whole request is known good.
+	pairs := make([]domainCertPair, 0, len(domains))
+	for _, d := range domains {
+		if h.hub == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "证书中心未初始化"})
+			return
+		}
+		crt, ok := h.hub.Get(d.CertID)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("域名 %s 指定的证书不存在", d.Domain)})
+			return
+		}
+		if !certCoversDomain(crt, d.Domain) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("所选证书不覆盖域名 %s（证书 SAN：%s），请选择其他证书或先签发覆盖该域名的证书", d.Domain, strings.Join(crt.Domains, ", "))})
+			return
+		}
+		if crt.KeyPEM == "" {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("域名 %s 所选证书材料缺失，请先重新签发该证书", d.Domain)})
+			return
+		}
+		pairs = append(pairs, domainCertPair{binding: d, crt: crt})
+	}
+
 	// One domain maps to exactly one app: two vhosts with the same
 	// server_name would both pass `nginx -t` and route unpredictably.
 	for _, a := range h.store.ListApps() {
-		if a.ID != app.ID && a.Domain != "" && strings.EqualFold(a.Domain, domain) {
-			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("域名已被应用 %q 绑定，请先解绑", a.Name)})
-			return
+		if a.ID == app.ID {
+			continue
+		}
+		for _, b := range a.ProxyDomains {
+			for _, d := range domains {
+				if b.Domain != "" && strings.EqualFold(b.Domain, d.Domain) {
+					c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("域名 %s 已被应用 %q 绑定，请先解绑", d.Domain, a.Name)})
+					return
+				}
+			}
 		}
 	}
 	mode := req.Mode
@@ -165,12 +241,10 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		return
 	}
 
-	// Guarantee the proxy container BEFORE resolving the certificate: a
-	// broken host (no docker, 80/443 occupied) must fail fast here instead of
-	// burning a synchronous ACME issuance and failing at the file push.
-	// Serialized against the push/re-push flow (rebuild never races an
-	// in-flight reload), but released before cert resolution so a slow ACME
-	// call never holds the lock.
+	// Guarantee the proxy container BEFORE pushing anything: a broken host
+	// (no docker, 80/443 occupied) must fail fast here instead of after half
+	// the cert files landed. Serialized against the push/re-push flow (rebuild
+	// never races an in-flight reload), but released before the push loop.
 	h.pushMu.Lock()
 	ensureErr := h.ensureProxyNginx(gatewayHub)
 	h.pushMu.Unlock()
@@ -182,39 +256,6 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		} else {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": ensureErr.Error()})
 		}
-		return
-	}
-
-	// Resolve the certificate covering the domain.
-	var crt *cert.Certificate
-	if req.CertID != "" {
-		got, ok := h.hub.Get(req.CertID)
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "指定的证书不存在"})
-			return
-		}
-		crt = got
-	} else {
-		got, ok := h.hub.FindByDomain(domain)
-		if !ok {
-			// Auto-issue certificate using default account if not found
-			acc, err := h.hub.GetDefaultAccount()
-			if err != nil {
-				c.JSON(http.StatusConflict, gin.H{"error": "证书中心没有覆盖该域名的证书，且未配置默认 ACME 账户，请先在证书中心签发"})
-				return
-			}
-			newCert, err := h.hub.Issue([]string{domain}, acc.ID)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("自动签发证书失败: %v", err)})
-				return
-			}
-			crt = newCert
-		} else {
-			crt = got
-		}
-	}
-	if crt.KeyPEM == "" {
-		c.JSON(http.StatusConflict, gin.H{"error": "证书材料缺失，请先重新签发该证书"})
 		return
 	}
 
@@ -231,16 +272,22 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		}
 	}
 
-	// 1. Push cert + key to the nginx host, 2. push the vhost config,
+	// 1. Push every cert + key to the nginx host, 2. push the vhost config,
 	// 3. validate + hot-reload nginx. Serialized against the renewal
-	// re-push (pushMu) so two write sessions never interleave chunks on
-	// the same file path.
+	// re-push (pushMu) so two write sessions never interleave chunks on the
+	// same file path.
+	bindings := make([]DomainBinding, 0, len(pairs))
+	for _, p := range pairs {
+		bindings = append(bindings, p.binding)
+	}
 	h.pushMu.Lock()
 	pushErr := func() error {
-		if err := h.pushCertFiles(gatewayHub, domain, crt); err != nil {
-			return err
+		for _, p := range pairs {
+			if err := h.pushCertFiles(gatewayHub, p.binding.Domain, p.crt); err != nil {
+				return err
+			}
 		}
-		conf := renderVhost(domain, upstream, req.WebSocket)
+		conf := renderVhosts(bindings, upstream, req.WebSocket)
 		confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
 		if err := writeFileOnAgent(gatewayHub, confPath, []byte(conf)); err != nil {
 			return fmt.Errorf("推送反代配置失败: %w", err)
@@ -259,7 +306,7 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 
 	// 4. Persist the binding on the application.
 	if err := h.store.UpdateApp(app.ID, func(a *Application) error {
-		a.Domain = domain
+		a.ProxyDomains = bindings
 		a.ProxyMode = mode
 		a.ProxyUpstream = upstream
 		if mode == "gateway" {
@@ -272,7 +319,23 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "domain": domain, "mode": mode, "upstream": upstream})
+	c.JSON(http.StatusOK, gin.H{
+		"ok":       true,
+		"domains":  bindings,
+		"mode":     mode,
+		"upstream": upstream,
+	})
+}
+
+// certCoversDomain reports whether any SAN of the certificate covers the
+// domain (cert.DomainCovers — the same rule FindByDomain applies).
+func certCoversDomain(crt *cert.Certificate, domain string) bool {
+	for _, san := range crt.Domains {
+		if cert.DomainCovers(san, domain) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *ProxyHandler) unbindProxy(c *gin.Context) {
@@ -281,12 +344,13 @@ func (h *ProxyHandler) unbindProxy(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
 		return
 	}
-	if app.Domain == "" {
+	if len(app.ProxyDomains) == 0 {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "message": "该应用没有绑定域名"})
 		return
 	}
 
-	// Remove the vhost config from wherever it was deployed.
+	// Remove the vhost config plus every domain's cert files from wherever
+	// they were deployed (certs would otherwise linger as stale key material).
 	targets := []string{app.HostID}
 	if app.ProxyMode == "gateway" && app.ProxyGatewayHostID != "" {
 		targets = append(targets, app.ProxyGatewayHostID)
@@ -296,13 +360,16 @@ func (h *ProxyHandler) unbindProxy(c *gin.Context) {
 		if hub == nil {
 			continue
 		}
-		confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
+		h.pushMu.Lock()
 		_, _ = execOnAgent(hub, "proxy-unbind-"+randomToken(4),
-			fmt.Sprintf("rm -f %s && docker exec %s nginx -s reload 2>/dev/null || true", confPath, nginxContainer), 30)
+			fmt.Sprintf("rm -f %s %s && docker exec %s nginx -s reload 2>/dev/null || true",
+				fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID),
+				proxyCleanupCertGlob(app), nginxContainer), 30)
+		h.pushMu.Unlock()
 	}
 
 	_ = h.store.UpdateApp(app.ID, func(a *Application) error {
-		a.Domain = ""
+		a.ProxyDomains = nil
 		a.ProxyMode = ""
 		a.ProxyUpstream = ""
 		// The gateway host must go too, or a later rebind would leave the
@@ -314,11 +381,31 @@ func (h *ProxyHandler) unbindProxy(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
+// proxyCleanupCertGlob renders the per-domain cert/key paths for an app's
+// bound domains as one shell argument list, used by unbind/purge cleanup.
+func proxyCleanupCertGlob(app *Application) string {
+	parts := make([]string, 0, len(app.ProxyDomains)*2)
+	for _, b := range app.ProxyDomains {
+		if b.Domain == "" {
+			continue
+		}
+		parts = append(parts,
+			fmt.Sprintf("%s/%s.crt", proxyCertDir, b.Domain),
+			fmt.Sprintf("%s/%s.key", proxyCertDir, b.Domain))
+	}
+	if len(parts) == 0 {
+		// Always keep at least one (harmless) path so the rm command shape
+		// stays constant.
+		return fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
+	}
+	return strings.Join(parts, " ")
+}
+
 // SyncProxyForHost updates the Nginx reverse-proxy configuration when an
 // application moves to a new host (or rolls back).
 // If oldHostID is non-empty and mode == "local", the old host's vhost is cleaned up.
 func (h *ProxyHandler) SyncProxyForHost(app *Application, oldHostID string) error {
-	if app.Domain == "" {
+	if len(app.ProxyDomains) == 0 {
 		return nil
 	}
 	mode := app.ProxyMode
@@ -339,9 +426,11 @@ func (h *ProxyHandler) SyncProxyForHost(app *Application, oldHostID string) erro
 		if ensureErr != nil {
 			return ensureErr
 		}
-		crt, ok := h.hub.FindByDomain(app.Domain)
-		if !ok || crt == nil || crt.KeyPEM == "" {
-			return fmt.Errorf("未找到覆盖域名 %s 的证书材料", app.Domain)
+		// Resolve every binding up front: no partial cert set may land on the
+		// target host when one of them fails.
+		pairs, err := h.resolveBindingCerts(app)
+		if err != nil {
+			return err
 		}
 		upstream, err := h.defaultUpstream(app, "local", "")
 		if err != nil {
@@ -349,10 +438,12 @@ func (h *ProxyHandler) SyncProxyForHost(app *Application, oldHostID string) erro
 		}
 		h.pushMu.Lock()
 		pushErr := func() error {
-			if err := h.pushCertFiles(targetHub, app.Domain, crt); err != nil {
-				return err
+			for _, p := range pairs {
+				if err := h.pushCertFiles(targetHub, p.binding.Domain, p.crt); err != nil {
+					return err
+				}
 			}
-			conf := renderVhost(app.Domain, upstream, true)
+			conf := renderVhosts(bindingList(pairs), upstream, true)
 			confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
 			if err := writeFileOnAgent(targetHub, confPath, []byte(conf)); err != nil {
 				return fmt.Errorf("推送反代配置失败: %w", err)
@@ -367,7 +458,8 @@ func (h *ProxyHandler) SyncProxyForHost(app *Application, oldHostID string) erro
 			if oldHub := h.reg.Hub(oldHostID); oldHub != nil {
 				confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
 				_, _ = execOnAgent(oldHub, "proxy-clean-"+randomToken(4),
-					fmt.Sprintf("rm -f %s && docker exec %s nginx -s reload 2>/dev/null || true", confPath, nginxContainer), 30)
+					fmt.Sprintf("rm -f %s %s && docker exec %s nginx -s reload 2>/dev/null || true",
+						confPath, proxyCleanupCertGlob(app), nginxContainer), 30)
 			}
 		}
 		_ = h.store.UpdateApp(app.ID, func(a *Application) error {
@@ -388,7 +480,7 @@ func (h *ProxyHandler) SyncProxyForHost(app *Application, oldHostID string) erro
 	if err != nil {
 		return err
 	}
-	conf := renderVhost(app.Domain, upstream, true)
+	conf := renderVhosts(app.ProxyDomains, upstream, true)
 	confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
 	h.pushMu.Lock()
 	pushErr := func() error {
@@ -406,6 +498,68 @@ func (h *ProxyHandler) SyncProxyForHost(app *Application, oldHostID string) erro
 		return nil
 	})
 	return nil
+}
+
+// bindingList extracts the domain bindings from resolved pairs.
+func bindingList(pairs []domainCertPair) []DomainBinding {
+	out := make([]DomainBinding, 0, len(pairs))
+	for _, p := range pairs {
+		out = append(out, p.binding)
+	}
+	return out
+}
+
+// domainList extracts just the hostnames, for logs.
+func domainList(bindings []DomainBinding) []string {
+	out := make([]string, 0, len(bindings))
+	for _, b := range bindings {
+		out = append(out, b.Domain)
+	}
+	return out
+}
+
+// resolveBindingCerts resolves every domain binding of an app to its
+// certificate. Explicit CertIDs are honored as-is; legacy entries (empty
+// CertID, migrated from the single-domain era) fall back to the deterministic
+// best match, which is then frozen back onto the record — the once-implicit
+// choice becomes an explicit, durable fact the next caller can rely on.
+func (h *ProxyHandler) resolveBindingCerts(app *Application) ([]domainCertPair, error) {
+	pairs := make([]domainCertPair, 0, len(app.ProxyDomains))
+	freeze := map[string]string{} // domain → cert id, for legacy entries
+	for _, b := range app.ProxyDomains {
+		domain := strings.ToLower(strings.TrimSpace(b.Domain))
+		if domain == "" {
+			continue
+		}
+		b.Domain = domain
+		if b.CertID != "" {
+			crt, ok := h.hub.Get(b.CertID)
+			if !ok || crt == nil {
+				return nil, fmt.Errorf("域名 %s 绑定的证书已不存在，请重新绑定证书", domain)
+			}
+			pairs = append(pairs, domainCertPair{binding: b, crt: crt})
+			continue
+		}
+		crt, ok := h.hub.FindByDomain(domain)
+		if !ok || crt == nil {
+			return nil, fmt.Errorf("域名 %s 的存量绑定未记录证书，且证书中心没有覆盖它的证书，请先在应用详情绑定证书", domain)
+		}
+		freeze[domain] = crt.ID
+		pairs = append(pairs, domainCertPair{binding: DomainBinding{Domain: domain, CertID: crt.ID}, crt: crt})
+	}
+	if len(freeze) > 0 {
+		if err := h.store.UpdateApp(app.ID, func(a *Application) error {
+			for i := range a.ProxyDomains {
+				if id, ok := freeze[strings.ToLower(strings.TrimSpace(a.ProxyDomains[i].Domain))]; ok {
+					a.ProxyDomains[i].CertID = id
+				}
+			}
+			return nil
+		}); err == nil {
+			h.log.Info("存量域名绑定已按确定性匹配冻结证书", "app", app.Name, "frozen", freeze)
+		}
+	}
+	return pairs, nil
 }
 
 // pushCertFiles writes the certificate chain and key for one domain onto the
@@ -603,55 +757,63 @@ func (h *ProxyHandler) reloadNginx(agentHub *rpc.Hub) error {
 	return nil
 }
 
-// repushTarget names one app whose bound domain is covered by a freshly
-// stored certificate, plus the host its nginx runs on.
+// repushTarget names one app whose freshly stored certificate must be
+// re-distributed, the domain bindings affected and the host its nginx runs on.
 type repushTarget struct {
 	app        *Application
-	domain     string
+	bindings   []DomainBinding
 	targetHost string
 }
 
-// appsCoveredByCert selects the apps a freshly stored certificate must be
-// re-distributed to: bound domain non-empty and covered by one of the
-// cert's SANs (exact or wildcard, via cert.DomainCovers — the same rule
-// FindByDomain applies when binding). nginx runs on the app host for local
-// mode and on the gateway host for gateway mode.
-func appsCoveredByCert(crt *cert.Certificate, apps []*Application) []repushTarget {
+// appsForCertPush selects what a freshly stored certificate must update.
+// Identity first: a binding whose CertID equals the certificate is always
+// re-pushed — a renewed certificate keeps serving exactly the domains it was
+// bound to, and another certificate covering the same domain can never
+// silently replace it. Legacy entries (empty CertID, pre-explicit-binding
+// records) keep the domain-coverage rule, gated on the deterministic
+// FindByDomain so two overlapping certificates don't take turns. nginx runs
+// on the app host for local mode and on the gateway host for gateway mode.
+func (h *ProxyHandler) appsForCertPush(crt *cert.Certificate, apps []*Application) []repushTarget {
 	if crt == nil {
 		return nil
 	}
 	var out []repushTarget
 	for _, app := range apps {
-		domain := strings.TrimSpace(strings.ToLower(app.Domain))
-		if domain == "" {
-			continue
-		}
-		covered := false
-		for _, san := range crt.Domains {
-			if cert.DomainCovers(san, domain) {
-				covered = true
-				break
+		var matched []DomainBinding
+		for _, b := range app.ProxyDomains {
+			domain := strings.TrimSpace(strings.ToLower(b.Domain))
+			if domain == "" {
+				continue
+			}
+			if b.CertID == crt.ID {
+				matched = append(matched, DomainBinding{Domain: domain, CertID: b.CertID})
+				continue
+			}
+			if b.CertID == "" {
+				if best, ok := h.hub.FindByDomain(domain); ok && best.ID == crt.ID {
+					matched = append(matched, DomainBinding{Domain: domain, CertID: crt.ID})
+				}
 			}
 		}
-		if !covered {
+		if len(matched) == 0 {
 			continue
 		}
 		targetHost := app.HostID
 		if app.ProxyMode == "gateway" && app.ProxyGatewayHostID != "" {
 			targetHost = app.ProxyGatewayHostID
 		}
-		out = append(out, repushTarget{app: app, domain: domain, targetHost: targetHost})
+		out = append(out, repushTarget{app: app, bindings: matched, targetHost: targetHost})
 	}
 	return out
 }
 
 // RepushAppCerts re-distributes a freshly stored certificate to every nginx
-// host serving a bound app domain the certificate covers. Wired as the cert
-// hub's OnRenewed callback (see Hub.SetOnRenewed) so renewals — and any new
-// issuance or import covering bound domains — reach the serving hosts
-// instead of silently going stale at expiry. System-triggered, not a user
-// operation: per-app failures are logged and never block the remaining apps
-// or the renewal flow itself (per §7 it stays out of the operation audit).
+// host serving a domain explicitly bound to it. Wired as the cert hub's
+// OnRenewed callback (see Hub.SetOnRenewed) so renewals — and any new
+// issuance or import bound to app domains — reach the serving hosts instead
+// of silently going stale at expiry. System-triggered, not a user operation:
+// per-app failures are logged and never block the remaining apps or the
+// renewal flow itself (per §7 it stays out of the operation audit).
 func (h *ProxyHandler) RepushAppCerts(crt *cert.Certificate) {
 	if crt == nil || crt.CertPEM == "" || crt.KeyPEM == "" {
 		return
@@ -661,23 +823,28 @@ func (h *ProxyHandler) RepushAppCerts(crt *cert.Certificate) {
 	if h.store == nil || h.reg == nil {
 		return
 	}
-	for _, t := range appsCoveredByCert(crt, h.store.ListApps()) {
+	for _, t := range h.appsForCertPush(crt, h.store.ListApps()) {
 		agentHub := h.reg.Hub(t.targetHost)
 		if agentHub == nil {
 			h.log.Warn("证书回推跳过：nginx 主机 Agent 不在线", "app", t.app.Name, "host_id", t.targetHost)
 			continue
 		}
 		h.pushMu.Lock()
-		err := h.pushCertFiles(agentHub, t.domain, crt)
+		err := error(nil)
+		for _, b := range t.bindings {
+			if err = h.pushCertFiles(agentHub, b.Domain, crt); err != nil {
+				break
+			}
+		}
 		if err == nil {
 			err = h.reloadNginx(agentHub)
 		}
 		h.pushMu.Unlock()
 		if err != nil {
-			h.log.Warn("证书回推失败", "app", t.app.Name, "domain", t.domain, "error", err.Error())
+			h.log.Warn("证书回推失败", "app", t.app.Name, "domains", domainList(t.bindings), "error", err.Error())
 			continue
 		}
-		h.log.Info("证书回推完成", "app", t.app.Name, "domain", t.domain)
+		h.log.Info("证书回推完成", "app", t.app.Name, "cert", crt.ID, "bindings", len(t.bindings))
 	}
 }
 
@@ -764,39 +931,45 @@ func validProxyDomain(d string) bool {
 	return true
 }
 
-// renderVhost produces the nginx server block for one application domain.
-func renderVhost(domain, upstream string, websocket bool) string {
+// renderVhosts produces the nginx config for one application: per domain an
+// 80→443 redirect block plus a 443 server block carrying that domain's own
+// certificate (each domain may come from a different CA/vendor). All blocks
+// proxy to the same upstream; nginx SNI picks the right cert per name.
+func renderVhosts(bindings []DomainBinding, upstream string, websocket bool) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "# Generated by Watchman for %s\n", domain)
-	fmt.Fprintf(&b, "server {\n")
-	fmt.Fprintf(&b, "    listen 80;\n")
-	fmt.Fprintf(&b, "    server_name %s;\n", domain)
-	fmt.Fprintf(&b, "    return 301 https://$host$request_uri;\n")
-	fmt.Fprintf(&b, "}\n\n")
-	fmt.Fprintf(&b, "server {\n")
-	fmt.Fprintf(&b, "    listen 443 ssl;\n")
-	fmt.Fprintf(&b, "    http2 on;\n")
-	fmt.Fprintf(&b, "    server_name %s;\n", domain)
-	fmt.Fprintf(&b, "    ssl_certificate %s/%s.crt;\n", proxyCertDir, domain)
-	fmt.Fprintf(&b, "    ssl_certificate_key %s/%s.key;\n", proxyCertDir, domain)
-	fmt.Fprintf(&b, "    ssl_protocols TLSv1.2 TLSv1.3;\n")
-	// nginx defaults to a 1m body limit; proxied uploads would be silently
-	// truncated with a confusing 413 for the app behind the vhost.
-	fmt.Fprintf(&b, "    client_max_body_size 64m;\n\n")
-	fmt.Fprintf(&b, "    location / {\n")
-	fmt.Fprintf(&b, "        proxy_pass http://%s;\n", upstream)
-	fmt.Fprintf(&b, "        proxy_set_header Host $host;\n")
-	fmt.Fprintf(&b, "        proxy_set_header X-Real-IP $remote_addr;\n")
-	fmt.Fprintf(&b, "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
-	fmt.Fprintf(&b, "        proxy_set_header X-Forwarded-Proto https;\n")
-	if websocket {
-		fmt.Fprintf(&b, "        proxy_set_header Upgrade $http_upgrade;\n")
-		fmt.Fprintf(&b, "        proxy_set_header Connection \"upgrade\";\n")
-		fmt.Fprintf(&b, "        proxy_read_timeout 300s;\n")
+	for _, bd := range bindings {
+		domain := bd.Domain
+		fmt.Fprintf(&b, "# Generated by Watchman for %s\n", domain)
+		fmt.Fprintf(&b, "server {\n")
+		fmt.Fprintf(&b, "    listen 80;\n")
+		fmt.Fprintf(&b, "    server_name %s;\n", domain)
+		fmt.Fprintf(&b, "    return 301 https://$host$request_uri;\n")
+		fmt.Fprintf(&b, "}\n\n")
+		fmt.Fprintf(&b, "server {\n")
+		fmt.Fprintf(&b, "    listen 443 ssl;\n")
+		fmt.Fprintf(&b, "    http2 on;\n")
+		fmt.Fprintf(&b, "    server_name %s;\n", domain)
+		fmt.Fprintf(&b, "    ssl_certificate %s/%s.crt;\n", proxyCertDir, domain)
+		fmt.Fprintf(&b, "    ssl_certificate_key %s/%s.key;\n", proxyCertDir, domain)
+		fmt.Fprintf(&b, "    ssl_protocols TLSv1.2 TLSv1.3;\n")
+		// nginx defaults to a 1m body limit; proxied uploads would be silently
+		// truncated with a confusing 413 for the app behind the vhost.
+		fmt.Fprintf(&b, "    client_max_body_size 64m;\n\n")
+		fmt.Fprintf(&b, "    location / {\n")
+		fmt.Fprintf(&b, "        proxy_pass http://%s;\n", upstream)
+		fmt.Fprintf(&b, "        proxy_set_header Host $host;\n")
+		fmt.Fprintf(&b, "        proxy_set_header X-Real-IP $remote_addr;\n")
+		fmt.Fprintf(&b, "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
+		fmt.Fprintf(&b, "        proxy_set_header X-Forwarded-Proto https;\n")
+		if websocket {
+			fmt.Fprintf(&b, "        proxy_set_header Upgrade $http_upgrade;\n")
+			fmt.Fprintf(&b, "        proxy_set_header Connection \"upgrade\";\n")
+			fmt.Fprintf(&b, "        proxy_read_timeout 300s;\n")
+		}
+		fmt.Fprintf(&b, "    }\n")
+		fmt.Fprintf(&b, "}\n\n")
 	}
-	fmt.Fprintf(&b, "    }\n")
-	fmt.Fprintf(&b, "}\n")
-	return b.String()
+	return strings.TrimRight(b.String(), "\n") + "\n"
 }
 
 // writeFileOnAgent streams one small file (cert/conf) through the existing

@@ -20,14 +20,24 @@ type Handlers struct {
 	// time to keep the cert package decoupled from the settings store.
 	panelCertInfo func() (certID, domain string)
 	// appDomains lists deployed applications with a bound domain, for the
-	// same used-by lookup.
+	// same used-by lookup (one ref per domain binding, CertID included).
 	appDomains func() []AppDomainRef
+	// clearAppCertBindings drops the explicit CertID from every domain
+	// binding that references a certificate, used by the delete-cert guard's
+	// force path; injected at wiring time, nil keeps the guard read-only.
+	clearAppCertBindings func(certID string) []string
 }
 
 // NewHandlers creates the certificate hub handlers. Both lookup deps may be
 // nil (unit tests); the detail endpoint then simply omits those predicates.
 func NewHandlers(hub *Hub, panelCertInfo func() (string, string), appDomains func() []AppDomainRef) *Handlers {
 	return &Handlers{hub: hub, panelCertInfo: panelCertInfo, appDomains: appDomains}
+}
+
+// SetAppCertBindingClearer injects the force-delete hook that unreferences a
+// certificate from every app domain binding (returns the affected app names).
+func (h *Handlers) SetAppCertBindingClearer(fn func(certID string) []string) {
+	h.clearAppCertBindings = fn
 }
 
 // Register mounts routes. Config reads are open to all roles (the UI shows
@@ -425,7 +435,35 @@ func (h *Handlers) renewCert(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"ok": true, "message": "续期请求已受理，请稍后刷新列表"})
 }
 
+// deleteCert removes a certificate. When an app domain binding explicitly
+// references it, the delete is refused (409) with the app names so the
+// operator rebinds those domains first; ?force=true clears the references
+// (the domains keep serving whatever cert is already on the nginx host and
+// fall back to deterministic best-match until rebound) and deletes anyway.
 func (h *Handlers) deleteCert(c *gin.Context) {
+	id := c.Param("id")
+		if h.appDomains != nil {
+			var names []string
+			seen := make(map[string]bool)
+			for _, ref := range h.appDomains() {
+				if ref.CertID == id && !seen[ref.Name] {
+					seen[ref.Name] = true
+					names = append(names, ref.Name)
+				}
+			}
+			if len(names) > 0 {
+			force := c.Query("force") == "true" || c.Query("force") == "1"
+			if !force {
+				c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf(
+					"证书已被以下应用绑定：%s。请先在应用详情-域名与反代中更换证书，或携带 force=true 强制删除（相关域名将回落为待重新绑定证书状态）",
+					strings.Join(names, "、"))})
+				return
+			}
+			if h.clearAppCertBindings != nil {
+				_ = h.clearAppCertBindings(id)
+			}
+		}
+	}
 	if err := h.hub.Delete(c.Param("id")); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return

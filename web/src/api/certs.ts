@@ -1,4 +1,5 @@
 import { http, unwrap } from './http'
+import type { DomainBinding } from './apps'
 
 export interface CertHubConfig {
   enabled: boolean
@@ -213,21 +214,22 @@ export function importCert(certPEM: string, keyPEM: string) {
   ).then((r) => r.data)
 }
 
-export function deleteCert(id: string) {
-  return unwrap<{ ok: boolean }>(http.delete(`/certs/${id}`))
+export function deleteCert(id: string, force = false) {
+  return unwrap<{ ok: boolean }>(http.delete(`/certs/${id}${force ? '?force=true' : ''}`))
 }
 
 export interface ProxyBindRequest {
-  domain: string
+  domains?: DomainBinding[]
+  domain?: string
+  cert_id?: string
   mode: 'local' | 'gateway'
   gateway_host_id?: string
   upstream?: string
-  cert_id?: string
   websocket?: boolean
 }
 
 export function bindProxy(appId: string, req: ProxyBindRequest) {
-  return unwrap<{ ok: boolean; domain: string; mode: string; upstream: string }>(
+  return unwrap<{ ok: boolean; domains?: DomainBinding[]; domain?: string; mode: string; upstream: string }>(
     http.put(`/apps/${appId}/proxy`, req),
   )
 }

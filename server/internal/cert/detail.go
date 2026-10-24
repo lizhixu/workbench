@@ -13,11 +13,13 @@ import (
 
 // AppDomainRef names one deployed application's bound domain, used by the
 // used-by reverse lookup of the cert detail endpoint. Supplied by the router
-// layer so the cert package stays decoupled from the apps store.
+// layer so the cert package stays decoupled from the apps store. CertID is
+// the explicitly bound certificate (empty on legacy single-domain entries).
 type AppDomainRef struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
 	Domain string `json:"domain"`
+	CertID string `json:"cert_id,omitempty"`
 }
 
 // CertDetail extends the plain Certificate JSON with X.509 metadata parsed
@@ -132,6 +134,14 @@ func (h *Hub) Detail(id, panelCertID, panelDomain string, apps []AppDomainRef) (
 	}
 	for _, a := range apps {
 		if strings.TrimSpace(a.Domain) == "" {
+			continue
+		}
+		// Explicit binding wins; only legacy entries (no recorded cert) fall
+		// back to the domain lookup — same rule the renewal re-push applies.
+		if a.CertID != "" {
+			if a.CertID == c.ID {
+				d.UsedByApps = append(d.UsedByApps, a)
+			}
 			continue
 		}
 		if m, ok := h.FindByDomain(a.Domain); ok && m.ID == c.ID {

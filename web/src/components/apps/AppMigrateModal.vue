@@ -92,6 +92,13 @@ const targetMeshIP = computed(() =>
 
 const proxyMode = computed(() => (props.app?.proxy_mode as 'local' | 'gateway') ?? 'local')
 
+const appDomains = computed<string[]>(() => {
+  if (props.app?.proxy_domains && props.app.proxy_domains.length > 0) {
+    return props.app.proxy_domains.map((b) => b.domain)
+  }
+  return props.app?.domain ? [props.app.domain] : []
+})
+
 async function loadHosts() {
   loadingHosts.value = true
   try {
@@ -285,7 +292,8 @@ async function submit() {
       <div class="mig-section">
         <div class="mig-section-title">迁移后的流量与网络</div>
         <AppTopologyPreview
-          :domain="app.domain || ''"
+          :domains="appDomains"
+          :domain="appDomains[0] || ''"
           :proxy-mode="proxyMode"
           :app-name="app.name"
           :host-name="targetHost?.hostname || ''"
@@ -308,8 +316,8 @@ async function submit() {
           :mesh-forward-target-port="app.mesh_forward_target_port"
         />
         <div class="mig-hint">
-          <template v-if="app.domain">
-            已绑定域名 <strong>{{ app.domain }}</strong>：
+          <template v-if="appDomains.length > 0">
+            已绑定域名 <strong>{{ appDomains.join(', ') }}</strong>：
             {{ proxyMode === 'gateway' ? '网关主机会重新解析到目标主机的上游并热加载。' : '目标主机会初始化系统托管反代容器并接管该域名，源主机上的旧配置同时清理。' }}
           </template>
           <template v-else>该应用未绑定域名，无需重定向反代。</template>

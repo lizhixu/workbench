@@ -9,6 +9,11 @@ export interface PortMapping {
 
 export type AppSourceType = 'git' | 'image' | 'template' | 'raw_compose'
 
+export interface DomainBinding {
+  domain: string
+  cert_id: string
+}
+
 export interface AppEntity {
   id: string
   name: string
@@ -42,6 +47,7 @@ export interface AppEntity {
   healthcheck_url?: string
   container_name?: string
   domain?: string
+  proxy_domains?: DomainBinding[]
   proxy_mode?: 'local' | 'gateway'
   proxy_gateway_host_id?: string
   proxy_upstream?: string

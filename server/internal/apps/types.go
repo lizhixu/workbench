@@ -55,10 +55,18 @@ type Application struct {
 	MeshForwardTarget     string `json:"mesh_forward_target,omitempty"`      // Resolved host:port target
 
 	// Reverse proxy binding.
-	Domain            string `json:"domain,omitempty"`
-	ProxyMode         string `json:"proxy_mode,omitempty"`           // "local" | "gateway"
-	ProxyGatewayHostID string `json:"proxy_gateway_host_id,omitempty"` // gateway node host id
-	ProxyUpstream     string `json:"proxy_upstream,omitempty"`       // e.g. "127.0.0.1:8080" or mesh IP
+	// Domain is a LEGACY field: it only exists so json.Unmarshal can capture
+	// old apps.json records; loadApps migrates it into ProxyDomains (with an
+	// empty CertID = legacy entry) and clears it. New code must never read or
+	// write it.
+	Domain string `json:"domain,omitempty"`
+	// ProxyDomains lists every bound hostname with the certificate that
+	// serves it — each domain carries its own explicit CertID (no domain
+	// auto-matching, no auto-issuance on bind).
+	ProxyDomains       []DomainBinding `json:"proxy_domains,omitempty"`
+	ProxyMode          string          `json:"proxy_mode,omitempty"`             // "local" | "gateway"
+	ProxyGatewayHostID string          `json:"proxy_gateway_host_id,omitempty"` // gateway node host id
+	ProxyUpstream      string          `json:"proxy_upstream,omitempty"`         // e.g. "127.0.0.1:8080" or mesh IP
 
 	// Runtime state.
 	CurrentCommit string    `json:"current_commit,omitempty"`
@@ -77,6 +85,16 @@ type PortMapping struct {
 	// BindScope: "public" (binds to 0.0.0.0) | "mesh" (binds to Tailscale IP).
 	// Empty string defaults to "public".
 	BindScope string `json:"bind_scope,omitempty"`
+}
+
+// DomainBinding is one explicitly bound hostname plus the certificate that
+// serves it. CertID is mandatory on every new bind (the API validates the
+// certificate exists AND covers the domain); the empty CertID only occurs on
+// entries migrated from the legacy single Domain field, which are resolved
+// via deterministic best-match and frozen back on first use.
+type DomainBinding struct {
+	Domain string `json:"domain"`
+	CertID string `json:"cert_id"`
 }
 
 // Deployment statuses.

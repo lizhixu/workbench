@@ -485,8 +485,22 @@ async function saveEdit(redeploy: boolean) {
 const envRows = ref<{ key: string; value: string }[]>([])
 const savingEnv = ref(false)
 
+// 值首尾成对的引号来自 .env 风格粘贴（KEY="value"），并不属于值本身；
+// 服务端探测 .env.example / Dockerfile ENV 时同样会剥掉，这里保持同一口径。
+// 无引号时原样返回，避免顺带改动值两侧的空格。
+function stripEnvQuotes(value: string): string {
+  const raw = value ?? ''
+  const v = raw.trim()
+  if (v.length < 2) return raw
+  const q = v[0]
+  return (q === '"' || q === "'") && v[v.length - 1] === q ? v.slice(1, -1) : raw
+}
+
 function syncEnvRows() {
-  envRows.value = Object.entries(app.value?.env_vars ?? {}).map(([key, value]) => ({ key, value }))
+  envRows.value = Object.entries(app.value?.env_vars ?? {}).map(([key, value]) => ({
+    key,
+    value: stripEnvQuotes(value),
+  }))
 }
 
 function addEnvRow() {

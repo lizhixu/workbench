@@ -116,6 +116,7 @@ export const actionLabels: Record<string, string> = {
   app_start: '启动应用',
   app_restart: '重启应用',
   app_webhook_sync: '同步 Webhook 自动部署',
+  app_migrate: '迁移应用',
   app_volume_backup: '备份应用挂载卷',
   app_volume_restore: '恢复应用挂载卷',
   app_volume_backup_delete: '删除应用挂载卷归档',

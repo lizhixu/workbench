@@ -245,6 +245,12 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 			ph.SetNetworkStore(networkStore)
 			ph.SetLogger(log)
 			ph.Register(appWrite)
+			// The deployment engine needs the proxy handler to re-point a bound
+			// domain when an application migrates to another host (and to roll it
+			// back on failure).
+			if appEngine != nil {
+				appEngine.SetProxyHandler(ph)
+			}
 			// Renewal re-distribution: every certificate that lands in the
 			// hub (renewal, fresh issuance covering already-bound domains,
 			// manual DNS-01 confirmation, import) is re-pushed to the nginx
@@ -2034,6 +2040,9 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodPost, "/api/v1/apps/:id/start", "app_start", "app", "id", audit.RiskHigh, "启动应用"},
 		{http.MethodPost, "/api/v1/apps/:id/restart", "app_restart", "app", "id", audit.RiskHigh, "重启应用"},
 		{http.MethodPost, "/api/v1/apps/:id/webhook/sync", "app_webhook_sync", "app", "id", audit.RiskHigh, "同步应用 Webhook 自动部署"},
+		// Cross-host service migration: moves the app (and optionally its
+		// volumes, via S3) to another host and reroutes traffic — high-risk.
+		{http.MethodPost, "/api/v1/apps/:id/migrate", "app_migrate", "app", "id", audit.RiskHigh, "迁移应用"},
 		// App volume backup/restore: a restore stops the app container and
 		// overwrites live volume data, so it is high-risk like the container
 		// lifecycle actions above.

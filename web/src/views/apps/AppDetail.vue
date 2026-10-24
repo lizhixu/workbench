@@ -11,7 +11,7 @@ import type { DataTableColumns } from 'naive-ui'
 import {
   ArrowBackOutline, BuildOutline, CloudUploadOutline, CopyOutline,
   DownloadOutline,
-  GitCommitOutline, PlayOutline, RefreshOutline, SparklesOutline, StopOutline,
+  GitCommitOutline, MoveOutline, PlayOutline, RefreshOutline, SparklesOutline, StopOutline,
   SwapHorizontalOutline, TrashOutline,
 } from '@vicons/ionicons5'
 import { useTablePagination } from '../../composables/useTablePagination'
@@ -30,6 +30,7 @@ import { bothMeshed } from '../../utils/mesh'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useAuthStore } from '../../stores/auth'
 import OpsTunnelModal from '../../components/tunnels/OpsTunnelModal.vue'
+import AppMigrateModal from '../../components/apps/AppMigrateModal.vue'
 
 defineOptions({ name: 'AppDetail' })
 
@@ -51,6 +52,16 @@ const activeTab = ref('overview')
 // Deployment log viewer.
 const showLog = ref(false)
 const logDeployment = ref<Deployment | null>(null)
+
+// Service migration (cross-host move): the modal drives precheck + submit,
+// and a successful start switches to the deployment tab to follow progress.
+const showMigrate = ref(false)
+
+function onMigrated() {
+  activeTab.value = 'deployments'
+  page.value = 1
+  refreshAll()
+}
 
 // Ops tunnel one-click entry (kubectl port-forward style): opened from a
 // port mapping row, prefilled with that host port.
@@ -993,7 +1004,11 @@ const depStatusTag = (s: string) => {
 }
 
 const triggerLabel = (t: string) =>
-  t === 'create' ? '创建' : t === 'webhook' ? 'Git 推送' : t === 'rollback' ? '回滚' : '手动'
+  t === 'create' ? '创建'
+    : t === 'webhook' ? 'Git 推送'
+      : t === 'rollback' ? '回滚'
+        : t === 'migrate' ? '迁移'
+          : '手动'
 
 const columns = computed<DataTableColumns<Deployment>>(() => [
   { title: '状态', key: 'status', width: 90, render: (r) => depStatusTag(r.status) },
@@ -1210,6 +1225,17 @@ onDeactivated(() => {
           </template>
           回滚到上一个成功版本？
         </NPopconfirm>
+        <NButton
+          size="small"
+          :loading="acting"
+          :disabled="deploying || status?.state === 'undeployed'"
+          @click="showMigrate = true"
+        >
+          <template #icon>
+            <NIcon><MoveOutline /></NIcon>
+          </template>
+          迁移服务
+        </NButton>
         <NButton size="small" :loading="acting" @click="doAction('restart')">
           <template #icon>
             <NIcon><RefreshOutline /></NIcon>
@@ -1754,6 +1780,9 @@ onDeactivated(() => {
 
     <!-- 运维隧道一键入口（kubectl port-forward 式） -->
     <OpsTunnelModal v-model:show="showTunnel" :prefill="tunnelPrefill" />
+
+    <!-- 服务迁移：跨主机搬迁（可选经 S3 携带挂载卷数据） -->
+    <AppMigrateModal v-model:show="showMigrate" :app="app" @migrated="onMigrated" />
 
     <!-- 应用配置编辑（部分更新：只提交改动字段） -->
     <NModal

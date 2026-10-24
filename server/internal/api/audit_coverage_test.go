@@ -25,6 +25,7 @@ func TestDeriveMutationActionCoverage(t *testing.T) {
 		{http.MethodPost, "/api/v1/apps", "app_create", "app", ""},
 		{http.MethodPost, "/api/v1/apps/:id/deploy", "app_deploy", "app", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/apps/:id/deployments/cancel", "app_deploy_cancel", "app", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/apps/:id/migrate", "app_migrate", "app", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/apps/:id/volume-backups", "app_volume_backup", "app", ""},
 		{http.MethodPost, "/api/v1/apps/:id/volume-backups/:archiveID/restore", "app_volume_restore", "app", audit.RiskHigh},
 		{http.MethodDelete, "/api/v1/apps/:id/volume-backups/:archiveID", "app_volume_backup_delete", "app", audit.RiskHigh},
@@ -101,6 +102,7 @@ func TestDeriveMutationActionCoverage(t *testing.T) {
 		{http.MethodPost, "/api/v1/ai/diagnose"},
 		{http.MethodPost, "/api/v1/ai/chat"},
 		{http.MethodPost, "/api/v1/apps/webhook/:token"},
+		{http.MethodPost, "/api/v1/apps/:id/migrate/precheck"},
 	}
 	for _, s := range silent {
 		if _, ok := deriveMutationAction(s[0], s[1]); ok {

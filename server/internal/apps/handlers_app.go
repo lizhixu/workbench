@@ -1,7 +1,9 @@
 package apps
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -81,6 +83,11 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	writeRG.POST("/apps/:id/start", h.startApp)
 	writeRG.POST("/apps/:id/restart", h.restartApp)
 	writeRG.POST("/apps/:id/webhook/sync", h.syncAppWebhook)
+	// Service migration: moving an app across hosts (optionally with its
+	// volumes) is a high-risk mutation, so it rides the audited write group.
+	// The precheck only probes readiness and stays on the read group.
+	writeRG.POST("/apps/:id/migrate", h.migrateApp)
+	readRG.POST("/apps/:id/migrate/precheck", h.precheckMigrate)
 	// Volume backup/restore mutates host data (tar over live volume dirs) and
 	// a restore stops/restarts the app container, so these ride the audited
 	// write group.
@@ -659,6 +666,75 @@ func (h *AppHandlers) syncAppWebhook(c *gin.Context) {
 		"message": "已成功通过 GitHub API 为该仓库配置 Webhook",
 		"data":    updated,
 	})
+}
+
+// precheckMigrate reports whether a target host is ready to receive the app:
+// agent reachability, Docker availability, port conflicts and volume-migration
+// prerequisites. It mutates nothing, so it lives on the read group without an
+// operation-audit record; every problem is advisory (a warning), not a refusal.
+func (h *AppHandlers) precheckMigrate(c *gin.Context) {
+	app, ok := h.store.GetApp(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
+		return
+	}
+	if h.engine == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deployment engine unavailable"})
+		return
+	}
+	var req struct {
+		TargetHostID string `json:"target_host_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体格式错误"})
+		return
+	}
+	target := strings.TrimSpace(req.TargetHostID)
+	if target == "" {
+		target = strings.TrimSpace(c.Query("target_host_id"))
+	}
+	if target == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请选择目标主机"})
+		return
+	}
+	resp, err := h.engine.PrecheckMigration(app, target)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": resp})
+}
+
+// migrateApp moves an application to another host, optionally carrying its
+// declared volumes through S3. The run is asynchronous (202): the caller polls
+// the deployment record for progress, and the engine rolls the app back onto
+// the source host if any stage fails.
+func (h *AppHandlers) migrateApp(c *gin.Context) {
+	app, ok := h.store.GetApp(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
+		return
+	}
+	if h.engine == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deployment engine unavailable"})
+		return
+	}
+	var req MigrateAppReq
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体格式错误"})
+		return
+	}
+	req.TargetHostID = strings.TrimSpace(req.TargetHostID)
+	if req.TargetHostID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请选择目标主机"})
+		return
+	}
+	dep, err := h.engine.StartMigration(app, req, usernameOf(c))
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"data": dep})
 }
 
 func (h *AppHandlers) deployApp(c *gin.Context) {

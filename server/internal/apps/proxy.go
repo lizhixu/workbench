@@ -314,6 +314,100 @@ func (h *ProxyHandler) unbindProxy(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
+// SyncProxyForHost updates the Nginx reverse-proxy configuration when an
+// application moves to a new host (or rolls back).
+// If oldHostID is non-empty and mode == "local", the old host's vhost is cleaned up.
+func (h *ProxyHandler) SyncProxyForHost(app *Application, oldHostID string) error {
+	if app.Domain == "" {
+		return nil
+	}
+	mode := app.ProxyMode
+	if mode == "" {
+		mode = "local"
+	}
+	if mode == "local" {
+		targetHub := h.reg.Hub(app.HostID)
+		if targetHub == nil {
+			return fmt.Errorf("目标主机 Agent 不在线")
+		}
+		if ag := h.reg.GetAgent(app.HostID); ag != nil && strings.EqualFold(ag.OS, "windows") {
+			return fmt.Errorf("反代暂不支持 Windows 主机")
+		}
+		h.pushMu.Lock()
+		ensureErr := h.ensureProxyNginx(targetHub)
+		h.pushMu.Unlock()
+		if ensureErr != nil {
+			return ensureErr
+		}
+		crt, ok := h.hub.FindByDomain(app.Domain)
+		if !ok || crt == nil || crt.KeyPEM == "" {
+			return fmt.Errorf("未找到覆盖域名 %s 的证书材料", app.Domain)
+		}
+		upstream, err := h.defaultUpstream(app, "local", "")
+		if err != nil {
+			return err
+		}
+		h.pushMu.Lock()
+		pushErr := func() error {
+			if err := h.pushCertFiles(targetHub, app.Domain, crt); err != nil {
+				return err
+			}
+			conf := renderVhost(app.Domain, upstream, true)
+			confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
+			if err := writeFileOnAgent(targetHub, confPath, []byte(conf)); err != nil {
+				return fmt.Errorf("推送反代配置失败: %w", err)
+			}
+			return h.reloadNginx(targetHub)
+		}()
+		h.pushMu.Unlock()
+		if pushErr != nil {
+			return pushErr
+		}
+		if oldHostID != "" && oldHostID != app.HostID {
+			if oldHub := h.reg.Hub(oldHostID); oldHub != nil {
+				confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
+				_, _ = execOnAgent(oldHub, "proxy-clean-"+randomToken(4),
+					fmt.Sprintf("rm -f %s && docker exec %s nginx -s reload 2>/dev/null || true", confPath, nginxContainer), 30)
+			}
+		}
+		_ = h.store.UpdateApp(app.ID, func(a *Application) error {
+			a.ProxyUpstream = upstream
+			return nil
+		})
+		return nil
+	}
+	// Gateway mode:
+	if app.ProxyGatewayHostID == "" {
+		return fmt.Errorf("网关模式未记录网关主机 ID")
+	}
+	gatewayHub := h.reg.Hub(app.ProxyGatewayHostID)
+	if gatewayHub == nil {
+		return fmt.Errorf("网关主机 Agent 不在线")
+	}
+	upstream, err := h.defaultUpstream(app, "gateway", app.ProxyGatewayHostID)
+	if err != nil {
+		return err
+	}
+	conf := renderVhost(app.Domain, upstream, true)
+	confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
+	h.pushMu.Lock()
+	pushErr := func() error {
+		if err := writeFileOnAgent(gatewayHub, confPath, []byte(conf)); err != nil {
+			return fmt.Errorf("推送反代配置到网关失败: %w", err)
+		}
+		return h.reloadNginx(gatewayHub)
+	}()
+	h.pushMu.Unlock()
+	if pushErr != nil {
+		return pushErr
+	}
+	_ = h.store.UpdateApp(app.ID, func(a *Application) error {
+		a.ProxyUpstream = upstream
+		return nil
+	})
+	return nil
+}
+
 // pushCertFiles writes the certificate chain and key for one domain onto the
 // nginx host. Shared by the bind flow and the renewal re-push.
 func (h *ProxyHandler) pushCertFiles(agentHub *rpc.Hub, domain string, crt *cert.Certificate) error {

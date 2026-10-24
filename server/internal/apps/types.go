@@ -98,7 +98,7 @@ type Deployment struct {
 	AppID         string    `json:"app_id"`
 	CommitHash    string    `json:"commit_hash,omitempty"`
 	CommitMessage string    `json:"commit_message,omitempty"`
-	Trigger       string    `json:"trigger"` // "create" | "webhook" | "manual" | "rollback"
+	Trigger       string    `json:"trigger"` // "create" | "webhook" | "manual" | "rollback" | "migrate"
 	Status        string    `json:"status"`
 	StartedBy     string    `json:"started_by,omitempty"`
 	StartedAt     time.Time `json:"started_at"`
@@ -116,4 +116,24 @@ type Deployment struct {
 	// CancelledBy records the username that aborted this run (only set when
 	// Status == DeployCancelled).
 	CancelledBy string `json:"cancelled_by,omitempty"`
+}
+
+// MigrateAppReq is the payload of POST /apps/:id/migrate.
+type MigrateAppReq struct {
+	TargetHostID   string `json:"target_host_id"`
+	MigrateVolumes bool   `json:"migrate_volumes"`
+	CleanSource    bool   `json:"clean_source"`
+}
+
+// MigratePrecheckResp reports target-host readiness for a migration. It is
+// advisory: problems surface as warnings so the operator can still decide.
+type MigratePrecheckResp struct {
+	TargetHostID  string   `json:"target_host_id"`
+	AgentOnline   bool     `json:"agent_online"`
+	DockerRunning bool     `json:"docker_running"`
+	VolumeCount   int      `json:"volume_count"`
+	S3Ready       bool     `json:"s3_ready"`
+	S3Bucket      string   `json:"s3_bucket,omitempty"`
+	PortConflicts []int    `json:"port_conflicts,omitempty"`
+	Warnings      []string `json:"warnings,omitempty"`
 }

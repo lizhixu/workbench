@@ -7,7 +7,7 @@ import {
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import {
-  AddCircleOutline, RocketOutline, GitCommitOutline, RefreshOutline,
+  AddCircleOutline, MoveOutline, RocketOutline, GitCommitOutline, RefreshOutline,
   TrashOutline,
 } from '@vicons/ionicons5'
 import {
@@ -17,6 +17,7 @@ import { listHosts } from '../../api/hosts'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { useAuthStore } from '../../stores/auth'
 import { fmtDateTimeMinute } from '../../utils/time'
+import AppMigrateModal from '../../components/apps/AppMigrateModal.vue'
 
 defineOptions({ name: 'AppList' })
 
@@ -137,7 +138,7 @@ const columns = computed<DataTableColumns<AppEntity>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 120,
+    width: 160,
     render: (row) =>
       h(NSpace, { size: 8 }, {
         default: () => {
@@ -149,6 +150,13 @@ const columns = computed<DataTableColumns<AppEntity>>(() => [
             ),
           ]
           if (canWrite.value) {
+            buttons.push(
+              h(
+                NButton,
+                { size: 'tiny', secondary: true, onClick: () => openMigrate(row) },
+                { default: () => h(NIcon, null, { default: () => h(MoveOutline) }) },
+              ),
+            )
             buttons.push(
               h(
                 NButton,
@@ -206,6 +214,23 @@ function openDetail(app: AppEntity) {
     viewName: 'AppDetail',
   })
   router.push(`/apps/${app.id}`)
+}
+
+// 迁移快捷入口：复用详情页同一个弹窗组件，成功后跳到详情页的部署历史
+// 看实时进度（列表页没有进度流）。
+const showMigrate = ref(false)
+const migrateTarget = ref<AppEntity | null>(null)
+
+function openMigrate(app: AppEntity) {
+  migrateTarget.value = app
+  showMigrate.value = true
+}
+
+function onMigrated() {
+  const target = migrateTarget.value
+  showMigrate.value = false
+  loadData().then(refreshStatuses)
+  if (target) openDetail(target)
 }
 
 function openCreate() {
@@ -328,6 +353,9 @@ onDeactivated(() => {
         </NButton>
       </NEmpty>
     </div>
+
+    <!-- 服务迁移：与详情页共用同一弹窗，成功后进入详情页部署历史看进度 -->
+    <AppMigrateModal v-model:show="showMigrate" :app="migrateTarget" @migrated="onMigrated" />
 
     <NModal
       v-model:show="showDeleteModal"

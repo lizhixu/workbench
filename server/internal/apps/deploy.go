@@ -41,6 +41,9 @@ type Engine struct {
 	vault       *vault.Store
 	networkStore *network.Store
 	gitProvider gitTokenProvider
+	// proxy re-points a bound domain at the new host when an app migrates
+	// (migrate.go), and rolls it back on failure. nil until wired.
+	proxy *ProxyHandler
 	// vols stores app volume backup/restore archive metadata (volbackup.go);
 	// nil until wired, in which case volume work reports a clear error.
 	vols *VolumeStore
@@ -69,6 +72,12 @@ func (e *Engine) SetGitProvider(gp gitTokenProvider) {
 // SetNetworkStore injects the overlay network store to resolve Tailscale mesh IPs.
 func (e *Engine) SetNetworkStore(ns *network.Store) {
 	e.networkStore = ns
+}
+
+// SetProxyHandler injects the reverse-proxy handler so a migration can move the
+// vhost (and roll it back) together with the application.
+func (e *Engine) SetProxyHandler(ph *ProxyHandler) {
+	e.proxy = ph
 }
 
 // NewEngine creates the deployment engine. A nil log falls back to the

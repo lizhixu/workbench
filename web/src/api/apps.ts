@@ -57,7 +57,7 @@ export interface Deployment {
   app_id: string
   commit_hash?: string
   commit_message?: string
-  trigger: 'create' | 'webhook' | 'manual' | 'rollback'
+  trigger: 'create' | 'webhook' | 'manual' | 'rollback' | 'migrate'
   status: 'queued' | 'building' | 'deploying' | 'success' | 'failed' | 'cancelled'
   started_by?: string
   cancelled_by?: string
@@ -164,6 +164,41 @@ export function cancelDeployment(id: string) {
   return unwrap<{ ok: boolean; cancelled: boolean; message: string }>(
     http.post(`/apps/${id}/deployments/cancel`),
   )
+}
+
+/** 服务迁移：把应用（可选连同挂载卷数据）搬到另一台主机。 */
+export interface MigrateAppRequest {
+  target_host_id: string
+  /** 经 S3 中转同步挂载卷数据；需要默认 S3 存储目标 */
+  migrate_volumes?: boolean
+  /** 迁移成功后删除源主机容器（bind mount 宿主目录始终保留） */
+  clean_source?: boolean
+}
+
+/** 目标主机就绪探测结果。所有问题都以 warnings 下发，不阻断请求。 */
+export interface MigratePrecheck {
+  target_host_id: string
+  agent_online: boolean
+  docker_running: boolean
+  volume_count: number
+  s3_ready: boolean
+  s3_bucket?: string
+  port_conflicts?: number[]
+  warnings?: string[]
+}
+
+/** 只读预检：探测目标主机连通性、Docker、端口占用与卷迁移前置条件。 */
+export function precheckMigration(id: string, targetHostId: string) {
+  return unwrap<{ data: MigratePrecheck }>(
+    http.post(`/apps/${id}/migrate/precheck`, { target_host_id: targetHostId }),
+  ).then((r) => r.data)
+}
+
+/** 发起迁移（异步 202）：返回部署记录，进度经部署历史轮询。 */
+export function migrateApp(id: string, req: MigrateAppRequest) {
+  return unwrap<{ data: Deployment }>(
+    http.post(`/apps/${id}/migrate`, req),
+  ).then((r) => r.data)
 }
 
 /** 应用挂载卷备份归档（volbackup.go 的 HTTP 面，归档存 S3） */

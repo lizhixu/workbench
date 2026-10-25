@@ -269,10 +269,18 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	if certHub != nil {
 		certHandlers := cert.NewHandlers(certHub,
 			// Panel usage mirrors panelsec's binding: an explicit cert id, plus
-			// the SNI fallback against the panel domain when unbound.
-			func() (string, string) {
+			// the SNI fallback against the panel domain when unbound. The
+			// binding only counts as active (delete-guarding) while SSL is
+			// enabled with a cert_center source; a stale SSLCertID left
+			// after switching to custom PEM or disabling SSL must not
+			// block deleting a certificate the panel no longer serves.
+			func() cert.PanelCertBinding {
 				p := settingsStore.PanelSecurity()
-				return p.SSLCertID, p.PanelDomain
+				return cert.PanelCertBinding{
+					CertID: p.SSLCertID,
+					Domain: p.PanelDomain,
+					Active: p.SSLEnabled && p.SSLMode == "cert_center",
+				}
 			},
 			// App reverse-proxy bindings carry their explicit CertID; one ref
 			// per domain binding so the detail endpoint and the delete guard

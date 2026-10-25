@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"watchman/proto/agentpb"
 	"watchman/server/internal/cert"
+	"watchman/server/internal/network"
 	"watchman/server/internal/rpc"
 )
 
@@ -179,14 +180,15 @@ func TestRepushAppCertsGuards(t *testing.T) {
 func TestUnbindProxyClearsGatewayHostID(t *testing.T) {
 	store := newTestStore(t)
 	app := &Application{
-		ID:                 "app_gw",
-		Name:               "demo",
-		HostID:             "h1",
-		ProxyDomains:       []DomainBinding{{Domain: "www.example.com", CertID: "crt1"}},
-		ProxyMode:          "gateway",
-		ProxyUpstream:      "127.0.0.1:8080",
-		ProxyGatewayHostID: "gw1",
-		Ports:              []PortMapping{{Host: 8080, Container: 80}},
+		ID:                  "app_gw",
+		Name:                "demo",
+		HostID:              "h1",
+		ProxyDomains:        []DomainBinding{{Domain: "www.example.com", CertID: "crt1"}},
+		ProxyMode:           "gateway",
+		ProxyUpstream:       "127.0.0.1:8080",
+		ProxyUpstreamManual: true,
+		ProxyGatewayHostID:  "gw1",
+		Ports:               []PortMapping{{Host: 8080, Container: 80}},
 	}
 	if err := store.PutApp(app); err != nil {
 		t.Fatalf("PutApp: %v", err)
@@ -209,8 +211,8 @@ func TestUnbindProxyClearsGatewayHostID(t *testing.T) {
 	if !ok {
 		t.Fatal("app disappeared on unbind")
 	}
-	if len(got.ProxyDomains) != 0 || got.ProxyMode != "" || got.ProxyUpstream != "" || got.ProxyGatewayHostID != "" {
-		t.Fatalf("unbind must clear the whole binding incl. gateway host: %+v", got)
+	if len(got.ProxyDomains) != 0 || got.ProxyMode != "" || got.ProxyUpstream != "" || got.ProxyGatewayHostID != "" || got.ProxyUpstreamManual {
+		t.Fatalf("unbind must clear the whole binding incl. gateway host and manual flag: %+v", got)
 	}
 }
 
@@ -613,6 +615,8 @@ func TestValidProxyUpstream(t *testing.T) {
 		"127.0.0.1:0",
 		"127.0.0.1:65536",
 		"127.0.0.1:abc",
+		"127.0.0.1:+8080",
+		"127.0.0.1:+80",
 		"127.0.0.1:8080; rm -rf /",
 		"127.0.0.1:8080}",
 		"127.0.0.1:8080\nserver_name evil",
@@ -677,6 +681,60 @@ func TestSyncUpstreamPreservesManual(t *testing.T) {
 	got, err = ph.syncUpstream(empty, "local", "", "h0")
 	if err != nil || got != "127.0.0.1:8080" {
 		t.Errorf("local empty upstream: got %q, err %v, want 127.0.0.1:8080", got, err)
+	}
+}
+
+// TestSyncUpstreamManualFlag: a gateway upstream flagged manual survives
+// even when it names the old host on the first published port — the exact
+// collision the old-host heuristic would otherwise recompute away. The
+// old host's mesh IP is seeded through the network store so the heuristic
+// would fire for an unflagged record; the unflagged twin must instead
+// attempt recomputation (here it errors: nothing else resolves).
+func TestSyncUpstreamManualFlag(t *testing.T) {
+	ns, err := network.NewStore(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("network store: %v", err)
+	}
+	if err := ns.SetNodeStatus(network.NodeStatus{HostID: "h0", IP: "100.64.0.5"}); err != nil {
+		t.Fatalf("SetNodeStatus: %v", err)
+	}
+	reg := rpc.NewRegistry(t.TempDir(), nil)
+	ph := NewProxyHandler(reg, nil, nil)
+	ph.SetNetworkStore(ns)
+	manual := &Application{ID: "a1", HostID: "h2", ProxyUpstream: "100.64.0.5:8080", ProxyUpstreamManual: true, Ports: []PortMapping{{Host: 8080, Container: 80}}}
+	got, err := ph.syncUpstream(manual, "gateway", "gw1", "h0")
+	if err != nil || got != "100.64.0.5:8080" {
+		t.Errorf("manual gateway upstream: got %q, err %v, want 100.64.0.5:8080", got, err)
+	}
+	legacy := &Application{ID: "a2", HostID: "h2", ProxyUpstream: "100.64.0.5:8080", Ports: []PortMapping{{Host: 8080, Container: 80}}}
+	if got, err := ph.syncUpstream(legacy, "gateway", "gw1", "h0"); err == nil {
+		t.Errorf("legacy gateway upstream naming old host must recompute, got %q without error", got)
+	}
+}
+
+// TestReloadFailureImplicatesApp: compensation after a failed nginx -t must
+// only fire when the output names this app's conf or cert files — another
+// app's broken conf must not delete this app's good binding.
+func TestReloadFailureImplicatesApp(t *testing.T) {
+	conf := "/opt/apps/nginx/conf.d/watchman-app1.conf"
+	cases := []struct {
+		name   string
+		output string
+		pushed []string
+		want   bool
+	}{
+		{"own conf full path", "nginx: [emerg] unexpected end in /opt/apps/nginx/conf.d/watchman-app1.conf:12", nil, true},
+		{"own conf basename", "nginx: [emerg] directive error in watchman-app1.conf:3", nil, true},
+		{"own cert missing", "nginx: [emerg] cannot load certificate \"/opt/apps/nginx/certs/a.example.com.crt\"", []string{"a.example.com"}, true},
+		{"other app conf", "nginx: [emerg] unexpected end in /opt/apps/nginx/conf.d/watchman-app2.conf:12", []string{"a.example.com"}, false},
+		{"other app cert", "nginx: [emerg] cannot load certificate \"/opt/apps/nginx/certs/b.example.com.crt\"", []string{"a.example.com"}, false},
+		{"generic no file", "nginx: [emerg] unknown directive \"foo\"", []string{"a.example.com"}, false},
+		{"empty output", "", []string{"a.example.com"}, false},
+	}
+	for _, tc := range cases {
+		if got := reloadFailureImplicatesApp(tc.output, conf, tc.pushed); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

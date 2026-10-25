@@ -646,6 +646,13 @@ func (h *AppHandlers) deleteApp(c *gin.Context) {
 		var err error
 		warnings, err = h.purgeAppResources(app)
 		if err != nil {
+			// A volume op that started between the VolumeBusy check above
+			// and the purge's slot claim is the same 409 conflict, not a
+			// 503: the agent is fine, the app is just busy.
+			if errors.Is(err, errPurgeVolumeSlotBusy) {
+				c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+				return
+			}
 			// Agent offline etc: refuse so resources are not silently orphaned.
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return

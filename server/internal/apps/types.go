@@ -67,6 +67,16 @@ type Application struct {
 	ProxyMode          string          `json:"proxy_mode,omitempty"`            // "local" | "gateway"
 	ProxyGatewayHostID string          `json:"proxy_gateway_host_id,omitempty"` // gateway node host id
 	ProxyUpstream      string          `json:"proxy_upstream,omitempty"`        // e.g. "127.0.0.1:8080" or mesh IP
+	// ProxyUpstreamManual records that ProxyUpstream was supplied by the
+	// operator at bind time (req.Upstream non-empty) rather than computed
+	// by defaultUpstream. SyncProxyForHost's gateway branch honors it by
+	// keeping the stored value verbatim across migrations; without it the
+	// old-host heuristic could recompute away a manual value that happens
+	// to collide with the old host + first published port, or preserve a
+	// computed value whose host IP has since drifted. Legacy records
+	// (false) keep the heuristic. Cleared on unbind with the rest of the
+	// binding.
+	ProxyUpstreamManual bool `json:"proxy_upstream_manual,omitempty"`
 	// ProxyWebSocket persists the bind-time WebSocket choice (Upgrade /
 	// Connection headers + 300s read timeout). It must survive migrations:
 	// SyncProxyForHost used to hardcode websocket=true, silently flipping

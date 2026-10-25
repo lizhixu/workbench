@@ -25,9 +25,11 @@ var reservedNetworks []*net.IPNet
 
 func init() {
 	for _, cidr := range []string{
+		"0.0.0.0/8",       // "this network" (RFC 791): 0.x routes to the local host on Linux, not just 0.0.0.0 itself
 		"100.64.0.0/10",   // CGNAT shared address space
 		"192.0.0.0/24",    // IETF protocol assignments
 		"192.0.2.0/24",    // TEST-NET-1 (documentation)
+		"198.18.0.0/15",   // benchmarking range (RFC 2544): routinely routed to the local host
 		"198.51.100.0/24", // TEST-NET-2 (documentation)
 		"203.0.113.0/24",  // TEST-NET-3 (documentation)
 		"240.0.0.0/4",     // reserved + limited broadcast

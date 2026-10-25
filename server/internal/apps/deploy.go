@@ -450,9 +450,14 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 		// The app may have been deleted while `up` was running: do not
 		// leave an orphan stack behind a deleted record.
 		if _, ok := e.store.GetApp(app.ID); !ok {
-			_, _ = execOnAgent(hub, "compose-down-"+randomToken(4),
+			downRes, downErr := execOnAgent(hub, "compose-down-"+randomToken(4),
 				fmt.Sprintf("docker compose -f %s -p %s down", shellQuote(composePath), shellQuote("watchman-"+app.ID)), 60)
-			fail("应用在部署期间已被删除，部署已中止")
+			if downErr != nil || downRes.GetExitCode() != 0 {
+				logBuf.WriteString(fmt.Sprintf("WARN: 应用已删除但清理 Compose 栈失败: %v\n", firstErr(downErr, downRes)))
+				fail("应用在部署期间已被删除，部署已中止；清理 Compose 栈失败，栈可能仍在运行，请手动执行 docker compose down 清理")
+			} else {
+				fail("应用在部署期间已被删除，部署已中止")
+			}
 			return
 		}
 		if ctx.Err() != nil {
@@ -586,9 +591,14 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 			return
 		}
 		if _, ok := e.store.GetApp(app.ID); !ok {
-			_, _ = execOnAgent(hub, "compose-down-"+randomToken(4),
+			downRes, downErr := execOnAgent(hub, "compose-down-"+randomToken(4),
 				fmt.Sprintf("cd %s && docker compose -f %s -p %s down", shellQuote(repoDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID)), 60)
-			fail("应用在部署期间已被删除，部署已中止")
+			if downErr != nil || downRes.GetExitCode() != 0 {
+				logBuf.WriteString(fmt.Sprintf("WARN: 应用已删除但清理 Compose 栈失败: %v\n", firstErr(downErr, downRes)))
+				fail("应用在部署期间已被删除，部署已中止；清理 Compose 栈失败，栈可能仍在运行，请手动执行 docker compose down 清理")
+			} else {
+				fail("应用在部署期间已被删除，部署已中止")
+			}
 			return
 		}
 		if ctx.Err() != nil {

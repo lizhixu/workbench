@@ -229,13 +229,13 @@ export interface ProxyBindRequest {
 }
 
 export function bindProxy(appId: string, req: ProxyBindRequest) {
-  return unwrap<{ ok: boolean; domains?: DomainBinding[]; domain?: string; mode: string; upstream: string }>(
+  return unwrap<{ ok: boolean; domains?: DomainBinding[]; domain?: string; mode: string; upstream: string; warnings?: string[] }>(
     http.put(`/apps/${appId}/proxy`, req),
   )
 }
 
 export function unbindProxy(appId: string) {
-  return unwrap<{ ok: boolean }>(http.delete(`/apps/${appId}/proxy`))
+  return unwrap<{ ok: boolean; warnings?: string[] }>(http.delete(`/apps/${appId}/proxy`))
 }
 
 // ---- 面板一键证书签发 ----

@@ -15,10 +15,11 @@ type Handlers struct {
 	// issuing serializes Issue/Renew calls: ACME rate limits are strict and
 	// two concurrent wildcard orders for the same zone would race.
 	mu sync.Mutex
-	// panelCertInfo resolves (bound cert id, panel domain) from the panel
-	// security settings for the used-by reverse lookup; injected at wiring
-	// time to keep the cert package decoupled from the settings store.
-	panelCertInfo func() (certID, domain string)
+	// panelCertInfo resolves the panel's certificate binding from the panel
+	// security settings for the used-by reverse lookup and the delete
+	// guard; injected at wiring time to keep the cert package decoupled
+	// from the settings store.
+	panelCertInfo func() PanelCertBinding
 	// appDomains lists deployed applications with a bound domain, for the
 	// same used-by lookup (one ref per domain binding, CertID included).
 	appDomains func() []AppDomainRef
@@ -28,9 +29,23 @@ type Handlers struct {
 	clearAppCertBindings func(certID string) []string
 }
 
+// PanelCertBinding describes how the panel security settings reference a
+// certificate. CertID is the explicitly bound certificate id ("" when
+// unbound) and Domain is the panel domain used for the SNI-fallback
+// display. Active reports whether the panel actually serves that
+// certificate right now: SSL enabled with a cert_center source. A stale
+// SSLCertID left behind after switching to custom PEM (or after disabling
+// SSL) must not keep blocking deletes of a certificate the panel no
+// longer uses — the guard only fires for an active binding.
+type PanelCertBinding struct {
+	CertID string
+	Domain string
+	Active bool
+}
+
 // NewHandlers creates the certificate hub handlers. Both lookup deps may be
 // nil (unit tests); the detail endpoint then simply omits those predicates.
-func NewHandlers(hub *Hub, panelCertInfo func() (string, string), appDomains func() []AppDomainRef) *Handlers {
+func NewHandlers(hub *Hub, panelCertInfo func() PanelCertBinding, appDomains func() []AppDomainRef) *Handlers {
 	return &Handlers{hub: hub, panelCertInfo: panelCertInfo, appDomains: appDomains}
 }
 
@@ -249,7 +264,8 @@ func (h *Handlers) getCert(c *gin.Context) {
 func (h *Handlers) getCertDetail(c *gin.Context) {
 	var certID, domain string
 	if h.panelCertInfo != nil {
-		certID, domain = h.panelCertInfo()
+		binding := h.panelCertInfo()
+		certID, domain = binding.CertID, binding.Domain
 	}
 	var apps []AppDomainRef
 	if h.appDomains != nil {
@@ -439,13 +455,16 @@ func (h *Handlers) renewCert(c *gin.Context) {
 //
 // Two guards protect certificates that are still in use:
 //
-//   - Panel binding: when the panel security settings explicitly bind this
-//     certificate (panelCertInfo), the delete is refused (409) and
-//     ?force=true does NOT override it. The panel certificate can only be
-//     unbound from the panel security settings; deleting it out from under
-//     a running panel would make panelsec silently fall back to another
-//     certificate (or fail outright once the hub is empty), so the operator
-//     must unbind it there first.
+//   - Panel binding: when the panel security settings actively serve this
+//     certificate (panelCertInfo with Active set: SSL enabled, cert_center
+//     mode), the delete is refused (409) and ?force=true does NOT override
+//     it. The panel certificate can only be unbound from the panel
+//     security settings; deleting it out from under a running panel would
+//     make panelsec silently fall back to another certificate (or fail
+//     outright once the hub is empty), so the operator must unbind it
+//     there first. A stale SSLCertID left after switching to custom PEM
+//     or disabling SSL is not an active binding and does not block the
+//     delete.
 //   - App domain bindings: when an app domain explicitly references the
 //     certificate, the delete is refused (409) with the app names so the
 //     operator rebinds those domains first; ?force=true clears the
@@ -455,7 +474,7 @@ func (h *Handlers) renewCert(c *gin.Context) {
 func (h *Handlers) deleteCert(c *gin.Context) {
 	id := c.Param("id")
 	if h.panelCertInfo != nil {
-		if panelCertID, _ := h.panelCertInfo(); panelCertID != "" && panelCertID == id {
+		if binding := h.panelCertInfo(); binding.Active && binding.CertID != "" && binding.CertID == id {
 			c.JSON(http.StatusConflict, gin.H{"error": "该证书正被面板证书绑定使用（系统设置 → 面板域名与证书）。请先解除面板证书绑定后再删除；force 参数不适用于面板绑定证书"})
 			return
 		}

@@ -1,9 +1,17 @@
 package apps
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
+
+// errPurgeVolumeSlotBusy marks a purge refused because a volume backup or
+// restore holds the app's volume slot. deleteApp maps this sentinel to 409
+// (same cause as its up-front VolumeBusy check); every other purge error
+// still maps to 503, so the distinction must stay on errors.Is, not on
+// string matching.
+var errPurgeVolumeSlotBusy = errors.New("应用正在执行数据卷备份或恢复，请稍后再删除")
 
 // purgeAppResources removes the runtime resources an application created on
 // its host: the single container, the compose project (containers, networks,
@@ -24,7 +32,7 @@ func (h *AppHandlers) purgeAppResources(app *Application) ([]string, error) {
 	// re-creating archive metadata after it is dropped below.
 	if h.engine != nil {
 		if !h.engine.acquireVolumeSlot(app.ID) {
-			return nil, fmt.Errorf("应用正在执行数据卷备份或恢复，请稍后再删除")
+			return nil, errPurgeVolumeSlotBusy
 		}
 		defer h.engine.releaseVolumeSlot(app.ID)
 	}

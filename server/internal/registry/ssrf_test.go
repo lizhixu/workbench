@@ -41,6 +41,9 @@ func TestIsPublicIP(t *testing.T) {
 		{"169.254.169.254", false}, // cloud metadata endpoint
 		{"100.64.0.1", false},      // CGNAT shared space
 		{"0.0.0.0", false},
+		{"0.1.2.3", false},    // 0.0.0.0/8 "this network" routes to the local host on Linux
+		{"198.18.0.1", false}, // benchmarking range (RFC 2544)
+		{"198.19.255.255", false},
 		{"::1", false},
 		{"fe80::1", false},
 		{"fc00::1", false},
@@ -68,8 +71,10 @@ func TestValidatePublicHost(t *testing.T) {
 	}{
 		{"8.8.8.8:443", false},
 		{"[2606:4700:4700::1111]:443", false},
-		{"10.1.2.3:5000", true},  // private literal
-		{"127.0.0.1:5000", true}, // loopback literal
+		{"10.1.2.3:5000", true},   // private literal
+		{"127.0.0.1:5000", true},  // loopback literal
+		{"0.1.2.3:5000", true},    // "this network" literal
+		{"198.18.0.1:5000", true}, // benchmarking literal
 		{"public.example.com:443", false},
 		{"evil.example.com:443", true},  // DNS resolves private
 		{"mixed.example.com:443", true}, // any private answer fails closed

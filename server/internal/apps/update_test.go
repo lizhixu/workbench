@@ -302,6 +302,26 @@ func TestLoadAppsBackfillsUpdatedAt(t *testing.T) {
 // (trigger=create) and returns the record. With no agent attached the
 // pipeline fails asynchronously — the create response must still be a success
 // carrying the deployment, because the app record is valid on its own.
+//
+// The test must not return while the pipeline goroutine can still write to
+// the store dir: its status writes race t.TempDir's RemoveAll cleanup
+// ("directory not empty"). Waiting for the pipeline's own terminal state is
+// NOT the fix here — on a streamless hub the first agent exec blocks for
+// its full timeout (docker-run 120s + 30s grace = 150s) before failing, so
+// a terminal-state poll would stall every run for minutes.
+//
+// The race is subtler than "guarded writes are no-ops": cancelling
+// immediately after create is not enough either. The pipeline goroutine may
+// not have run yet when the test cancels, and under load it can wake up
+// AFTER the test returns: its first setDeploymentStatus(Building) is
+// terminal-guarded in memory, but Store.UpdateDeployment still rewrites
+// app_deployments.jsonl (tmp file + rename) even when the mutate was a
+// no-op — recreating the file mid-RemoveAll. The reliable gate is to wait
+// until the goroutine has demonstrably passed every pre-exec status write
+// (Queued → Building → Deploying) and is blocked inside the first agent
+// exec: from there no further store write can land until the 150s exec
+// timeout, long after cleanup has finished. So: poll for Deploying, then
+// cancel, then poll for terminal.
 func TestCreateAppStartsDeployment(t *testing.T) {
 	store, err := NewStore(t.TempDir(), slog.Default())
 	if err != nil {
@@ -357,5 +377,49 @@ func TestCreateAppStartsDeployment(t *testing.T) {
 	}
 	if got, ok := store.GetDeployment(body.Data.ID, body.Deployment.ID); !ok || got == nil {
 		t.Fatal("deployment record must be persisted")
+	}
+	// Gate on Deploying before cancelling (see the doc comment above):
+	// only once the pipeline goroutine has passed its pre-exec status
+	// writes and is blocked in the first agent exec is it safe to cancel
+	// and return — a goroutine that has not run yet would otherwise do
+	// its (guarded but still file-rewriting) first status write during
+	// TempDir cleanup.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got, ok := store.GetDeployment(body.Data.ID, body.Deployment.ID)
+		if !ok || got == nil {
+			t.Fatal("deployment record disappeared while waiting for deploying state")
+		}
+		if got.Status == DeployDeploying {
+			break
+		}
+		if isTerminalDeploymentStatus(got.Status) {
+			t.Fatalf("deployment reached terminal state %q before deploying, want %q", got.Status, DeployDeploying)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("deployment did not reach deploying state within 10s, last status %q", got.Status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Cancel the run before returning: the cancel finalizes the record
+	// synchronously, and the goroutine is now blocked in the agent exec,
+	// so no further store write can land until its 150s timeout — long
+	// after TempDir cleanup has finished.
+	if !engine.CancelDeployment(body.Data.ID, "test") {
+		t.Fatal("expected the deploying deployment to still be running so the test can cancel it")
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		got, ok := store.GetDeployment(body.Data.ID, body.Deployment.ID)
+		if !ok || got == nil {
+			t.Fatal("deployment record disappeared while waiting for terminal state")
+		}
+		if isTerminalDeploymentStatus(got.Status) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cancelled deployment did not reach a terminal state within 10s, last status %q", got.Status)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

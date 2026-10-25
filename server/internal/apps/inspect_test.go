@@ -97,3 +97,18 @@ func TestInspectHandlersRateLimit(t *testing.T) {
 	}
 	probeLimiter = newProbeRateLimiter(30, time.Minute)
 }
+
+// TestProbeLimiterProductionValue pins the production probe quota: 30 probes
+// per user per minute (inspect.go's package-level probeLimiter). The
+// mechanism tests above inject smaller limiters, so every test that
+// reassigns probeLimiter must restore the production value before it
+// returns — this assertion reads the shared variable and fails if a test
+// leaks a different limiter or if the production value itself drifts.
+func TestProbeLimiterProductionValue(t *testing.T) {
+	if probeLimiter.limit != 30 {
+		t.Errorf("production probe limit = %d, want 30", probeLimiter.limit)
+	}
+	if probeLimiter.window != time.Minute {
+		t.Errorf("production probe window = %v, want 1m", probeLimiter.window)
+	}
+}

@@ -393,7 +393,7 @@ async function doBindProxy() {
   try {
     // 绑定响应可能带 warnings（旧目标主机离线、旧配置残留等）：绑定本身
     // 已生效，但残留必须让用户看见，不能只报“已下发”。
-    const res = (await bindProxy(appId.value, {
+    const res = await bindProxy(appId.value, {
       domains: proxyForm.value.domains.map((r) => ({
         domain: r.domain.trim().toLowerCase(),
         cert_id: r.cert_id,
@@ -402,7 +402,7 @@ async function doBindProxy() {
       gateway_host_id: proxyForm.value.gateway_host_id || undefined,
       upstream: proxyForm.value.upstream.trim() || undefined,
       websocket: proxyForm.value.websocket,
-    })) as unknown as { warnings?: string[] }
+    })
     message.success('反代配置已下发')
     if (res.warnings && res.warnings.length > 0) {
       message.warning(`反代已生效，但有残留未清理：${res.warnings.join('；')}`)
@@ -418,7 +418,7 @@ async function doBindProxy() {
 async function doUnbindProxy() {
   savingProxy.value = true
   try {
-    const res = (await unbindProxy(appId.value)) as unknown as { warnings?: string[] }
+    const res = await unbindProxy(appId.value)
     message.success('已解除域名绑定')
     if (res.warnings && res.warnings.length > 0) {
       message.warning(`绑定记录已清除，但以下主机上的旧配置未能清理：${res.warnings.join('；')}`)

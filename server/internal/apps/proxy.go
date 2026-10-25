@@ -320,6 +320,10 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		a.ProxyDomains = bindings
 		a.ProxyMode = mode
 		a.ProxyUpstream = upstream
+		// Only an operator-supplied upstream counts as manual: a computed
+		// upstream must stay recomputable on the next migration, so a
+		// rebind without an explicit upstream clears the flag.
+		a.ProxyUpstreamManual = strings.TrimSpace(req.Upstream) != ""
 		a.ProxyWebSocket = req.WebSocket
 		if mode == "gateway" {
 			a.ProxyGatewayHostID = req.GatewayHostID
@@ -408,6 +412,7 @@ func (h *ProxyHandler) unbindProxy(c *gin.Context) {
 		a.ProxyDomains = nil
 		a.ProxyMode = ""
 		a.ProxyUpstream = ""
+		a.ProxyUpstreamManual = false
 		a.ProxyWebSocket = nil
 		// The gateway host must go too, or a later rebind would leave the
 		// stale gateway id behind (and the app detail would keep showing a
@@ -578,8 +583,11 @@ func (h *ProxyHandler) SyncProxyForHost(app *Application, oldHostID string) erro
 // port) must survive a migration, and recomputing would silently rewrite it
 // to the first published port. The one exception is a gateway upstream that
 // still names the previous app host — that value was computed, not chosen,
-// and keeping it would point the gateway at the host the app just left.
-// Empty or malformed stored values fall back to defaultUpstream.
+// and keeping it would point the gateway at the host the app just left —
+// unless ProxyUpstreamManual says the operator chose it, in which case the
+// collision is intentional and the value is kept verbatim. Legacy records
+// (manual flag false) keep the heuristic. Empty or malformed stored values
+// fall back to defaultUpstream.
 func (h *ProxyHandler) syncUpstream(app *Application, mode, gatewayHostID, oldHostID string) (string, error) {
 	stored := strings.TrimSpace(app.ProxyUpstream)
 	if stored == "" || !validProxyUpstream(stored) {
@@ -588,6 +596,11 @@ func (h *ProxyHandler) syncUpstream(app *Application, mode, gatewayHostID, oldHo
 	if mode == "local" {
 		// Loopback upstreams are host-independent: the stored value stays
 		// valid on the new host, manual or computed.
+		return stored, nil
+	}
+	if app.ProxyUpstreamManual {
+		// Operator-chosen: never recompute, even if it happens to name the
+		// old host on the first published port.
 		return stored, nil
 	}
 	if oldHostID != "" && oldHostID != app.HostID {
@@ -641,12 +654,21 @@ func syncFirstPort(app *Application) int {
 // attempt, and nginx is reloaded once more so a broken file never lingers
 // in conf.d to fail every later nginx -t on this host. The original error
 // is what the caller reports — compensation failures must not mask it.
-// Note the asymmetry that makes this safe: the conf path is overwritten by
-// the new render, so deleting it cannot destroy a still-valid old conf;
-// but when the failure happened before any conf write, the old conf is
-// still live and still references the old cert paths, so pushed certs are
-// left alone in that case (the new certs were validated to cover their
-// domains, and the divergence heals on the next successful bind).
+// Two guard rails keep compensation from destroying a working binding:
+//   - confWritten is set only AFTER the conf write succeeds. A failure
+//     before that point (agent open failure, ack timeout) leaves the old
+//     conf live and still referencing the old cert paths, so pushed certs
+//     are left alone in that case (the new certs were validated to cover
+//     their domains, and the divergence heals on the next successful bind).
+//     Setting the flag before the write used to delete the intact old conf
+//     plus the new certs on exactly this path.
+//   - a reload (-t) failure is compensated only when the -t output actually
+//     implicates this app (its conf file or one of its pushed cert files,
+//     see reloadFailureImplicatesApp). Another app's broken conf failing
+//     -t must not delete this app's good conf + certs: compensation would
+//     turn someone else's breakage into an outage for this binding, and the
+//     follow-up reload would fail again on the same foreign conf anyway.
+//     The skipped compensation is logged; the original error still surfaces.
 func (h *ProxyHandler) pushVhost(agentHub *rpc.Hub, appID string, pairs []domainCertPair, upstream string, websocket bool) error {
 	pushed := make([]string, 0, len(pairs))
 	confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, appID)
@@ -659,19 +681,50 @@ func (h *ProxyHandler) pushVhost(agentHub *rpc.Hub, appID string, pairs []domain
 			pushed = append(pushed, p.binding.Domain)
 		}
 		conf := renderVhosts(bindingList(pairs), upstream, websocket)
-		confWritten = true
 		if err := writeFileOnAgent(agentHub, confPath, []byte(conf)); err != nil {
 			return fmt.Errorf("推送反代配置失败: %w", err)
 		}
+		confWritten = true
 		return h.reloadNginx(agentHub)
 	}()
 	if pushErr != nil && confWritten {
-		h.removeProxyFiles(agentHub, confPath, pushed)
-		// Best-effort: restore nginx to a config that passes -t. Ignored
-		// on purpose — the original push error is the one that matters.
-		_ = h.reloadNginx(agentHub)
+		var nerr *nginxReloadError
+		if errors.As(pushErr, &nerr) && !reloadFailureImplicatesApp(nerr.output, confPath, pushed) {
+			h.log.Warn("nginx 校验失败未归因到本次应用，跳过反代补偿删除（保留本次写入的 conf 与证书）",
+				"app_id", appID, "error", pushErr.Error())
+		} else {
+			h.removeProxyFiles(agentHub, confPath, pushed)
+			// Best-effort: restore nginx to a config that passes -t. Ignored
+			// on purpose — the original push error is the one that matters.
+			_ = h.reloadNginx(agentHub)
+		}
 	}
 	return pushErr
+}
+
+// reloadFailureImplicatesApp reports whether an nginx -t failure output
+// names this app's own files: its vhost conf, or any cert/key pushed in
+// this attempt (a conf failing -t because its cert is missing names the
+// cert path, not the conf). Anything else — another app's broken conf, a
+// generic emerg line naming no file — is not this app's fault, and
+// compensating would delete a good binding to no effect.
+func reloadFailureImplicatesApp(output, confPath string, pushedDomains []string) bool {
+	if strings.Contains(output, confPath) {
+		return true
+	}
+	// nginx -t usually prints the conf basename, not the full path.
+	if base := confPath[strings.LastIndex(confPath, "/")+1:]; base != "" && strings.Contains(output, base) {
+		return true
+	}
+	for _, d := range pushedDomains {
+		if d == "" {
+			continue
+		}
+		if strings.Contains(output, d+".crt") || strings.Contains(output, d+".key") {
+			return true
+		}
+	}
+	return false
 }
 
 // removeProxyFiles deletes one vhost conf plus the given domains' cert/key
@@ -821,6 +874,16 @@ func validProxyUpstream(u string) bool {
 	host, portStr, err := net.SplitHostPort(u)
 	if err != nil || host == "" {
 		return false
+	}
+	// strconv.Atoi accepts a leading sign ("+8080"), which nginx rejects —
+	// the port must be all digits before the range check.
+	if portStr == "" {
+		return false
+	}
+	for i := 0; i < len(portStr); i++ {
+		if portStr[i] < '0' || portStr[i] > '9' {
+			return false
+		}
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port < 1 || port > 65535 {
@@ -1083,6 +1146,18 @@ func proxyPullFailure(stderr string) bool {
 	return false
 }
 
+// nginxReloadError carries an nginx -t/reload failure together with the
+// raw -t output, so pushVhost can attribute the failure (errors.As) before
+// deciding whether compensation is safe. A plain wrapped string would lose
+// the output to the caller-visible message alone.
+type nginxReloadError struct {
+	output string
+}
+
+func (e *nginxReloadError) Error() string {
+	return fmt.Sprintf("nginx 配置校验失败: %s", e.output)
+}
+
 // reloadNginx validates the pushed config (nginx -t) and hot-reloads nginx in
 // the proxy container. Shared by the bind flow and the renewal re-push.
 func (h *ProxyHandler) reloadNginx(agentHub *rpc.Hub) error {
@@ -1098,7 +1173,7 @@ func (h *ProxyHandler) reloadNginx(agentHub *rpc.Hub) error {
 		if out == "" {
 			out = string(res.GetStderr())
 		}
-		return fmt.Errorf("nginx 配置校验失败: %s", strings.TrimSpace(out))
+		return &nginxReloadError{output: strings.TrimSpace(out)}
 	}
 	return nil
 }

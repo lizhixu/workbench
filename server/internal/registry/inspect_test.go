@@ -148,7 +148,7 @@ func TestInspectAgainstMockSingleArch(t *testing.T) {
 	srv := mockRegistry(t, false)
 	defer srv.Close()
 
-	c := &Client{Scheme: "http"}
+	c := &Client{Scheme: "http", allowPrivateHosts: true} // mock server runs on loopback
 	ref := Reference{Registry: srv.Listener.Addr().String(), Repository: "xerxes-2/clewdr", Tag: "latest"}
 	meta, err := c.inspectAgainst(context.Background(), ref, ref.Registry)
 	if err != nil {
@@ -184,7 +184,7 @@ func TestInspectAgainstMockIndexPicksAmd64(t *testing.T) {
 	srv := mockRegistry(t, true)
 	defer srv.Close()
 
-	c := &Client{Scheme: "http"}
+	c := &Client{Scheme: "http", allowPrivateHosts: true} // mock server runs on loopback
 	ref := Reference{Registry: srv.Listener.Addr().String(), Repository: "xerxes-2/clewdr", Tag: "latest"}
 	meta, err := c.inspectAgainst(context.Background(), ref, ref.Registry)
 	if err != nil {
@@ -202,7 +202,7 @@ func TestInspectNotFound(t *testing.T) {
 	srv := mockRegistry(t, false)
 	defer srv.Close()
 
-	c := &Client{Scheme: "http"}
+	c := &Client{Scheme: "http", allowPrivateHosts: true} // mock server runs on loopback
 	ref := Reference{Registry: srv.Listener.Addr().String(), Repository: "not/exist", Tag: "v9"}
 	_, err := c.inspectAgainst(context.Background(), ref, ref.Registry)
 	if err == nil {

@@ -40,6 +40,15 @@ func (e *Engine) StartMigration(app *Application, req MigrateAppReq, startedBy s
 	if ag := e.reg.GetAgent(req.TargetHostID); ag != nil && strings.EqualFold(ag.OS, "windows") {
 		return nil, fmt.Errorf("目标主机为 Windows 系统,暂不支持容器反代与迁移")
 	}
+	// The source must be reachable too: without it stage 1 cannot stop the
+	// source container, and a volumeless migration would otherwise "succeed"
+	// while the source instance keeps running — a live dual-active pair.
+	if e.hubFor(app.HostID) == nil {
+		return nil, fmt.Errorf("源主机 Agent 不在线")
+	}
+	if ag := e.reg.GetAgent(app.HostID); ag != nil && strings.EqualFold(ag.OS, "windows") {
+		return nil, fmt.Errorf("源主机为 Windows 系统,暂不支持容器反代与迁移")
+	}
 	if e.IsRunning(app.ID) {
 		return nil, fmt.Errorf("该应用已有部署或迁移任务在执行")
 	}
@@ -189,6 +198,63 @@ func intsToCSV(in []int) string {
 	return strings.Join(parts, ", ")
 }
 
+// migratedVolumeData records one volume unpacked onto the target during this
+// run so rollback can remove exactly the files this run wrote. The whole
+// target directory is never wiped: a pre-existing target directory may hold
+// data the migration never touched, and deleting it would destroy data the
+// migration itself did not overwrite.
+type migratedVolumeData struct {
+	tgtDir string
+	files  []string
+}
+
+// parseTarMembers extracts the file members of a tar listing (tar -tzf
+// output): directory entries, absolute paths, parent traversals and
+// control-character names are dropped — rollback must only ever delete
+// paths strictly under the volume's target directory.
+func parseTarMembers(out string) []string {
+	var members []string
+	for _, line := range strings.Split(out, "\n") {
+		m := strings.TrimPrefix(strings.TrimSpace(line), "./")
+		if m == "" || m == "." || strings.HasSuffix(m, "/") ||
+			strings.HasPrefix(m, "/") || strings.Contains(m, "\n") || strings.Contains(m, "\r") {
+			continue
+		}
+		bad := false
+		for _, part := range strings.Split(m, "/") {
+			if part == ".." {
+				bad = true
+				break
+			}
+		}
+		if bad {
+			continue
+		}
+		members = append(members, m)
+	}
+	return members
+}
+
+// targetContainerCleanupScript removes the app's container plus any -next
+// replacement containers (legacy unsuffixed and new dep-suffixed names).
+// The -next match uses a docker name filter, not a shell glob: globs expand
+// against filenames, never container names.
+func targetContainerCleanupScript(container string) string {
+	return fmt.Sprintf("docker rm -f %s 2>/dev/null || true; for id in $(docker ps -aq --filter %s); do docker rm -f $id 2>/dev/null || true; done",
+		shellQuote(container), shellQuote("name=^/"+container+"-next"))
+}
+
+// gitComposeFile resolves the compose file of a git-backed compose app, with
+// the same defaulting as the deploy path (Dockerfile field holds the compose
+// file path for compose builds; empty or "Dockerfile" means compose.yaml).
+func gitComposeFile(app *Application) string {
+	f := app.Dockerfile
+	if f == "" || f == "Dockerfile" {
+		return "compose.yaml"
+	}
+	return f
+}
+
 // runMigration drives the whole migration: quiesce source, sync volumes,
 // rebind + reroute, deploy on target, optional source cleanup. Any failure
 // rolls the app back onto the source host so it never ends up half-moved.
@@ -202,13 +268,6 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 	fail := func(format string, args ...any) {
 		e.fail(app, dep, logBuf, fmt.Sprintf(format, args...))
 	}
-	cancelled := func() bool {
-		if ctx.Err() == nil {
-			return false
-		}
-		e.cleanupCancelled(app, dep, e.reg.Hub(app.HostID), "", "", logBuf)
-		return true
-	}
 
 	oldHostID := app.HostID
 	targetHostID := req.TargetHostID
@@ -217,6 +276,10 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 		container = "watchman-app-" + app.ID
 	}
 	composePath := fmt.Sprintf("/var/lib/watchman/apps/%s/compose.yaml", app.ID)
+	repoDir := fmt.Sprintf("/var/lib/watchman/apps/%s/repo", app.ID)
+
+	// Volumes unpacked onto the target by this run, for rollback cleanup.
+	var migrated []migratedVolumeData
 
 	sourceHub := e.hubFor(oldHostID)
 	targetHub := e.hubFor(targetHostID)
@@ -224,14 +287,141 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 		fail("目标主机 Agent 不在线")
 		return
 	}
+	// The source may have gone offline between acceptance (which now checks
+	// it) and this goroutine starting: nothing has moved yet, so fail
+	// without rolling back rather than proceeding into a dual-active pair.
+	if sourceHub == nil {
+		fail("源主机 Agent 不在线")
+		return
+	}
 
 	logBuf.WriteString(fmt.Sprintf("[MIGRATE] 服务迁移 %s: %s -> %s\n", app.Name, oldHostID, targetHostID))
 	logBuf.WriteString(fmt.Sprintf("[MIGRATE] 迁移数据卷=%v 清理源容器=%v\n", req.MigrateVolumes, req.CleanSource))
 	_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployBuilding })
 
+	// rollback undoes a half-finished migration: host binding, proxy and
+	// relay back to the source, source container restarted, target residue
+	// (including this run's unpacked volume files) removed. It returns the
+	// steps that failed so the caller can stamp "rollback incomplete" onto
+	// the record — a rollback that itself failed must never look like a
+	// clean failure-with-rollback.
+	sourceWasRunning := false
+	rollback := func(cause error) []string {
+		var issues []string
+		logBuf.WriteString(fmt.Sprintf("\n[ROLLBACK] 迁移失败: %v\n[ROLLBACK] 回滚应用至源主机 %s\n", cause, oldHostID))
+		if app.HostID != oldHostID {
+			_ = e.store.UpdateApp(app.ID, func(a *Application) error {
+				a.HostID = oldHostID
+				return nil
+			})
+			app.HostID = oldHostID
+		}
+		if e.proxy != nil && len(app.ProxyDomains) > 0 {
+			if err := e.proxy.SyncProxyForHost(app, targetHostID); err != nil {
+				issues = append(issues, fmt.Sprintf("反向代理指回失败: %v", err))
+				logBuf.WriteString(fmt.Sprintf("WARN: 回滚反向代理失败: %v\n", err))
+			} else {
+				logBuf.WriteString("[ROLLBACK] 反向代理已指回源主机\n")
+			}
+		}
+		if app.MeshForwardEnabled {
+			if err := e.syncMeshForwarder(app, logBuf); err != nil {
+				issues = append(issues, fmt.Sprintf("组网转发重定向失败: %v", err))
+			}
+		}
+		if sourceWasRunning && sourceHub != nil {
+			restartCmd := fmt.Sprintf("docker start %s", shellQuote(container))
+			if app.SourceType == "raw_compose" {
+				restartCmd = fmt.Sprintf("docker compose -f %s up -d", shellQuote(composePath))
+			}
+			restartRes, restartErr := execOnAgent(sourceHub, "mig-rb-start-"+randomToken(4), restartCmd, 90)
+			if restartErr != nil || restartRes.GetExitCode() != 0 {
+				issues = append(issues, fmt.Sprintf("源主机容器重启失败: %v", firstErr(restartErr, restartRes)))
+				logBuf.WriteString(fmt.Sprintf("WARN: 重启源主机容器失败: %v\n", firstErr(restartErr, restartRes)))
+			} else {
+				logBuf.WriteString("[ROLLBACK] 源主机容器已重新启动\n")
+			}
+		}
+		if targetHub != nil {
+			cleanCmd := targetContainerCleanupScript(container)
+			if app.SourceType == "raw_compose" {
+				cleanCmd = fmt.Sprintf("docker compose -f %s down 2>/dev/null || true", shellQuote(composePath))
+			} else if app.SourceType == "git" && app.BuildType == "compose" {
+				// A git-backed compose stack is not a single container:
+				// `docker rm` would miss every <project>-<service>-1
+				// container, so bring the stack down instead.
+				cleanCmd = fmt.Sprintf("cd %s && docker compose -f %s -p %s down 2>/dev/null || true",
+					shellQuote(repoDir), shellQuote(gitComposeFile(app)), shellQuote("watchman-"+app.ID))
+			}
+			cleanRes, cleanErr := execOnAgent(targetHub, "mig-rb-clean-"+randomToken(4), cleanCmd, 60)
+			if cleanErr != nil || cleanRes.GetExitCode() != 0 {
+				issues = append(issues, fmt.Sprintf("目标主机残留清理失败: %v", firstErr(cleanErr, cleanRes)))
+				logBuf.WriteString(fmt.Sprintf("WARN: 清理目标主机残留容器失败: %v\n", firstErr(cleanErr, cleanRes)))
+			}
+			// Remove exactly the files this run unpacked onto the target:
+			// a retry must not eat stale data, and wiping the whole
+			// directory could destroy pre-existing target data.
+			for _, mv := range migrated {
+				if len(mv.files) == 0 {
+					continue
+				}
+				var sb strings.Builder
+				sb.WriteString("set -e\n")
+				for _, f := range mv.files {
+					sb.WriteString(fmt.Sprintf("rm -f %s\n", shellQuote(strings.TrimSuffix(mv.tgtDir, "/")+"/"+f)))
+				}
+				if _, err := execOnAgent(targetHub, "mig-rb-vol-"+randomToken(4), sb.String(), 120); err != nil {
+					issues = append(issues, fmt.Sprintf("目标卷数据清理失败(%s): %v", mv.tgtDir, err))
+					logBuf.WriteString(fmt.Sprintf("WARN: 回滚清理目标卷数据失败(%s): %v\n", mv.tgtDir, err))
+				}
+			}
+		}
+		return issues
+	}
+
+	// failRollback records the failure, rolls back, and stamps the record
+	// when rollback itself was incomplete.
+	failRollback := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		fail("%s", msg)
+		e.markRollbackIncomplete(app, dep, rollback(fmt.Errorf("%s", msg)))
+	}
+
+	// cancelled finalizes a cancelled run. Before the host switch it rolls
+	// back first (restart the stopped source container, clean target
+	// residue) and only then marks cancelled — a cancel must not leave the
+	// service stopped on the source behind a bare "cancelled" record.
+	cancelled := func() bool {
+		if ctx.Err() == nil {
+			return false
+		}
+		issues := rollback(fmt.Errorf("操作已取消"))
+		e.cleanupCancelled(app, dep, nil, "", "", logBuf)
+		// cleanupCancelled rewrote Error, so re-stamp the rollback marker.
+		e.markRollbackIncomplete(app, dep, issues)
+		return true
+	}
+
+	// abortIfGone stops the run when the application record vanished
+	// mid-run (a delete that raced the start): continuing would deploy,
+	// reroute or clean up resources for an app that no longer exists.
+	abortIfGone := func() bool {
+		if _, ok := e.store.GetApp(app.ID); ok {
+			return false
+		}
+		if targetHub != nil {
+			_, _ = execOnAgent(targetHub, "mig-gone-clean-"+randomToken(4), targetContainerCleanupScript(container), 60)
+		}
+		fail("应用在迁移期间已被删除，迁移已中止")
+		return true
+	}
+
+	if abortIfGone() {
+		return
+	}
+
 	// ---- Stage 1: quiesce the source container so the volume snapshot is
 	// consistent (no writes racing the tar).
-	sourceWasRunning := false
 	if sourceHub != nil {
 		if st, err := execOnAgent(sourceHub, "mig-src-state-"+randomToken(4), volumeContainerStateScript(container), 15); err == nil &&
 			strings.TrimSpace(string(st.GetStdout())) == "RUNNING" {
@@ -244,47 +434,13 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 			if app.SourceType == "raw_compose" {
 				stopCmd = fmt.Sprintf("docker compose -f %s stop", shellQuote(composePath))
 			}
-			if _, err := execOnAgent(sourceHub, "mig-src-stop-"+randomToken(4), stopCmd, 90); err != nil {
-				logBuf.WriteString(fmt.Sprintf("WARN: 停止源主机容器失败: %v\n", err))
-			}
-		}
-	}
-
-	rollback := func(cause error) {
-		logBuf.WriteString(fmt.Sprintf("\n[ROLLBACK] 迁移失败: %v\n[ROLLBACK] 回滚应用至源主机 %s\n", cause, oldHostID))
-		_ = e.store.UpdateApp(app.ID, func(a *Application) error {
-			a.HostID = oldHostID
-			return nil
-		})
-		app.HostID = oldHostID
-		if e.proxy != nil && len(app.ProxyDomains) > 0 {
-			if err := e.proxy.SyncProxyForHost(app, targetHostID); err != nil {
-				logBuf.WriteString(fmt.Sprintf("WARN: 回滚反向代理失败: %v\n", err))
-			} else {
-				logBuf.WriteString("[ROLLBACK] 反向代理已指回源主机\n")
-			}
-		}
-		if app.MeshForwardEnabled {
-			e.syncMeshForwarder(app, logBuf)
-		}
-		if sourceWasRunning && sourceHub != nil {
-			restartCmd := fmt.Sprintf("docker start %s", shellQuote(container))
-			if app.SourceType == "raw_compose" {
-				restartCmd = fmt.Sprintf("docker compose -f %s up -d", shellQuote(composePath))
-			}
-			if _, err := execOnAgent(sourceHub, "mig-rb-start-"+randomToken(4), restartCmd, 90); err != nil {
-				logBuf.WriteString(fmt.Sprintf("WARN: 重启源主机容器失败: %v\n", err))
-			} else {
-				logBuf.WriteString("[ROLLBACK] 源主机容器已重新启动\n")
-			}
-		}
-		if targetHub != nil {
-			cleanCmd := fmt.Sprintf("docker rm -f %s %s-next 2>/dev/null || true", shellQuote(container), shellQuote(container))
-			if app.SourceType == "raw_compose" {
-				cleanCmd = fmt.Sprintf("docker compose -f %s down 2>/dev/null || true", shellQuote(composePath))
-			}
-			if _, err := execOnAgent(targetHub, "mig-rb-clean-"+randomToken(4), cleanCmd, 60); err != nil {
-				logBuf.WriteString(fmt.Sprintf("WARN: 清理目标主机残留容器失败: %v\n", err))
+			// A failed stop breaks the snapshot-consistency guarantee the
+			// whole migration rests on: fail and roll back instead of
+			// packing a torn snapshot while the source keeps writing.
+			stopRes, stopErr := execOnAgent(sourceHub, "mig-src-stop-"+randomToken(4), stopCmd, 90)
+			if stopErr != nil || stopRes.GetExitCode() != 0 {
+				failRollback("停止源主机容器失败: %v", firstErr(stopErr, stopRes))
+				return
 			}
 		}
 	}
@@ -292,22 +448,22 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 	// ---- Stage 2: migrate volume data through S3 (direct-to-storage).
 	if req.MigrateVolumes && len(app.Volumes) > 0 {
 		if sourceHub == nil {
-			fail("源主机 Agent 离线,无法迁移数据卷")
-			rollback(fmt.Errorf("源主机 Agent 离线"))
+			// Unreachable now (the run start checks the source), kept as a
+			// guard so a later refactor cannot silently reintroduce it.
+			failRollback("源主机 Agent 离线,无法迁移数据卷")
 			return
 		}
 		target, err := e.defaultS3Target()
 		if err != nil {
-			fail("未配置默认 S3 存储目标")
-			rollback(err)
+			failRollback("未配置默认 S3 存储目标")
 			return
 		}
 		s3c := snapshots.NewS3Client(target)
 		logBuf.WriteString("$ 经 S3 同步挂载卷数据\n")
 
 		for _, spec := range app.Volumes {
+			// cancelled() already rolls back internally.
 			if cancelled() {
-				rollback(fmt.Errorf("操作已取消"))
 				return
 			}
 			src, dst, _, ok := parseVolumeSpec(spec)
@@ -319,8 +475,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 
 			srcDir, err := resolveVolumeDir(sourceHub, src)
 			if err != nil {
-				fail("解析源主机卷路径失败: %v", err)
-				rollback(err)
+				failRollback("解析源主机卷路径失败: %v", err)
 				return
 			}
 			migID := "mig-" + randomToken(10)
@@ -331,8 +486,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 			if err != nil || res.GetExitCode() != 0 {
 				e.cleanupHostPaths(sourceHub, srcStaging)
 				cerr := fmt.Errorf("打包卷数据失败(%s): %v", src, firstErr(err, res))
-				fail("%v", cerr)
-				rollback(cerr)
+				failRollback("%v", cerr)
 				return
 			}
 			_, sha := parseVolumeArchiveMeta(res.GetStdout())
@@ -340,8 +494,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 			putURL, err := s3c.PresignPut(s3Key, 2*time.Hour)
 			if err != nil {
 				e.cleanupHostPaths(sourceHub, srcStaging)
-				fail("生成 S3 上传地址失败: %v", err)
-				rollback(err)
+				failRollback("生成 S3 上传地址失败: %v", err)
 				return
 			}
 			upRes, upErr := execOnAgent(sourceHub, "mig-up-"+migID, volumeUploadScript(srcStaging, putURL), volumeS3OpTimeout)
@@ -349,8 +502,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 			if upErr != nil || upRes.GetExitCode() != 0 {
 				e.dropS3Object(s3c, s3Key)
 				cerr := fmt.Errorf("上传卷数据至 S3 失败(%s): %v", src, firstErr(upErr, upRes))
-				fail("%v", cerr)
-				rollback(cerr)
+				failRollback("%v", cerr)
 				return
 			}
 
@@ -358,16 +510,14 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 			tgtDir, err := ensureVolumeDir(targetHub, src)
 			if err != nil {
 				e.dropS3Object(s3c, s3Key)
-				fail("准备目标主机卷失败: %v", err)
-				rollback(err)
+				failRollback("准备目标主机卷失败: %v", err)
 				return
 			}
 
 			getURL, err := s3c.PresignGet(s3Key, 2*time.Hour)
 			if err != nil {
 				e.dropS3Object(s3c, s3Key)
-				fail("生成 S3 下载地址失败: %v", err)
-				rollback(err)
+				failRollback("生成 S3 下载地址失败: %v", err)
 				return
 			}
 			tStaging := volumeRestorePath(app.ID, migID)
@@ -376,8 +526,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 				e.cleanupHostPaths(targetHub, tStaging)
 				e.dropS3Object(s3c, s3Key)
 				cerr := fmt.Errorf("下载卷数据失败(%s): %v", src, firstErr(dlErr, dlRes))
-				fail("%v", cerr)
-				rollback(cerr)
+				failRollback("%v", cerr)
 				return
 			}
 
@@ -387,9 +536,19 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 				e.cleanupHostPaths(targetHub, tStaging)
 				e.dropS3Object(s3c, s3Key)
 				cerr := fmt.Errorf("卷数据校验不一致(%s: 源 %s / 目标 %s)", src, sha, tSha)
-				fail("%v", cerr)
-				rollback(cerr)
+				failRollback("%v", cerr)
 				return
+			}
+
+			// List the archive members before unpacking so rollback can
+			// remove exactly what this run wrote (see migratedVolumeData).
+			// A failed listing only degrades rollback cleanup for this
+			// volume; the unpack itself still proceeds.
+			var members []string
+			if listRes, listErr := execOnAgent(targetHub, "mig-list-"+migID, fmt.Sprintf("tar -tzf %s", shellQuote(tStaging)), 120); listErr == nil && listRes.GetExitCode() == 0 {
+				members = parseTarMembers(string(listRes.GetStdout()))
+			} else {
+				logBuf.WriteString(fmt.Sprintf("WARN: 无法列出卷 %s 的归档成员，回滚时无法清理该卷\n", src))
 			}
 
 			unpack := fmt.Sprintf("set -e\nmkdir -p %s\ntar -C %s -xzf %s",
@@ -399,16 +558,19 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 			e.dropS3Object(s3c, s3Key)
 			if unErr != nil || unRes.GetExitCode() != 0 {
 				cerr := fmt.Errorf("解压卷数据失败(%s): %v", src, firstErr(unErr, unRes))
-				fail("%v", cerr)
-				rollback(cerr)
+				failRollback("%v", cerr)
 				return
 			}
+			migrated = append(migrated, migratedVolumeData{tgtDir: tgtDir, files: members})
 			logBuf.WriteString(fmt.Sprintf("--> 卷 %s 同步完成 (sha256 %s)\n", src, tSha))
 		}
 	}
 
+	// cancelled() already rolls back internally.
 	if cancelled() {
-		rollback(fmt.Errorf("操作已取消"))
+		return
+	}
+	if abortIfGone() {
 		return
 	}
 
@@ -420,34 +582,58 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 	})
 	app.HostID = targetHostID
 
+	// A failed reroute must fail the migration (and roll back): the source
+	// container is already stopped, so "success with a WARN" would leave
+	// the domain pointing at a stopped container.
 	if e.proxy != nil && len(app.ProxyDomains) > 0 {
 		if err := e.proxy.SyncProxyForHost(app, oldHostID); err != nil {
-			logBuf.WriteString(fmt.Sprintf("WARN: 同步反向代理失败: %v\n", err))
-		} else {
-			logBuf.WriteString("[PROXY] 反向代理已切换到目标主机\n")
+			failRollback("同步反向代理失败: %v", err)
+			return
 		}
+		logBuf.WriteString("[PROXY] 反向代理已切换到目标主机\n")
 	}
 	if app.MeshForwardEnabled {
-		e.syncMeshForwarder(app, logBuf)
+		if err := e.syncMeshForwarder(app, logBuf); err != nil {
+			failRollback("同步组网转发失败: %v", err)
+			return
+		}
 	}
 
 	// ---- Stage 4: full build + rollout on the target host.
-	_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
+	if !e.setDeploymentStatus(app.ID, dep.ID, DeployDeploying) {
+		return
+	}
 	e.activeHub(app.ID, targetHub)
+	if abortIfGone() {
+		return
+	}
 
 	if err := e.deployOnTargetHost(ctx, targetHub, app, dep, logBuf, container); err != nil {
-		fail("目标主机部署未通过: %v", err)
-		rollback(err)
+		if ctx.Err() != nil {
+			// Cancelled mid-deploy: roll back, then finalize as
+			// cancelled (not failed) — and re-stamp any rollback
+			// incompleteness that cleanupCancelled just overwrote.
+			issues := rollback(err)
+			e.cleanupCancelled(app, dep, nil, "", "", logBuf)
+			e.markRollbackIncomplete(app, dep, issues)
+			return
+		}
+		failRollback("目标主机部署未通过: %v", err)
 		return
 	}
 
 	// ---- Stage 5: optional source cleanup. Bind-mount host dirs are never
 	// touched, only the containers/volumes created by the platform.
+	if abortIfGone() {
+		return
+	}
 	if req.CleanSource && sourceHub != nil {
-		cleanCmd := fmt.Sprintf("docker rm -f %s %s-prev %s-next 2>/dev/null || true",
-			shellQuote(container), shellQuote(container), shellQuote(container))
+		cleanCmd := targetContainerCleanupScript(container) + fmt.Sprintf("; docker rm -f %s 2>/dev/null || true", shellQuote(container+"-prev"))
 		if app.SourceType == "raw_compose" {
 			cleanCmd = fmt.Sprintf("docker compose -f %s down --remove-orphans 2>/dev/null || true", shellQuote(composePath))
+		} else if app.SourceType == "git" && app.BuildType == "compose" {
+			cleanCmd = fmt.Sprintf("cd %s && docker compose -f %s -p %s down 2>/dev/null || true",
+				shellQuote(repoDir), shellQuote(gitComposeFile(app)), shellQuote("watchman-"+app.ID))
 		}
 		logBuf.WriteString("$ 清理源主机容器(保留宿主数据目录)\n")
 		if _, err := execOnAgent(sourceHub, "mig-src-clean-"+randomToken(4), cleanCmd, 90); err != nil {
@@ -499,7 +685,14 @@ func (e *Engine) deployOnTargetHost(ctx context.Context, hub *rpc.Hub, app *Appl
 		if res.GetExitCode() != 0 {
 			return fmt.Errorf("Docker Compose 启动失败 (exit %d)", res.GetExitCode())
 		}
-		if !e.probe(ctx, hub, app, container, logBuf) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Compose stack containers are named <project>-<service>-1, not
+		// watchman-app-<id>: a container-name probe can never pass here
+		// (the normal deploy path does not probe compose stacks at all).
+		// Only a configured HTTP health check is meaningful.
+		if app.HealthcheckURL != "" && !e.probe(ctx, hub, app, container, logBuf) {
 			return fmt.Errorf("健康检查未通过")
 		}
 		return nil
@@ -564,10 +757,7 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 	}
 
 	if app.BuildType == "compose" {
-		composeFile := app.Dockerfile
-		if composeFile == "" || composeFile == "Dockerfile" {
-			composeFile = "compose.yaml"
-		}
+		composeFile := gitComposeFile(app)
 		upCmd := fmt.Sprintf("docker compose -f %s -p %s up -d --build --remove-orphans",
 			shellQuote(composeFile), shellQuote("watchman-"+app.ID))
 		logBuf.WriteString("$ " + upCmd + "\n")
@@ -583,7 +773,12 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 		if res.GetExitCode() != 0 {
 			return fmt.Errorf("Docker Compose 部署失败 (exit %d)", res.GetExitCode())
 		}
-		if !e.probe(ctx, hub, app, container, logBuf) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Same container-name probe problem as the raw_compose branch:
+		// only a configured HTTP health check is meaningful here.
+		if app.HealthcheckURL != "" && !e.probe(ctx, hub, app, container, logBuf) {
 			return fmt.Errorf("健康检查未通过")
 		}
 		return nil
@@ -733,6 +928,29 @@ func (e *Engine) dropS3Object(c *snapshots.S3Client, key string) {
 	if err := c.DeleteObject(ctx, key); err != nil {
 		e.log.Warn("migration staging object cleanup failed", "key", key, "err", err)
 	}
+}
+
+// markRollbackIncomplete stamps a visible marker onto the deployment record
+// when rollback itself failed: without it the record reads as a clean
+// failure-with-rollback while the source container or the proxy may still be
+// down. It also escalates to the server log — the previous code only left a
+// WARN line inside the build log, which no operator watches.
+// Note: there is no alert-channel wiring on Engine (that would need main.go
+// injection), so the record marker plus the server error log are the
+// notification here; wiring a real alert remains follow-up work.
+func (e *Engine) markRollbackIncomplete(app *Application, dep *Deployment, issues []string) {
+	if len(issues) == 0 {
+		return
+	}
+	msg := "回滚未完成，需人工检查源主机容器与反代状态：" + strings.Join(issues, "；")
+	_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
+		if d.Error != "" {
+			d.Error += "；" + msg
+		} else {
+			d.Error = msg
+		}
+	})
+	e.log.Error("migration rollback incomplete", "app", app.ID, "deployment", dep.ID, "issues", strings.Join(issues, "; "))
 }
 
 // firstErr returns the transport error when present, else the exec result's

@@ -154,10 +154,15 @@ function syncProxyForm() {
     proxyForm.value.mode = (app.value.proxy_mode as 'local' | 'gateway') ?? 'local'
     proxyForm.value.gateway_host_id = app.value.proxy_gateway_host_id ?? null
     proxyForm.value.upstream = app.value.proxy_upstream ?? ''
+    // WebSocket 开关同样来自服务端存量：存量记录没有该字段时默认 true，
+    // 与此前同步恒渲染 Upgrade 头的行为一致，避免老应用被静默关掉。
+    proxyForm.value.websocket = app.value.proxy_websocket ?? true
   }
 }
 
-async function loadProxyData() {
+// syncForm=false 时只刷新证书/主机/组网等只读数据，不覆盖反代表单：
+// onActivated 走这条路，否则切走再切回会用服务端值抹掉未保存的编辑。
+async function loadProxyData(syncForm = true) {
   try {
     certs.value = (await listCerts()) as Certificate[]
   } catch {
@@ -177,7 +182,7 @@ async function loadProxyData() {
   } catch {
     hostsList.value = []
   }
-  syncProxyForm()
+  if (syncForm) syncProxyForm()
 }
 
 function certDaysRemaining(notAfter: string): number {
@@ -261,6 +266,9 @@ const forwardForm = ref({
   target_port: null as number | null,
 })
 const savingForward = ref(false)
+// 最近一次保存转发配置时后端返回的中继同步告警，展示在转发表单附近，
+// 下一次保存时清空（成功即消失，不靠 toast 一闪而过）。
+const forwardSyncWarning = ref('')
 
 function syncForwardForm() {
   if (app.value) {
@@ -309,15 +317,30 @@ async function doSaveForward() {
     }
   }
   savingForward.value = true
+  forwardSyncWarning.value = ''
   try {
-    await updateApp(appId.value, {
+    const res = await updateApp(appId.value, {
       mesh_forward_enabled: forwardForm.value.enabled,
       mesh_forward_host_id: forwardForm.value.enabled ? forwardForm.value.host_id || undefined : undefined,
       mesh_forward_entry_port: forwardForm.value.enabled ? forwardForm.value.entry_port ?? undefined : undefined,
       mesh_forward_target_port: forwardForm.value.enabled ? forwardForm.value.target_port ?? undefined : undefined,
     })
-    message.success(forwardForm.value.enabled ? '组网端口转发已保存并同步中继容器' : '已关闭组网端口转发')
     await loadApp()
+    if (!forwardForm.value.enabled) {
+      message.success('已关闭组网端口转发')
+      return
+    }
+    // 配置已保存 ≠ 中继已生效：后端同步失败时顶层带 mesh_forward_warning，
+    // 此时绝不能再报“已保存并同步”；重载后目标仍为空同样说明中继未就绪。
+    if (res.meshForwardWarning) {
+      forwardSyncWarning.value = res.meshForwardWarning
+      message.warning(`组网端口转发已保存，但中继同步告警：${res.meshForwardWarning}`)
+    } else if (!app.value?.mesh_forward_target) {
+      forwardSyncWarning.value = '中继容器未同步成功（未解析到中继目标），请检查入口主机状态后重试'
+      message.warning(`组网端口转发已保存，但${forwardSyncWarning.value}`)
+    } else {
+      message.success('组网端口转发已保存并同步中继容器')
+    }
   } catch (e: any) {
     message.error(e.message || '保存失败')
   } finally {
@@ -368,7 +391,9 @@ async function doBindProxy() {
   }
   savingProxy.value = true
   try {
-    await bindProxy(appId.value, {
+    // 绑定响应可能带 warnings（旧目标主机离线、旧配置残留等）：绑定本身
+    // 已生效，但残留必须让用户看见，不能只报“已下发”。
+    const res = (await bindProxy(appId.value, {
       domains: proxyForm.value.domains.map((r) => ({
         domain: r.domain.trim().toLowerCase(),
         cert_id: r.cert_id,
@@ -377,8 +402,11 @@ async function doBindProxy() {
       gateway_host_id: proxyForm.value.gateway_host_id || undefined,
       upstream: proxyForm.value.upstream.trim() || undefined,
       websocket: proxyForm.value.websocket,
-    })
+    })) as unknown as { warnings?: string[] }
     message.success('反代配置已下发')
+    if (res.warnings && res.warnings.length > 0) {
+      message.warning(`反代已生效，但有残留未清理：${res.warnings.join('；')}`)
+    }
     await loadApp()
   } catch (e: any) {
     message.error(e.message || '下发失败')
@@ -390,8 +418,11 @@ async function doBindProxy() {
 async function doUnbindProxy() {
   savingProxy.value = true
   try {
-    await unbindProxy(appId.value)
+    const res = (await unbindProxy(appId.value)) as unknown as { warnings?: string[] }
     message.success('已解除域名绑定')
+    if (res.warnings && res.warnings.length > 0) {
+      message.warning(`绑定记录已清除，但以下主机上的旧配置未能清理：${res.warnings.join('；')}`)
+    }
     proxyForm.value.domains = []
     await loadApp()
   } catch (e: any) {
@@ -1237,8 +1268,14 @@ onMounted(() => {
 })
 
 onActivated(() => {
-  refreshAll()
-  loadProxyData()
+  // 切回页签时只刷新只读状态（状态/部署历史/归档/证书与主机列表），不重载
+  // 应用详情：loadApp() 会经 sync* 用服务端值覆盖环境变量/反代/转发表单，
+  // 用户切走前未保存的编辑会被无声抹掉（违反 AGENTS.md §8.4 页签保状态）。
+  // 首屏仍由 onMounted 的 refreshAll() 全量加载。
+  loadStatus()
+  loadDeployments()
+  loadVolumeBackups()
+  loadProxyData(false)
   // 页签切走期间轮询窗口可能已过期，仍在执行的任务需要重新开启观察。
   if (volumeBusy.value) volumePollUntil.value = Date.now() + 60_000
   startPolling()
@@ -1840,6 +1877,16 @@ onDeactivated(() => {
                   </span>
                 </NFormItem>
               </template>
+
+              <NAlert
+                v-if="forwardSyncWarning"
+                type="warning"
+                :show-icon="true"
+                style="margin-bottom: 12px"
+              >
+                <template #header>中继同步告警</template>
+                {{ forwardSyncWarning }}
+              </NAlert>
 
               <NSpace>
                 <NButton type="primary" :loading="savingForward" @click="doSaveForward">

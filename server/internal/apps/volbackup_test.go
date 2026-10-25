@@ -900,3 +900,101 @@ func TestPurgeVolumeArchivesDropsSnapshotJobs(t *testing.T) {
 		t.Fatalf("purge without cleanup hook: %v", err)
 	}
 }
+
+// ---- restore volume-spec validation (P1-1) ----
+
+func TestResolveRestoreVolumeDir(t *testing.T) {
+	// Bind mounts resolve without touching the agent, so a nil hub is fine
+	// here; named-volume re-resolution needs a live hub and is exercised
+	// through the same docker volume inspect call backupAppVolume uses.
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image",
+		Volumes: []string{"/opt/a:/a", "/opt/ro:/ro:ro"}}
+	cases := []struct {
+		name string
+		arch *VolumeArchive
+		want string
+		err  string
+	}{
+		{"bind match", &VolumeArchive{VolumeSpec: "/opt/a:/a", HostPath: "/opt/a", ContainerPath: "/a"}, "/opt/a", ""},
+		{"bind spec trimmed", &VolumeArchive{VolumeSpec: "  /opt/a:/a  ", HostPath: "/opt/a", ContainerPath: "/a"}, "/opt/a", ""},
+		{"bind ro match", &VolumeArchive{VolumeSpec: "/opt/ro:/ro:ro", HostPath: "/opt/ro", ContainerPath: "/ro"}, "/opt/ro", ""},
+		{"spec not declared", &VolumeArchive{VolumeSpec: "/opt/gone:/a", HostPath: "/opt/gone", ContainerPath: "/a"}, "", "卷配置已变更"},
+		{"bind host path re-pointed", &VolumeArchive{VolumeSpec: "/opt/a:/a", HostPath: "/opt/old", ContainerPath: "/a"}, "", "卷配置已变更"},
+		{"container path changed", &VolumeArchive{VolumeSpec: "/opt/a:/a", HostPath: "/opt/a", ContainerPath: "/other"}, "", "卷配置已变更"},
+		{"empty spec", &VolumeArchive{VolumeSpec: "", HostPath: "/opt/a", ContainerPath: "/a"}, "", "卷规格缺失"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := NewEngine(nil, nil, nil, nil).resolveRestoreVolumeDir(nil, app, tc.arch)
+			if tc.err == "" {
+				if err != nil {
+					t.Fatalf("want dir %q, got error %v", tc.want, err)
+				}
+				if got != tc.want {
+					t.Fatalf("dir = %q, want %q", got, tc.want)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.err) {
+				t.Fatalf("want error containing %q, got %v", tc.err, err)
+			}
+		})
+	}
+	// A declared but malformed spec must fail parsing, not match by accident.
+	badApp := &Application{ID: "app2", HostID: "h1", SourceType: "image", Volumes: []string{"a:b"}}
+	if _, err := NewEngine(nil, nil, nil, nil).resolveRestoreVolumeDir(nil, badApp,
+		&VolumeArchive{VolumeSpec: "a:b", HostPath: "a", ContainerPath: "b"}); err == nil || !strings.Contains(err.Error(), "卷规格无效") {
+		t.Fatalf("want invalid-spec error, got %v", err)
+	}
+}
+
+// ---- backup marker validation (P1-2) ----
+
+func TestValidateVolumeArchiveMeta(t *testing.T) {
+	cases := []struct {
+		size int64
+		sha  string
+		ok   bool
+	}{
+		{1024, "abc", true},
+		{0, "abc", false},
+		{-1, "abc", false},
+		{1024, "", false},
+		{0, "", false},
+	}
+	for _, tc := range cases {
+		if err := validateVolumeArchiveMeta(tc.size, tc.sha); (err == nil) != tc.ok {
+			t.Errorf("validateVolumeArchiveMeta(%d, %q) err = %v, want ok=%v", tc.size, tc.sha, err, tc.ok)
+		}
+	}
+}
+
+// ---- purge volume slot (P1-3) ----
+
+func TestPurgeVolumeArchivesCallerHoldsSlot(t *testing.T) {
+	e, store, _ := newVolumeTestEngine(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image"}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	// The purge flow acquires the volume slot at entry and holds it for the
+	// whole purge, so PurgeVolumeArchives must run under the caller's slot:
+	// it must succeed (not self-deadlock on a non-reentrant acquire) and
+	// must leave the caller's slot untouched for the caller to release.
+	// A backup/restore racing the purge is refused earlier — deleteApp
+	// returns 409 when VolumeBusy, and purgeAppResources itself fails its
+	// entry acquire — never inside this function.
+	if !e.acquireVolumeSlot(app.ID) {
+		t.Fatal("test setup: acquire slot")
+	}
+	if err := e.PurgeVolumeArchives(app); err != nil {
+		t.Fatalf("purge under held slot: %v", err)
+	}
+	if !e.VolumeBusy(app.ID) {
+		t.Fatal("purge must not release the caller's slot")
+	}
+	e.releaseVolumeSlot(app.ID)
+	if e.VolumeBusy(app.ID) {
+		t.Fatal("caller release must free the slot")
+	}
+}

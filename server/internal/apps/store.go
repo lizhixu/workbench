@@ -207,6 +207,10 @@ func cloneApplication(a *Application) *Application {
 	if a.ProxyDomains != nil {
 		cp.ProxyDomains = append([]DomainBinding(nil), a.ProxyDomains...)
 	}
+	if a.ProxyWebSocket != nil {
+		v := *a.ProxyWebSocket
+		cp.ProxyWebSocket = &v
+	}
 	return &cp
 }
 

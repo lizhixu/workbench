@@ -2085,6 +2085,9 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodDelete, "/api/v1/certs/manual/:id", "cert_manual_dns_cancel", "cert", "id", audit.RiskHigh, "取消手动 DNS-01 签发订单"},
 		{http.MethodPost, "/api/v1/certs/import", "cert_import", "cert", "", audit.RiskHigh, "导入已有证书"},
 		{http.MethodPost, "/api/v1/certs/:id/renew", "cert_renew", "cert", "id", audit.RiskHigh, "续期证书"},
+		// Remark edits are metadata-only, so the empty risk normalizes to
+		// medium in the middleware (same convention as cert_config_update).
+		{http.MethodPut, "/api/v1/certs/:id/remark", "cert_remark", "cert", "id", "", "编辑证书备注"},
 		// Private-key reveal in the cert detail dialog: same convention as the
 		// AI API key reveal — adminOnly + high risk, one audit row per view.
 		{http.MethodPost, "/api/v1/certs/:id/key", "cert_key_reveal", "cert", "id", audit.RiskHigh, "查看证书私钥明文"},

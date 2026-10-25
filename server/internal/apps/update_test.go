@@ -121,6 +121,46 @@ func TestUpdateAppExplicitClear(t *testing.T) {
 	}
 }
 
+// TestUpdateAppExplicitClearBuildFields: the same explicit-clear contract
+// for the five build fields whose non-empty guards silently ignored "".
+// Empty values are stored as-is; the deploy pipeline re-applies its
+// defaults (Dockerfile, "." context, 900s timeout) for them.
+func TestUpdateAppExplicitClearBuildFields(t *testing.T) {
+	app := &Application{
+		ID: "app_clear_build", Name: "n", HostID: "h1", SourceType: "git",
+		Dockerfile: "Dockerfile", BuildContext: ".", BuildTimeout: 600,
+		ComposeContent: "services: {}", BuildType: "dockerfile",
+	}
+	h, store := newUpdateTestHandler(t, app)
+
+	w := putApp(h, "app_clear_build", map[string]any{
+		"dockerfile":        "",
+		"build_context":     "",
+		"build_timeout_sec": 0,
+		"compose_content":   "",
+		"build_type":        "",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+	got, _ := store.GetApp("app_clear_build")
+	if got.Dockerfile != "" {
+		t.Errorf("explicit empty dockerfile must clear, got %q", got.Dockerfile)
+	}
+	if got.BuildContext != "" {
+		t.Errorf("explicit empty build_context must clear, got %q", got.BuildContext)
+	}
+	if got.BuildTimeout != 0 {
+		t.Errorf("explicit 0 build_timeout_sec must clear, got %d", got.BuildTimeout)
+	}
+	if got.ComposeContent != "" {
+		t.Errorf("explicit empty compose_content must clear, got %q", got.ComposeContent)
+	}
+	if got.BuildType != "" {
+		t.Errorf("explicit empty build_type must clear, got %q", got.BuildType)
+	}
+}
+
 // TestUpdateAppMeshTouchedRequiresEntryHost: touching a relay field validates
 // the EFFECTIVE config — disabling needs no entry host, enabling does.
 func TestUpdateAppMeshTouchedValidates(t *testing.T) {

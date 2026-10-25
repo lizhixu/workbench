@@ -1023,7 +1023,9 @@ function validate(): string | null {
   return null
 }
 
-// 创建后的域名绑定编排（含证书签发）。任何失败都不回滚应用创建、不阻断跳转
+// 创建后的域名绑定编排（含证书签发）。任何失败都不回滚应用创建、不阻断跳转。
+// 逐域处理：任一域名签发失败只记入失败清单，不用 return 中断整批——已备妥
+// 证书的域名仍要正常绑定，失败的域名最后汇总提示、引导到详情页重试。
 async function bindDomainsWithCert(appId: string) {
   const toBind = activeDomains.value.map((r) => ({
     domain: r.domain.trim().toLowerCase(),
@@ -1031,42 +1033,51 @@ async function bindDomainsWithCert(appId: string) {
   }))
   if (toBind.length === 0) return
 
+  const ready: { domain: string; cert_id: string }[] = []
+  const failed: { domain: string; reason: string }[] = []
   for (const item of toBind) {
-    if (!item.cert_id) {
-      if (issueAccountId.value) {
-        creatingLabel.value = `签发证书 (${item.domain})…`
-        let issuedId = ''
-        try {
-          await issueCert([item.domain], issueAccountId.value, issueChallenge.value || undefined)
-          const cert = await pollCover(item.domain)
-          if (cert) issuedId = cert.id
-        } catch {
-          // 受理失败：落到未完成提示并跳过绑定
-        }
-        creatingLabel.value = ''
-        if (!issuedId) {
-          message.warning(`应用已创建，域名 ${item.domain} 证书签发未完成：可到证书中心查看进度，稍后在应用详情-域名与反代中重试绑定`)
-          return
-        }
-        item.cert_id = issuedId
-      } else {
-        message.warning(`应用已创建，但域名 ${item.domain} 未选择证书且未配置 ACME 账户，已跳过反代绑定`)
-        return
-      }
+    if (item.cert_id) {
+      ready.push({ domain: item.domain, cert_id: item.cert_id })
+      continue
+    }
+    if (!issueAccountId.value) {
+      failed.push({ domain: item.domain, reason: '未选择证书且未配置 ACME 账户' })
+      continue
+    }
+    creatingLabel.value = `签发证书 (${item.domain})…`
+    let issuedId = ''
+    try {
+      await issueCert([item.domain], issueAccountId.value, issueChallenge.value || undefined)
+      const cert = await pollCover(item.domain)
+      if (cert) issuedId = cert.id
+    } catch {
+      // 受理失败：记入失败清单，继续处理下一个域名
+    }
+    creatingLabel.value = ''
+    if (issuedId) {
+      ready.push({ domain: item.domain, cert_id: issuedId })
+    } else {
+      failed.push({ domain: item.domain, reason: '证书签发未完成，可到证书中心查看进度' })
     }
   }
-  creatingLabel.value = '绑定反代中…'
-  try {
-    await bindProxy(appId, {
-      domains: toBind,
-      mode: form.proxy_mode,
-      gateway_host_id: form.proxy_mode === 'gateway' ? form.gateway_host_id || undefined : undefined,
-    })
-    message.success(`已绑定 ${toBind.length} 个域名并下发反代`)
-  } catch (e: any) {
-    message.warning(`应用已创建，但域名绑定失败：${e.message || e}（可稍后在应用详情-域名与反代中重试）`)
-  } finally {
-    creatingLabel.value = ''
+  if (ready.length > 0) {
+    creatingLabel.value = '绑定反代中…'
+    try {
+      await bindProxy(appId, {
+        domains: ready,
+        mode: form.proxy_mode,
+        gateway_host_id: form.proxy_mode === 'gateway' ? form.gateway_host_id || undefined : undefined,
+      })
+      message.success(`已绑定 ${ready.length} 个域名并下发反代`)
+    } catch (e: any) {
+      // 绑定整体失败：已备妥的域名也没绑上，全部记入失败清单统一提示。
+      for (const r of ready) failed.push({ domain: r.domain, reason: `绑定失败：${e.message || e}` })
+    } finally {
+      creatingLabel.value = ''
+    }
+  }
+  if (failed.length > 0) {
+    message.warning(`应用已创建，但以下域名未完成反代绑定，可稍后在应用详情-域名与反代中重试：${failed.map((f) => `${f.domain}（${f.reason}）`).join('；')}`)
   }
 }
 

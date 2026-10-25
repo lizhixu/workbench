@@ -51,6 +51,7 @@ export interface AppEntity {
   proxy_mode?: 'local' | 'gateway'
   proxy_gateway_host_id?: string
   proxy_upstream?: string
+  proxy_websocket?: boolean
   current_commit?: string
   last_deploy_at?: string
   created_at: string
@@ -150,8 +151,18 @@ export function createApp(req: AppCreateRequest) {
   return unwrap<{ data: AppEntity }>(http.post('/apps', req)).then((r) => r.data)
 }
 
-export function updateApp(id: string, req: Partial<AppCreateRequest>) {
-  return unwrap<{ data: AppEntity }>(http.put(`/apps/${id}`, req)).then((r) => r.data)
+/** 更新应用的返回：data 之外，后端可能在顶层附带 mesh_forward_warning
+ *（组网中继同步失败时配置已保存但中继未生效）。此前 updateApp 只 unwrap
+ * .data，警告被静默丢弃，前端无条件报“已保存并同步”——假成功。 */
+export interface AppUpdateResult {
+  data: AppEntity
+  meshForwardWarning?: string
+}
+
+export function updateApp(id: string, req: Partial<AppCreateRequest>): Promise<AppUpdateResult> {
+  return unwrap<{ data: AppEntity; mesh_forward_warning?: string }>(
+    http.put(`/apps/${id}`, req),
+  ).then((r) => ({ data: r.data, meshForwardWarning: r.mesh_forward_warning }))
 }
 
 export function deleteApp(id: string, purge = false) {

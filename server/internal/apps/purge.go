@@ -87,6 +87,16 @@ func (h *AppHandlers) purgeAppResources(app *Application) ([]string, error) {
 	rmIDs("容器",
 		fmt.Sprintf(`docker ps -aq --filter %s`, shellQuote("name=^/"+container+"$")),
 		"docker rm -f")
+	// Replacement (-next, legacy unsuffixed and new dep-suffixed names) and
+	// previous (-prev) containers from interrupted or superseded deploys.
+	// The -next match is a prefix filter, not a shell glob: globs expand
+	// against filenames, never container names.
+	rmIDs("容器",
+		fmt.Sprintf(`docker ps -aq --filter %s`, shellQuote("name=^/"+container+"-next")),
+		"docker rm -f")
+	rmIDs("容器",
+		fmt.Sprintf(`docker ps -aq --filter %s`, shellQuote("name=^/"+container+"-prev$")),
+		"docker rm -f")
 
 	// 3. Named volumes declared in the app's volume specs ("name:/path").
 	//    Bind mounts (host paths) are never touched.

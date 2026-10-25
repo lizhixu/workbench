@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -103,8 +105,16 @@ type proxyBindReq struct {
 	// Upstream overrides the computed target, e.g. "127.0.0.1:8080" or a mesh IP.
 	Upstream string `json:"upstream"`
 	// WebSocket support adds the Upgrade/Connection proxy headers.
-	WebSocket bool `json:"websocket"`
+	// Pointer on purpose: absent means "no choice recorded" (see
+	// Application.ProxyWebSocket) and renders exactly like the pre-change
+	// behavior — Upgrade headers on. Only an explicit false turns them off.
+	WebSocket *bool `json:"websocket,omitempty"`
 }
+
+// websocketEnabled resolves the effective WebSocket choice: nil (legacy
+// records, binds that did not send the field) means on, matching the
+// pre-change behavior where Upgrade headers were always rendered.
+func websocketEnabled(p *bool) bool { return p == nil || *p }
 
 // domainCertPair is one resolved (binding, certificate) pair, normalized to
 // the lowercase hostname that lands in the vhost.
@@ -262,8 +272,17 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 	// Compute the upstream unless overridden: local mode always proxies to
 	// the loopback app port; gateway mode prefers the overlay (100.x) path
 	// when both hosts are in the mesh, else 直连 the app host directly.
+	// A manual upstream is interpolated verbatim into a root-written nginx
+	// config, so it must pass the strict host:port whitelist — an upstream
+	// carrying `;`, `}` or a newline would break out of the proxy_pass
+	// directive and poison the shared gateway host.
 	upstream := strings.TrimSpace(req.Upstream)
-	if upstream == "" {
+	if upstream != "" {
+		if !validProxyUpstream(upstream) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Upstream 格式非法：仅允许 IP/主机名:端口（如 127.0.0.1:8080），端口 1~65535"})
+			return
+		}
+	} else {
 		var err error
 		upstream, err = h.defaultUpstream(app, mode, req.GatewayHostID)
 		if err != nil {
@@ -275,25 +294,15 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 	// 1. Push every cert + key to the nginx host, 2. push the vhost config,
 	// 3. validate + hot-reload nginx. Serialized against the renewal
 	// re-push (pushMu) so two write sessions never interleave chunks on the
-	// same file path.
+	// same file path. pushVhost compensates a failed push (removes the
+	// half-written conf) so a broken file never lingers in conf.d to fail
+	// every later nginx -t on this host.
 	bindings := make([]DomainBinding, 0, len(pairs))
 	for _, p := range pairs {
 		bindings = append(bindings, p.binding)
 	}
 	h.pushMu.Lock()
-	pushErr := func() error {
-		for _, p := range pairs {
-			if err := h.pushCertFiles(gatewayHub, p.binding.Domain, p.crt); err != nil {
-				return err
-			}
-		}
-		conf := renderVhosts(bindings, upstream, req.WebSocket)
-		confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
-		if err := writeFileOnAgent(gatewayHub, confPath, []byte(conf)); err != nil {
-			return fmt.Errorf("推送反代配置失败: %w", err)
-		}
-		return h.reloadNginx(gatewayHub)
-	}()
+	pushErr := h.pushVhost(gatewayHub, app.ID, pairs, upstream, websocketEnabled(req.WebSocket))
 	h.pushMu.Unlock()
 	if pushErr != nil {
 		if errors.Is(pushErr, errReloadTimeout) {
@@ -304,11 +313,14 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		return
 	}
 
-	// 4. Persist the binding on the application.
+	// 4. Persist the binding on the application. `app` still holds the
+	// pre-bind snapshot (GetApp returns a deep copy) — it is needed below
+	// to clean up the previous binding's hosts.
 	if err := h.store.UpdateApp(app.ID, func(a *Application) error {
 		a.ProxyDomains = bindings
 		a.ProxyMode = mode
 		a.ProxyUpstream = upstream
+		a.ProxyWebSocket = req.WebSocket
 		if mode == "gateway" {
 			a.ProxyGatewayHostID = req.GatewayHostID
 		} else {
@@ -319,12 +331,24 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+
+	// 5. A full-replace bind can orphan the previous binding: rebinds across
+	// local/gateway (or a gateway change) leave the old host's vhost serving
+	// the domain, and removed domains leave their cert/key files behind.
+	// Clean both up now that the new binding is live; anything that cannot
+	// be cleaned (old host offline) surfaces as a warning instead of
+	// vanishing silently.
+	warnings := h.cleanupStaleProxyTargets(app, targetHost, bindings)
+	resp := gin.H{
 		"ok":       true,
 		"domains":  bindings,
 		"mode":     mode,
 		"upstream": upstream,
-	})
+	}
+	if len(warnings) > 0 {
+		resp["warnings"] = warnings
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // certCoversDomain reports whether any SAN of the certificate covers the
@@ -351,34 +375,74 @@ func (h *ProxyHandler) unbindProxy(c *gin.Context) {
 
 	// Remove the vhost config plus every domain's cert files from wherever
 	// they were deployed (certs would otherwise linger as stale key material).
+	// Both hosts are cleaned: the gateway host holds the live vhost, and the
+	// app host may hold residue from an earlier local-mode binding.
+	// Cleanup failures are warnings, not silent skips — once the record is
+	// cleared there is no other pointer to the stale files, so "ok: true"
+	// with a dead host would otherwise pretend the unbind fully happened.
+	// The reload result matters: a failed reload leaves the old vhost live
+	// in nginx's memory even though its file is gone.
 	targets := []string{app.HostID}
 	if app.ProxyMode == "gateway" && app.ProxyGatewayHostID != "" {
 		targets = append(targets, app.ProxyGatewayHostID)
 	}
+	var warnings []string
 	for _, hostID := range dedupe(targets) {
 		hub := h.reg.Hub(hostID)
 		if hub == nil {
+			warnings = append(warnings, fmt.Sprintf("主机 %s 离线：该主机上的反代配置（vhost 与证书）未能清理，主机恢复后请重新解绑或手动清理", hostID))
 			continue
 		}
 		h.pushMu.Lock()
-		_, _ = execOnAgent(hub, "proxy-unbind-"+randomToken(4),
-			fmt.Sprintf("rm -f %s %s && docker exec %s nginx -s reload 2>/dev/null || true",
-				fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID),
-				proxyCleanupCertGlob(app), nginxContainer), 30)
+		res, err := execOnAgent(hub, "proxy-unbind-"+randomToken(4),
+			proxyUnbindScript(app, fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)), 30)
 		h.pushMu.Unlock()
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("主机 %s 反代配置清理失败：%v", hostID, err))
+		} else if res.GetExitCode() != 0 {
+			warnings = append(warnings, fmt.Sprintf("主机 %s 反代配置清理失败：nginx reload 未成功，旧配置在重载前仍会继续生效", hostID))
+		}
 	}
 
-	_ = h.store.UpdateApp(app.ID, func(a *Application) error {
+	if err := h.store.UpdateApp(app.ID, func(a *Application) error {
 		a.ProxyDomains = nil
 		a.ProxyMode = ""
 		a.ProxyUpstream = ""
+		a.ProxyWebSocket = nil
 		// The gateway host must go too, or a later rebind would leave the
 		// stale gateway id behind (and the app detail would keep showing a
 		// gateway binding that no longer exists).
 		a.ProxyGatewayHostID = ""
 		return nil
-	})
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	resp := gin.H{"ok": true}
+	if len(warnings) > 0 {
+		resp["warnings"] = warnings
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// proxyUnbindScript removes one app's vhost conf plus its domains' cert/key
+// files, then reloads nginx. Every path is shell-quoted: stored domains
+// predate the strict bind-time validation, so a legacy dirty domain must
+// never break out of the rm command. The reload is deliberately NOT masked
+// with `|| true` — its exit code is the only signal that the old vhost is
+// actually gone from the running nginx.
+func proxyUnbindScript(app *Application, confPath string) string {
+	args := []string{shellQuote(confPath)}
+	for _, b := range app.ProxyDomains {
+		if b.Domain == "" {
+			continue
+		}
+		args = append(args,
+			shellQuote(fmt.Sprintf("%s/%s.crt", proxyCertDir, b.Domain)),
+			shellQuote(fmt.Sprintf("%s/%s.key", proxyCertDir, b.Domain)))
+	}
+	return fmt.Sprintf("rm -f %s && docker exec %s nginx -s reload 2>&1",
+		strings.Join(args, " "), nginxContainer)
 }
 
 // proxyCleanupCertGlob renders the per-domain cert/key paths for an app's
@@ -404,6 +468,13 @@ func proxyCleanupCertGlob(app *Application) string {
 // SyncProxyForHost updates the Nginx reverse-proxy configuration when an
 // application moves to a new host (or rolls back).
 // If oldHostID is non-empty and mode == "local", the old host's vhost is cleaned up.
+// Both modes now share the same guarantees: the companion container is
+// ensured, every domain's certs are pushed (a vhost referencing a missing
+// crt/key fails nginx -t), the target is rejected when Windows, and a failed
+// push is compensated instead of leaving a broken conf behind. The upstream
+// and websocket flag come from the stored binding (see syncUpstream), not
+// recomputed defaults — a migration must not silently rewrite a manual
+// upstream or flip websocket support off.
 func (h *ProxyHandler) SyncProxyForHost(app *Application, oldHostID string) error {
 	if len(app.ProxyDomains) == 0 {
 		return nil
@@ -432,43 +503,37 @@ func (h *ProxyHandler) SyncProxyForHost(app *Application, oldHostID string) erro
 		if err != nil {
 			return err
 		}
-		upstream, err := h.defaultUpstream(app, "local", "")
+		upstream, err := h.syncUpstream(app, "local", "", oldHostID)
 		if err != nil {
 			return err
 		}
 		h.pushMu.Lock()
-		pushErr := func() error {
-			for _, p := range pairs {
-				if err := h.pushCertFiles(targetHub, p.binding.Domain, p.crt); err != nil {
-					return err
-				}
-			}
-			conf := renderVhosts(bindingList(pairs), upstream, true)
-			confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
-			if err := writeFileOnAgent(targetHub, confPath, []byte(conf)); err != nil {
-				return fmt.Errorf("推送反代配置失败: %w", err)
-			}
-			return h.reloadNginx(targetHub)
-		}()
+		pushErr := h.pushVhost(targetHub, app.ID, pairs, upstream, websocketEnabled(app.ProxyWebSocket))
 		h.pushMu.Unlock()
 		if pushErr != nil {
 			return pushErr
 		}
 		if oldHostID != "" && oldHostID != app.HostID {
-			if oldHub := h.reg.Hub(oldHostID); oldHub != nil {
-				confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
-				_, _ = execOnAgent(oldHub, "proxy-clean-"+randomToken(4),
-					fmt.Sprintf("rm -f %s %s && docker exec %s nginx -s reload 2>/dev/null || true",
-						confPath, proxyCleanupCertGlob(app), nginxContainer), 30)
+			// A stale vhost on the old host used to be cleaned with a void,
+			// result-discarding exec; log failures so a migration that
+			// "succeeded" doesn't hide a still-serving stale vhost.
+			if err := h.cleanupProxyHost(oldHostID, app.ID, app.ProxyDomains); err != nil {
+				h.log.Warn("旧主机反代配置清理失败", "app", app.Name, "host_id", oldHostID, "error", err.Error())
 			}
 		}
-		_ = h.store.UpdateApp(app.ID, func(a *Application) error {
+		if err := h.store.UpdateApp(app.ID, func(a *Application) error {
 			a.ProxyUpstream = upstream
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 		return nil
 	}
-	// Gateway mode:
+	// Gateway mode: symmetric with local. The gateway host keeps serving the
+	// app after a migration (only the upstream moves), so it needs the same
+	// ensure + cert push + Windows gate the local branch already had —
+	// without them a deleted companion container or a missing cert file
+	// fails the sync deep inside a docker exec / nginx -t.
 	if app.ProxyGatewayHostID == "" {
 		return fmt.Errorf("网关模式未记录网关主机 ID")
 	}
@@ -476,28 +541,309 @@ func (h *ProxyHandler) SyncProxyForHost(app *Application, oldHostID string) erro
 	if gatewayHub == nil {
 		return fmt.Errorf("网关主机 Agent 不在线")
 	}
-	upstream, err := h.defaultUpstream(app, "gateway", app.ProxyGatewayHostID)
+	if ag := h.reg.GetAgent(app.ProxyGatewayHostID); ag != nil && strings.EqualFold(ag.OS, "windows") {
+		return fmt.Errorf("反代暂不支持 Windows 主机")
+	}
+	h.pushMu.Lock()
+	ensureErr := h.ensureProxyNginx(gatewayHub)
+	h.pushMu.Unlock()
+	if ensureErr != nil {
+		return ensureErr
+	}
+	pairs, err := h.resolveBindingCerts(app)
 	if err != nil {
 		return err
 	}
-	conf := renderVhosts(app.ProxyDomains, upstream, true)
-	confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)
+	upstream, err := h.syncUpstream(app, "gateway", app.ProxyGatewayHostID, oldHostID)
+	if err != nil {
+		return err
+	}
 	h.pushMu.Lock()
-	pushErr := func() error {
-		if err := writeFileOnAgent(gatewayHub, confPath, []byte(conf)); err != nil {
-			return fmt.Errorf("推送反代配置到网关失败: %w", err)
-		}
-		return h.reloadNginx(gatewayHub)
-	}()
+	pushErr := h.pushVhost(gatewayHub, app.ID, pairs, upstream, websocketEnabled(app.ProxyWebSocket))
 	h.pushMu.Unlock()
 	if pushErr != nil {
 		return pushErr
 	}
-	_ = h.store.UpdateApp(app.ID, func(a *Application) error {
+	if err := h.store.UpdateApp(app.ID, func(a *Application) error {
 		a.ProxyUpstream = upstream
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
 	return nil
+}
+
+// syncUpstream picks the upstream a SyncProxyForHost render uses. A stored
+// upstream wins over recomputation: a manual override (e.g. a non-default
+// port) must survive a migration, and recomputing would silently rewrite it
+// to the first published port. The one exception is a gateway upstream that
+// still names the previous app host — that value was computed, not chosen,
+// and keeping it would point the gateway at the host the app just left.
+// Empty or malformed stored values fall back to defaultUpstream.
+func (h *ProxyHandler) syncUpstream(app *Application, mode, gatewayHostID, oldHostID string) (string, error) {
+	stored := strings.TrimSpace(app.ProxyUpstream)
+	if stored == "" || !validProxyUpstream(stored) {
+		return h.defaultUpstream(app, mode, gatewayHostID)
+	}
+	if mode == "local" {
+		// Loopback upstreams are host-independent: the stored value stays
+		// valid on the new host, manual or computed.
+		return stored, nil
+	}
+	if oldHostID != "" && oldHostID != app.HostID {
+		// Gather the previous host's known addresses (mesh IP from the
+		// network store, public/internal IP from the agent record). An
+		// offline host yields none, so an unresolvable stored upstream is
+		// treated as manual — preserving it is safer than recomputing
+		// away a manual value.
+		oldMesh, oldPublic, oldInternal := "", "", ""
+		if h.networkStore != nil {
+			if st, ok := h.networkStore.GetNodeStatus(oldHostID); ok {
+				oldMesh = st.IP
+			}
+		}
+		if h.reg != nil {
+			if ag := h.reg.GetAgent(oldHostID); ag != nil {
+				oldPublic, oldInternal = ag.PublicIP, ag.InternalIP
+			}
+		}
+		if gatewayStoredUpstreamWasComputed(stored, oldMesh, oldPublic, oldInternal, syncFirstPort(app)) {
+			return h.defaultUpstream(app, mode, gatewayHostID)
+		}
+	}
+	return stored, nil
+}
+
+// gatewayStoredUpstreamWasComputed reports whether a stored gateway upstream
+// still names the previous app host (mesh, public or internal IP) on the
+// app's published port — i.e. it was computed for the old host, not manually
+// set. Pure helper so the rule is table-testable without a registry.
+func gatewayStoredUpstreamWasComputed(stored, oldMesh, oldPublic, oldInternal string, firstPort int) bool {
+	host, port := splitUpstreamHostPort(stored)
+	if host == "" || port != firstPort {
+		return false
+	}
+	return host == oldMesh || host == oldPublic || host == oldInternal
+}
+
+// syncFirstPort mirrors defaultUpstream's port choice: the first published
+// host port, or 8080 when the app publishes nothing.
+func syncFirstPort(app *Application) int {
+	if len(app.Ports) > 0 && app.Ports[0].Host != 0 {
+		return app.Ports[0].Host
+	}
+	return 8080
+}
+
+// pushVhost pushes every binding's cert + key, writes the vhost conf and
+// reloads nginx on the proxy host. On any failure it compensates: the conf
+// is removed again (when it was written) plus the certs pushed in this
+// attempt, and nginx is reloaded once more so a broken file never lingers
+// in conf.d to fail every later nginx -t on this host. The original error
+// is what the caller reports — compensation failures must not mask it.
+// Note the asymmetry that makes this safe: the conf path is overwritten by
+// the new render, so deleting it cannot destroy a still-valid old conf;
+// but when the failure happened before any conf write, the old conf is
+// still live and still references the old cert paths, so pushed certs are
+// left alone in that case (the new certs were validated to cover their
+// domains, and the divergence heals on the next successful bind).
+func (h *ProxyHandler) pushVhost(agentHub *rpc.Hub, appID string, pairs []domainCertPair, upstream string, websocket bool) error {
+	pushed := make([]string, 0, len(pairs))
+	confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, appID)
+	confWritten := false
+	pushErr := func() error {
+		for _, p := range pairs {
+			if err := h.pushCertFiles(agentHub, p.binding.Domain, p.crt); err != nil {
+				return err
+			}
+			pushed = append(pushed, p.binding.Domain)
+		}
+		conf := renderVhosts(bindingList(pairs), upstream, websocket)
+		confWritten = true
+		if err := writeFileOnAgent(agentHub, confPath, []byte(conf)); err != nil {
+			return fmt.Errorf("推送反代配置失败: %w", err)
+		}
+		return h.reloadNginx(agentHub)
+	}()
+	if pushErr != nil && confWritten {
+		h.removeProxyFiles(agentHub, confPath, pushed)
+		// Best-effort: restore nginx to a config that passes -t. Ignored
+		// on purpose — the original push error is the one that matters.
+		_ = h.reloadNginx(agentHub)
+	}
+	return pushErr
+}
+
+// removeProxyFiles deletes one vhost conf plus the given domains' cert/key
+// files on the nginx host. Best-effort by design (callers already hold the
+// error that matters); paths are shell-quoted like everywhere else in this
+// file, since stored domains predate strict bind-time validation.
+func (h *ProxyHandler) removeProxyFiles(agentHub *rpc.Hub, confPath string, domains []string) {
+	args := []string{shellQuote(confPath)}
+	for _, d := range domains {
+		if d == "" {
+			continue
+		}
+		args = append(args,
+			shellQuote(fmt.Sprintf("%s/%s.crt", proxyCertDir, d)),
+			shellQuote(fmt.Sprintf("%s/%s.key", proxyCertDir, d)))
+	}
+	_, _ = execOnAgent(agentHub, "proxy-rollback-"+randomToken(4), "rm -f "+strings.Join(args, " "), 30)
+}
+
+// removeProxyCertFiles deletes only cert/key files for the given bindings
+// (conf untouched). Returns an error when the removal itself fails.
+func (h *ProxyHandler) removeProxyCertFiles(agentHub *rpc.Hub, bindings []DomainBinding) error {
+	args := make([]string, 0, len(bindings)*2)
+	for _, b := range bindings {
+		if b.Domain == "" {
+			continue
+		}
+		args = append(args,
+			shellQuote(fmt.Sprintf("%s/%s.crt", proxyCertDir, b.Domain)),
+			shellQuote(fmt.Sprintf("%s/%s.key", proxyCertDir, b.Domain)))
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	res, err := execOnAgent(agentHub, "proxy-cert-clean-"+randomToken(4), "rm -f "+strings.Join(args, " "), 30)
+	if err != nil {
+		return err
+	}
+	if res.GetExitCode() != 0 {
+		return fmt.Errorf("证书文件删除失败（exit %d）", res.GetExitCode())
+	}
+	return nil
+}
+
+// proxyTargetHosts returns the hosts a binding actually serves from: the
+// gateway host for gateway mode, the app host otherwise (including legacy
+// records with an empty mode).
+func proxyTargetHosts(app *Application) []string {
+	if app.ProxyMode == "gateway" && app.ProxyGatewayHostID != "" {
+		return []string{app.ProxyGatewayHostID}
+	}
+	return []string{app.HostID}
+}
+
+// cleanupProxyHost removes one app's vhost conf + cert files from a host
+// that no longer serves it, then reloads that host's nginx. The rm and the
+// reload are separate steps on purpose: a failed reload must not report the
+// files as still present (they are gone), nor may it pass silently (the old
+// vhost stays live in nginx's memory until a reload succeeds).
+func (h *ProxyHandler) cleanupProxyHost(hostID, appID string, bindings []DomainBinding) error {
+	hub := h.reg.Hub(hostID)
+	if hub == nil {
+		return fmt.Errorf("主机 %s 离线：该主机上的旧反代配置（vhost 与证书）未能清理，主机恢复后请重新解绑或手动清理", hostID)
+	}
+	confPath := fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, appID)
+	args := []string{shellQuote(confPath)}
+	for _, b := range bindings {
+		if b.Domain == "" {
+			continue
+		}
+		args = append(args,
+			shellQuote(fmt.Sprintf("%s/%s.crt", proxyCertDir, b.Domain)),
+			shellQuote(fmt.Sprintf("%s/%s.key", proxyCertDir, b.Domain)))
+	}
+	h.pushMu.Lock()
+	defer h.pushMu.Unlock()
+	res, err := execOnAgent(hub, "proxy-clean-"+randomToken(4), "rm -f "+strings.Join(args, " "), 30)
+	if err != nil {
+		return fmt.Errorf("主机 %s 旧反代文件删除失败：%v", hostID, err)
+	}
+	if res.GetExitCode() != 0 {
+		return fmt.Errorf("主机 %s 旧反代文件删除失败（exit %d）", hostID, res.GetExitCode())
+	}
+	res, err = execOnAgent(hub, "proxy-clean-reload-"+randomToken(4),
+		fmt.Sprintf("docker exec %s nginx -s reload 2>&1", nginxContainer), 30)
+	if err != nil {
+		return fmt.Errorf("主机 %s 旧 vhost 文件已删除，但 nginx reload 未成功，旧配置在重载前仍会继续生效：%v", hostID, err)
+	}
+	if res.GetExitCode() != 0 {
+		return fmt.Errorf("主机 %s 旧 vhost 文件已删除，但 nginx reload 未成功，旧配置在重载前仍会继续生效", hostID)
+	}
+	return nil
+}
+
+// cleanupStaleProxyTargets removes what a full-replace bind leaves behind:
+// the previous binding's vhost + certs on hosts that no longer serve the app
+// (local↔gateway switch, gateway change), and cert files of domains dropped
+// from the new set on the current target. Failures come back as warnings —
+// the new binding is already live, so there is nothing to roll back, but
+// the operator must know residue survived.
+func (h *ProxyHandler) cleanupStaleProxyTargets(oldApp *Application, newTargetHost string, newBindings []DomainBinding) []string {
+	// First bind: there is no previous vhost anywhere, so there is nothing
+	// to clean — without this guard a first gateway bind would pointlessly
+	// rm + reload on the app host and warn about it.
+	if len(oldApp.ProxyDomains) == 0 {
+		return nil
+	}
+	var warnings []string
+	newSet := make(map[string]bool, len(newBindings))
+	for _, b := range newBindings {
+		newSet[b.Domain] = true
+	}
+	for _, hostID := range dedupe(proxyTargetHosts(oldApp)) {
+		if hostID == newTargetHost {
+			continue
+		}
+		if err := h.cleanupProxyHost(hostID, oldApp.ID, oldApp.ProxyDomains); err != nil {
+			warnings = append(warnings, err.Error())
+		}
+	}
+	var removed []DomainBinding
+	for _, b := range oldApp.ProxyDomains {
+		if b.Domain != "" && !newSet[b.Domain] {
+			removed = append(removed, b)
+		}
+	}
+	if len(removed) > 0 {
+		hub := h.reg.Hub(newTargetHost)
+		if hub == nil {
+			warnings = append(warnings, "目标主机离线，已剔除域名的证书文件未能清理")
+		} else if err := h.removeProxyCertFiles(hub, removed); err != nil {
+			warnings = append(warnings, fmt.Sprintf("已剔除域名的证书文件清理失败：%v", err))
+		}
+	}
+	return warnings
+}
+
+// validProxyUpstream validates a manually supplied upstream (host:port) for
+// interpolation into a root-written nginx config. Only an IP literal or a
+// strict hostname plus a 1-65535 port is accepted — anything else (spaces,
+// `;{}#$` and friends, a missing port) is rejected before it can break out
+// of the proxy_pass directive and poison the shared gateway host.
+func validProxyUpstream(u string) bool {
+	if u == "" || strings.ContainsAny(u, " \t\r\n;{}#$/?@") {
+		return false
+	}
+	host, portStr, err := net.SplitHostPort(u)
+	if err != nil || host == "" {
+		return false
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return true
+	}
+	return validProxyDomain(strings.ToLower(host))
+}
+
+// splitUpstreamHostPort splits a validated upstream into host and port; it
+// returns port 0 for anything unparseable.
+func splitUpstreamHostPort(u string) (string, int) {
+	host, portStr, err := net.SplitHostPort(u)
+	if err != nil {
+		return "", 0
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0
+	}
+	return host, port
 }
 
 // bindingList extracts the domain bindings from resolved pairs.

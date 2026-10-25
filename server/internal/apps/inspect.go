@@ -4,9 +4,11 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"watchman/server/internal/auth"
 	"watchman/server/internal/gitprovider"
 	"watchman/server/internal/registry"
 )
@@ -27,6 +29,79 @@ func (h *AppHandlers) SetProbers(image ImageInspectFunc, repo RepoInspectFunc) {
 	h.repoInspector = repo
 }
 
+// probeRateLimiter is a per-user fixed-window limiter for the metadata probe
+// endpoints. Probing is anonymous-pull / token-backed GitHub API traffic, so
+// an unauthenticated-by-role script must not be able to burn the stored
+// GitHub token's rate quota: 30 probes per user per minute is far above the
+// create page's blur-driven usage and far below scripted abuse.
+type probeRateLimiter struct {
+	mu      sync.Mutex
+	limit   int
+	window  time.Duration
+	buckets map[string]*probeBucket
+}
+
+type probeBucket struct {
+	count       int
+	windowStart time.Time
+}
+
+func newProbeRateLimiter(limit int, window time.Duration) *probeRateLimiter {
+	return &probeRateLimiter{limit: limit, window: window, buckets: map[string]*probeBucket{}}
+}
+
+func (l *probeRateLimiter) allow(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	for k, b := range l.buckets {
+		if now.Sub(b.windowStart) > 2*l.window {
+			delete(l.buckets, k)
+		}
+	}
+	b, ok := l.buckets[key]
+	if !ok || now.Sub(b.windowStart) >= l.window {
+		l.buckets[key] = &probeBucket{count: 1, windowStart: now}
+		return true
+	}
+	if b.count >= l.limit {
+		return false
+	}
+	b.count++
+	return true
+}
+
+var probeLimiter = newProbeRateLimiter(30, time.Minute)
+
+// requireProbeRole rejects viewers (and unknown roles) from the metadata
+// probe endpoints. The repo probe runs with the admin's stored GitHub token,
+// so a viewer could otherwise read private repositories' compose files and
+// env defaults through a guessable github.com/<owner>/<repo> URL. Fail
+// closed: only admin and operator — the roles allowed to create apps —
+// may probe.
+func requireProbeRole(c *gin.Context) bool {
+	role := auth.RoleOf(c)
+	if role != auth.RoleAdmin && role != auth.RoleOperator {
+		c.JSON(http.StatusForbidden, gin.H{"error": "仅管理员与运维员可使用探测功能"})
+		return false
+	}
+	return true
+}
+
+// checkProbeRate applies the per-user probe quota; it runs after the role
+// gate so denied viewers do not consume quota.
+func checkProbeRate(c *gin.Context) bool {
+	key := auth.Username(c)
+	if key == "" {
+		key = c.ClientIP()
+	}
+	if !probeLimiter.allow(key) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "探测过于频繁，请稍后再试"})
+		return false
+	}
+	return true
+}
+
 // inspectImageReq is the payload for POST /apps/inspect-image.
 type inspectImageReq struct {
 	Image string `json:"image" binding:"required"`
@@ -41,6 +116,9 @@ type inspectRepoReq struct {
 // the extracted runtime metadata. Read-only and non-mutating, hence exempt
 // from the operation audit (diagnostic class, AGENTS.md §7).
 func (h *AppHandlers) inspectImage(c *gin.Context) {
+	if !requireProbeRole(c) || !checkProbeRate(c) {
+		return
+	}
 	var req inspectImageReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请提供镜像地址"})
@@ -70,6 +148,9 @@ func (h *AppHandlers) inspectImage(c *gin.Context) {
 // (compose / Dockerfile / env example) so the create form and the AI assistant
 // can work with the repo's real ports and environment keys.
 func (h *AppHandlers) inspectRepo(c *gin.Context) {
+	if !requireProbeRole(c) || !checkProbeRate(c) {
+		return
+	}
 	var req inspectRepoReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请提供仓库地址"})

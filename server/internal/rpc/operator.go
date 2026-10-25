@@ -258,6 +258,20 @@ func (s *OperatorService) Connect(stream grpc.BidiStreamingServer[agentpb.Operat
 	return nil
 }
 
+// checkGroupAccess resolves the agent for hostID and enforces group
+// visibility. Unknown hosts and cross-group hosts deliberately share the
+// same error text so callers cannot distinguish them (existence oracle).
+func (s *OperatorService) checkGroupAccess(claims *auth.Claims, hostID string) error {
+	agent := s.deps.Registry.GetAgent(hostID)
+	if agent == nil {
+		return fmt.Errorf("目标不存在或无权访问")
+	}
+	if s.deps.CanAccessGroup != nil && !s.deps.CanAccessGroup(claims.Username, claims.Role == auth.RoleAdmin, agent.Group) {
+		return fmt.Errorf("目标不存在或无权访问")
+	}
+	return nil
+}
+
 // resolveTarget validates an OperatorOpen against role/group/port rules and
 // resolves host, target and audit metadata. Returned risk is for the deny
 // audit when err != nil, and for the open audit otherwise.
@@ -279,6 +293,13 @@ func (s *OperatorService) resolveTarget(open *agentpb.OperatorOpen, claims *auth
 		}
 		hostID, targetType, targetID = app.HostID, "app", open.GetAppId()
 		desc = fmt.Sprintf("应用 %s", app.Name)
+		// Group visibility is checked BEFORE any app-specific validation
+		// (port whitelist, target address, mesh IP): those distinct error
+		// texts would otherwise let a cross-group caller probe an app's
+		// existence and its exposed ports.
+		if err := s.checkGroupAccess(claims, hostID); err != nil {
+			return "", "", 0, targetType, targetID, desc, audit.RiskMedium, err
+		}
 		var matched *AppPortInfo
 		for i := range app.Ports {
 			if uint32(app.Ports[i].Port) == open.GetTargetPort() {
@@ -314,6 +335,12 @@ func (s *OperatorService) resolveTarget(open *agentpb.OperatorOpen, claims *auth
 		}
 		hostID = open.GetHostId()
 		desc = "主机直连"
+		// Same ordering as app mode: group visibility first, so a
+		// cross-group caller always sees the identical denial regardless of
+		// the target address they probe with.
+		if err := s.checkGroupAccess(claims, hostID); err != nil {
+			return "", "", 0, targetType, targetID, desc, audit.RiskMedium, err
+		}
 		targetHost = open.GetTargetHost()
 		switch targetHost {
 		case "", "127.0.0.1", "localhost":
@@ -328,16 +355,6 @@ func (s *OperatorService) resolveTarget(open *agentpb.OperatorOpen, claims *auth
 		}
 	}
 
-	agent := s.deps.Registry.GetAgent(hostID)
-	if agent == nil {
-		return "", "", 0, targetType, targetID, desc, audit.RiskMedium, fmt.Errorf("目标不存在或无权访问")
-	}
-	if s.deps.CanAccessGroup != nil && !s.deps.CanAccessGroup(claims.Username, isAdmin, agent.Group) {
-		// Same text as the not-found denials above: cross-group callers must
-		// not learn that a host/app exists by comparing error messages.
-		return "", "", 0, targetType, targetID, desc, audit.RiskMedium,
-			fmt.Errorf("目标不存在或无权访问")
-	}
 	if hub := s.deps.Registry.Hub(hostID); hub == nil {
 		return "", "", 0, targetType, targetID, desc, audit.RiskLow, fmt.Errorf("目标主机不在线")
 	}

@@ -474,6 +474,21 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 		}
 	}
 
+	// Tear down the old relay BEFORE the record stops pointing at it. Once
+	// the coordinates are cleared, a failed cleanup leaves an orphaned
+	// container that purge can no longer find — so a failed teardown
+	// refuses the update (409) instead of silently orphaning the relay.
+	// (The disable case counts as abandoning: the update closure below
+	// clears the coordinates when enabled flips to false.)
+	abandonOldRelay := meshTouched && oldApp.MeshForwardHostID != "" &&
+		(!effMeshEnabled || effMeshHost != oldApp.MeshForwardHostID)
+	if abandonOldRelay && h.engine != nil {
+		if err := h.engine.CleanMeshForwarder(oldApp.MeshForwardHostID, id); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "清理旧组网转发中继容器失败，配置未变更: " + err.Error()})
+			return
+		}
+	}
+
 	if err := h.store.UpdateApp(id, func(a *Application) error {
 		if req.Name != nil {
 			a.Name = strings.TrimSpace(*req.Name)
@@ -490,13 +505,17 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 		if req.AutoDeploy != nil {
 			a.AutoDeploy = *req.AutoDeploy
 		}
-		if req.Dockerfile != nil && *req.Dockerfile != "" {
+		// Explicit "" / 0 clears: the pipeline re-applies its defaults
+		// (Dockerfile, "." context, 900s timeout) for empty values, so
+		// storing the empty value is exactly "reset to default", not a
+		// lost update.
+		if req.Dockerfile != nil {
 			a.Dockerfile = *req.Dockerfile
 		}
-		if req.BuildContext != nil && *req.BuildContext != "" {
+		if req.BuildContext != nil {
 			a.BuildContext = *req.BuildContext
 		}
-		if req.BuildTimeout != nil && *req.BuildTimeout > 0 {
+		if req.BuildTimeout != nil {
 			a.BuildTimeout = *req.BuildTimeout
 		}
 		if req.EnvVars != nil {
@@ -508,13 +527,13 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 		if req.Volumes != nil {
 			a.Volumes = *req.Volumes
 		}
-		if req.ComposeContent != nil && *req.ComposeContent != "" {
+		if req.ComposeContent != nil {
 			a.ComposeContent = *req.ComposeContent
 		}
 		if req.Image != nil {
 			a.Image = *req.Image
 		}
-		if req.BuildType != nil && *req.BuildType != "" {
+		if req.BuildType != nil {
 			a.BuildType = *req.BuildType
 		}
 		if req.HealthcheckURL != nil {
@@ -574,11 +593,14 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 			oldApp.MeshForwardEntryPort != app.MeshForwardEntryPort ||
 			oldApp.MeshForwardTargetPort != app.MeshForwardTargetPort
 		if meshChanged {
-			// The stored fields were overwritten/cleared: the old relay would
-			// otherwise be orphaned with nothing in the record pointing at it,
-			// and purge would never find it. Tear it down by its old location.
+			// The old relay was normally already torn down before the
+			// store update above; this is a second pass for the case
+			// where the record changed underneath. A failure here is
+			// surfaced, never silently dropped.
 			if oldApp.MeshForwardHostID != "" && oldApp.MeshForwardHostID != app.MeshForwardHostID {
-				h.engine.CleanMeshForwarder(oldApp.MeshForwardHostID, id)
+				if err := h.engine.CleanMeshForwarder(oldApp.MeshForwardHostID, id); err != nil {
+					resp["mesh_forward_warning"] = "旧组网转发中继容器清理失败，旧中继可能仍在运行: " + err.Error()
+				}
 			}
 			deployed := app.ContainerName != "" || app.CurrentCommit != "" || app.SourceType == "raw_compose"
 			if deployed && app.MeshForwardEnabled {
@@ -604,6 +626,20 @@ func (h *AppHandlers) deleteApp(c *gin.Context) {
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
 		return
+	}
+	// Deleting under a running deployment or volume op was the one write
+	// path with no in-flight guard: purge would remove the old container
+	// and volumes while the pipeline still swapped a -next container into
+	// place (or while a restore was unpacking), orphaning the result.
+	if h.engine != nil {
+		if h.engine.IsRunning(id) {
+			c.JSON(http.StatusConflict, gin.H{"error": "该应用有部署或迁移任务在执行，请先终止后再删除"})
+			return
+		}
+		if h.engine.VolumeBusy(id) {
+			c.JSON(http.StatusConflict, gin.H{"error": "该应用正在执行数据卷备份或恢复，请稍后再删除"})
+			return
+		}
 	}
 	var warnings []string
 	if purge {
@@ -743,13 +779,17 @@ func (h *AppHandlers) deployApp(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
 		return
 	}
+	if h.engine == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deployment engine unavailable"})
+		return
+	}
 	var req struct {
 		Force bool `json:"force"`
 	}
 	_ = c.ShouldBindJSON(&req)
 	force := req.Force || c.Query("force") == "true" || c.Query("force") == "1"
 
-	if force && h.engine != nil {
+	if force {
 		h.engine.CancelDeployment(app.ID, usernameOf(c))
 	}
 

@@ -587,3 +587,131 @@ func TestRenderVhosts(t *testing.T) {
 		t.Errorf("websocket enabled must include Upgrade header:\n%s", conf)
 	}
 }
+
+// TestValidProxyUpstream: a manual upstream is interpolated verbatim into a
+// root-written nginx config, so only IP/hostname:port survives — anything
+// carrying shell/nginx metacharacters must be rejected before render.
+func TestValidProxyUpstream(t *testing.T) {
+	valid := []string{
+		"127.0.0.1:8080",
+		"100.64.0.5:9000",
+		"1.2.3.4:1",
+		"1.2.3.4:65535",
+		"app.internal:8080",
+		"[::1]:8080",
+	}
+	for _, u := range valid {
+		if !validProxyUpstream(u) {
+			t.Errorf("validProxyUpstream(%q) = false, want true", u)
+		}
+	}
+	invalid := []string{
+		"",
+		"127.0.0.1",
+		"127.0.0.1:",
+		":8080",
+		"127.0.0.1:0",
+		"127.0.0.1:65536",
+		"127.0.0.1:abc",
+		"127.0.0.1:8080; rm -rf /",
+		"127.0.0.1:8080}",
+		"127.0.0.1:8080\nserver_name evil",
+		"ho st:8080",
+		"example.com:8080#foo",
+		"example.com:8080$var",
+		"a:b:c:8080",
+		"-lead.example.com:8080",
+		"double..dot.com:8080",
+	}
+	for _, u := range invalid {
+		if validProxyUpstream(u) {
+			t.Errorf("validProxyUpstream(%q) = true, want false", u)
+		}
+	}
+}
+
+// TestGatewayStoredUpstreamWasComputed: the sync-time rule that tells a
+// computed gateway upstream (still naming the previous app host) apart from
+// a manual override that must survive a migration.
+func TestGatewayStoredUpstreamWasComputed(t *testing.T) {
+	cases := []struct {
+		name                            string
+		stored                          string
+		oldMesh, oldPublic, oldInternal string
+		firstPort                       int
+		want                            bool
+	}{
+		{"computed mesh ip", "100.64.0.5:8080", "100.64.0.5", "1.2.3.4", "10.0.0.5", 8080, true},
+		{"computed public ip", "1.2.3.4:8080", "100.64.0.5", "1.2.3.4", "10.0.0.5", 8080, true},
+		{"computed internal ip", "10.0.0.5:8080", "100.64.0.5", "1.2.3.4", "10.0.0.5", 8080, true},
+		{"manual port differs from published", "100.64.0.5:9000", "100.64.0.5", "1.2.3.4", "10.0.0.5", 8080, false},
+		{"manual host unrelated to old host", "203.0.113.9:8080", "100.64.0.5", "1.2.3.4", "10.0.0.5", 8080, false},
+		{"old host offline yields no match", "100.64.0.5:8080", "", "", "", 8080, false},
+		{"empty stored", "", "100.64.0.5", "1.2.3.4", "10.0.0.5", 8080, false},
+		{"unparseable stored", "not-an-upstream", "100.64.0.5", "1.2.3.4", "10.0.0.5", 8080, false},
+	}
+	for _, tc := range cases {
+		got := gatewayStoredUpstreamWasComputed(tc.stored, tc.oldMesh, tc.oldPublic, tc.oldInternal, tc.firstPort)
+		if got != tc.want {
+			t.Errorf("%s: gatewayStoredUpstreamWasComputed(%q) = %v, want %v", tc.name, tc.stored, got, tc.want)
+		}
+	}
+}
+
+// TestSyncUpstreamPreservesManual: syncUpstream keeps a stored upstream
+// (local always; gateway when it is not the old host's computed value) and
+// falls back to defaultUpstream only for empty/malformed stored values.
+func TestSyncUpstreamPreservesManual(t *testing.T) {
+	ph := NewProxyHandler(nil, nil, nil)
+	local := &Application{ID: "a1", HostID: "h1", ProxyUpstream: "127.0.0.1:9000", Ports: []PortMapping{{Host: 8080, Container: 80}}}
+	got, err := ph.syncUpstream(local, "local", "", "h0")
+	if err != nil || got != "127.0.0.1:9000" {
+		t.Errorf("local manual upstream: got %q, err %v, want 127.0.0.1:9000", got, err)
+	}
+	gw := &Application{ID: "a2", HostID: "h2", ProxyUpstream: "203.0.113.9:8080", Ports: []PortMapping{{Host: 8080, Container: 80}}}
+	got, err = ph.syncUpstream(gw, "gateway", "gw1", "h0")
+	if err != nil || got != "203.0.113.9:8080" {
+		t.Errorf("gateway manual upstream: got %q, err %v, want 203.0.113.9:8080", got, err)
+	}
+	empty := &Application{ID: "a3", HostID: "h3", Ports: []PortMapping{{Host: 8080, Container: 80}}}
+	got, err = ph.syncUpstream(empty, "local", "", "h0")
+	if err != nil || got != "127.0.0.1:8080" {
+		t.Errorf("local empty upstream: got %q, err %v, want 127.0.0.1:8080", got, err)
+	}
+}
+
+// TestRenderVhostsWebsocketFlag: the stored ProxyWebSocket choice (not a
+// hardcoded true) decides whether Upgrade/Connection headers render — a
+// migration must not silently flip websocket support on.
+func TestRenderVhostsWebsocketFlag(t *testing.T) {
+	bindings := []DomainBinding{{Domain: "a.example.com", CertID: "c1"}}
+	off := renderVhosts(bindings, "127.0.0.1:8080", false)
+	if strings.Contains(off, "Upgrade $http_upgrade;") {
+		t.Errorf("websocket=false must not render Upgrade header:\n%s", off)
+	}
+	on := renderVhosts(bindings, "127.0.0.1:8080", true)
+	if !strings.Contains(on, "Upgrade $http_upgrade;") {
+		t.Errorf("websocket=true must render Upgrade header:\n%s", on)
+	}
+}
+
+// TestProxyUnbindScriptQuotesPaths: stored domains predate strict bind-time
+// validation, so the unbind rm command must quote every path — a legacy
+// dirty domain must never break out of the command.
+func TestProxyUnbindScriptQuotesPaths(t *testing.T) {
+	app := &Application{ID: "app1", ProxyDomains: []DomainBinding{{Domain: "a.example.com", CertID: "c1"}}}
+	script := proxyUnbindScript(app, "/opt/apps/nginx/conf.d/watchman-app1.conf")
+	for _, want := range []string{
+		"'/opt/apps/nginx/conf.d/watchman-app1.conf'",
+		"'/opt/apps/nginx/certs/a.example.com.crt'",
+		"'/opt/apps/nginx/certs/a.example.com.key'",
+		"docker exec watchman-proxy-nginx nginx -s reload",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("unbind script missing %q:\n%s", want, script)
+		}
+	}
+	if strings.Contains(script, "|| true") {
+		t.Errorf("unbind script must not mask the reload result with || true:\n%s", script)
+	}
+}

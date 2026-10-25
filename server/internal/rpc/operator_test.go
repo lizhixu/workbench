@@ -636,3 +636,42 @@ func TestOperatorDenyMessagesEqualized(t *testing.T) {
 		t.Fatalf("unexpected equalized denial text: %q", unknownApp)
 	}
 }
+
+// Cross-group callers must not be able to probe an app's existence or its
+// exposed ports: an illegal port on a cross-group app must be denied with the
+// same text as an unknown app, not with the port-whitelist message. This
+// locks the ordering inside resolveTarget (group check before port checks).
+func TestOperatorDenyCrossGroupAppIllegalPort(t *testing.T) {
+	rig := newOpTestRig(t)
+	rig.apps["app-1"] = AppTargetInfo{
+		HostID: "agent-1",
+		Name:   "web",
+		Ports:  []AppPortInfo{{Port: 8080}},
+	}
+	denyDetail := func(open *agentpb.OperatorOpen, username string, role auth.Role) string {
+		stream := newFakeOpStream(opCtxWithClaims(username, role))
+		done := rig.runConnect(stream)
+		stream.recvCh <- &agentpb.OperatorMessage{Payload: &agentpb.OperatorMessage_Open{Open: open}}
+		<-done
+		return lastAudit(t, rig.audits, "op_tunnel_deny").Detail
+	}
+
+	unknownApp := denyDetail(&agentpb.OperatorOpen{AppId: "ghost-app", TargetPort: 80}, "root", auth.RoleAdmin)
+	rig.groups = map[string]bool{} // alice sees nothing
+	crossGroupAppBadPort := denyDetail(&agentpb.OperatorOpen{AppId: "app-1", TargetPort: 9999}, "alice", auth.RoleOperator)
+	crossGroupAppGoodPort := denyDetail(&agentpb.OperatorOpen{AppId: "app-1", TargetPort: 8080}, "alice", auth.RoleOperator)
+	crossGroupHostArbitrary := denyDetail(&agentpb.OperatorOpen{HostId: "agent-1", TargetHost: "10.1.2.3", TargetPort: 22}, "alice", auth.RoleOperator)
+
+	for name, got := range map[string]string{
+		"cross-group app illegal port": crossGroupAppBadPort,
+		"cross-group app legal port":   crossGroupAppGoodPort,
+		"cross-group host arbitrary":   crossGroupHostArbitrary,
+	} {
+		if got != unknownApp {
+			t.Fatalf("%s denial = %q, want identical to unknown app %q", name, got, unknownApp)
+		}
+		if strings.Contains(got, "白名单") || strings.Contains(got, "仅管理员") {
+			t.Fatalf("%s denial leaks app/host details: %q", name, got)
+		}
+	}
+}

@@ -48,6 +48,15 @@ var errVolumeOpInProgress = errors.New("该应用正在执行数据卷备份或�
 // delete drop the metadata instead of retrying forever.
 var errVolumeS3TargetMissing = errors.New("归档的 S3 存储目标已不存在")
 
+// NOTE: an earlier revision had PurgeVolumeArchives acquire the volume slot
+// itself and return a busy sentinel, but its only caller (the purge flow)
+// already holds that slot for the whole purge — the self-acquire could
+// never succeed, so archive cleanup was silently skipped on every purge.
+// The slot discipline now lives with the caller: deleteApp rejects when
+// VolumeBusy, and purgeAppResources acquires the slot at entry and holds it
+// for the whole purge, so no backup/restore can interleave with the archive
+// cleanup below.
+
 const (
 	// volumeStagingRoot is scratch space on the managed host: tar output before
 	// the S3 upload, archives downloaded for a restore, and the pre-restore
@@ -492,6 +501,17 @@ func parseVolumeArchiveMeta(stdout []byte) (size int64, sha string) {
 	return
 }
 
+// validateVolumeArchiveMeta rejects a backup whose agent markers are missing
+// or implausible. The markers are the archive's only integrity proof: without
+// a SHA the restore path cannot verify the downloaded bytes, so such an
+// archive must fail here rather than be recorded as a usable success.
+func validateVolumeArchiveMeta(size int64, sha string) error {
+	if size <= 0 || sha == "" {
+		return fmt.Errorf("备份产物标记缺失（未能读取归档大小与 SHA256），归档不可信")
+	}
+	return nil
+}
+
 // ---- S3 ----
 
 // SetS3TargetStore injects the S3 destination store (snapshots.Store).
@@ -653,6 +673,15 @@ func (e *Engine) backupAppVolume(hub *rpc.Hub, app *Application, spec, note stri
 		return arch, fmt.Errorf("%s", msg)
 	}
 	size, sha := parseVolumeArchiveMeta(res.GetStdout())
+	// A tar that "succeeded" but reported no size/sha markers must not become
+	// a success record: the markers are the only proof the archive is intact,
+	// and a sha-less success record would skip restore verification entirely
+	// (see runRestoreAppVolume). An empty volume still tars to a non-empty
+	// gzip stream, so size <= 0 always means the markers were lost or cut.
+	if err := validateVolumeArchiveMeta(size, sha); err != nil {
+		e.failVolumeArchive(hub, arch, staging, err.Error())
+		return arch, err
+	}
 	arch.Size = size
 	arch.SHA256 = sha
 
@@ -846,6 +875,63 @@ func (e *Engine) RestoreAppVolume(app *Application, arch *VolumeArchive) (restar
 	return e.runRestoreAppVolume(app, arch)
 }
 
+// resolveRestoreVolumeDir validates that the archive's volume spec is still
+// declared on the app (trim-exact match, the same rule the backup front door
+// enforces) and returns the host directory the archive must be unpacked into.
+// Bind mounts compare against the recorded path (the declared source is the
+// path); named volumes are re-resolved through docker volume inspect so a
+// recreated volume's new mountpoint is caught instead of blindly trusting the
+// recorded path. Any mismatch means the volume configuration changed since
+// the backup was taken and the archive must not be unpacked anywhere.
+// The caller must have verified the hub is online: named-volume resolution
+// executes on the agent (bind mounts return before any agent call).
+func (e *Engine) resolveRestoreVolumeDir(hub *rpc.Hub, app *Application, arch *VolumeArchive) (string, error) {
+	spec := strings.TrimSpace(arch.VolumeSpec)
+	if spec == "" {
+		return "", fmt.Errorf("归档卷规格缺失，无法恢复（请重新备份）")
+	}
+	declared := false
+	for _, v := range app.Volumes {
+		if strings.TrimSpace(v) == spec {
+			declared = true
+			break
+		}
+	}
+	if !declared {
+		return "", fmt.Errorf("卷配置已变更，请重新备份")
+	}
+	src, dst, _, ok := parseVolumeSpec(spec)
+	if !ok {
+		return "", fmt.Errorf("归档卷规格无效，请重新备份")
+	}
+	if arch.ContainerPath != "" && arch.ContainerPath != dst {
+		return "", fmt.Errorf("卷配置已变更，请重新备份")
+	}
+	if volumeIsBindMount(src) {
+		if arch.HostPath != src {
+			return "", fmt.Errorf("卷配置已变更，请重新备份")
+		}
+		return src, nil
+	}
+	// Named volume: re-resolve the mountpoint instead of trusting the
+	// recorded path — the volume may have been deleted and recreated.
+	res, err := execOnAgent(hub, "volpath-"+randomToken(4), volumeResolveMountpointScript(src), 30)
+	if err != nil {
+		return "", fmt.Errorf("查询 Docker 卷 %s 挂载点失败: %v", src, err)
+	}
+	if res.GetExitCode() != 0 {
+		return "", fmt.Errorf("Docker 卷 %s 不存在，卷配置已变更，请重新备份", src)
+	}
+	hostDir := strings.TrimSpace(string(res.GetStdout()))
+	if hostDir == "" {
+		return "", fmt.Errorf("无法解析 Docker 卷 %s 的挂载点", src)
+	}
+	if hostDir != arch.HostPath {
+		return "", fmt.Errorf("卷配置已变更，请重新备份")
+	}
+	return hostDir, nil
+}
+
 // runRestoreAppVolume assumes the caller already holds the app's volume slot.
 func (e *Engine) runRestoreAppVolume(app *Application, arch *VolumeArchive) (restarted bool, err error) {
 	// Record the outcome on the archive: the HTTP layer answers 202 and the
@@ -880,6 +966,22 @@ func (e *Engine) runRestoreAppVolume(app *Application, arch *VolumeArchive) (res
 	if arch.HostID != app.HostID {
 		return false, fmt.Errorf("归档所属主机与应用不一致")
 	}
+	if arch.SHA256 == "" {
+		// A success record without a SHA cannot be verified after download,
+		// so refusing before any downtime is the only safe option. Such
+		// records can only exist from backups taken before marker validation
+		// was enforced in backupAppVolume — re-backup instead of trusting them.
+		return false, fmt.Errorf("归档缺少 SHA256 标记，无法校验完整性，请重新备份")
+	}
+	// The archive must still point at a volume the app declares: restoring
+	// into a path the app no longer owns would overwrite another
+	// application's data (e.g. the bind path was re-pointed after the backup
+	// was taken). Named volumes are re-resolved through docker volume inspect
+	// rather than trusting the recorded mountpoint.
+	restoreDir, err := e.resolveRestoreVolumeDir(hub, app, arch)
+	if err != nil {
+		return false, err
+	}
 	// The deployment pipeline recreates the container; stopping it underneath
 	// the pipeline would make both operations fight over the same app.
 	if e.IsRunning(app.ID) {
@@ -913,14 +1015,14 @@ func (e *Engine) runRestoreAppVolume(app *Application, arch *VolumeArchive) (res
 		}
 		return false, fmt.Errorf("%s", msg)
 	}
-	if arch.SHA256 != "" {
-		shaRes, shaErr := execOnAgent(hub, "volsha-"+arch.ID, volumeSHA256Script(staging), 120)
-		if shaErr != nil {
-			return false, fmt.Errorf("校验下载归档失败: %v", shaErr)
-		}
-		if got := strings.TrimSpace(string(shaRes.GetStdout())); got != arch.SHA256 {
-			return false, fmt.Errorf("归档校验失败：SHA256 不匹配（期望 %s，实际 %s）", arch.SHA256, got)
-		}
+	// SHA256 is guaranteed non-empty by the preflight above, so verification
+	// is unconditional: a missing digest must never silently skip this check.
+	shaRes, shaErr := execOnAgent(hub, "volsha-"+arch.ID, volumeSHA256Script(staging), 120)
+	if shaErr != nil {
+		return false, fmt.Errorf("校验下载归档失败: %v", shaErr)
+	}
+	if got := strings.TrimSpace(string(shaRes.GetStdout())); got != arch.SHA256 {
+		return false, fmt.Errorf("归档校验失败：SHA256 不匹配（期望 %s，实际 %s）", arch.SHA256, got)
 	}
 
 	stateRes, serr := execOnAgent(hub, "volst-"+randomToken(4), volumeContainerStateScript(container), 30)
@@ -955,7 +1057,7 @@ func (e *Engine) runRestoreAppVolume(app *Application, arch *VolumeArchive) (res
 	}
 
 	res, rerr := execOnAgent(hub, "volre-"+arch.ID,
-		volumeRestoreScript(arch.HostPath, staging, volumeSafetyPath(app.ID, arch.ID)), volumeS3OpTimeout)
+		volumeRestoreScript(restoreDir, staging, volumeSafetyPath(app.ID, arch.ID)), volumeS3OpTimeout)
 	if rerr != nil {
 		return restarted, fmt.Errorf("恢复执行失败: %v", rerr)
 	}
@@ -1007,6 +1109,11 @@ func (e *Engine) deleteAppVolumeArchive(app *Application, arch *VolumeArchive) e
 // directory and all of its metadata. Called from the purge flow (host already
 // proven online). Every object is attempted; metadata goes either way because
 // the owning application is being deleted.
+//
+// Caller contract: the caller must already hold the app's volume slot (the
+// purge flow acquires it at entry and holds it for the whole purge), so this
+// function must NOT try to acquire it again — the slot is non-reentrant and
+// a self-acquire would always fail and skip the cleanup entirely.
 func (e *Engine) PurgeVolumeArchives(app *Application) error {
 	// Scheduled app_volume jobs live in the snapshot module; with the app gone
 	// each cron sweep would fail on 「应用不存在」and append a failing archive

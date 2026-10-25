@@ -211,6 +211,46 @@ func (e *Engine) finishRunning(appID, depID string) {
 	e.mu.Unlock()
 }
 
+// isTerminalDeploymentStatus reports whether a deployment record has reached
+// a final state. Terminal records are append-only history: no later stage,
+// cancel or success path may rewrite them, otherwise a cancel that landed
+// between two stage boundaries gets overwritten by the next stage's status
+// write and the UI reports the opposite of what the operator asked for.
+func isTerminalDeploymentStatus(status string) bool {
+	return status == DeploySuccess || status == DeployFailed || status == DeployCancelled
+}
+
+// updateDeploymentIfActive runs mutate only when the record has not reached
+// a terminal state, and reports whether the mutation ran. Stage status
+// writes must go through here (or setDeploymentStatus): a bare
+// UpdateDeployment at a stage boundary resurrects a record that a cancel
+// already finalized.
+func (e *Engine) updateDeploymentIfActive(appID, depID string, mutate func(*Deployment)) bool {
+	ran := false
+	_ = e.store.UpdateDeployment(appID, depID, func(d *Deployment) {
+		if !isTerminalDeploymentStatus(d.Status) {
+			mutate(d)
+			ran = true
+		}
+	})
+	return ran
+}
+
+// setDeploymentStatus moves a record to a non-terminal status (building /
+// deploying) only when it has not already been finalized.
+func (e *Engine) setDeploymentStatus(appID, depID, status string) bool {
+	return e.updateDeploymentIfActive(appID, depID, func(d *Deployment) { d.Status = status })
+}
+
+// nextContainerName scopes the replacement container to one deployment run:
+// two runs of the same app must never share a -next name, otherwise a late
+// cancel cleanup from the old run deletes the new run's container (the
+// force-redeploy race: CancelDeployment frees the slot immediately while the
+// old pipeline is still wedged in an agent exec).
+func nextContainerName(container, depID string) string {
+	return container + "-next-" + depID
+}
+
 // CancelDeployment aborts the in-flight deployment for an app. The run's
 // context is cancelled, which makes every stage check in the pipeline bail
 // out at its next step boundary.
@@ -270,6 +310,12 @@ func (e *Engine) cleanupCancelled(app *Application, dep *Deployment, hub *rpc.Hu
 	now := time.Now()
 	finalLog := logBuf.String() + "\n[CANCELLED] 部署已被用户取消\n"
 	_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
+		// Terminal guard: a success or failure that already landed (e.g. the
+		// swap completed just before the cancel arrived) must not be
+		// rewritten as cancelled, and vice versa.
+		if isTerminalDeploymentStatus(d.Status) {
+			return
+		}
 		d.Status = DeployCancelled
 		d.FinishedAt = now
 		d.DurationMS = now.Sub(d.StartedAt).Milliseconds()
@@ -294,7 +340,7 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 	defer e.finishRunning(app.ID, dep.ID)
 
 	if pin != "" {
-		_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.CommitHash = pin })
+		e.updateDeploymentIfActive(app.ID, dep.ID, func(d *Deployment) { d.CommitHash = pin })
 	}
 
 	logBuf := &logBuffer{}
@@ -314,7 +360,12 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 		return true
 	}
 
-	e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployBuilding })
+	// A cancel that landed before this goroutine started must not be
+	// resurrected by the first status write: bail out when the record is
+	// already terminal.
+	if !e.setDeploymentStatus(app.ID, dep.ID, DeployBuilding) {
+		return
+	}
 
 	var hub *rpc.Hub
 	if e.reg != nil {
@@ -356,12 +407,14 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 
 	// Branch for raw Docker Compose applications (online YAML editor):
 	if app.SourceType == "raw_compose" {
-		e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
+		if !e.updateDeploymentIfActive(app.ID, dep.ID, func(d *Deployment) {
 			d.Status = DeployDeploying
 			// Snapshot the compose content so a later rollback can restore
 			// exactly this version (the live app.ComposeContent keeps moving).
 			d.ComposeContent = app.ComposeContent
-		})
+		}) {
+			return
+		}
 		logBuf.WriteString("$ deploy raw docker compose stack\n")
 		appDir := fmt.Sprintf("/var/lib/watchman/apps/%s", app.ID)
 		composePath := fmt.Sprintf("%s/compose.yaml", appDir)
@@ -394,7 +447,27 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 			fail("Docker Compose 启动失败 (exit %d)", res.GetExitCode())
 			return
 		}
-		if cancelled() {
+		// The app may have been deleted while `up` was running: do not
+		// leave an orphan stack behind a deleted record.
+		if _, ok := e.store.GetApp(app.ID); !ok {
+			_, _ = execOnAgent(hub, "compose-down-"+randomToken(4),
+				fmt.Sprintf("docker compose -f %s -p %s down", shellQuote(composePath), shellQuote("watchman-"+app.ID)), 60)
+			fail("应用在部署期间已被删除，部署已中止")
+			return
+		}
+		if ctx.Err() != nil {
+			// `compose up -d` cannot be interrupted mid-exec, so a cancel
+			// that landed during it leaves a live stack: tear it down
+			// before finalizing as cancelled, and say so loudly when the
+			// teardown itself fails instead of reporting a clean cancel.
+			downOK := e.cancelComposeStack(hub,
+				fmt.Sprintf("docker compose -f %s -p %s down", shellQuote(composePath), shellQuote("watchman-"+app.ID)), logBuf)
+			e.cleanupCancelled(app, dep, hub, "", "", logBuf)
+			if !downOK {
+				_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
+					d.Error = "部署已取消，但 Compose 栈清理失败，栈仍在运行，请手动执行 docker compose down 清理"
+				})
+			}
 			return
 		}
 		e.finishDeploySuccess(app, dep, "compose", imageTag, app.ContainerName, logBuf)
@@ -403,7 +476,9 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 
 		// Branch for single pre-built image deployment (app store / quick run):
 		if app.SourceType == "image" {
-			e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
+			if !e.setDeploymentStatus(app.ID, dep.ID, DeployDeploying) {
+				return
+			}
 			logBuf.WriteString("$ deploy pre-built image\n")
 			e.deploySingleContainer(ctx, hub, app, dep, logBuf, app.Image)
 			return
@@ -411,7 +486,9 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 
 		// Branch for built-in template deployment:
 	if app.SourceType == "template" {
-		e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
+		if !e.setDeploymentStatus(app.ID, dep.ID, DeployDeploying) {
+			return
+		}
 		logBuf.WriteString("$ deploy built-in template\n")
 		if err := ResolveTemplate(app); err != nil {
 			fail("解析应用模板失败: %v", err)
@@ -484,7 +561,9 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 
 	// Step 2 & 3: build and launch.
 	if app.BuildType == "compose" {
-		e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
+		if !e.setDeploymentStatus(app.ID, dep.ID, DeployDeploying) {
+			return
+		}
 		composeFile := app.Dockerfile
 		if composeFile == "" || composeFile == "Dockerfile" {
 			composeFile = "compose.yaml"
@@ -506,7 +585,23 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 			fail("Docker Compose 部署失败 (exit %d)", res.GetExitCode())
 			return
 		}
-		if cancelled() {
+		if _, ok := e.store.GetApp(app.ID); !ok {
+			_, _ = execOnAgent(hub, "compose-down-"+randomToken(4),
+				fmt.Sprintf("cd %s && docker compose -f %s -p %s down", shellQuote(repoDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID)), 60)
+			fail("应用在部署期间已被删除，部署已中止")
+			return
+		}
+		if ctx.Err() != nil {
+			// Same live-stack problem as the raw_compose branch: `up -d`
+			// already went live, so tear it down before finalizing.
+			downOK := e.cancelComposeStack(hub,
+				fmt.Sprintf("cd %s && docker compose -f %s -p %s down", shellQuote(repoDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID)), logBuf)
+			e.cleanupCancelled(app, dep, hub, "", "", logBuf)
+			if !downOK {
+				_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
+					d.Error = "部署已取消，但 Compose 栈清理失败，栈仍在运行，请手动执行 docker compose down 清理"
+				})
+			}
 			return
 		}
 		e.finishDeploySuccess(app, dep, commit, imageRef, app.ContainerName, logBuf)
@@ -532,7 +627,9 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 		return
 	}
 
-	e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) { d.Status = DeployDeploying })
+	if !e.setDeploymentStatus(app.ID, dep.ID, DeployDeploying) {
+		return
+	}
 
 	// Step 3: start the replacement container under a -next name, health
 	// probe, then swap. The old container keeps running the whole time so a
@@ -554,7 +651,7 @@ func (e *Engine) deploySingleContainer(ctx context.Context, hub *rpc.Hub, app *A
 	if container == "" {
 		container = "watchman-app-" + app.ID
 	}
-	nextName := container + "-next"
+	nextName := nextContainerName(container, dep.ID)
 
 	cancelled := func() bool {
 		if ctx.Err() == nil {
@@ -622,6 +719,12 @@ func (e *Engine) deploySingleContainer(ctx context.Context, hub *rpc.Hub, app *A
 	}
 	ok := e.probe(ctx, hub, app, nextName, logBuf)
 	if !ok {
+		// A cancel that landed during the probe must finalize as cancelled
+		// (keeping CancelledBy), not as a health-check failure overwriting
+		// the cancelled record.
+		if cancelled() {
+			return
+		}
 		fail("健康检查未通过，已保留旧版本容器")
 		e.removeContainer(hub, nextName)
 		return
@@ -644,6 +747,13 @@ docker inspect --format '{{.State.Status}}' %[2]s`,
 		shellQuote(container+"-prev"), shellQuote(container), shellQuote(nextName))
 	logBuf.WriteString("$ swap containers\n")
 	if cancelled() {
+		return
+	}
+	// The app may have been deleted while the replacement was built: never
+	// swap a container into place for a record that no longer exists.
+	if _, ok := e.store.GetApp(app.ID); !ok {
+		e.removeContainer(hub, nextName)
+		fail("应用在部署期间已被删除，部署已中止")
 		return
 	}
 	res, err = execOnAgent(hub, "docker-swap-"+randomToken(4), swapCmd, 60)
@@ -674,6 +784,13 @@ docker inspect --format '{{.State.Status}}' %[2]s`,
 		}
 	}
 
+	// A cancel that landed after the swap must finalize as cancelled, not
+	// be rewritten as success by the finish step below. (The swapped
+	// container is intentionally left alone: cleanupCancelled only removes
+	// the -next name, which no longer exists after the rename.)
+	if cancelled() {
+		return
+	}
 	e.finishDeploySuccess(app, dep, dep.CommitHash, imageRef, container, logBuf)
 }
 
@@ -735,12 +852,36 @@ func parseIPv4(out string) string {
 func (e *Engine) finishDeploySuccess(app *Application, dep *Deployment, commit, imageRef, container string, logBuf *logBuffer) {
 	now := time.Now()
 	finalLog := logBuf.String()
-	e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
+	finalized := false
+	_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
+		if isTerminalDeploymentStatus(d.Status) {
+			// A cancel (or a delete racing the run) already finalized this
+			// record; never rewrite it as success behind the operator.
+			finalized = true
+			return
+		}
 		d.Status = DeploySuccess
 		d.FinishedAt = now
 		d.DurationMS = now.Sub(d.StartedAt).Milliseconds()
 		d.BuildLog = finalLog
 	})
+	if finalized {
+		return
+	}
+	if _, ok := e.store.GetApp(app.ID); !ok {
+		// Deleted mid-run (a delete that raced the start): the record must
+		// not claim success for an app that no longer exists, and no
+		// forwarder may be created for it below. This intentionally
+		// demotes the success this same call just wrote: the terminal
+		// guard above protects against competing paths, but this branch
+		// is the correction of our own write, not a competing one.
+		_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
+			d.Status = DeployFailed
+			d.Error = "应用在部署期间已被删除"
+			d.BuildLog = finalLog + "\n[FAILED] 应用在部署期间已被删除\n"
+		})
+		return
+	}
 		e.store.UpdateApp(app.ID, func(a *Application) error {
 			a.CurrentCommit = commit
 			if imageRef != "" {
@@ -762,9 +903,13 @@ func (e *Engine) finishDeploySuccess(app *Application, dep *Deployment, commit, 
 			return
 		}
 		if fresh.MeshForwardEnabled && fresh.MeshForwardHostID != "" && fresh.MeshForwardEntryPort > 0 {
-			e.syncMeshForwarder(fresh, logBuf)
+			// A failed relay must not fail the deploy itself (the
+			// container is live), but the WARN is already in the log.
+			_ = e.syncMeshForwarder(fresh, logBuf)
 		} else if fresh.MeshForwardHostID != "" {
-			e.cleanMeshForwarder(fresh.MeshForwardHostID, fresh.ID)
+			if err := e.cleanMeshForwarder(fresh.MeshForwardHostID, fresh.ID); err != nil {
+				logBuf.WriteString(fmt.Sprintf("WARN: 清理组网中继容器失败: %v\n", err))
+			}
 		}
 		e.log.Info("deployment succeeded", "app", app.ID, "commit", commit, "deployment", dep.ID)
 }
@@ -773,6 +918,12 @@ func (e *Engine) fail(app *Application, dep *Deployment, logBuf *logBuffer, msg 
 	now := time.Now()
 	finalLog := logBuf.String() + "\n[FAILED] " + msg + "\n"
 	_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
+		// Terminal guard: never overwrite a cancelled record with a
+		// failure (probe-cancel and late stage errors both funnel here),
+		// and never overwrite an earlier terminal state at all.
+		if isTerminalDeploymentStatus(d.Status) {
+			return
+		}
 		d.Status = DeployFailed
 		d.FinishedAt = now
 		d.DurationMS = now.Sub(d.StartedAt).Milliseconds()
@@ -780,6 +931,26 @@ func (e *Engine) fail(app *Application, dep *Deployment, logBuf *logBuffer, msg 
 		d.BuildLog = finalLog
 	})
 	e.log.Warn("deployment failed", "app", app.ID, "deployment", dep.ID, "err", msg)
+}
+
+// cancelComposeStack tears down a compose stack that went live while the
+// operator cancelled. `compose up -d` cannot be interrupted mid-exec, so a
+// cancel landing during it must bring the stack back down; otherwise the
+// record would say "cancelled" while the new stack keeps serving. It
+// returns false when the teardown itself failed — the caller must then say
+// so on the record instead of reporting a clean cancel.
+func (e *Engine) cancelComposeStack(hub *rpc.Hub, downCmd string, logBuf *logBuffer) bool {
+	res, err := execOnAgent(hub, "compose-down-"+randomToken(4), downCmd, 120)
+	if err != nil {
+		logBuf.WriteString(fmt.Sprintf("WARN: 取消后清理 Compose 栈失败: %v\n", err))
+		return false
+	}
+	if res.GetExitCode() != 0 {
+		logBuf.WriteString(fmt.Sprintf("WARN: 取消后清理 Compose 栈失败 (exit %d): %s\n", res.GetExitCode(), string(res.GetStderr())))
+		return false
+	}
+	logBuf.WriteString("已取消部署，Compose 栈已清理\n")
+	return true
 }
 
 // probe waits for the replacement container to become healthy. With a
@@ -1091,16 +1262,23 @@ func resolveForwardUpstream(port int, appMesh, entryMesh, appPublicIP, appIntern
 	return "", fmt.Errorf("无法确定入口主机到应用主机的转发目标地址：应用主机未加入异地组网，且没有可用的公网/内网 IP")
 }
 
-func (e *Engine) syncMeshForwarder(app *Application, logBuf *logBuffer) {
+// syncMeshForwarder deploys (or replaces) the companion socat relay on the
+// entry host. It returns an error when forwarding is configured but the
+// relay could not be brought up, so callers that must not report success
+// (migration stage 3, update sync) can fail loudly; callers that only log
+// (deploy finish) still get the WARN in logBuf. An unconfigured relay is a
+// no-op, not an error.
+func (e *Engine) syncMeshForwarder(app *Application, logBuf *logBuffer) error {
 	if e.reg == nil || app.MeshForwardHostID == "" || app.MeshForwardEntryPort <= 0 {
-		return
+		return nil
 	}
 	fwdHub := e.reg.Hub(app.MeshForwardHostID)
 	if fwdHub == nil {
+		msg := fmt.Sprintf("组网转发入口主机 (%s) 离线，未能启动中继容器", app.MeshForwardHostID)
 		if logBuf != nil {
-			logBuf.WriteString(fmt.Sprintf("WARN: 组网转发入口主机 (%s) 离线，未能启动中继容器\n", app.MeshForwardHostID))
+			logBuf.WriteString("WARN: " + msg + "\n")
 		}
-		return
+		return fmt.Errorf("%s", msg)
 	}
 
 	target, err := e.resolveMeshForwardTarget(app)
@@ -1108,7 +1286,7 @@ func (e *Engine) syncMeshForwarder(app *Application, logBuf *logBuffer) {
 		if logBuf != nil {
 			logBuf.WriteString(fmt.Sprintf("WARN: 解析组网转发目标失败: %v\n", err))
 		}
-		return
+		return err
 	}
 
 	fwdContainer := "watchman-fwd-" + app.ID
@@ -1131,13 +1309,14 @@ func (e *Engine) syncMeshForwarder(app *Application, logBuf *logBuffer) {
 		if logBuf != nil {
 			logBuf.WriteString(fmt.Sprintf("WARN: 部署组网中继容器通信失败: %v\n", err))
 		}
-		return
+		return err
 	}
 	if res.GetExitCode() != 0 {
+		msg := fmt.Sprintf("部署组网中继容器失败 (exit %d): %s", res.GetExitCode(), string(res.GetStderr()))
 		if logBuf != nil {
-			logBuf.WriteString(fmt.Sprintf("WARN: 部署组网中继容器失败 (exit %d): %s\n", res.GetExitCode(), string(res.GetStderr())))
+			logBuf.WriteString("WARN: " + msg + "\n")
 		}
-		return
+		return fmt.Errorf("%s", msg)
 	}
 
 	_ = e.store.UpdateApp(app.ID, func(a *Application) error {
@@ -1147,32 +1326,51 @@ func (e *Engine) syncMeshForwarder(app *Application, logBuf *logBuffer) {
 	if logBuf != nil {
 		logBuf.WriteString(fmt.Sprintf("组网端口转发已就绪: 入口主机端口 %d -> %s\n", app.MeshForwardEntryPort, target))
 	}
+	return nil
 }
 
-func (e *Engine) cleanMeshForwarder(hostID, appID string) {
+// cleanMeshForwarder removes the companion relay container on the given entry
+// host. It returns an error when the entry host is offline or the removal
+// failed, so callers can refuse to drop the record's pointer to the relay
+// (an unremoved relay with no record pointing at it is an orphan purge can
+// never find). "No such container" is not a failure: the desired end state
+// already holds.
+func (e *Engine) cleanMeshForwarder(hostID, appID string) error {
 	if e.reg == nil || hostID == "" || appID == "" {
-		return
+		return nil
 	}
 	fwdHub := e.reg.Hub(hostID)
 	if fwdHub == nil {
-		return
+		return fmt.Errorf("组网转发入口主机 %s 离线", hostID)
 	}
 	fwdContainer := "watchman-fwd-" + appID
-	_, _ = execOnAgent(fwdHub, "clean-fwd-"+randomToken(4), "docker rm -f "+shellQuote(fwdContainer), 30)
+	res, err := execOnAgent(fwdHub, "clean-fwd-"+randomToken(4), "docker rm -f "+shellQuote(fwdContainer), 30)
+	if err != nil {
+		return err
+	}
+	if res.GetExitCode() != 0 {
+		if strings.Contains(string(res.GetStderr()), "No such container") {
+			return nil
+		}
+		return fmt.Errorf("删除中继容器失败 (exit %d): %s", res.GetExitCode(), string(res.GetStderr()))
+	}
+	return nil
 }
 
 // CleanMeshForwarder removes the companion relay container on the given entry
 // host. Exported so updateApp can tear down the old relay when forwarding is
 // disabled or moved to another entry host (the record no longer references it).
-func (e *Engine) CleanMeshForwarder(hostID, appID string) {
-	e.cleanMeshForwarder(hostID, appID)
+func (e *Engine) CleanMeshForwarder(hostID, appID string) error {
+	return e.cleanMeshForwarder(hostID, appID)
 }
 
 // SyncMeshForwarder updates or clears the companion socat relay container on the entry host.
 func (e *Engine) SyncMeshForwarder(app *Application) (string, error) {
 	if !app.MeshForwardEnabled {
 		if app.MeshForwardHostID != "" {
-			e.cleanMeshForwarder(app.MeshForwardHostID, app.ID)
+			if err := e.cleanMeshForwarder(app.MeshForwardHostID, app.ID); err != nil {
+				return "", err
+			}
 		}
 		return "", nil
 	}

@@ -1,12 +1,15 @@
 package apps
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
 	"testing"
 
+	"watchman/proto/agentpb"
+	"watchman/server/internal/rpc"
 	"watchman/server/internal/snapshots"
 )
 
@@ -429,4 +432,56 @@ func containsWarning(warnings []string, substr string) bool {
 		}
 	}
 	return false
+}
+
+// registerMigrateTestAgent enrolls a fake online agent with the given OS.
+// Only used for the synchronous StartMigration checks below: no pipeline
+// is ever started, so no exec is attempted on the fake hub (a real Hub
+// without a stream would block until the exec timeout).
+func registerMigrateTestAgent(t *testing.T, reg *rpc.Registry, id, os string) {
+	t.Helper()
+	tok := reg.IssueEnrollToken()
+	if _, _, err := reg.Register(context.Background(), &agentpb.RegisterRequest{
+		EnrollToken: tok, AgentId: id, Hostname: id, Os: os, Arch: "amd64",
+	}, ""); err != nil {
+		t.Fatalf("Register %s: %v", id, err)
+	}
+}
+
+// TestStartMigrationRejectsOfflineSource: the source agent was never
+// checked — with the source offline, Stage 1 silently skipped stopping the
+// source container and the migration could still "succeed", leaving two
+// live copies of the app.
+func TestStartMigrationRejectsOfflineSource(t *testing.T) {
+	store, err := NewStore(t.TempDir(), slog.Default())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	reg := rpc.NewRegistry(t.TempDir(), nil)
+	registerMigrateTestAgent(t, reg, "host_tgt", "linux")
+	engine := NewEngine(reg, store, nil, slog.Default())
+	app := putMigrateApp(t, store, &Application{HostID: "host_src"})
+	_, err = engine.StartMigration(app, MigrateAppReq{TargetHostID: "host_tgt"}, "tester")
+	if err == nil || !strings.Contains(err.Error(), "源主机 Agent 不在线") {
+		t.Errorf("expected offline-source rejection, got %v", err)
+	}
+}
+
+// TestStartMigrationRejectsWindowsSource: the migration pipeline is POSIX
+// tar/set -e, so a Windows source must be refused at admission, not deep
+// inside the pipeline.
+func TestStartMigrationRejectsWindowsSource(t *testing.T) {
+	store, err := NewStore(t.TempDir(), slog.Default())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	reg := rpc.NewRegistry(t.TempDir(), nil)
+	registerMigrateTestAgent(t, reg, "host_src", "windows")
+	registerMigrateTestAgent(t, reg, "host_tgt", "linux")
+	engine := NewEngine(reg, store, nil, slog.Default())
+	app := putMigrateApp(t, store, &Application{HostID: "host_src"})
+	_, err = engine.StartMigration(app, MigrateAppReq{TargetHostID: "host_tgt"}, "tester")
+	if err == nil || !strings.Contains(err.Error(), "源主机为 Windows") {
+		t.Errorf("expected Windows-source rejection, got %v", err)
+	}
 }

@@ -47,6 +47,11 @@ type Client struct {
 	// Timeout bounds a single registry round-trip.
 	Timeout time.Duration
 
+	// allowPrivateHosts disables the SSRF guards (safe dialer, redirect and
+	// realm validation). Test-only: in-package tests point the client at
+	// httptest loopback servers. Never set in production code.
+	allowPrivateHosts bool
+
 	http *http.Client
 }
 
@@ -62,10 +67,15 @@ func (c *Client) httpClient() *http.Client {
 		timeout = defaultTimeout
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	// SSRF enforcement at the connection layer: every dialed target must
+	// resolve to public IPs, and every redirect target is validated before
+	// it is followed (see ssrf.go). This closes the DNS-rebinding window
+	// that a parse-time-only hostname check would leave open.
+	tr.DialContext = c.safeDialContext
 	if c.InsecureSkipVerify {
 		tr.TLSClientConfig = insecureTLSConfig()
 	}
-	c.http = &http.Client{Timeout: timeout, Transport: tr}
+	c.http = &http.Client{Timeout: timeout, Transport: tr, CheckRedirect: c.checkRedirect}
 	return c.http
 }
 
@@ -126,6 +136,14 @@ func (c *Client) fetchToken(ctx context.Context, ch *authChallenge) (string, err
 	u, err := url.Parse(ch.Realm)
 	if err != nil {
 		return "", fmt.Errorf("token realm 非法: %w", err)
+	}
+	// A hostile registry controls the Www-Authenticate realm: it must pass
+	// the same public-host validation as any registry address, otherwise the
+	// token exchange itself becomes an SSRF vector into the internal network.
+	if !c.allowPrivateHosts {
+		if err := validatePublicHost(ctx, u.Host); err != nil {
+			return "", err
+		}
 	}
 	q := u.Query()
 	if ch.Service != "" {
@@ -215,9 +233,10 @@ func (c *Client) getJSON(ctx context.Context, fullURL string, accept, token stri
 		return "", fmt.Errorf("镜像仓库拒绝匿名读取（可能为私有镜像）(%s)", resp.Status)
 	}
 	if resp.StatusCode/100 != 2 {
-		body := make([]byte, 256)
-		n, _ := resp.Body.Read(body)
-		return "", fmt.Errorf("仓库响应异常 (%s): %s", resp.Status, strings.TrimSpace(string(body[:n])))
+		// Deliberately no upstream body excerpt: an attacker-controlled
+		// registry could otherwise exfiltrate internal content through the
+		// error string surfaced to API callers.
+		return "", fmt.Errorf("仓库响应异常 (%s)", resp.Status)
 	}
 
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxManifestSize)).Decode(out); err != nil {

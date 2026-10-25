@@ -30,9 +30,9 @@ type Application struct {
 	WebhookError       string `json:"webhook_error,omitempty"`
 
 	// Build configuration.
-	BuildType      string `json:"build_type,omitempty"`      // "dockerfile" | "compose"
-	Dockerfile     string `json:"dockerfile,omitempty"`      // relative path, default "Dockerfile"
-	BuildContext   string `json:"build_context,omitempty"`   // relative dir, default "."
+	BuildType      string `json:"build_type,omitempty"`    // "dockerfile" | "compose"
+	Dockerfile     string `json:"dockerfile,omitempty"`    // relative path, default "Dockerfile"
+	BuildContext   string `json:"build_context,omitempty"` // relative dir, default "."
 	BuildTimeout   int32  `json:"build_timeout_sec,omitempty"`
 	ComposeContent string `json:"compose_content,omitempty"` // raw compose.yaml for source_type == "raw_compose"
 
@@ -64,9 +64,20 @@ type Application struct {
 	// serves it — each domain carries its own explicit CertID (no domain
 	// auto-matching, no auto-issuance on bind).
 	ProxyDomains       []DomainBinding `json:"proxy_domains,omitempty"`
-	ProxyMode          string          `json:"proxy_mode,omitempty"`             // "local" | "gateway"
+	ProxyMode          string          `json:"proxy_mode,omitempty"`            // "local" | "gateway"
 	ProxyGatewayHostID string          `json:"proxy_gateway_host_id,omitempty"` // gateway node host id
-	ProxyUpstream      string          `json:"proxy_upstream,omitempty"`         // e.g. "127.0.0.1:8080" or mesh IP
+	ProxyUpstream      string          `json:"proxy_upstream,omitempty"`        // e.g. "127.0.0.1:8080" or mesh IP
+	// ProxyWebSocket persists the bind-time WebSocket choice (Upgrade /
+	// Connection headers + 300s read timeout). It must survive migrations:
+	// SyncProxyForHost used to hardcode websocket=true, silently flipping
+	// apps whose websocket support was off. It is a pointer on purpose:
+	// nil means "no choice recorded" (legacy records, and binds from
+	// callers that do not send the field, e.g. the create page), which
+	// renders exactly like the pre-change behavior — Upgrade headers on.
+	// Only an explicit false turns them off. A plain bool could not tell
+	// "legacy, always-on" apart from "explicitly off", and migrations
+	// would have silently dropped Upgrade headers from legacy apps.
+	ProxyWebSocket *bool `json:"proxy_websocket,omitempty"`
 
 	// Runtime state.
 	CurrentCommit string    `json:"current_commit,omitempty"`
@@ -80,8 +91,8 @@ type Application struct {
 
 // PortMapping is one published container port.
 type PortMapping struct {
-	Host      int    `json:"host"`
-	Container int    `json:"container"`
+	Host      int `json:"host"`
+	Container int `json:"container"`
 	// BindScope: "public" (binds to 0.0.0.0) | "mesh" (binds to Tailscale IP).
 	// Empty string defaults to "public".
 	BindScope string `json:"bind_scope,omitempty"`

@@ -435,23 +435,41 @@ func (h *Handlers) renewCert(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"ok": true, "message": "续期请求已受理，请稍后刷新列表"})
 }
 
-// deleteCert removes a certificate. When an app domain binding explicitly
-// references it, the delete is refused (409) with the app names so the
-// operator rebinds those domains first; ?force=true clears the references
-// (the domains keep serving whatever cert is already on the nginx host and
-// fall back to deterministic best-match until rebound) and deletes anyway.
+// deleteCert removes a certificate.
+//
+// Two guards protect certificates that are still in use:
+//
+//   - Panel binding: when the panel security settings explicitly bind this
+//     certificate (panelCertInfo), the delete is refused (409) and
+//     ?force=true does NOT override it. The panel certificate can only be
+//     unbound from the panel security settings; deleting it out from under
+//     a running panel would make panelsec silently fall back to another
+//     certificate (or fail outright once the hub is empty), so the operator
+//     must unbind it there first.
+//   - App domain bindings: when an app domain explicitly references the
+//     certificate, the delete is refused (409) with the app names so the
+//     operator rebinds those domains first; ?force=true clears the
+//     references (the domains keep serving whatever cert is already on the
+//     nginx host and fall back to deterministic best-match until rebound)
+//     and deletes anyway.
 func (h *Handlers) deleteCert(c *gin.Context) {
 	id := c.Param("id")
-		if h.appDomains != nil {
-			var names []string
-			seen := make(map[string]bool)
-			for _, ref := range h.appDomains() {
-				if ref.CertID == id && !seen[ref.Name] {
-					seen[ref.Name] = true
-					names = append(names, ref.Name)
-				}
+	if h.panelCertInfo != nil {
+		if panelCertID, _ := h.panelCertInfo(); panelCertID != "" && panelCertID == id {
+			c.JSON(http.StatusConflict, gin.H{"error": "该证书正被面板证书绑定使用（系统设置 → 面板域名与证书）。请先解除面板证书绑定后再删除；force 参数不适用于面板绑定证书"})
+			return
+		}
+	}
+	if h.appDomains != nil {
+		var names []string
+		seen := make(map[string]bool)
+		for _, ref := range h.appDomains() {
+			if ref.CertID == id && !seen[ref.Name] {
+				seen[ref.Name] = true
+				names = append(names, ref.Name)
 			}
-			if len(names) > 0 {
+		}
+		if len(names) > 0 {
 			force := c.Query("force") == "true" || c.Query("force") == "1"
 			if !force {
 				c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf(

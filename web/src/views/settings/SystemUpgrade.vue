@@ -757,7 +757,7 @@ onMounted(async () => {
       style="width: 540px; max-width: 92vw"
     >
       <div class="online-upgrade-dialog">
-        <NDescriptions :columns="1" label-placement="left" size="small" bordered>
+        <NDescriptions :columns="1" label-placement="left" size="small" bordered :label-style="{ width: '112px', whiteSpace: 'nowrap' }">
           <NDescriptionsItem label="当前版本">
             <span class="mono-font">{{ systemUpdate.currentVersion || healthData?.version || '0.1.0-dev' }}</span>
           </NDescriptionsItem>
@@ -972,7 +972,7 @@ onMounted(async () => {
 .online-upgrade-dialog {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 16px;
 }
 
 .upload-dialog-content {

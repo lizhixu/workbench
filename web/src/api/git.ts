@@ -61,3 +61,87 @@ export function listGitHubBranches(owner: string, repo: string) {
     http.get(`/git/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches`),
   ).then((r) => r.data)
 }
+
+// ---- GitHub App（App 级推送事件，替代逐仓 Webhook）----
+
+export interface GitHubAppInstallation {
+  id: number
+  account_login: string
+  account_type: string
+  target_type: string
+  repos?: string[]
+  suspended?: boolean
+  updated_at: string
+}
+
+export interface GitHubAppStatus {
+  configured: boolean
+  app_id?: number
+  slug?: string
+  webhook_url: string
+  installations: GitHubAppInstallation[]
+}
+
+export interface GitHubAppInstalledRepo {
+  account: string
+  full_name: string
+}
+
+export interface GitHubAppManifest {
+  manifest: Record<string, unknown>
+  state: string
+  submit_url: string
+  panel_url: string
+  public_url_configured: boolean
+}
+
+export function getGitHubAppStatus() {
+  return unwrap<GitHubAppStatus>(http.get('/github-app/status'))
+}
+
+export function createGitHubAppManifest(name: string, target: string, org?: string) {
+  return unwrap<GitHubAppManifest>(
+    http.post('/github-app/manifest', { name, target, org: org || undefined }),
+  )
+}
+
+export function exchangeGitHubAppManifest(code: string, state: string) {
+  return unwrap<{ ok: boolean; app_id: number; slug: string }>(
+    http.post('/github-app/manifest/exchange', { code, state }),
+  )
+}
+
+export function saveGitHubAppConfig(appId: number, privateKey: string, webhookSecret: string) {
+  return unwrap<{ ok: boolean; app_id: number }>(
+    http.post('/github-app/config', { app_id: appId, private_key: privateKey, webhook_secret: webhookSecret }),
+  )
+}
+
+export function disconnectGitHubApp() {
+  return unwrap<{ ok: boolean }>(http.delete('/github-app'))
+}
+
+export function syncGitHubAppInstallations() {
+  // 同步可能拉多个安装的仓库清单，给足 60s（默认 axios 超时仅 15s）。
+  return unwrap<{ installations: GitHubAppInstallation[] }>(
+    http.post('/github-app/installations/sync', undefined, { timeout: 60000 }),
+  ).then((r) => r.installations)
+}
+
+export function listGitHubAppRepos() {
+  return unwrap<{ repos: GitHubAppInstalledRepo[] }>(
+    http.get('/github-app/installations/repos'),
+  ).then((r) => r.repos)
+}
+
+export function listGitHubAppBranches(owner: string, repo: string) {
+  return unwrap<{ branches: string[] }>(
+    http.get(`/github-app/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches`),
+  ).then((r) => r.branches)
+}
+
+export function switchAppToGitHubApp(appId: string) {
+  return unwrap<{ ok: boolean; message: string; data: unknown }>(
+    http.post(`/apps/${appId}/github-app/switch`),
+  )
+}

@@ -103,7 +103,15 @@
   - `template`：内置模板一键部署（Nginx、Redis、MySQL、PostgreSQL、雷池 WAF 等），只填模板参数即可拉起；模板经 `ResolveTemplate` 解析为镜像 + 环境变量 + 默认端口/卷，走与应用中心一致的引擎部署流（持久化、健康检查、滚动替换）。
   - `image`：直接输入镜像引用（`nginx:alpine`、`registry.example.com/app:1.0`）部署单容器。
   - `raw_compose`：在线编写 Docker Compose YAML 编排微服务栈。
-  - `git`：链接 Git 仓库（GitHub 授权选择或手动 URL），Dockerfile / Compose 构建，支持推送自动部署（Webhook）。
+  - `git`：链接 Git 仓库（GitHub 授权选择或手动 URL），Dockerfile / Compose 构建，支持推送自动部署（Webhook；GitHub App 路径见下条）。
+- **GitHub App 自动部署（2026-10-26，github.com 主推路径，逐仓 Webhook 降级为备选）**：
+  - **一次安装覆盖全部/部分仓库**：面板「系统设置 → 代码源集成」新建 GitHub App（Manifest 两步流：填名称 + 目标（个人/组织）→ 跳 GitHub 创建 → 回调换 code（1 小时内，state 防 CSRF，state 嵌在 redirect_url 的 `github_app_state` 参数里带回——submit URL 的 query GitHub 不保证透传）→ 配置落盘；或手动填已有 App 的 App ID/私钥/Webhook Secret）→ 到 GitHub 安装页选账号/组织与仓库范围 → 面板「同步安装」拉取安装与仓库清单。
+  - **事件入口**：公开端点 `POST /api/v1/github-app/webhook`（HMAC-SHA256 验签、恒时比较、`X-GitHub-Delivery` 去重、body 4MB 上限；未配置 503；ping 200；仅 `refs/heads/` 分支推送触发，tag 推送跳过；push 按 `repository.full_name` 归一化匹配应用，分支匹配 + auto_deploy 门 + 在途 409，复用 `StartDeployment`，`trigger=github-app`；`installation`/`installation_repositories` 事件同步安装状态与仓库清单，卸载则相关应用降级提示；安装事件的仓库清单刷新走异步，upsert 本身同步落盘，持久化失败返回 5xx 供 GitHub 重投）。安全入口开启时该端点仍可达（secentry 豁免）。
+  - **部署取数优先级**：应用 vault 凭据 > installation token（现取现用、内存缓存 1h、过期前 5 分钟刷新；仓库不在安装范围时全量刷新后重试）> 现有 provider token。**刷新合并语义**：部分安装刷新失败时保留其旧缓存（只丢 GitHub 侧已不存在的安装），失败数如实返回调用方；配置变更/断开时清空内存 token 缓存。
+  - **凭据存储**：App ID/私钥/Webhook Secret 存 `github_app.json`（dataDir、0600、tmp+rename 原子写、API 永不回显），**不用 Vault**——Vault 是用户自管凭据的 UI，程序性塞入系统私钥反而会暴露在 Vault 界面；与 `git_provider.json` 同款先例。
+  - **前端**：GitProviders.vue GitHub App 分区（创建/手动/安装/同步/断开、事件地址复制，同步请求超时 60s）；AppDetail 三种自动部署状态（GitHub App 托管 / GitHub 自动托管 / 手动模式）+「切换到 GitHub App」按钮（切换前置条件：App 已配置且仓库在未暂停安装覆盖内，否则 409 并引导先安装/同步；切换时后端删旧逐仓 hook，失败 502 不改库）；AppCreate 仓库下拉含 App 安装仓库（标 `[GitHub App]`，分支走 App 令牌拉取）；App 来源应用默认 `auto_deploy=true`。
+  - **前提与边界**：面板必须有 GitHub 可达的公网地址（webhook_url 由 `server.public_url` 或请求 Host 推导；public_url 未配时创建页 warning）；内网面板不在本方案范围内，需轮询兜底（未实现）。权限最小化：`contents:read` + `metadata:read`，只订阅 push；v1 不含 PR 预览与 Watch paths。
+  - **审计**：`app_github_app_switch`（medium）/ `github_app_manifest`（low）/ `github_app_config`（high）/ `github_app_disconnect`（high）/ `github_app_install_sync`（medium）。
 - **集成组网端口转发（4 层 TCP 流量中继，2026-10-16）**：
   - 组网转发彻底从独立的假应用收敛为**具体业务应用的内置 4 层网络中继能力**（与 7 层 HTTP/HTTPS 域名反代并列）。
   - 用户在部署或维护任意具体应用（模板/镜像/Compose/Git）时，可开启「组网端口转发」，指定**入口主机**（`mesh_forward_host_id`，如带公网 IP 的跳板机/网关节点，不能是应用主机自身）、**入口监听端口**（`mesh_forward_entry_port`，1~65535）与**目标端口**（`mesh_forward_target_port`，缺省预填应用暴露端口）。
@@ -173,6 +181,7 @@
     - **强制重新部署（`force=true`）**：在已有部署执行时，`POST /apps/:id/deploy` 支持 `force=true`（Query 或 JSON Body），服务端自动先终止当前在途任务、释放槽位并立即启动全新部署，前端弹窗确认「当前已有部署任务正在进行中，继续将终止当前任务并启动全新部署」；
     - **历史记录与多点控制**：顶部操作栏展示醒目「终止部署」按钮与二次确认；部署历史列表针对 `queued`/`building`/`deploying` 记录提供行内「停止」按钮；部署状态 Tag 增加「已取消」（warning 琥珀色），提交信息列展示取消人。
     - **取消与终态加固（2026-10-25）**：Compose 部署取消时自动 `compose down` 清理已上线栈（raw_compose 与 git-compose 两分支；清理失败时记录 Error 明确标注栈仍在运行，请手动 down，禁止静默记干净取消）；部署记录终态守卫——success/failed/cancelled 一旦写入，任何后续阶段/取消/成功路径不得重写（此前探活取消可被 fail 覆盖丢 `CancelledBy`、swap 后取消可翻 success）；`-next` 容器名带 depID 后缀（`watchman-app-<id>-next-dep_<8字符>`，新旧两 run 容器名必然不同，旧管线清理删不掉新容器，purge 与迁移清理同步覆盖新旧两种命名）；swap 前与 `finishDeploySuccess` 入口查应用存活，已删则删 `-next` 并 fail（不建中继）；`deployApp` 补 engine nil 守卫（503）。
+  - **部署 Docker 前置检查（2026-10-26）**：管线在 Agent 在线校验通过后、拉取代码/构建之前，先对目标主机执行 Docker 可用性检查（`command -v docker` 与 `docker info` 两段、退出码区分，复用反代保障的分类口径）：未安装 → 快速失败「目标主机未安装 Docker：请先在主机详情 Docker 页一键安装 Docker 后重试」；daemon 未起 → 「目标主机 Docker 服务未运行：请先启动 Docker 服务后重试」；检查本身传输失败（Agent 断连/exec 超时）不归类为 Docker 问题。覆盖全部来源（git/镜像/模板/Compose 终点都是 docker），此前缺失该检查时，无 Docker 主机会一路跑到起容器才以裸 `docker: command not found`（exit 127）失败。创建即部署同样走该检查，失败时经 `deploy_warning` 带出同一文案。不覆盖：`docker compose` 插件缺失（`docker info` 通过但 compose 子命令不存在）仍在 Compose 步骤以原错误失败，属后续缺口。**前端安装提醒（2026-10-26）**：光给文字提示不够便捷，`AppDetail.vue` 在最新一次部署死于“未安装 Docker”时给两条路——详情页眉与正文之间的常驻警告横幅（一键安装 Docker 按钮）与本页会话内发起的部署刚失败时的自动弹窗（问是否安装，安装中禁关、装完给「立即重新部署」）；安装走现有 `POST /hosts/:id/docker/install-script`（服务端内置官方脚本，前端 330 秒超时）。识别靠部署记录 `error` 含固定文案“未安装 Docker”（记录无 error_code 字段，改后端文案须同步前端）；提醒状态取最新一条记录（单独拉第 1 页第 1 条，不依赖历史页签当前页码）；部署结束（部署中→非部署中）时补刷一次历史与最新记录，否则 1 秒内落终态的快速失败永远刷不出来。
   - **创建即部署（2026-10-21）**：`POST /apps` 持久化成功后立即 `engine.StartDeployment(app, "create", …)` 入队首轮部署（`Deployment.trigger` 新增 `create`，详情页展示为「创建」），响应附 `deployment`；引擎忙/启动失败不失败创建本身，仅附 `deploy_warning`（应用记录合法，可手动重试）。前端创建页提示「已创建，正在部署…」，详情页既有轮询自然展示 排队→构建→发布→成功/失败 与日志。
   - **应用列表（2026-10-21）**：列为 应用名称 / 服务器 / 来源 / 当前版本 / 状态 / 最近部署 / 最近更新 / 操作。「服务器」由前端并行 `listHosts()` 按 `host_id → hostname` 映射（`/apps` 不 join 主机，主机接口失败不阻断应用列表）；「来源」替代原只对 Git 有意义的 `repo_url @ branch` 列（git → 仓库+自动部署标记、image → 镜像、template → 模板、raw_compose → Docker Compose）；「最近更新」取 `Application.updated_at`。右上角入口文案「创建应用」（原「链接 Git 应用」）。
   - **`updated_at` 语义（2026-10-21）**：`Application.UpdatedAt` 在任何持久化变更时推进，写入点唯一——`Store.UpdateApp` 内统一打点（覆盖配置编辑、部署成功/失败收尾、反代绑定/解绑、组网中继同步），`PutApp` 在空值时以 `CreatedAt` 播种；时间戳单调（`nextUpdatedAt`，时钟回拨不回退）。历史 `apps.json` 缺该字段时，加载期回填 `max(CreatedAt, LastDeployAt)`，老应用不显示空白。
@@ -890,6 +899,17 @@ GET    /api/v1/apps/:id/deployments/:depID
 POST   /api/v1/apps/:id/deployments/:depID/diagnose # AI 排障
 GET    /api/v1/apps/:id/status
 POST   /api/v1/apps/:id/webhook/sync
+POST   /api/v1/apps/:id/github-app/switch # 切换到 GitHub App 触发（非 github.com 仓库 400；有旧逐仓 hook 时先删，失败 502 不改库）
+# GitHub App（见 §3.7）
+GET    /api/v1/github-app/status
+GET    /api/v1/github-app/installations/repos
+GET    /api/v1/github-app/repos/:owner/:repo/branches
+POST   /api/v1/github-app/manifest        # 生成 Manifest（state 内存 15 分钟过期）
+POST   /api/v1/github-app/manifest/exchange # 验 state 后换 code 落盘（私钥可用性校验）
+POST   /api/v1/github-app/config          # 手动填写 App ID/私钥/Webhook Secret（私钥可用性校验）
+POST   /api/v1/github-app/installations/sync # 同步安装与仓库清单
+DELETE /api/v1/github-app                # 断开（清配置与安装）
+POST   /api/v1/github-app/webhook         # 公开端点（HMAC-SHA256 验签、delivery 去重、未配置 503）
 POST   /api/v1/apps/inspect-image         # 镜像元数据免拉取只读探测
 POST   /api/v1/apps/inspect-repo          # 仓库元数据只读探测
 GET    /api/v1/apps/:id/volume-backups?volume=&offset=&page_size=  # 挂载卷备份归档列表（登录即可；含 last_restore_at/status/error 与 s3:{ready,target_id,target_name,bucket} 去向块）
@@ -1251,6 +1271,13 @@ POST   /api/v1/apps/:id/deployments/:depID/diagnose   # AI 排障
 PUT    /api/v1/apps/:id/proxy              # 绑定域名 {domain, mode: local|gateway, gateway_host_id, cert_id?, upstream?}；无证书时用默认 ACME 账户自动签发；绑定前自动保障系统托管反代容器（ensureProxyNginx，见 §3.7）：Windows 主机 400、Docker 不可用/80-443 被占/镜像拉取失败 → 409 分类提示、其余保障失败 500+日志摘要
 DELETE /api/v1/apps/:id/proxy              # 解绑（同时清理应用主机与网关主机配置）
 POST   /api/v1/apps/webhook/:token         # Git push 自动部署（token 鉴权）
+POST   /api/v1/github-app/webhook          # GitHub App 级 push 事件（公开、HMAC-SHA256 验签、delivery 去重、未配置 503；按 full_name 匹配应用，trigger=github-app）
+GET    /api/v1/github-app/status           # App 配置与安装概览（configured/app_id/slug/webhook_url/installations）
+GET    /api/v1/github-app/installations/repos  # 全部安装的仓库清单（App 令牌取数）
+GET    /api/v1/github-app/repos/:owner/:repo/branches  # 仓库分支（App 令牌取数；不在安装范围 404）
+POST   /api/v1/github-app/manifest|manifest/exchange|config|installations/sync  # Manifest 生成/换 code/手动配置/同步安装（admin + 审计）
+DELETE /api/v1/github-app                 # 断开 GitHub App（admin + 审计）
+POST   /api/v1/apps/:id/github-app/switch  # 应用切换到 GitHub App 触发（admin + 审计 app_github_app_switch；删旧逐仓 hook 失败 502）
 
 # 按需运维隧道（§3.17，控制面；数据面走 -opgrpc 端口的 OperatorService）
 GET    /api/v1/tunnels/client-info          # CLI 引导信息 {enabled, endpoint, cli{各平台 Release 直链}}；authed 读、免审计；enabled 反映数据面监听器真实状态（启动失败 fail-closed 置假），endpoint 推导链：server.public_url 设置 → -public-url 参数 → 请求 Host（IPv6 去重围括号）

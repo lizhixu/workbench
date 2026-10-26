@@ -23,8 +23,11 @@ import {
   volumeArchiveDownloadUrl, type VolumeArchive, type VolumeS3Status,
 } from '../../api/apps'
 import { bindProxy, unbindProxy, listCerts, type Certificate } from '../../api/certs'
-import { listHosts } from '../../api/hosts'
+import { installDocker, listHosts } from '../../api/hosts'
 import { listNetworkNodes } from '../../api/network'
+import {
+  getGitHubAppStatus, switchAppToGitHubApp, type GitHubAppStatus,
+} from '../../api/git'
 import { bothMeshed } from '../../utils/mesh'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useAuthStore } from '../../stores/auth'
@@ -667,7 +670,7 @@ async function loadDeployments() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadApp(), loadStatus(), loadDeployments(), loadVolumeBackups()])
+  await Promise.all([loadApp(), loadStatus(), loadDeployments(), loadVolumeBackups(), refreshNewestDeployment()])
 }
 
 const cancellingDeploy = ref(false)
@@ -675,9 +678,12 @@ const cancellingDeploy = ref(false)
 async function doDeploy(force = false) {
   acting.value = true
   try {
-    await deployApp(appId.value, force)
+    const dep = await deployApp(appId.value, force)
+    // 记下本页会话内发起的任务：它随后若失败为“未安装 Docker”，
+    // 下面 watch(newestDeployment) 会自动弹出安装提醒。
+    if (dep?.id) seenActiveDepIds.add(dep.id)
     message.success(force ? '已终止当前任务并重新启动部署' : '已开始部署')
-    await Promise.all([loadStatus(), loadDeployments()])
+    await Promise.all([loadStatus(), loadDeployments(), refreshNewestDeployment()])
   } catch (e: any) {
     message.error(e.message || '触发部署失败')
   } finally {
@@ -696,6 +702,89 @@ async function doCancelDeploy() {
   } finally {
     cancellingDeploy.value = false
   }
+}
+
+// ---- 未安装 Docker 时的安装提醒 ----
+// 后端部署前置检查的失败文案是固定字符串（见 deploy.go
+// classifyDockerPreflight），部署记录本身没有 error_code 字段，
+// 前端只能以该文案识别“未安装 Docker”类失败；改动后端文案时
+// 必须同步 DOCKER_MISSING_MARK。
+const DOCKER_MISSING_MARK = '未安装 Docker'
+
+// 最新一条部署记录：单独拉取第 1 页第 1 条，不依赖部署历史页签
+// 的当前页码——否则用户翻到第 2 页时横幅与自动提醒都会失效。
+const newestDeployment = ref<Deployment | null>(null)
+async function refreshNewestDeployment() {
+  try {
+    const res = await listDeployments(appId.value, 0, 1)
+    newestDeployment.value = res.data[0] ?? null
+  } catch {
+    // 提醒只是 best-effort：拉取失败时横幅/弹窗不出现，
+    // 部署历史页签本身仍是事实来源。
+  }
+}
+const dockerMissingFailed = computed(() =>
+  newestDeployment.value?.status === 'failed' &&
+  (newestDeployment.value.error ?? '').includes(DOCKER_MISSING_MARK),
+)
+
+// 本页会话内发起、随后失败为未安装 Docker 的任务才自动弹窗：
+// 直接打开详情页时历史里已有的旧失败只由横幅提示，不自动打扰。
+const seenActiveDepIds = new Set<string>()
+const promptedDepIds = new Set<string>()
+const showDockerInstallPrompt = ref(false)
+const installingDocker = ref(false)
+const dockerInstallOutput = ref('')
+const dockerInstallDone = ref<'success' | 'failed' | null>(null)
+watch(newestDeployment, (dep) => {
+  if (
+    !dep || dep.status !== 'failed' ||
+    !(dep.error ?? '').includes(DOCKER_MISSING_MARK) ||
+    !seenActiveDepIds.has(dep.id) || promptedDepIds.has(dep.id) ||
+    !canWrite.value || showDockerInstallPrompt.value ||
+    // 页签缓存实例在切走后仍会收到数据刷新：只给当前正在看的
+    // 应用弹窗，别给后台页签的应用弹。
+    !app.value || String(route.params.id ?? '') !== app.value.id
+  ) return
+  promptedDepIds.add(dep.id)
+  openDockerInstallPrompt()
+})
+function openDockerInstallPrompt() {
+  if (installingDocker.value) return
+  dockerInstallDone.value = null
+  dockerInstallOutput.value = ''
+  showDockerInstallPrompt.value = true
+}
+function closeDockerInstallPrompt() {
+  showDockerInstallPrompt.value = false
+}
+async function startInstallDockerFromPrompt() {
+  if (!app.value) return
+  installingDocker.value = true
+  dockerInstallDone.value = null
+  dockerInstallOutput.value = '>>> 正在下发服务端内置的 Docker 一键安装脚本 (curl -fsSL https://get.docker.com | sh)...\n'
+  try {
+    const res = await installDocker(app.value.host_id)
+    if (res.ok) {
+      dockerInstallDone.value = 'success'
+      dockerInstallOutput.value += '\n>>> 安装执行完成！\n' + (res.stdout || '')
+      message.success('Docker 安装完成')
+    } else {
+      dockerInstallDone.value = 'failed'
+      dockerInstallOutput.value += '\n>>> 执行异常 (Exit code ' + res.exit_code + '):\n' + (res.stderr || res.stdout || '')
+      message.error('Docker 安装未成功，请检查输出日志')
+    }
+  } catch (e: any) {
+    dockerInstallDone.value = 'failed'
+    dockerInstallOutput.value += '\n>>> 安装请求失败: ' + (e.message || e)
+    message.error('安装请求失败: ' + e.message)
+  } finally {
+    installingDocker.value = false
+  }
+}
+function redeployAfterDockerInstall() {
+  showDockerInstallPrompt.value = false
+  doDeploy(false)
 }
 
 async function doRollback(dep?: Deployment) {
@@ -1109,6 +1198,49 @@ async function doSyncWebhook() {
   }
 }
 
+// GitHub App 托管判定：App 已配置，且该应用仓库落在某个未暂停安装的
+// 仓库清单里。仓库地址归一化与后端 NormalizeRepoURL 同款（去 .git 后缀、
+// 小写、https/ssh 两种写法都认）。
+const githubAppStatus = ref<GitHubAppStatus | null>(null)
+function normalizeRepoUrl(raw: string): string {
+  let s = (raw || '').trim().replace(/\/$/, '').replace(/\.git$/, '')
+  const idx = s.indexOf('github.com')
+  if (idx >= 0) return s.slice(idx + 'github.com'.length).replace(/^[/:]+/, '').toLowerCase()
+  if ((s.match(/\//g) || []).length === 1 && !/[:@ ]/.test(s)) return s.toLowerCase()
+  return ''
+}
+const appManagedByGitHubApp = computed(() => {
+  const st = githubAppStatus.value
+  if (!st?.configured || !app.value?.auto_deploy || !app.value?.repo_url) return false
+  const norm = normalizeRepoUrl(app.value.repo_url)
+  if (!norm) return false
+  return (st.installations || []).some(
+    (inst) => !inst.suspended && (inst.repos || []).includes(norm),
+  )
+})
+async function loadGitHubAppStatus() {
+  try {
+    githubAppStatus.value = await getGitHubAppStatus()
+  } catch (e: any) {
+    // silently fail：GitHub App 未配置时详情页其余内容不受影响
+  }
+}
+const switchingToApp = ref(false)
+async function doSwitchToGitHubApp() {
+  if (!app.value?.id) return
+  switchingToApp.value = true
+  try {
+    const res = await switchAppToGitHubApp(app.value.id)
+    message.success(res.message || '已切换到 GitHub App 触发')
+    app.value = res.data as AppEntity
+    await loadGitHubAppStatus()
+  } catch (e: any) {
+    message.error(e.message || '切换失败')
+  } finally {
+    switchingToApp.value = false
+  }
+}
+
 function openLog(dep: Deployment) {
   logDeployment.value = dep
   showLog.value = true
@@ -1248,6 +1380,17 @@ watch(page, () => {
   loadDeployments()
 })
 
+// 部署结束（部署中 → 非部署中）时刷新一次部署历史与最新记录：
+// 快速失败的任务（如 Docker 前置检查，1 秒内落终态）会在两次
+// 轮询之间结束，只靠“部署中才刷历史”的轮询永远刷不出来，
+// 失败原因和安装提醒也就跟着出不来。
+watch(deploying, (now, prev) => {
+  if (prev && !now && route.name === 'app-detail') {
+    loadDeployments()
+    refreshNewestDeployment()
+  }
+})
+
 function startPolling() {
   if (pollTimer) return
   pollTimer = setInterval(() => {
@@ -1264,6 +1407,7 @@ function startPolling() {
 onMounted(() => {
   refreshAll()
   loadProxyData()
+  loadGitHubAppStatus()
   startPolling()
 })
 
@@ -1274,6 +1418,7 @@ onActivated(() => {
   // 首屏仍由 onMounted 的 refreshAll() 全量加载。
   loadStatus()
   loadDeployments()
+  refreshNewestDeployment()
   loadVolumeBackups()
   loadProxyData(false)
   // 页签切走期间轮询窗口可能已过期，仍在执行的任务需要重新开启观察。
@@ -1380,6 +1525,21 @@ onDeactivated(() => {
       </NSpace>
     </div>
 
+    <!-- 最新一次部署死于“未安装 Docker”：常驻提醒，直到一次非此类
+      失败/成功的部署把它顶掉。安装入口与部署失败自动弹窗共用
+      同一个安装流程。 -->
+    <NAlert
+      v-if="dockerMissingFailed"
+      type="warning"
+      style="flex-shrink: 0"
+      title="目标主机未安装 Docker，本应用无法部署"
+    >
+      最近一次部署在前置检查失败：目标主机没有 Docker，任何部署都会直接失败。
+      <div v-if="canWrite" style="margin-top: 8px">
+        <NButton size="small" type="warning" @click="openDockerInstallPrompt">一键安装 Docker</NButton>
+      </div>
+    </NAlert>
+
     <div class="detail-body">
       <NTabs v-model:value="activeTab" type="line" style="height: 100%; display: flex; flex-direction: column">
         <NTabPane name="overview" tab="概览">
@@ -1455,7 +1615,13 @@ onDeactivated(() => {
               </NDescriptionsItem>
             </NDescriptions>
 
-            <NAlert v-if="app.auto_deploy && app.webhook_auto_managed" type="success" style="margin-top: 14px" :show-icon="true">
+            <NAlert v-if="app.auto_deploy && appManagedByGitHubApp" type="success" style="margin-top: 14px" :show-icon="true">
+              <template #header>自动部署已生效 (GitHub App 托管)</template>
+              <div>
+                该仓库在 GitHub App 的安装范围内。每当向 <code>{{ app.branch || 'main' }}</code> 分支推送代码（git push）时，App 级事件将自动触发构建并重新部署，无需为该仓库单独配置 Webhook。
+              </div>
+            </NAlert>
+            <NAlert v-else-if="app.auto_deploy && app.webhook_auto_managed" type="success" style="margin-top: 14px" :show-icon="true">
               <template #header>自动部署已生效 (GitHub 自动托管)</template>
               <div>
                 系统已自动通过已连接的 GitHub 账号在仓库中配置了 Webhook。每当向 <code>{{ app.branch || 'main' }}</code> 分支推送代码（git push）时，将自动触发构建并重新部署（无需手动配置 Webhook）。
@@ -1463,6 +1629,16 @@ onDeactivated(() => {
               <div style="margin-top: 8px">
                 <NButton size="tiny" secondary :loading="syncingWebhook" @click="doSyncWebhook">
                   重新同步 Webhook
+                </NButton>
+                <NButton
+                  v-if="githubAppStatus?.configured"
+                  size="tiny"
+                  secondary
+                  :loading="switchingToApp"
+                  style="margin-left: 8px"
+                  @click="doSwitchToGitHubApp"
+                >
+                  切换到 GitHub App
                 </NButton>
               </div>
             </NAlert>
@@ -1484,6 +1660,15 @@ onDeactivated(() => {
                 </NButton>
                 <NButton v-if="app.repo_url?.includes('github.com')" size="tiny" secondary :loading="syncingWebhook" @click="doSyncWebhook">
                   重试自动同步
+                </NButton>
+                <NButton
+                  v-if="app.repo_url?.includes('github.com') && githubAppStatus?.configured"
+                  size="tiny"
+                  secondary
+                  :loading="switchingToApp"
+                  @click="doSwitchToGitHubApp"
+                >
+                  切换到 GitHub App
                 </NButton>
               </div>
             </NAlert>
@@ -1955,6 +2140,48 @@ onDeactivated(() => {
           {{ logDeployment.error }}
         </NAlert>
       </div>
+    </NModal>
+
+    <!-- 未安装 Docker：安装提醒。部署失败由 watch(newestDeployment)
+      自动弹出；横幅上的一键安装也进同一个弹窗。安装中禁止关闭，
+      否则请求在后台继续跑、结果没人接。 -->
+    <NModal
+      v-model:show="showDockerInstallPrompt"
+      preset="card"
+      title="目标主机未安装 Docker"
+      style="width: 640px; max-width: 94vw"
+      :mask-closable="!installingDocker"
+      :closable="!installingDocker"
+    >
+      <div v-if="dockerInstallDone === null && !installingDocker">
+        <p>本次部署在前置检查就失败了：目标主机上没有 Docker，无法拉起任何容器。是否立即为该主机安装 Docker？</p>
+        <p class="muted">将执行服务端内置的官方一键安装脚本（curl -fsSL https://get.docker.com | sh），耗时约几分钟。</p>
+      </div>
+      <div v-else>
+        <pre class="log-pre">{{ dockerInstallOutput }}</pre>
+        <NAlert v-if="dockerInstallDone === 'success'" type="success" style="margin-top: 10px">
+          Docker 安装完成，可以重新部署了。
+        </NAlert>
+        <NAlert v-if="dockerInstallDone === 'failed'" type="error" style="margin-top: 10px">
+          安装未成功，请检查输出日志，或到主机详情 Docker 页签手动安装。
+        </NAlert>
+      </div>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton v-if="dockerInstallDone === null && !installingDocker" @click="closeDockerInstallPrompt">暂不安装</NButton>
+          <NButton
+            v-if="dockerInstallDone === null"
+            type="primary"
+            :loading="installingDocker"
+            @click="startInstallDockerFromPrompt"
+          >
+            安装 Docker
+          </NButton>
+          <NButton v-if="dockerInstallDone === 'failed' && !installingDocker" @click="startInstallDockerFromPrompt">重新安装</NButton>
+          <NButton v-if="dockerInstallDone === 'success'" type="primary" @click="redeployAfterDockerInstall">立即重新部署</NButton>
+          <NButton v-if="dockerInstallDone !== null && !installingDocker" @click="closeDockerInstallPrompt">关闭</NButton>
+        </NSpace>
+      </template>
     </NModal>
 
     <!-- 运维隧道一键入口（kubectl port-forward 式） -->

@@ -47,6 +47,13 @@ func TestDeriveMutationActionCoverage(t *testing.T) {
 		{http.MethodPost, "/api/v1/backups/s3-targets/:id/test", "backup_s3_test", "backup", audit.RiskLow},
 		// Git provider.
 		{http.MethodPost, "/api/v1/git/github/token", "git_token_set", "system", audit.RiskHigh},
+		// GitHub App.
+		{http.MethodPost, "/api/v1/apps/:id/github-app/switch", "app_github_app_switch", "app", ""},
+		{http.MethodPost, "/api/v1/github-app/manifest", "github_app_manifest", "system", audit.RiskLow},
+		{http.MethodPost, "/api/v1/github-app/manifest/exchange", "github_app_config", "system", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/github-app/config", "github_app_config", "system", audit.RiskHigh},
+		{http.MethodDelete, "/api/v1/github-app", "github_app_disconnect", "system", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/github-app/installations/sync", "github_app_install_sync", "system", ""},
 		// Groups.
 		{http.MethodPost, "/api/v1/groups/:id/users", "group_grant", "group", audit.RiskHigh},
 		// Commands.

@@ -24,6 +24,8 @@ import {
   connectGitHubToken, disconnectGitHub, getGitProviders,
   listGitHubBranches, listGitHubRepos, type GitHubAccount,
   type GitHubBranch, type GitHubRepo,
+  getGitHubAppStatus, listGitHubAppRepos, listGitHubAppBranches,
+  type GitHubAppInstalledRepo,
 } from '../../api/git'
 import { useWorkspaceStore } from '../../stores/workspace'
 import AppAiAssistant from '../../components/apps/AppAiAssistant.vue'
@@ -123,6 +125,19 @@ const connectingGitHub = ref(false)
 const githubRepos = ref<GitHubRepo[]>([])
 const loadingRepos = ref(false)
 const selectedRepoFullName = ref<string | null>(null)
+
+// GitHub App 已安装仓库（无 PAT 时也能选仓；取数走 App 安装令牌）。
+const appInstalledRepos = ref<GitHubAppInstalledRepo[]>([])
+const githubSourceReady = computed(() => githubAccount.value !== null || appInstalledRepos.value.length > 0)
+
+async function fetchAppInstalledRepos() {
+  try {
+    const st = await getGitHubAppStatus()
+    if (st.configured) appInstalledRepos.value = await listGitHubAppRepos()
+  } catch {
+    // GitHub App 未配置时静默，PAT 流程不受影响
+  }
+}
 
 const branches = ref<GitHubBranch[]>([])
 const loadingBranches = ref(false)
@@ -701,12 +716,22 @@ const vaultOptions = computed(() => [
   ...vaults.value.map((v) => ({ label: `${v.name} (${v.type})`, value: v.id })),
 ])
 
-const repoOptions = computed(() =>
-  githubRepos.value.map((r) => ({
-    label: `${r.full_name}${r.private ? ' [私有]' : ''}${r.description ? ' - ' + r.description : ''}`,
-    value: r.full_name,
-  })),
-)
+const repoOptions = computed(() => {
+  const patNames = new Set(githubRepos.value.map((r) => r.full_name))
+  return [
+    ...githubRepos.value.map((r) => ({
+      label: `${r.full_name}${r.private ? ' [私有]' : ''}${r.description ? ' - ' + r.description : ''}`,
+      value: r.full_name,
+    })),
+    // GitHub App 安装仓库：PAT 列表里没有的才追加，避免同一仓库出现两次。
+    ...appInstalledRepos.value
+      .filter((r) => !patNames.has(r.full_name))
+      .map((r) => ({
+        label: `${r.full_name} [GitHub App]`,
+        value: r.full_name,
+      })),
+  ]
+})
 
 const branchOptions = computed(() =>
   branches.value.map((b) => ({
@@ -887,6 +912,7 @@ async function checkGitHubStatus() {
   } finally {
     checkingGitHub.value = false
   }
+  await fetchAppInstalledRepos()
 }
 
 async function fetchGitHubRepos() {
@@ -900,11 +926,37 @@ async function fetchGitHubRepos() {
   }
 }
 
+async function refreshRepoLists() {
+  if (githubAccount.value) await fetchGitHubRepos()
+  await fetchAppInstalledRepos()
+}
+
 // 当用户在下拉框选中某个 GitHub 仓库时：自动填充应用名、克隆地址，并拉取所有分支
 watch(selectedRepoFullName, async (fullName) => {
   if (!fullName) return
   const repo = githubRepos.value.find((r) => r.full_name === fullName)
-  if (!repo) return
+  if (!repo) {
+    // GitHub App 安装仓库（无 PAT 元数据）：只填克隆地址与应用名，分支走 App 令牌拉取。
+    const [owner, name] = fullName.split('/')
+    if (!owner || !name) return
+    form.repo_url = `https://github.com/${fullName}.git`
+    if (!form.name) form.name = name
+    void probeRepo(form.repo_url)
+    // 先清空分支：上一个仓库的分支残留到新仓库是静默错配，必须先清再拉。
+    form.branch = ''
+    loadingBranches.value = true
+    try {
+      const names = await listGitHubAppBranches(owner, name)
+      branches.value = names.map((n) => ({ name: n, protected: false, sha: '' }))
+      if (names.includes('main')) form.branch = 'main'
+      else if (names.length > 0) form.branch = names[0]
+    } catch (e: any) {
+      message.error(e.message || '获取仓库分支失败')
+    } finally {
+      loadingBranches.value = false
+    }
+    return
+  }
 
   form.repo_url = repo.clone_url
   if (!form.name) {
@@ -1309,13 +1361,13 @@ onMounted(loadData)
 
           <!-- GitHub 授权仓库 -->
           <template v-if="sourceMode === 'github'">
-            <div v-if="!githubAccount" class="github-connect-box">
+            <div v-if="!githubSourceReady" class="github-connect-box">
               <NSpace align="center" justify="space-between" style="width: 100%">
                 <NSpace align="center">
                   <NIcon size="28"><LogoGithub /></NIcon>
                   <div>
                     <div style="font-weight: 600">未连接 GitHub 账号</div>
-                    <div class="hint">连接后可直接读取您公开与私有的所有仓库列表，点击即可创建，自动拉取分支。</div>
+                    <div class="hint">连接后可直接读取您公开与私有的所有仓库列表，点击即可创建，自动拉取分支。已在设置里配置 GitHub App 时也可直接选仓，无需再连账号。</div>
                   </div>
                 </NSpace>
                 <NButton type="primary" secondary @click="showAuthModal = true">
@@ -1330,18 +1382,24 @@ onMounted(loadData)
             <div v-else class="github-connected-bar">
               <NSpace align="center" justify="space-between" style="width: 100%">
                 <NSpace align="center">
-                  <NAvatar :src="githubAccount.avatar_url" round size="small" />
-                  <span style="font-weight: 600">{{ githubAccount.name || githubAccount.login }}</span>
-                  <NTag size="tiny" type="success" :bordered="false">已授权连接</NTag>
+                  <template v-if="githubAccount">
+                    <NAvatar :src="githubAccount.avatar_url" round size="small" />
+                    <span style="font-weight: 600">{{ githubAccount.name || githubAccount.login }}</span>
+                    <NTag size="tiny" type="success" :bordered="false">已授权连接</NTag>
+                  </template>
+                  <template v-else>
+                    <NTag size="tiny" type="success" :bordered="false">GitHub App 已配置</NTag>
+                    <span class="hint">可直接从 App 安装仓库中选仓，部署拉取走安装令牌</span>
+                  </template>
                 </NSpace>
                 <NSpace align="center" :size="4">
-                  <NButton size="tiny" secondary @click="fetchGitHubRepos" :loading="loadingRepos">
+                  <NButton size="tiny" secondary @click="refreshRepoLists" :loading="loadingRepos">
                     <template #icon>
                       <NIcon><RefreshOutline /></NIcon>
                     </template>
                     刷新仓库
                   </NButton>
-                  <NButton size="tiny" quaternary type="error" @click="doDisconnectGitHub">断开</NButton>
+                  <NButton v-if="githubAccount" size="tiny" quaternary type="error" @click="doDisconnectGitHub">断开</NButton>
                 </NSpace>
               </NSpace>
             </div>

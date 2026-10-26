@@ -33,6 +33,7 @@ import (
 	"watchman/server/internal/backup"
 	"watchman/server/internal/cert"
 	"watchman/server/internal/commands"
+	"watchman/server/internal/githubapp"
 	"watchman/server/internal/gitprovider"
 	"watchman/server/internal/groups"
 	"watchman/server/internal/install"
@@ -337,6 +338,14 @@ func main() {
 	appEngine.SetGitProvider(gitProviderStore)
 	log.Info("git provider store ready")
 
+	// GitHub App integration (App-level push events, no per-repo webhook).
+	githubAppStore, err := githubapp.NewStore(*dataDir, log)
+	if err != nil {
+		log.Error("github app store init", "err", err)
+		os.Exit(1)
+	}
+	log.Info("github app store ready")
+
 	// Host & container volume snapshots / database hot-backup.
 	snapshotStore, err := snapshots.NewStore(*dataDir, log)
 	if err != nil {
@@ -581,7 +590,7 @@ func main() {
 	}()
 
 	// HTTP server (REST + WS).
-	hr := api.Router(reg, log, authStore, sessStore, alertStore, vaultStore, aiAssistant, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore, settingsStore, backupStore, networkStore, appStore, appEngine, certHub, snapshotStore, snapshotEngine, gitProviderStore, alertMonitor, *opGRPCAddr)
+	hr := api.Router(reg, log, authStore, sessStore, alertStore, vaultStore, aiAssistant, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore, settingsStore, backupStore, networkStore, appStore, appEngine, certHub, snapshotStore, snapshotEngine, gitProviderStore, githubAppStore, alertMonitor, *opGRPCAddr)
 	// Install endpoints (one-line agent install + binary download).
 	installHandler := install.NewHandler(reg, "bin")
 	installHandler.UpgradePubKey = api.UpgradePubKeyHex

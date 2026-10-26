@@ -31,6 +31,7 @@ import (
 	"watchman/server/internal/backup"
 	"watchman/server/internal/cert"
 	"watchman/server/internal/commands"
+	"watchman/server/internal/githubapp"
 	"watchman/server/internal/gitprovider"
 	"watchman/server/internal/groups"
 	"watchman/server/internal/install"
@@ -117,7 +118,7 @@ type HostDTO struct {
 // authorization, prefsStore backs per-user terminal preferences and
 // backupStore backs control-plane backup/restore; all may be nil to disable
 // those features.
-func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, settingsStore *settings.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine, gitProviderStore *gitprovider.Store, alertMon *alert.Monitor, opGRPCAddr string) *gin.Engine {
+func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, settingsStore *settings.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine, gitProviderStore *gitprovider.Store, githubAppStore *githubapp.Store, alertMon *alert.Monitor, opGRPCAddr string) *gin.Engine {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -229,6 +230,9 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 			appHandlers.SetGitProvider(gitProviderStore)
 			appHandlers.SetProbers(registry.Inspect, gitProviderStore.InspectRepo)
 		}
+		if githubAppStore != nil {
+			appHandlers.SetGitHubAppStore(githubAppStore)
+		}
 		if aiAssistant != nil {
 			appHandlers.SetAI(func(ctx context.Context, command, stdout, stderr string, exitCode int32) (any, error) {
 				return aiAssistant.AnalyzeExecResult(ctx, command, stdout, stderr, exitCode)
@@ -339,6 +343,24 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		gitprovider.NewHandlers(gitProviderStore).Register(
 			authed.Group(""),
 			hostWrite.Group("", h.auditMutation()),
+		)
+	}
+
+	// GitHub App integration (App-level push events, no per-repo webhook).
+	// Management is admin-only (it handles the App private key); the event
+	// endpoint is public and verifies the HMAC signature itself.
+	if githubAppStore != nil {
+		ghClient := githubapp.NewClient()
+		ghProvider := githubapp.NewTokenProvider(githubAppStore, ghClient)
+		var ghTrigger githubapp.PushTrigger
+		if appStore != nil && appEngine != nil {
+			ghTrigger = &apps.GitHubAppTrigger{Apps: appStore, Starter: appEngine}
+			appEngine.SetGitHubAppTokenProvider(ghProvider)
+		}
+		githubapp.NewHandlers(githubAppStore, ghClient, ghProvider, settingsStore, ghTrigger).Register(
+			authed.Group(""),
+			adminOnly.Group("", h.auditMutation()),
+			v1,
 		)
 	}
 
@@ -2071,6 +2093,13 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodPost, "/api/v1/apps/:id/start", "app_start", "app", "id", audit.RiskHigh, "启动应用"},
 		{http.MethodPost, "/api/v1/apps/:id/restart", "app_restart", "app", "id", audit.RiskHigh, "重启应用"},
 		{http.MethodPost, "/api/v1/apps/:id/webhook/sync", "app_webhook_sync", "app", "id", audit.RiskHigh, "同步应用 Webhook 自动部署"},
+		{http.MethodPost, "/api/v1/apps/:id/github-app/switch", "app_github_app_switch", "app", "id", "", "切换应用到 GitHub App 触发"},
+		// GitHub App integration: App-level push events replace per-repo webhooks.
+		{http.MethodPost, "/api/v1/github-app/manifest", "github_app_manifest", "system", "", audit.RiskLow, "生成 GitHub App 创建清单"},
+		{http.MethodPost, "/api/v1/github-app/manifest/exchange", "github_app_config", "system", "", audit.RiskHigh, "保存 GitHub App 配置"},
+		{http.MethodPost, "/api/v1/github-app/config", "github_app_config", "system", "", audit.RiskHigh, "保存 GitHub App 配置"},
+		{http.MethodDelete, "/api/v1/github-app", "github_app_disconnect", "system", "", audit.RiskHigh, "断开 GitHub App"},
+		{http.MethodPost, "/api/v1/github-app/installations/sync", "github_app_install_sync", "system", "", "", "同步 GitHub App 安装"},
 		// Cross-host service migration: moves the app (and optionally its
 		// volumes, via S3) to another host and reroutes traffic — high-risk.
 		{http.MethodPost, "/api/v1/apps/:id/migrate", "app_migrate", "app", "id", audit.RiskHigh, "迁移应用"},

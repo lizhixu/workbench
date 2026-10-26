@@ -96,7 +96,7 @@ func newTestRouterOp(t *testing.T, opAddr string) (*gin.Engine, *auth.Store, *se
 	reg.SetTunnelCoordinator(rpc.NewTunnelCoordinator(reg, log))
 	r := Router(reg, log, authStore, sessStore, alertStore, vaultStore,
 		nil, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore,
-		settingsStore, backupStore, networkStore, appStore, appEngine, nil, nil, nil, nil, nil, opAddr)
+		settingsStore, backupStore, networkStore, appStore, appEngine, nil, nil, nil, nil, nil, nil, opAddr)
 	return r, authStore, settingsStore
 }
 

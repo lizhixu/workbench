@@ -11,6 +11,7 @@ import (
 	"context"
 
 	"github.com/gin-gonic/gin"
+	"watchman/server/internal/githubapp"
 	"watchman/server/internal/rpc"
 )
 
@@ -24,6 +25,7 @@ type AppHandlers struct {
 	engine      *Engine
 	ai          AIDiagnoseFunc
 	gitProvider GitWebhookManager
+	ghAppStore  *githubapp.Store
 
 	imageInspector ImageInspectFunc
 	repoInspector  RepoInspectFunc
@@ -48,6 +50,13 @@ func (h *AppHandlers) SetAI(fn AIDiagnoseFunc) {
 // SetGitProvider injects the Git provider store for automatic Webhook lifecycle management.
 func (h *AppHandlers) SetGitProvider(gp GitWebhookManager) {
 	h.gitProvider = gp
+}
+
+// SetGitHubAppStore injects the GitHub App store so the App-trigger switch
+// can verify the App is configured and the repository is actually covered
+// by an installation before deleting the legacy per-repo hook.
+func (h *AppHandlers) SetGitHubAppStore(s *githubapp.Store) {
+	h.ghAppStore = s
 }
 
 // RegisterAppRoutes mounts the application lifecycle routes. Reads are open
@@ -83,6 +92,7 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	writeRG.POST("/apps/:id/start", h.startApp)
 	writeRG.POST("/apps/:id/restart", h.restartApp)
 	writeRG.POST("/apps/:id/webhook/sync", h.syncAppWebhook)
+	writeRG.POST("/apps/:id/github-app/switch", h.switchToGitHubApp)
 	// Service migration: moving an app across hosts (optionally with its
 	// volumes) is a high-risk mutation, so it rides the audited write group.
 	// The precheck only probes readiness and stays on the read group.
@@ -707,6 +717,74 @@ func (h *AppHandlers) syncAppWebhook(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ok":      true,
 		"message": "已成功通过 GitHub API 为该仓库配置 Webhook",
+		"data":    updated,
+	})
+}
+
+// switchToGitHubApp moves an app's push trigger from its legacy per-repo
+// webhook to the GitHub App: the repo-level hook (if one was auto-managed)
+// is deleted on GitHub and the auto-managed flags are cleared, so later
+// pushes arrive only through the App-level event endpoint. The App trigger
+// itself needs no per-app record — a push to an installed repository with
+// auto_deploy on is routed by repository name — so after this call the
+// app is App-triggered as long as its repository is inside an installation.
+//
+// The switch is refused unless that coverage actually holds: deleting the
+// legacy hook for a repository no installation covers would silently break
+// automatic deployment (the app would fall back to a manual webhook URL
+// while reporting a successful switch).
+func (h *AppHandlers) switchToGitHubApp(c *gin.Context) {
+	id := c.Param("id")
+	app, ok := h.store.GetApp(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "应用不存在"})
+		return
+	}
+	if !strings.Contains(strings.ToLower(app.RepoURL), "github.com") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "该应用不是 GitHub 仓库"})
+		return
+	}
+	if h.ghAppStore == nil || !h.ghAppStore.Configured() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "请先在系统设置中配置 GitHub App"})
+		return
+	}
+	if _, covered := h.ghAppStore.FindInstallationForRepo(githubapp.NormalizeRepoURL(app.RepoURL)); !covered {
+		c.JSON(http.StatusConflict, gin.H{"error": "该仓库不在 GitHub App 安装范围内，请先将 App 安装到该仓库（设置 → 代码源集成 → 同步安装），再切换"})
+		return
+	}
+	hookDeleted := false
+	if app.GitHubHookID > 0 {
+		if h.gitProvider == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "未启用 Git Provider 集成，无法删除旧的逐仓 Webhook"})
+			return
+		}
+		if err := h.gitProvider.DeleteRepoWebhook(c.Request.Context(), app.RepoURL, app.GitHubHookID); err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": "删除旧的逐仓 Webhook 失败: " + err.Error()})
+			return
+		}
+		hookDeleted = true
+	}
+	if err := h.store.UpdateApp(id, func(a *Application) error {
+		a.WebhookAutoManaged = false
+		a.GitHubHookID = 0
+		a.WebhookError = ""
+		return nil
+	}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "切换失败: " + err.Error()})
+		return
+	}
+	updated, ok := h.store.GetApp(id)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "切换已保存，但应用记录读取失败"})
+		return
+	}
+	msg := "已切换到 GitHub App 触发"
+	if hookDeleted {
+		msg += "（旧的逐仓 Webhook 已删除）"
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      true,
+		"message": msg,
 		"data":    updated,
 	})
 }

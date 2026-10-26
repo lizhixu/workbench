@@ -3,6 +3,7 @@ package apps
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -18,6 +19,14 @@ import (
 
 type gitTokenProvider interface {
 	GetToken() (string, bool)
+}
+
+// gitHubAppTokenProvider resolves a git-fetch credential from a GitHub App
+// installation covering the repository. It sits between the app's explicit
+// Vault credential and the legacy provider token in the deploy credential
+// chain.
+type gitHubAppTokenProvider interface {
+	InstallationTokenForRepo(repoURL string) (string, bool)
 }
 
 // activeDeployment tracks an in-flight deployment so an operator can abort it
@@ -36,11 +45,12 @@ type activeDeployment struct {
 // existing agent gRPC channel (ExecRequest / DockerOp), one deployment per
 // application at a time (Dokploy-style serial build queue).
 type Engine struct {
-	reg         *rpc.Registry
-	store       *Store
-	vault       *vault.Store
+	reg          *rpc.Registry
+	store        *Store
+	vault        *vault.Store
 	networkStore *network.Store
-	gitProvider gitTokenProvider
+	gitProvider  gitTokenProvider
+	ghAppToken   gitHubAppTokenProvider
 	// proxy re-points a bound domain at the new host when an app migrates
 	// (migrate.go), and rolls it back on failure. nil until wired.
 	proxy *ProxyHandler
@@ -67,6 +77,12 @@ type Engine struct {
 // SetGitProvider injects a token provider (e.g. GitHub connection) for auto-cloning.
 func (e *Engine) SetGitProvider(gp gitTokenProvider) {
 	e.gitProvider = gp
+}
+
+// SetGitHubAppTokenProvider injects the GitHub App installation-token
+// provider for auto-cloning App-installed repositories.
+func (e *Engine) SetGitHubAppTokenProvider(p gitHubAppTokenProvider) {
+	e.ghAppToken = p
 }
 
 // SetNetworkStore injects the overlay network store to resolve Tailscale mesh IPs.
@@ -374,6 +390,21 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 	e.activeHub(app.ID, hub)
 	if hub == nil {
 		fail("目标主机 Agent 不在线")
+		return
+	}
+
+	// Preflight: every deploy path ends in docker (build / run / compose),
+	// so a host without Docker — or with a dead daemon — must fail fast
+	// here with an actionable message. Without this the pipeline runs to
+	// the container-start step and dies with a bare "docker: command not
+	// found" (exit 127), which reads as a server bug and wastes the whole
+	// fetch/build run before it.
+	if cancelled() {
+		return
+	}
+	logBuf.WriteString("$ check docker availability\n")
+	if err := e.checkDockerReady(hub); err != nil {
+		fail("%v", err)
 		return
 	}
 
@@ -1042,6 +1073,14 @@ func (e *Engine) gitToken(app *Application) (string, error) {
 		}
 		return cred.Secret, nil
 	}
+	// If no explicit Vault credential is configured, but the repository is
+	// covered by a GitHub App installation, use a fresh installation token
+	// (short-lived, minted at deploy time, never persisted).
+	if e.ghAppToken != nil {
+		if tok, ok := e.ghAppToken.InstallationTokenForRepo(app.RepoURL); ok && tok != "" {
+			return tok, nil
+		}
+	}
 	// If no explicit Vault credential is configured, but this is a GitHub repository
 	// and the GitHub Provider is connected, automatically use the GitHub account token.
 	if e.gitProvider != nil && strings.Contains(strings.ToLower(app.RepoURL), "github.com") {
@@ -1109,6 +1148,50 @@ func execOnAgent(hub *rpc.Hub, execID string, command string, timeoutSec int32) 
 		hub.SetRespHandler(execID, nil)
 		return nil, fmt.Errorf("agent exec timeout")
 	}
+}
+
+// Docker preflight exit codes, mirroring proxyEnsureCheckScript's split:
+// the user-facing fix differs between "install Docker" and "start the
+// daemon", so the two failures must stay distinguishable.
+const (
+	deployDockerMissing    = 4
+	deployDockerDaemonDown = 5
+)
+
+// dockerPreflightScript probes only what every deploy path needs: a docker
+// binary and a responding daemon. It deliberately does not check the
+// compose plugin or images — those fail later with their own step context.
+func dockerPreflightScript() string {
+	return fmt.Sprintf(`command -v docker >/dev/null 2>&1 || exit %d
+docker info >/dev/null 2>&1 || exit %d`,
+		deployDockerMissing, deployDockerDaemonDown)
+}
+
+// classifyDockerPreflight maps a preflight exit code to an actionable
+// error. Exit 0 is the only success; anything else names the host-side
+// fix (install vs start) instead of leaking a bare exit code.
+func classifyDockerPreflight(exitCode int32) error {
+	switch exitCode {
+	case 0:
+		return nil
+	case deployDockerMissing:
+		return errors.New("目标主机未安装 Docker：请先在主机详情 Docker 页一键安装 Docker 后重试")
+	case deployDockerDaemonDown:
+		return errors.New("目标主机 Docker 服务未运行：请先启动 Docker 服务后重试")
+	default:
+		return fmt.Errorf("目标主机 Docker 不可用 (exit %d)：请检查 Docker 安装与服务状态后重试", exitCode)
+	}
+}
+
+// checkDockerReady runs the preflight on the target host. A transport
+// failure (agent gone mid-check, exec timeout) is reported as-is — it is
+// not a Docker problem and must not be misclassified as one.
+func (e *Engine) checkDockerReady(hub *rpc.Hub) error {
+	res, err := execOnAgent(hub, "docker-preflight-"+randomToken(4), dockerPreflightScript(), 30)
+	if err != nil {
+		return fmt.Errorf("Docker 可用性检查失败: %w", err)
+	}
+	return classifyDockerPreflight(res.GetExitCode())
 }
 
 // logBuffer accumulates build output with a hard bound so one chatty build

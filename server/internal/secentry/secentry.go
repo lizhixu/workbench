@@ -157,6 +157,7 @@ func exemptPath(p string) bool {
 	}
 	for _, pre := range []string{
 		"/api/v1/apps/webhook/",
+		"/api/v1/github-app/webhook",
 		"/api/v1/terminals/share/",
 		"/agent/",
 	} {

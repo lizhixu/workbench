@@ -1707,6 +1707,12 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
    - 所有承载表格的卡片容器背景统一绑定为 `var(--bg-card)`，杜绝因未定义 `--n-color` 导致回退到发灰的伪透明背景；
    - 消除表格外层硬编码的 `border: 1px solid var(--border-color)` 与内缩 `padding`，保持平整、沉浸的控制台无边框视觉。
 
+5. **暗色模式表单控件必须有可见边框（2026-10-28）**：
+   - naive-ui 暗色主题把 `Input` 与 `InternalSelection` 的**常态**边框默认写成 `1px solid #0000`（全透明），仅 hover/focus 时才显形，导致暗色下输入框、下拉框、日期/时间选择器看起来没有边界（表格卡片本身仍按上一条保持无边框视觉，两者不冲突）。
+   - 统一在 `web/src/App.vue` 的 `themeOverrides` 中补回：`Input.border` / `Input.borderDisabled` / `Input.groupLabelBorder` 与 `InternalSelection.border`（取值 `1px solid rgba(255, 255, 255, 0.16)`，暗色专属，浅色不动）。
+   - 该覆盖经 `NConfigProvider` 对全站生效（含 InputNumber、DatePicker/TimePicker 内嵌输入与弹窗内控件）；**不要**在页面/组件内单独写输入框边框样式。
+   - `Input.borderColor` 不是 Input 的合法主题变量（写了是 no-op），新增覆盖前先查 `naive-ui/es/*/styles/light|dark.mjs` 的实际变量名。
+
 ### 8.9 顶部 Workspace 多页签拖拽排序
 
 顶部多工作区页签（`AppShell.vue` 中的 `workspace-tab-item`）承载多任务多视图上下文，支持鼠标拖拽水平调整页签顺序：

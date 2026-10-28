@@ -37,6 +37,12 @@ const currentTheme = computed(() => {
   return settingsStore.themeMode === 'dark' ? darkTheme : null
 })
 
+// naive-ui 暗色主题把表单控件的常态边框写成 `1px solid #0000`（全透明），
+// 只有 hover/focus 才出现边框，暗色下输入框、下拉框看起来像没有边界。
+// 这里在主题层给 Input 系列（含 InputNumber/DatePicker 内嵌输入）与
+// InternalSelection（Select/Cascader/TreeSelect 等）补回可见的常态边框。
+const darkControlBorder = '1px solid rgba(255, 255, 255, 0.16)'
+
 const themeOverrides = computed<GlobalThemeOverrides>(() => {
   const isDark = settingsStore.themeMode === 'dark'
   return {
@@ -89,8 +95,19 @@ const themeOverrides = computed<GlobalThemeOverrides>(() => {
     },
     Input: {
       borderRadius: '6px',
-      borderColor: isDark ? 'rgba(255, 255, 255, 0.12)' : '#cbd5e1',
+      ...(isDark
+        ? {
+            border: darkControlBorder,
+            borderDisabled: '1px solid rgba(255, 255, 255, 0.08)',
+            groupLabelBorder: darkControlBorder,
+          }
+        : {}),
     },
+    InternalSelection: isDark
+      ? {
+          border: darkControlBorder,
+        }
+      : {},
     Tag: {
       borderRadius: '4px',
     },

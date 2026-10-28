@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# commit-msg 钩子：校验提交信息符合 Conventional Commits（AGENTS.md B.6.6）。
+# 启用：make hooks（内部执行 git config core.hooksPath .githooks）
+# 绕过会污染 changelog 聚合结果，请勿使用 --no-verify。
+
+set -euo pipefail
+
+MSG_FILE="${1:?commit-msg hook requires the message file path}"
+FIRST_LINE="$(head -1 "$MSG_FILE" | sed -e 's/[[:space:]]*$//')"
+
+# 空消息（如 --allow-empty-message）直接交给 git 处理
+[ -z "$FIRST_LINE" ] && exit 0
+
+# 合并、rebase 中间态不校验
+case "$FIRST_LINE" in
+  "Merge "*|"Revert "*|"fixup! "*|"squash! "*|"amend! "*) exit 0 ;;
+esac
+
+TYPES='feat|fix|security|perf|refactor|style|docs|test|build|ci|chore|revert'
+
+if ! printf '%s' "$FIRST_LINE" | grep -Eq "^(${TYPES})(\([a-z0-9+_-]+\))?!?: [^[:space:]]"; then
+  cat >&2 <<'EOF'
+✗ 提交信息不符合规范（AGENTS.md B.6.6）
+
+  格式：<type>(<scope>): <subject>
+
+  type  feat     新功能              → changelog Added
+        fix      缺陷修复            → changelog Fixed
+        security 安全修复            → changelog Security
+        perf     性能优化            → changelog Changed
+        style    UI/视觉调整         → changelog Changed
+        refactor 重构（行为不变）     → changelog Changed
+        docs / test / build / ci / chore / revert
+
+  scope agent server proto web apps hosts metrics cert terminal files docker
+        ai upgrade settings auth audit tunnel registry deps ci
+        多模块用 + 连接，如 feat(apps+web)
+
+  破坏性变更：feat(apps)!: ... 或 footer 写 BREAKING CHANGE: <影响面>
+
+  示例  feat(apps): 应用跨主机迁移支持携带挂载卷数据
+        fix(cert): 修复续期回推漏推 SAN 内次级域名
+        docs: 补全发版与提交规范
+
+  禁止  update / 修改 / 修复一下 / wip / 无 type 的裸描述
+EOF
+  exit 1
+fi
+
+SUBJECT="${FIRST_LINE#*: }"
+if [ "${#SUBJECT}" -gt 50 ]; then
+  printf '✗ subject 超过 50 字（当前 %s 字）：%s\n' "${#SUBJECT}" "$SUBJECT" >&2
+  exit 1
+fi
+
+case "$SUBJECT" in
+  *。) printf '✗ subject 末尾不要加句号：%s\n' "$SUBJECT" >&2; exit 1 ;;
+esac
+
+exit 0

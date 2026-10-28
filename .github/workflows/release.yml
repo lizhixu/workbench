@@ -47,6 +47,13 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      # 发版 tag 必须是「附注 tag + 版本级 changelog」。轻量 tag 的 %(contents)
+      # 会静默退化为指向 commit 的 message，直接发出去就会变成「Release 正文 =
+      # 最近一条提交」，该版本其余变更全部丢失（历史事故，见 AGENTS.md B.6.5）。
+      - name: Verify release tag
+        if: github.event_name == 'push'
+        run: bash scripts/verify-tag.sh "${GITHUB_REF_NAME}"
+
       - name: Resolve version metadata
         id: meta
         run: |
@@ -198,12 +205,13 @@ jobs:
           set -euo pipefail
           TAG="${{ steps.meta.outputs.tag }}"
           TAG_MSG="$(git tag -l --format='%(contents)' "$TAG" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-          ARGS=(--title "$TAG")
-          if [ -n "$TAG_MSG" ]; then
-            ARGS+=(--notes "$TAG_MSG")
-          else
-            ARGS+=(--generate-notes)
+          # 禁止回退到 --generate-notes：它会用提交列表拼出「最近一条提交」式的正文，
+          # 正好掩盖住轻量 tag 的问题。附注为空说明打 tag 流程已被绕过，直接失败。
+          if [ -z "$TAG_MSG" ]; then
+            echo "::error::tag $TAG 的附注为空，拒绝创建 Release（见 AGENTS.md B.6.5）"
+            exit 1
           fi
+          ARGS=(--title "$TAG" --notes "$TAG_MSG")
           if [ "${{ steps.meta.outputs.prerelease }}" = "true" ]; then
             ARGS+=(--prerelease)
           fi

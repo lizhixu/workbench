@@ -61,3 +61,6 @@ Thumbs.db
 *.py
 __pycache__/
 web/web-dist.tar.gz
+
+# 发版临时 changelog（make changelog 输出，见 AGENTS.md B.6.6）
+notes-*.md

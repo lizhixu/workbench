@@ -51,3 +51,17 @@ vet:
 
 fmt:
 	gofmt -w agent cmd internal proto server
+
+# ---- 提交与发版辅助（AGENTS.md B.6.5 / B.6.6）----
+# 启用版本化的 git 钩子（commit-msg 校验提交格式）
+hooks:
+	git config core.hooksPath .githooks
+	@echo "✓ 已启用 .githooks/commit-msg"
+
+# 生成版本级 changelog：make changelog SINCE=v0.1.0-beta.24 VERSION=v0.2.0-beta.1
+changelog:
+	@bash scripts/changelog.sh $(SINCE)
+
+# 校验待发布 tag：make tag-check TAG=v0.2.0-beta.1
+tag-check:
+	@bash scripts/verify-tag.sh $(TAG)

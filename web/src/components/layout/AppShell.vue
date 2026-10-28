@@ -87,7 +87,7 @@ const navEntries: NavEntry[] = [
   { key: '/alerts', title: '消息中心', path: '/alerts', icon: NotificationsOutline, viewName: 'AlertList' },
   { key: '/vault', title: '凭据金库', path: '/vault', icon: KeyOutline, adminOnly: true, viewName: 'CredentialList' },
   { key: '/network', title: '异地组网', path: '/network', icon: GitNetworkOutline, viewName: 'NetworkList' },
-  { key: '/apps', title: '应用发布', path: '/apps', icon: RocketOutline, viewName: 'AppList' },
+  { key: '/apps', title: '应用中心', path: '/apps', icon: RocketOutline, viewName: 'AppList' },
   { key: '/certs', title: '证书中心', path: '/certs', icon: ShieldCheckmarkOutline, viewName: 'CertList' },
   { key: '/snapshots', title: '快照备份', path: '/snapshots', icon: ArchiveOutline, viewName: 'SnapshotList' },
   { key: '/groups', title: '分组权限', path: '/groups', icon: LayersOutline, viewName: 'GroupList' },

@@ -18,6 +18,7 @@ import { useSystemUpdateStore } from '../../stores/systemUpdate'
 import type { Host } from '../../api/types'
 import { formatUpgradeStage } from '../../utils/upgrade'
 import { fmtDateTime } from '../../utils/time'
+import { renderMarkdown } from '../../utils/markdown'
 
 const auth = useAuthStore()
 const isAdmin = computed(() => auth.role === 'admin')
@@ -32,6 +33,9 @@ const loading = ref(false)
 const showOnlineUpgradeModal = ref(false)
 const showChangelog = ref(false)
 const onlineUpgrading = ref(false)
+
+// GitHub Release 的正文是 markdown（含 ### 分段与 - 列表），按 markdown 渲染而不是原样输出
+const releaseNotesHtml = computed(() => renderMarkdown(systemUpdate.updateInfo?.release_notes || ''))
 
 // 离线上传升级控制端弹窗
 const showUploadModal = ref(false)
@@ -401,9 +405,7 @@ onMounted(async () => {
                   {{ showChangelog ? '收起' : '展开查看' }}
                 </NButton>
               </div>
-              <div v-if="showChangelog" class="changelog-body">
-                <pre>{{ systemUpdate.updateInfo.release_notes }}</pre>
-              </div>
+              <div v-if="showChangelog" class="changelog-body" v-html="releaseNotesHtml" />
             </div>
           </div>
         </NAlert>
@@ -872,12 +874,92 @@ onMounted(async () => {
         max-height: 220px;
         overflow-y: auto;
         font-size: 12px;
-        line-height: 1.6;
+        line-height: 1.65;
+        color: var(--n-text-color-2);
+        overflow-wrap: anywhere;
 
-        pre {
-          margin: 0;
+        // v-html 注入的节点没有 scoped 属性，统一走 :deep()
+        :deep(> :first-child) {
+          margin-top: 0;
+        }
+
+        :deep(> :last-child) {
+          margin-bottom: 0;
+        }
+
+        :deep(h4),
+        :deep(h5),
+        :deep(h6) {
+          margin: 12px 0 5px;
+          font-size: 12.5px;
+          font-weight: 600;
+          line-height: 1.4;
+          color: var(--n-text-color-1);
+        }
+
+        :deep(p) {
+          margin: 0 0 6px;
+        }
+
+        :deep(ul),
+        :deep(ol) {
+          margin: 2px 0 8px;
+          padding-left: 18px;
+        }
+
+        :deep(li) {
+          margin: 2px 0;
+        }
+
+        :deep(li::marker) {
+          color: var(--n-text-color-3);
+        }
+
+        :deep(strong) {
+          font-weight: 600;
+          color: var(--n-text-color-1);
+        }
+
+        :deep(a) {
+          color: var(--n-primary-color, #2080f0);
+          text-decoration: none;
+
+          &:hover {
+            text-decoration: underline;
+          }
+        }
+
+        :deep(:not(pre) > code) {
+          padding: 1px 4px;
+          border-radius: 3px;
+          background: rgba(0, 0, 0, 0.06);
+          font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          font-size: 11.5px;
+        }
+
+        :deep(pre) {
+          margin: 6px 0 8px;
+          padding: 8px 10px;
+          border-radius: 4px;
+          background: rgba(0, 0, 0, 0.05);
+          overflow-x: auto;
           white-space: pre-wrap;
-          font-family: inherit;
+          font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          font-size: 11.5px;
+          line-height: 1.5;
+        }
+
+        :deep(blockquote) {
+          margin: 6px 0;
+          padding: 2px 0 2px 8px;
+          border-left: 2px solid var(--n-border-color);
+          color: var(--n-text-color-3);
+        }
+
+        :deep(hr) {
+          margin: 10px 0;
+          border: none;
+          border-top: 1px solid var(--n-border-color);
         }
       }
     }

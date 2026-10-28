@@ -74,6 +74,9 @@ async function copyMsg(content: string) {
   }
 }
 
+// 仅覆盖 AI 回答中的加粗、行内代码、代码块与换行。
+// 需要标题/列表/链接时改用 utils/markdown.ts 的 renderMarkdown（AGENTS.md §8.11），
+// 迁移时传 codeBlockClass: 'chat-code-block'、inlineCodeClass: 'chat-inline-code' 保持现有样式。
 function renderMarkdown(text: string): string {
   // Lightweight markdown rendering: code blocks, bold, line breaks.
   let html = text

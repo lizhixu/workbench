@@ -1735,6 +1735,17 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 - 各页面**说明性**的帮助段落（`<p class="muted">` 这类功能说明文字）在 `class` 上追加 `tip-hint`，受用户设置 `appearance.show_tips` 控制：App.vue 按设置给 `documentElement` 切换 `hide-tips` 类，全局样式隐藏 `.tip-hint`。
 - **警告/报错类 NAlert、数据展示用的 muted 文本不加** `tip-hint`，开关只隐藏说明文字，不隐藏业务信息。
 
+### 8.11 外部 Markdown 内容的渲染约定
+
+凡是展示**外部输入的 Markdown**（GitHub Release 正文 `release_notes`、AI 助手回答等），一律走 `web/src/utils/markdown.ts` 的 `renderMarkdown()`，**不得直接用 `<pre>{{ text }}</pre>` 原样输出**——GitHub Release 正文是标准 Markdown，原样输出会把 `### Added`、`- **apps** ...` 连标记一起显示给用户。
+
+- **零依赖**：渲染器是项目内实现，不引入 marked / markdown-it 等库，避免为几个标题和列表增加打包体积。
+- **支持范围**：`#`~`######` 标题（映射 h4~h6，避免卡片内过大）、有序/无序列表及缩进续行、`**加粗**`、`~~删除线~~`、行内 `code`、``` 代码块、`[文本](链接)`、`>` 引用、`---` 分隔线。**不支持表格与行内 HTML**，release notes 场景用不到。
+- **安全**：整体先转义 HTML 再做标记替换，输出标签全部由渲染器生成；链接只放行 `http(s)://`、`mailto:`、锚点与站内绝对路径，`javascript:` 等一律降级为 `#`。因此可以安全地配合 `v-html` 使用，禁止改成「先渲染再过滤」的写法。
+- **样式**：`v-html` 注入的节点没有 scoped 属性，容器样式必须用 `:deep()` 下发给 h4~h6 / ul / li / p / code / pre / a / blockquote / hr，参考 `SystemUpgrade.vue` 的 `.changelog-body`。
+- **AI 对话**（`AiChat.vue`）目前仍是组件内的简易实现（仅加粗、代码块、换行），行为未变；后续如需标题与列表，改为调用同一函数并传 `codeBlockClass` / `inlineCodeClass` 保持现有类名即可。
+
+
 
 
 

@@ -42,7 +42,11 @@ if [ -n "$REMOTE_TAGS" ]; then
   case "$REMOTE_KIND" in
     annotated) ;;
     light) fail "$TAG 在远端是轻量 tag，Release 正文会退化为最近一条提交。处理：git tag -d $TAG && git push origin :refs/tags/$TAG，再用 git tag -a $TAG -F <notes> 重打" ;;
-    *) fail "远端不存在 tag $TAG，无法确认发版对象" ;;
+    *)
+      # 远端还没有这个 tag：首次发布，尚未推送，以本地对象类型为准
+      [ "$(git cat-file -t "refs/tags/${TAG}" 2>/dev/null || true)" = "tag" ] \
+        || fail "$TAG 是轻量 tag（本地已存在且不是附注 tag）。请用 git tag -a $TAG -F <notes> 重建"
+      ;;
   esac
 else
   # 离线兜底：只能看本地对象类型

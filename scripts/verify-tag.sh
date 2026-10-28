@@ -29,20 +29,34 @@ if ! printf '%s' "$TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9]
   禁止：v1.2、v1.2.3.4、v1.2.3+build、latest、日期版本、任何 commit hash 拼接"
 fi
 
-# 2. 必须有 refs/tags/<tag>：actions/checkout 的 fetch-tags 默认 false，
-#    只 checkout sha 时本地没有 tag ref，cat-file 与 tag -l 都会失效。
-if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
-  git fetch --force --no-tags origin "refs/tags/${TAG}:refs/tags/${TAG}" >/dev/null 2>&1 || true
-fi
-if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
-  fail "本地不存在 refs/tags/${TAG}：CI 需在 checkout 配置 fetch-tags: true；本地需先 git fetch --tags"
+# 2. 判断是否为附注 tag。
+#    以远端 ls-remote 的 peeled 行（refs/tags/X^{}）为权威：actions/checkout 在 tag
+#    事件下会把本地 refs/tags/<tag> 建成指向 commit 的轻量引用（实测 beta.25 复现），
+#    只看本地 cat-file 会把正确的附注 tag 误判成轻量 tag。
+REMOTE_TAGS="$(git ls-remote --tags origin 2>/dev/null || true)"
+if [ -n "$REMOTE_TAGS" ]; then
+  REMOTE_KIND="$(printf '%s\n' "$REMOTE_TAGS" | awk -v t="refs/tags/${TAG}" '
+    $2 == t      { kind = "light" }
+    $2 == t "^{}" { kind = "annotated" }
+    END          { print kind }')"
+  case "$REMOTE_KIND" in
+    annotated) ;;
+    light) fail "$TAG 在远端是轻量 tag，Release 正文会退化为最近一条提交。处理：git tag -d $TAG && git push origin :refs/tags/$TAG，再用 git tag -a $TAG -F <notes> 重打" ;;
+    *) fail "远端不存在 tag $TAG，无法确认发版对象" ;;
+  esac
+else
+  # 离线兜底：只能看本地对象类型
+  [ "$(git cat-file -t "refs/tags/${TAG}" 2>/dev/null || true)" = "tag" ] \
+    || fail "离线无法确认远端 tag 类型，且本地 refs/tags/${TAG} 不是附注 tag"
 fi
 
-# 3. 必须是附注 tag（annotated tag 的对象类型为 tag；轻量 tag 为 commit）
-OBJ_TYPE="$(git cat-file -t "refs/tags/${TAG}" 2>/dev/null || true)"
-[ "$OBJ_TYPE" = "tag" ] || fail "$TAG 是轻量 tag（对象类型 ${OBJ_TYPE:-unknown}），不是附注 tag。
-  %(contents) 会退化为指向 commit 的 message，Release 正文将只显示最近一条提交。
-  处理：git tag -d $TAG && git push origin :refs/tags/$TAG，然后 git tag -a $TAG -F <notes> 重打"
+# 3. 保证本地持有 tag 对象本身，否则读不到附注正文
+if [ "$(git cat-file -t "refs/tags/${TAG}" 2>/dev/null || true)" != "tag" ]; then
+  git update-ref -d "refs/tags/${TAG}" 2>/dev/null || true
+  git fetch --force --no-tags origin "refs/tags/${TAG}:refs/tags/${TAG}" >/dev/null 2>&1 || true
+fi
+[ "$(git cat-file -t "refs/tags/${TAG}" 2>/dev/null || true)" = "tag" ] \
+  || fail "无法取得 $TAG 的 tag 对象（本地 ref 被建成轻量引用，重新拉取也失败）"
 
 MSG="$(git tag -l --format='%(contents)' "$TAG")"
 

@@ -33,6 +33,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # 必须显式拉取 tag 对象：actions/checkout 的 fetch-tags 默认 false，
+          # 缺少 refs/tags/<tag> 时 git cat-file / git tag -l 都拿不到附注，
+          # 校验会误判为轻量 tag，Release 正文也会退化成自动生成。
+          fetch-tags: true
 
       - name: Set up Go
         uses: actions/setup-go@v5

@@ -829,7 +829,10 @@ func TestVolumeBackupRejectsWithoutS3Target(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/apps/app1/volume-backups", nil))
-	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "未配置默认 S3 存储目标") {
+	// No target chosen and no default configured: the destination-selection
+	// message (2026-10-26) replaces the old default-only wording; the
+	// rejection itself (400, no slot leak) is unchanged.
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "请先选择备份位置") {
 		t.Fatalf("no-S3 backup: code=%d body=%s", w.Code, w.Body.String())
 	}
 	if e.VolumeBusy(app.ID) {

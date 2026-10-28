@@ -329,6 +329,15 @@ func main() {
 	appEngine.SetVolumeStore(volumeStore)
 	log.Info("volume backup store ready", "apps", len(appStore.ListApps()))
 
+	// Panel-side staging for upload-restores (volupload.go): operator files
+	// land here first, then the agent pulls them back over one-time tokens.
+	volumeUploadStore, err := apps.NewVolumeUploadStore(appStore.Dir(), log)
+	if err != nil {
+		log.Error("volume upload store init", "err", err)
+		os.Exit(1)
+	}
+	appEngine.SetVolumeUploadStore(volumeUploadStore)
+
 	// Git provider integration (GitHub authorization & repo selector).
 	gitProviderStore, err := gitprovider.NewStore(*dataDir, log)
 	if err != nil {

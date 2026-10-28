@@ -57,6 +57,10 @@ type Engine struct {
 	// vols stores app volume backup/restore archive metadata (volbackup.go);
 	// nil until wired, in which case volume work reports a clear error.
 	vols *VolumeStore
+	// volUploads stages operator-uploaded restore files on the panel plus
+	// their one-time agent download tokens (volupload.go); nil until wired,
+	// in which case upload-restores report a clear error.
+	volUploads *VolumeUploadStore
 	// s3 resolves the S3 destination volume archives are uploaded to/downloaded
 	// from (implemented by snapshots.Store).
 	s3 S3TargetStore

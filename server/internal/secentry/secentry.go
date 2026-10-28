@@ -159,6 +159,7 @@ func exemptPath(p string) bool {
 		"/api/v1/apps/webhook/",
 		"/api/v1/github-app/webhook",
 		"/api/v1/terminals/share/",
+		"/api/v1/volume-uploads/",
 		"/agent/",
 	} {
 		if strings.HasPrefix(p, pre) {

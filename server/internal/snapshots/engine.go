@@ -53,6 +53,9 @@ type AppVolumeArchive struct {
 	LastRestoreAt     *time.Time
 	LastRestoreStatus string
 	LastRestoreError  string
+	// Source mirrors the app engine's record source ("upload" for records
+	// created by an upload-restore, "" for panel backups).
+	Source string
 }
 
 // AppVolumeHost is implemented by the app engine (apps.Engine). The snapshot
@@ -277,6 +280,7 @@ func (e *Engine) AppVolumeArchives(job *Job, offset, pageSize int) ([]*Archive, 
 			LastRestoreAt:     a.LastRestoreAt,
 			LastRestoreStatus: a.LastRestoreStatus,
 			LastRestoreError:  a.LastRestoreError,
+			Source:            a.Source,
 			CreatedAt:         a.CreatedAt,
 		})
 	}

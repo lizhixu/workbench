@@ -2108,6 +2108,7 @@ func deriveAllMutationRules() []mutationRule {
 		// lifecycle actions above.
 		{http.MethodPost, "/api/v1/apps/:id/volume-backups", "app_volume_backup", "app", "id", "", "备份应用挂载卷数据"},
 		{http.MethodPost, "/api/v1/apps/:id/volume-backups/:archiveID/restore", "app_volume_restore", "app", "id", audit.RiskHigh, "恢复应用挂载卷数据"},
+		{http.MethodPost, "/api/v1/apps/:id/volume-backups/upload-restore", "app_volume_restore_upload", "app", "id", audit.RiskHigh, "上传备份文件并恢复应用挂载卷数据"},
 		{http.MethodDelete, "/api/v1/apps/:id/volume-backups/:archiveID", "app_volume_backup_delete", "app", "id", audit.RiskHigh, "删除应用挂载卷备份归档"},
 		// Reverse-proxy domain binding: traffic-affecting, high-risk.
 		{http.MethodPut, "/api/v1/apps/:id/proxy", "app_proxy_bind", "app", "id", audit.RiskHigh, "绑定反代域名"},

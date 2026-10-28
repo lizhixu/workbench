@@ -104,10 +104,16 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	writeRG.POST("/apps/:id/volume-backups", h.createVolumeBackup)
 	writeRG.POST("/apps/:id/volume-backups/:archiveID/restore", h.restoreVolumeBackup)
 	writeRG.DELETE("/apps/:id/volume-backups/:archiveID", h.deleteVolumeBackup)
+	// Upload-restore: the browser uploads a backup file, the panel stages
+	// it, and the agent pulls it back for the shared restore core.
+	writeRG.POST("/apps/:id/volume-backups/upload-restore", h.uploadVolumeBackupRestore)
 
 	// Git provider webhooks: no JWT, token-in-path authentication.
 	public.POST("/apps/webhook/:token", h.webhook)
 	public.GET("/apps/webhook/:token", h.webhookGet)
+	// Agent download of an uploaded restore file: no JWT (the agent holds
+	// no panel session); the one-time token in the path is the credential.
+	public.GET("/volume-uploads/:token", h.downloadVolumeUpload)
 }
 
 func (h *AppHandlers) listApps(c *gin.Context) {

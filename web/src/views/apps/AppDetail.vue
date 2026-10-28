@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { computed, h, onActivated, onDeactivated, onMounted, ref, watch } from 'vue'
+import { computed, h, onActivated, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   NAlert, NButton, NCode, NDataTable, NDescriptions, NDescriptionsItem,
   NEmpty, NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPopconfirm, NRadio, NRadioGroup,
-  NSelect, NSpace, NSwitch, NTabPane, NTabs,
+  NSelect, NSpace, NSwitch, NTabPane, NTabs, NUpload,
   NTag, useMessage,
 } from 'naive-ui'
-import type { DataTableColumns } from 'naive-ui'
+import type { DataTableColumns, UploadCustomRequestOptions, UploadFileInfo } from 'naive-ui'
 import {
   ArrowBackOutline, BuildOutline, CloudUploadOutline, CopyOutline,
   DownloadOutline,
@@ -20,8 +20,13 @@ import {
   rollbackApp, startApp, stopApp, updateApp, syncAppWebhook, type AppEntity, type AppStatus, type Deployment,
   type AIDiagnosis,
   backupAppVolumes, listVolumeBackups, restoreVolumeArchive, deleteVolumeArchive,
-  volumeArchiveDownloadUrl, type VolumeArchive, type VolumeS3Status,
+  uploadVolumeRestore,
+  volumeArchiveDownloadUrl, type VolumeArchive,
 } from '../../api/apps'
+import {
+  listBackupJobs, createBackupJob, updateBackupJob, deleteBackupJob, runBackupJob,
+  listS3Targets, type BackupJob, type CreateJobReq, type S3Target,
+} from '../../api/snapshots'
 import { bindProxy, unbindProxy, listCerts, type Certificate } from '../../api/certs'
 import { installDocker, listHosts } from '../../api/hosts'
 import { listNetworkNodes } from '../../api/network'
@@ -670,7 +675,7 @@ async function loadDeployments() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadApp(), loadStatus(), loadDeployments(), loadVolumeBackups(), refreshNewestDeployment()])
+  await Promise.all([loadApp(), loadStatus(), loadDeployments(), loadVolumeBackups(), loadS3Targets(), loadAppBackupJobs(), refreshNewestDeployment()])
 }
 
 const cancellingDeploy = ref(false)
@@ -801,13 +806,17 @@ async function doRollback(dep?: Deployment) {
 }
 
 // ---- 数据卷备份与恢复 ----
-// 备份把卷数据目录打成 tar.gz 后直传 S3 默认存储目标（走快照备份的 S3 配置），
-// 元数据在服务端；下载由服务端 302 到短期 S3 预签名 URL。恢复语义：下载并校验
+// 备份把卷数据目录打成 tar.gz 后直传页内选定的 S3 存储目标（Dokploy 式：
+// 目标先在「快照备份 → S3 存储」配好，备份时在本页选一个；目标列表走
+// 快照模块的 s3-targets 接口，密钥已由服务端脱敏）。元数据在服务端；
+// 下载由服务端 302 到短期 S3 预签名 URL。恢复语义：下载并校验
 // SHA256 → 自动停机 → 安全副本 → 解压覆盖 → 重启容器（stop 失败则中止，绝不在线
 // 覆盖运行中的数据）。
 const volumeBackups = ref<VolumeArchive[]>([])
 const volumeBackupTotal = ref(0)
-const volumeS3 = ref<VolumeS3Status>({ ready: false })
+// 备份位置选项（NSelect 空值约定 §8.3.1：未选 = null，不用 ''）。
+const s3Targets = ref<S3Target[]>([])
+const selectedBackupTargetId = ref<string | null>(null)
 const volBackupNote = ref('')
 const selectedVolumeSpecs = ref<string[]>([])
 const backingVolumes = ref(false)
@@ -865,6 +874,256 @@ const volumeBackupSupported = computed(() => {
   return true
 })
 
+// 备份位置选项只在首屏与页签切回时拉一次，不跟归档 5 秒轮询走——
+// 目标清单几乎不变，轮询里反复拉只是多余请求。
+async function loadS3Targets() {
+  try {
+    const list = await listS3Targets()
+    s3Targets.value = list
+    // 已选目标被删掉时回到默认；从未选过时默认预选默认目标（有默认时），
+    // 无默认则保持未选，强制用户显式挑一个（Dokploy 式显式选择）。
+    if (selectedBackupTargetId.value && !list.some((t) => t.id === selectedBackupTargetId.value)) {
+      selectedBackupTargetId.value = null
+    }
+    if (selectedBackupTargetId.value == null) {
+      selectedBackupTargetId.value = list.find((t) => t.is_default)?.id ?? null
+    }
+  } catch {
+    // 目标拉取失败不弹错：备份按钮由 selectedBackupTargetId 门控，
+    // 用户仍可从归档列表与恢复入口正常工作。
+  }
+}
+
+// ---- 本应用的备份任务（快照 app_volume 任务，详情页直接管理）----
+// 任务定义与调度归快照模块，详情页只做本应用任务的 CRUD 与触发；
+// 执行与归档仍走应用引擎，运行记录见下方「备份归档」与任务行的
+// 最近执行/上次错误——两者合起来就是本页的备份日志（逐行 tar/上传
+// 输出服务端不落盘，不在日志范围内）。
+const appBackupJobs = ref<BackupJob[]>([])
+const backupJobsLoading = ref(false)
+const showJobModal = ref(false)
+const editingJobId = ref<string | null>(null)
+const savingJob = ref(false)
+const runningJobId = ref('')
+const togglingJobId = ref('')
+const jobForm = reactive({
+  name: '',
+  target: null as string | null,
+  storage_target: 'default',
+  cron: '0 3 * * *',
+  retention: 7,
+  enabled: true,
+})
+
+const appBackupJobsSorted = computed(() =>
+  [...appBackupJobs.value].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || '')),
+)
+
+// 备份位置选项与详情页手动备份共用同一套 S3 目标（app_volume 仅支持 S3，
+// 不提供「本地主机」；默认目标不存在时只列具体目标）。
+const jobStorageOptions = computed(() => {
+  const opts: { label: string; value: string }[] = []
+  const def = s3Targets.value.find((t) => t.is_default)
+  if (def) opts.push({ label: `默认 S3 目标 (${def.name} - ${def.bucket})`, value: 'default' })
+  for (const t of s3Targets.value) opts.push({ label: `S3: ${t.name} (${t.bucket})`, value: t.id })
+  return opts
+})
+
+function jobStorageLabel(job: BackupJob): string {
+  const st = job.storage_target
+  if (!st || st === 'default') {
+    const def = s3Targets.value.find((t) => t.is_default)
+    return def ? `S3: ${def.name}` : '未配置默认 S3'
+  }
+  const target = s3Targets.value.find((t) => t.id === st)
+  return target ? `S3: ${target.name}` : 'S3 (未知)'
+}
+
+async function loadAppBackupJobs() {
+  try {
+    const all = await listBackupJobs()
+    appBackupJobs.value = all.filter((j) => j.kind === 'app_volume' && j.app_id === appId.value)
+  } catch {
+    // 任务列表失败不弹错：归档与手动备份不受影响。
+  }
+}
+
+async function refreshBackupJobs() {
+  backupJobsLoading.value = true
+  try {
+    await loadAppBackupJobs()
+  } finally {
+    backupJobsLoading.value = false
+  }
+}
+
+function openJobModal(job?: BackupJob) {
+  if (job) {
+    editingJobId.value = job.id
+    jobForm.name = job.name
+    jobForm.target = job.target
+    jobForm.storage_target = job.storage_target || 'default'
+    jobForm.cron = job.schedule?.cron ?? ''
+    jobForm.retention = job.retention || 7
+    jobForm.enabled = job.enabled
+  } else {
+    editingJobId.value = null
+    jobForm.name = app.value ? `${app.value.name} 数据卷备份` : ''
+    jobForm.target = parsedVolumes.value[0]?.spec ?? null
+    const def = s3Targets.value.find((t) => t.is_default)
+    jobForm.storage_target = def ? 'default' : (s3Targets.value[0]?.id ?? 'default')
+    jobForm.cron = '0 3 * * *'
+    jobForm.retention = 7
+    jobForm.enabled = true
+  }
+  showJobModal.value = true
+}
+
+async function submitJob() {
+  if (!jobForm.name.trim()) {
+    message.warning('请填写任务名称')
+    return
+  }
+  if (!jobForm.target) {
+    message.warning('请选择要备份的挂载卷')
+    return
+  }
+  if (!jobStorageOptions.value.some((o) => o.value === jobForm.storage_target)) {
+    message.warning('请先在「快照备份 → S3 存储」中添加存储目标')
+    return
+  }
+  savingJob.value = true
+  try {
+    if (editingJobId.value) {
+      await updateBackupJob(editingJobId.value, {
+        name: jobForm.name.trim(),
+        target: jobForm.target,
+        storage_target: jobForm.storage_target,
+        retention: jobForm.retention,
+        cron: jobForm.cron.trim(),
+        enabled: jobForm.enabled,
+      })
+      message.success('备份任务已更新')
+    } else {
+      const req: CreateJobReq = {
+        name: jobForm.name.trim(),
+        host_id: '',
+        kind: 'app_volume',
+        app_id: appId.value,
+        target: jobForm.target,
+        storage_target: jobForm.storage_target,
+        retention: jobForm.retention,
+        cron: jobForm.cron.trim(),
+        enabled: jobForm.enabled,
+      }
+      await createBackupJob(req)
+      message.success('备份任务已创建')
+    }
+    showJobModal.value = false
+    await loadAppBackupJobs()
+  } catch (e: any) {
+    message.error(e.message || '保存备份任务失败')
+  } finally {
+    savingJob.value = false
+  }
+}
+
+async function doRunTask(job: BackupJob) {
+  runningJobId.value = job.id
+  try {
+    await runBackupJob(job.id)
+    message.success('备份任务已开始，完成后归档会出现在下方列表')
+    // 复用归档轮询的有界窗口：任务运行同样产生 running 归档，窗口内
+    // 轮询会同时刷新归档与任务的最近执行。
+    volumePollUntil.value = Date.now() + 30 * 60_000
+    setTimeout(loadAppBackupJobs, 3000)
+  } catch (e: any) {
+    message.error(e.message || '触发失败')
+  } finally {
+    runningJobId.value = ''
+  }
+}
+
+async function doToggleTask(job: BackupJob) {
+  togglingJobId.value = job.id
+  try {
+    await updateBackupJob(job.id, { enabled: !job.enabled })
+    await loadAppBackupJobs()
+  } catch (e: any) {
+    message.error(e.message || '切换失败')
+  } finally {
+    togglingJobId.value = ''
+  }
+}
+
+async function doDeleteTask(job: BackupJob) {
+  try {
+    await deleteBackupJob(job.id)
+    message.success('备份任务已删除')
+    await loadAppBackupJobs()
+  } catch (e: any) {
+    message.error(e.message || '删除失败')
+  }
+}
+
+const backupJobColumns = computed<DataTableColumns<BackupJob>>(() => [
+  { title: '任务名称', key: 'name', width: 150, render: (r) => h('span', { style: 'font-weight: 600' }, r.name) },
+  {
+    title: '目标卷', key: 'target', ellipsis: { tooltip: true },
+    render: (r) => h('span', { class: 'mono-font', style: 'font-size: 12px' }, r.target),
+  },
+  {
+    title: '备份位置', key: 'storage_target', width: 160,
+    render: (r) => {
+      const label = jobStorageLabel(r)
+      const warn = label === '未配置默认 S3' || label === 'S3 (未知)'
+      return h(NTag, { size: 'small', type: warn ? 'warning' : 'success', bordered: false }, { default: () => label })
+    },
+  },
+  {
+    title: '调度', key: 'schedule', width: 120,
+    render: (r) => r.schedule?.cron ? h('code', { style: 'font-size: 12px' }, r.schedule.cron) : '仅手动',
+  },
+  { title: '保留', key: 'retention', width: 70, render: (r) => `${r.retention} 份` },
+  {
+    title: '启用', key: 'enabled', width: 70,
+    render: (r) => canWrite.value
+      ? h(NSwitch, { size: 'small', value: r.enabled, loading: togglingJobId.value === r.id, onUpdateValue: () => doToggleTask(r) })
+      : h(NTag, { size: 'small', bordered: false, type: r.enabled ? 'success' : 'default' }, { default: () => r.enabled ? '启用' : '停用' }),
+  },
+  {
+    title: '最近执行', key: 'last_run', width: 130,
+    render: (r) => {
+      if (!r.last_run) return renderVolDash()
+      return h(NSpace, { size: 4, align: 'center' }, {
+        default: () => [
+          renderVolTime(r.last_run),
+          r.last_error ? h(NTag, { size: 'tiny', type: 'error', bordered: false }, { default: () => '失败' }) : null,
+        ],
+      })
+    },
+  },
+  {
+    title: '上次错误', key: 'last_error', ellipsis: { tooltip: true },
+    render: (r) => r.last_error ? h('span', { style: 'font-size: 12px' }, r.last_error) : renderVolDash(),
+  },
+  {
+    title: '操作', key: 'actions', width: 210, fixed: 'right',
+    render: (r) => canWrite.value
+      ? h(NSpace, { size: 6 }, {
+        default: () => [
+          h(NButton, { size: 'tiny', secondary: true, type: 'primary', loading: runningJobId.value === r.id, onClick: () => doRunTask(r) }, { default: () => '立即备份' }),
+          h(NButton, { size: 'tiny', secondary: true, onClick: () => openJobModal(r) }, { default: () => '编辑' }),
+          h(NPopconfirm, { onPositiveClick: () => doDeleteTask(r) }, {
+            trigger: () => h(NButton, { size: 'tiny', secondary: true, type: 'error' }, { default: () => '删除' }),
+            default: () => `确定删除备份任务「${r.name}」？`,
+          }),
+        ],
+      })
+      : renderVolDash(),
+  },
+])
+
 async function loadVolumeBackups() {
   // 不依赖 app.value：首屏 refreshAll 与 loadApp 并行，应用详情尚未返回时
   // 归档列表同样可以加载（只需路由里的 appId）。
@@ -872,7 +1131,6 @@ async function loadVolumeBackups() {
     const res = await listVolumeBackups(appId.value, { page_size: 100 })
     volumeBackups.value = res.data
     volumeBackupTotal.value = res.total
-    volumeS3.value = res.s3 ?? { ready: false }
     if (volumeBackupRunning.value) {
       // 备份仍在进行：保持轮询。
       volumePollUntil.value = Math.max(volumePollUntil.value, Date.now() + 60_000)
@@ -932,16 +1190,17 @@ async function copyArchiveSHA(sha: string) {
 }
 
 async function doBackupVolumes() {
-  if (!volumeS3.value.ready) {
-    message.warning('未配置默认 S3 存储目标，请先在「快照备份 → S3 存储」中添加并设为默认')
+  const targetId = selectedBackupTargetId.value
+  if (!targetId) {
+    message.warning('请先选择备份位置；若还没有存储目标，先在「快照备份 → S3 存储」中添加')
     return
   }
   backingVolumes.value = true
   try {
     const note = volBackupNote.value.trim()
     const payload = selectedVolumeSpecs.value.length > 0
-      ? { volumes: selectedVolumeSpecs.value, note }
-      : { note }
+      ? { volumes: selectedVolumeSpecs.value, note, target_id: targetId }
+      : { note, target_id: targetId }
     await backupAppVolumes(appId.value, payload)
     volumePollUntil.value = Date.now() + 30 * 60_000
     message.success('备份任务已开始，完成后归档会出现在下方列表')
@@ -985,6 +1244,65 @@ function downloadArchive(a: VolumeArchive) {
   // 服务端校验后 302 到短期 S3 预签名 URL，字节从 S3 直达浏览器
   // （JWT 走 ?token=，由 volumeArchiveDownloadUrl 拼好）。
   window.open(volumeArchiveDownloadUrl(appId.value, a.id), '_blank')
+}
+
+// ---- 上传备份并恢复 ----
+// 浏览器到不了被管主机，文件先经面板暂存、再由 Agent 一次性回拉，
+// 之后走与归档恢复同一条执行链（校验→停机→安全副本→解包→重启）。
+// NUpload 只做文件选择，真正的上传在确认弹窗后由提交按钮发起。
+const uploadTargetVolume = ref<string | null>(null)
+const uploadFileList = ref<UploadFileInfo[]>([])
+const uploadFile = ref<File | null>(null)
+const uploadSha = ref('')
+const uploadingRestore = ref(false)
+
+function handleUploadSelect({ file, onFinish }: UploadCustomRequestOptions) {
+  if (file.file) uploadFile.value = file.file
+  // 只选文件不上传：标记完成，避免文件行一直停在上传中状态。
+  onFinish()
+}
+
+function handleUploadRemove() {
+  uploadFile.value = null
+  return true
+}
+
+async function doUploadRestore() {
+  if (!uploadTargetVolume.value) {
+    message.warning('请选择要恢复到的挂载卷')
+    return
+  }
+  if (!uploadFile.value) {
+    message.warning('请选择备份文件')
+    return
+  }
+  const sha = uploadSha.value.trim().toLowerCase()
+  if (sha && !/^[0-9a-f]{64}$/.test(sha)) {
+    message.warning('SHA256 格式无效（应为 64 位十六进制）')
+    return
+  }
+  uploadingRestore.value = true
+  try {
+    const form = new FormData()
+    form.append('file', uploadFile.value)
+    form.append('volume_spec', uploadTargetVolume.value)
+    if (sha) form.append('sha256', sha)
+    const res = await uploadVolumeRestore(appId.value, form)
+    // 复用恢复轮询：新记录的 last_restore_at 变化即判定恢复结束。
+    restoringArchiveID.value = res.archive_id
+    restoreBaseline.value = ''
+    volumePollUntil.value = Date.now() + 30 * 60_000
+    message.success(res.message || '恢复任务已开始')
+    uploadFileList.value = []
+    uploadFile.value = null
+    uploadSha.value = ''
+    uploadTargetVolume.value = null
+    await loadVolumeBackups()
+  } catch (e: any) {
+    message.error(e.message || '上传恢复失败')
+  } finally {
+    uploadingRestore.value = false
+  }
 }
 
 const volArchiveStatusTag = (s: string) => {
@@ -1052,7 +1370,13 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
     title: '大小', key: 'size', width: 88,
     render: (r) => h('span', { class: 'mono-font', style: 'font-size: 12px' }, r.size > 0 ? formatBytes(r.size) : '—'),
   },
-  { title: '状态', key: 'status', width: 84, render: (r) => volArchiveStatusTag(r.status) },
+  {
+    title: '状态', key: 'status', width: 84,
+    // 上传记录无 S3 对象、状态恒为 uploaded，不走备份成功/失败的标签。
+    render: (r) => r.source === 'upload'
+      ? h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '上传' })
+      : volArchiveStatusTag(r.status),
+  },
   {
     title: '最近恢复', key: 'last_restore', width: 148,
     render: (r) => {
@@ -1156,7 +1480,9 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
               icon: () => h(NIcon, null, { default: () => h(TrashOutline) }),
             },
           ),
-          default: () => '删除归档（含 S3 上的归档对象）？此操作不可恢复。',
+          default: () => r.source === 'upload'
+            ? '删除该上传恢复记录？此操作不可恢复。'
+            : '删除归档（含 S3 上的归档对象）？此操作不可恢复。',
         },
       ),
     ].filter(Boolean) as any),
@@ -1399,7 +1725,10 @@ function startPolling() {
       if (deploying.value) loadDeployments()
       // 备份归档里的 running 记录由异步 agent tar 推进，轮询直到落终态；
       // 恢复只在终态回写归档，故用受理后开启的有界窗口兜底。
-      if (volumeBackupRunning.value || Date.now() < volumePollUntil.value) loadVolumeBackups()
+      if (volumeBackupRunning.value || Date.now() < volumePollUntil.value) {
+        loadVolumeBackups()
+        loadAppBackupJobs()
+      }
     }
   }, 5000)
 }
@@ -1420,6 +1749,8 @@ onActivated(() => {
   loadDeployments()
   refreshNewestDeployment()
   loadVolumeBackups()
+  loadS3Targets()
+  loadAppBackupJobs()
   loadProxyData(false)
   // 页签切走期间轮询窗口可能已过期，仍在执行的任务需要重新开启观察。
   if (volumeBusy.value) volumePollUntil.value = Date.now() + 60_000
@@ -1688,24 +2019,22 @@ onDeactivated(() => {
               该应用未配置挂载卷。挂载卷可在「编辑配置」中添加（宿主路径:容器路径），保存并重新部署后生效。
             </NAlert>
             <template v-else>
-              <NAlert v-if="!volumeS3.ready" type="warning" style="margin-bottom: 12px">
-                <template #header>未配置 S3 存储目标</template>
-                数据卷归档统一存放在 S3（不在应用主机留存），请先在「快照备份 → S3 存储」中添加存储目标并设为默认。
+              <NAlert v-if="s3Targets.length === 0" type="warning" style="margin-bottom: 12px">
+                <template #header>还没有 S3 存储目标</template>
+                数据卷归档统一存放在 S3（不在应用主机留存），请先在「快照备份 → S3 存储」中添加存储目标，添加后即可在本页发起备份时选择。
                 <NButton size="tiny" secondary style="margin-left: 8px" @click="$router.push('/snapshots')">
                   前往 S3 存储配置
                 </NButton>
               </NAlert>
               <NAlert v-else type="info" style="margin-bottom: 12px">
-                备份将卷数据目录打包为 tar.gz，直传 S3 存储目标
-                <strong>{{ volumeS3.target_name || volumeS3.target_id }}</strong>
-                <template v-if="volumeS3.bucket">（存储桶 <code>{{ volumeS3.bucket }}</code>）</template>，
+                备份将卷数据目录打包为 tar.gz，直传下方所选的 S3 存储目标，
                 每卷保留最近 5 份成功归档。备份在容器运行中直接打包，属于在线文件快照——数据库等对跨文件一致性敏感的
                 应用建议选业务低峰期执行。恢复时会先下载归档并校验 SHA256，<strong>自动停止应用容器</strong>、
                 保留当前状态安全副本后解压覆盖，完成后自动重启容器。
-                <br />
-                需要定时自动备份？到
-                <NButton text type="primary" size="tiny" @click="$router.push('/snapshots')">快照备份</NButton>
-                新建「应用数据卷」任务：调度与保留份数由快照模块管理，归档与本页共用同一份记录。
+                <div style="margin-top: 6px">
+                  定时备份任务在下方「备份任务」中创建与管理（调度执行仍由快照模块负责，归档与本页共用同一份记录），全部任务也可在快照备份页按应用聚合查看。
+                  <NButton secondary size="tiny" style="margin-left: 6px" @click="$router.push('/snapshots')">前往快照备份</NButton>
+                </div>
               </NAlert>
 
               <!-- 应用挂载卷清单（数据量 = 应用声明的卷数，天然有限，属 §8.2 例外：不分页） -->
@@ -1723,18 +2052,26 @@ onDeactivated(() => {
               <div v-if="canWrite" class="vol-section">
                 <div class="vol-section-title">发起备份</div>
                 <NSpace vertical :size="10">
-                  <NSelect
-                    v-model:value="selectedVolumeSpecs"
-                    multiple
-                    clearable
-                    :options="parsedVolumes.map((v) => ({ label: v.spec, value: v.spec }))"
-                    placeholder="全部挂载卷（不选则备份所有）"
-                  />
+                  <div class="vol-form-row">
+                    <NSelect
+                      v-model:value="selectedVolumeSpecs"
+                      multiple
+                      clearable
+                      :options="parsedVolumes.map((v) => ({ label: v.spec, value: v.spec }))"
+                      placeholder="全部挂载卷（不选则备份所有）"
+                    />
+                    <NSelect
+                      v-model:value="selectedBackupTargetId"
+                      :options="s3Targets.map((t) => ({ label: `${t.name} · ${t.bucket}`, value: t.id }))"
+                      placeholder="请选择备份位置"
+                      :disabled="s3Targets.length === 0"
+                    />
+                  </div>
                   <div class="vol-backup-row">
                     <NInput
                       v-model:value="volBackupNote"
                       placeholder="备注（可选）"
-                      style="width: 320px"
+                      style="flex: 1; min-width: 200px"
                       :maxlength="200"
                       show-count
                     />
@@ -1742,7 +2079,7 @@ onDeactivated(() => {
                       type="primary"
                       size="small"
                       :loading="backingVolumes"
-                      :disabled="!volumeS3.ready || volumeBusy || deploying"
+                      :disabled="!selectedBackupTargetId || volumeBusy || deploying"
                       @click="doBackupVolumes"
                     >
                       <template #icon>
@@ -1754,6 +2091,136 @@ onDeactivated(() => {
                       <NIcon><RefreshOutline /></NIcon>
                       归档状态每 5 秒自动刷新
                     </span>
+                  </div>
+                </NSpace>
+              </div>
+
+              <!-- 备份任务（快照 app_volume 任务，详情页直接管理；任务数 = 本应用任务数，天然有限，属 §8.2 例外：不分页） -->
+              <div class="vol-section">
+                <div class="vol-section-title">
+                  <span>
+                    备份任务
+                    <span v-if="appBackupJobs.length > 0" class="vol-count">（{{ appBackupJobs.length }} 个）</span>
+                  </span>
+                  <NSpace :size="6">
+                    <NButton v-if="canWrite" size="tiny" secondary @click="openJobModal()">新建备份任务</NButton>
+                    <NButton size="tiny" secondary :loading="backupJobsLoading" @click="refreshBackupJobs">刷新</NButton>
+                  </NSpace>
+                </div>
+                <NDataTable
+                  :columns="backupJobColumns"
+                  :data="appBackupJobsSorted"
+                  size="small"
+                  :bordered="false"
+                  :loading="backupJobsLoading"
+                  :scroll-x="1080"
+                  :row-key="(r: BackupJob) => r.id"
+                >
+                  <template #empty>
+                    <NEmpty
+                      :description="canWrite ? '暂无备份任务，点「新建备份任务」为本应用创建定时备份' : '暂无备份任务'"
+                      size="small"
+                    />
+                  </template>
+                </NDataTable>
+                <p class="muted tip-hint" style="margin-top: 8px">
+                  备份任务由快照备份模块调度执行，运行产生的归档与下方「备份归档」共用同一份记录；任务行的最近执行与上次错误即备份日志。
+                </p>
+              </div>
+
+              <NModal
+                v-model:show="showJobModal"
+                preset="card"
+                :title="editingJobId ? '编辑备份任务' : '新建备份任务'"
+                style="width: 560px; max-width: 94vw"
+              >
+                <NForm label-placement="top">
+                  <NFormItem label="任务名称" required>
+                    <NInput v-model:value="jobForm.name" placeholder="如 每日凌晨备份数据卷" />
+                  </NFormItem>
+                  <NFormItem label="目标卷" required>
+                    <NSelect
+                      v-model:value="jobForm.target"
+                      :options="parsedVolumes.map((v) => ({ label: v.spec, value: v.spec }))"
+                      placeholder="选择要备份的挂载卷"
+                    />
+                  </NFormItem>
+                  <NFormItem label="备份位置" required>
+                    <NSelect
+                      v-model:value="jobForm.storage_target"
+                      :options="jobStorageOptions"
+                      placeholder="请选择备份位置"
+                      :disabled="jobStorageOptions.length === 0"
+                    />
+                  </NFormItem>
+                  <NAlert v-if="jobStorageOptions.length === 0" type="warning" style="margin-bottom: 12px">
+                    还没有 S3 存储目标，应用数据卷归档仅支持 S3。请先到「快照备份 → S3 存储」添加。
+                  </NAlert>
+                  <div class="vol-modal-row">
+                    <NFormItem label="定时计划（Cron 5 段）" style="flex: 1; min-width: 0">
+                      <NInput v-model:value="jobForm.cron" placeholder="0 3 * * *（留空仅手动）" class="mono-font" />
+                    </NFormItem>
+                    <NFormItem label="保留份数" style="flex-shrink: 0; width: 140px">
+                      <NInputNumber v-model:value="jobForm.retention" :min="1" :max="100" style="width: 100%" />
+                    </NFormItem>
+                  </div>
+                  <NFormItem label="启用定时调度">
+                    <NSwitch v-model:value="jobForm.enabled" />
+                  </NFormItem>
+                </NForm>
+                <template #footer>
+                  <NSpace justify="end">
+                    <NButton @click="showJobModal = false">取消</NButton>
+                    <NButton type="primary" :loading="savingJob" :disabled="jobStorageOptions.length === 0" @click="submitJob">保存</NButton>
+                  </NSpace>
+                </template>
+              </NModal>
+
+              <!-- 上传备份并恢复：文件先经面板暂存、再由 Agent 回拉，恢复语义与归档恢复一致 -->
+              <div v-if="canWrite" class="vol-section">
+                <div class="vol-section-title">
+                  <span>上传备份并恢复</span>
+                </div>
+                <NSpace vertical :size="10">
+                  <div class="vol-form-row">
+                    <NSelect
+                      v-model:value="uploadTargetVolume"
+                      :options="parsedVolumes.map((v) => ({ label: v.spec, value: v.spec }))"
+                      placeholder="选择要恢复到的挂载卷"
+                    />
+                    <NInput
+                      v-model:value="uploadSha"
+                      placeholder="可选：文件 SHA256（填了才校验）"
+                      class="mono-font"
+                    />
+                  </div>
+                  <NUpload
+                    v-model:file-list="uploadFileList"
+                    :max="1"
+                    :multiple="false"
+                    accept=".tar.gz,.tgz,application/gzip"
+                    :custom-request="handleUploadSelect"
+                    @remove="handleUploadRemove"
+                  >
+                    <NButton secondary>选择备份文件（.tar.gz）</NButton>
+                  </NUpload>
+                  <NAlert type="warning">
+                    恢复将自动停止应用容器，用上传文件覆盖所选卷数据（覆盖前保留当前状态安全副本），完成后自动重启容器。
+                    文件先暂存面板、恢复结束即删（不超过 2GB）；Agent 须能通过面板地址回拉文件，拉取或校验失败在停机前即报错，不产生停机。
+                  </NAlert>
+                  <div>
+                    <NPopconfirm @positive-click="doUploadRestore">
+                      <template #trigger>
+                        <NButton
+                          type="warning"
+                          :loading="uploadingRestore"
+                          :disabled="!uploadTargetVolume || !uploadFile || volumeBusy || deploying"
+                        >
+                          上传并恢复
+                        </NButton>
+                      </template>
+                      确认把上传文件恢复到所选挂载卷？恢复会覆盖该卷现有数据。
+                    </NPopconfirm>
                   </div>
                 </NSpace>
               </div>
@@ -1784,7 +2251,7 @@ onDeactivated(() => {
                 >
                   <template #empty>
                     <NEmpty
-                      :description="volumeS3.ready ? '暂无备份归档，选好挂载卷后点「开始备份」' : '暂无备份归档'"
+                      :description="s3Targets.length > 0 ? '暂无备份归档，选好备份位置与挂载卷后点「开始备份」' : '暂无备份归档'"
                       size="small"
                     />
                   </template>
@@ -2369,9 +2836,35 @@ onDeactivated(() => {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  min-height: 28px;
   font-size: 13px;
   font-weight: 600;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+/* 表单并排一行：窄屏自动换行，固定宽输入不再挤出容器 */
+.vol-form-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.vol-form-row > * {
+  flex: 1;
+  min-width: 240px;
+}
+
+.vol-modal-row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.vol-modal-row > .n-form-item {
+  margin-bottom: 18px;
 }
 
 .vol-count {

@@ -236,8 +236,10 @@ export interface VolumeArchive {
   storage_path: string
   size: number
   sha256?: string
-  /** running | success | failed */
+  /** running | success | failed | uploaded（uploaded = 上传恢复记录，无 S3 对象） */
   status: string
+  /** 归档来源：空 = 面板备份，upload = 上传恢复记录 */
+  source?: string
   error?: string
   note?: string
   created_at: string
@@ -267,7 +269,7 @@ export function listVolumeBackups(id: string, params?: { volume?: string; offset
   return unwrap<VolumeBackupListResp>(http.get(`/apps/${id}/volume-backups`, { params }))
 }
 
-export function backupAppVolumes(id: string, req: { volumes?: string[]; note?: string }) {
+export function backupAppVolumes(id: string, req: { volumes?: string[]; note?: string; target_id?: string }) {
   return unwrap<{ ok: boolean; message: string }>(http.post(`/apps/${id}/volume-backups`, req))
 }
 
@@ -279,6 +281,17 @@ export function restoreVolumeArchive(id: string, archiveId: string) {
 
 export function deleteVolumeArchive(id: string, archiveId: string) {
   return unwrap<{ ok: boolean }>(http.delete(`/apps/${id}/volume-backups/${archiveId}`))
+}
+
+/**
+ * 上传备份文件并恢复到指定挂载卷：multipart 直传（文件可能达 GB 级，
+ * 不设 axios 超时）；服务端 202 受理后异步执行恢复，返回归档记录 id
+ * 供详情页轮询其最近恢复结果。
+ */
+export function uploadVolumeRestore(id: string, form: FormData) {
+  return unwrap<{ ok: boolean; archive_id: string; message: string }>(
+    http.post(`/apps/${id}/volume-backups/upload-restore`, form, { timeout: 0 }),
+  )
 }
 
 /** 归档下载地址：服务端校验后 302 到短期 S3 预签名 URL；导航下载走 ?token= */

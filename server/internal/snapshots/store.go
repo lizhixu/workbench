@@ -72,12 +72,12 @@ type Job struct {
 
 // Archive is one completed backup on a managed host or S3 bucket.
 type Archive struct {
-	ID            string    `json:"id"` // job id + timestamp, also the file stem
-	JobID         string    `json:"job_id"`
-	HostName      string    `json:"host_id"`
-	Kind          JobKind   `json:"kind"`
-	Target        string    `json:"target"`
-	StorageTarget string    `json:"storage_target,omitempty"` // "local" | "s3_xxxx"
+	ID            string  `json:"id"` // job id + timestamp, also the file stem
+	JobID         string  `json:"job_id"`
+	HostName      string  `json:"host_id"`
+	Kind          JobKind `json:"kind"`
+	Target        string  `json:"target"`
+	StorageTarget string  `json:"storage_target,omitempty"` // "local" | "s3_xxxx"
 	// StorageTargetName/Status/Error/Note/LastRestore* are populated for
 	// app_volume archives only: those have a lifecycle (running -> success /
 	// failed) and a frozen S3 target name, while the other kinds only ever
@@ -92,7 +92,10 @@ type Archive struct {
 	LastRestoreAt     *time.Time `json:"last_restore_at,omitempty"`
 	LastRestoreStatus string     `json:"last_restore_status,omitempty"`
 	LastRestoreError  string     `json:"last_restore_error,omitempty"`
-	CreatedAt         time.Time  `json:"created_at"`
+	// Source is populated for app_volume archives only: "upload" marks a
+	// record created by an upload-restore (no S3 object, panel temp file).
+	Source    string    `json:"source,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Store persists backup jobs, archive metadata and S3 storage targets.

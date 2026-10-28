@@ -52,7 +52,9 @@ export interface Archive {
   // app_volume 归档专用：任务记录带生命周期（running/success/failed）与冻结的
   // S3 目标名，其余类型只在成功终态落一条记录。
   storage_target_name?: string
-  status?: 'running' | 'success' | 'failed'
+  status?: 'running' | 'success' | 'failed' | 'uploaded'
+  /** app_volume 归档来源：upload = 上传恢复记录（无 S3 对象） */
+  source?: string
   error?: string
   note?: string
   last_restore_at?: string

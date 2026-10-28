@@ -157,6 +157,7 @@ func TestGuardExemptions(t *testing.T) {
 	v1.POST("/apps/webhook/:token", func(c *gin.Context) { c.Status(http.StatusOK) })
 	v1.GET("/apps/webhook/:token", func(c *gin.Context) { c.Status(http.StatusOK) })
 	v1.GET("/terminals/share/:token", func(c *gin.Context) { c.Status(http.StatusOK) })
+	v1.GET("/volume-uploads/:token", func(c *gin.Context) { c.Status(http.StatusOK) })
 	r.GET("/install", func(c *gin.Context) { c.Status(http.StatusOK) })
 	r.GET("/agent/binary", func(c *gin.Context) { c.Status(http.StatusOK) })
 
@@ -164,6 +165,7 @@ func TestGuardExemptions(t *testing.T) {
 		{"POST", "/api/v1/hosts/enroll"},
 		{"GET", "/api/v1/apps/webhook/sometoken"},
 		{"GET", "/api/v1/terminals/share/sometoken"},
+		{"GET", "/api/v1/volume-uploads/sometoken"},
 		{"GET", "/install"},
 		{"GET", "/agent/binary"},
 	} {

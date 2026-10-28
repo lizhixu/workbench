@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, h, onActivated, onMounted, reactive, ref, watch } from 'vue'
 import {
-  NAlert, NButton, NCard, NDataTable, NForm, NFormItem, NIcon, NInput,
-  NInputNumber, NModal, NPopconfirm, NRadio, NRadioGroup, NSelect,
+  NAlert, NButton, NCard, NDataTable, NEmpty, NForm, NFormItem, NIcon, NInput,
+  NInputNumber, NModal, NPopconfirm, NRadio, NRadioButton, NRadioGroup, NSelect,
   NSpace, NSwitch, NTabPane, NTabs, NTag, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
@@ -358,7 +358,11 @@ const s3Columns = computed<DataTableColumns<S3Target>>(() => [
   },
 ])
 
-function archiveStatusTag(status?: string) {
+function archiveStatusTag(status?: string, source?: string) {
+  // 上传恢复记录无 S3 对象、状态恒为 uploaded，不按成功/失败渲染。
+  if (source === 'upload') {
+    return h(NTag, { size: 'tiny', type: 'info', bordered: false }, { default: () => '上传' })
+  }
   // 旧类型归档只在成功终态落记录，status 字段缺省视为成功。
   if (!status || status === 'success') {
     return h(NTag, { size: 'tiny', type: 'success', bordered: false }, { default: () => '成功' })
@@ -392,7 +396,7 @@ const archiveColumns = computed<DataTableColumns<Archive>>(() => {
       title: '状态',
       key: 'status',
       width: 82,
-      render: (r) => archiveStatusTag(r.status),
+      render: (r) => archiveStatusTag(r.status, r.source),
     })
   }
   cols.push({
@@ -400,6 +404,10 @@ const archiveColumns = computed<DataTableColumns<Archive>>(() => {
     key: 'storage_target',
     width: 160,
     render: (r) => {
+      // 上传恢复记录无 S3 对象：文件只在面板暂存、恢复结束即删，不是本地主机。
+      if (r.source === 'upload') {
+        return h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '上传文件' })
+      }
       // app_volume 归档冻结了备份时的 S3 目标名，切换默认目标后仍按记录展示。
       if (r.storage_target_name) {
         return h(NTag, { size: 'small', type: 'success', bordered: false }, {
@@ -715,6 +723,30 @@ async function submitCreate() {
   }
 }
 
+// ---- 按应用聚合视图 ----
+// 应用详情页可以直接建本应用的备份任务，快照页则按应用聚合展示：
+// app_volume 任务按 app_id 分组，其他种类任务仍平铺在「其他备份任务」。
+const jobView = ref<'flat' | 'byApp'>('byApp')
+
+const appVolumeGroups = computed(() => {
+  const groups: { appId: string; appName: string; jobs: BackupJob[] }[] = []
+  const byId = new Map<string, { appId: string; appName: string; jobs: BackupJob[] }>()
+  for (const j of jobs.value) {
+    if (j.kind !== 'app_volume') continue
+    let g = byId.get(j.app_id || '')
+    if (!g) {
+      const app = apps.value.find((a) => a.id === j.app_id)
+      g = { appId: j.app_id || '', appName: app?.name || j.app_id || '应用已删除', jobs: [] }
+      byId.set(j.app_id || '', g)
+      groups.push(g)
+    }
+    g.jobs.push(j)
+  }
+  return groups
+})
+
+const otherJobs = computed(() => jobs.value.filter((j) => j.kind !== 'app_volume'))
+
 async function doRun(job: BackupJob) {
   try {
     const res = await runBackupJob(job.id)
@@ -832,7 +864,37 @@ onActivated(() => {
         <!-- 备份任务列表 -->
         <NTabPane name="jobs" tab="备份任务列表">
           <div class="tab-pane-content">
-            <NCard :bordered="false" class="table-flex-fill">
+            <div class="job-view-toolbar">
+              <span class="tip-hint" style="font-size: 12px; color: var(--text-secondary)">按应用聚合时，应用数据卷任务按应用分组，其他类型任务归入「其他备份任务」。</span>
+              <NRadioGroup v-model:value="jobView" size="small">
+                <NRadioButton value="byApp">按应用聚合</NRadioButton>
+                <NRadioButton value="flat">平铺</NRadioButton>
+              </NRadioGroup>
+            </div>
+            <!-- 聚合视图：每组任务数天然有限，属 §8.2 例外：不分页；组列表自身滚动（外层 overflow hidden，见下方样式） -->
+            <div v-if="jobView === 'byApp' && jobs.length > 0" class="job-group-scroll">
+              <div v-for="g in appVolumeGroups" :key="g.appId" class="job-group-card">
+                <NCard :bordered="false" size="small" :title="`${g.appName}（${g.jobs.length} 个任务）`" :content-style="{ padding: 0 }">
+                  <NDataTable
+                    :columns="columns"
+                    :data="g.jobs"
+                    :row-key="(r: BackupJob) => r.id"
+                    :bordered="false"
+                    size="small"
+                  />
+                </NCard>
+              </div>
+              <NCard v-if="otherJobs.length > 0" :bordered="false" size="small" title="其他备份任务" :content-style="{ padding: 0 }">
+                <NDataTable
+                  :columns="columns"
+                  :data="otherJobs"
+                  :row-key="(r: BackupJob) => r.id"
+                  :bordered="false"
+                  size="small"
+                />
+              </NCard>
+            </div>
+            <NCard v-else :bordered="false" class="table-flex-fill">
               <NDataTable
                 flex-height
                 :columns="columns"
@@ -841,7 +903,11 @@ onActivated(() => {
                 :pagination="{ pageSize: 20 }"
                 :bordered="false"
                 size="small"
-              />
+              >
+                <template #empty>
+                  <NEmpty description="暂无备份任务，点右上角「新建备份任务」创建一个" size="small" />
+                </template>
+              </NDataTable>
             </NCard>
           </div>
         </NTabPane>
@@ -1143,6 +1209,32 @@ onActivated(() => {
     display: flex;
     flex-direction: column;
     overflow: hidden;
+  }
+
+  /* 备份任务视图切换栏：左侧说明 + 右侧分段控件，窄屏自动换行 */
+  .job-view-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+    flex-shrink: 0;
+  }
+
+  .job-group-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .job-group-card {
+    margin-bottom: 12px;
+  }
+
+  .job-group-card:last-child {
+    margin-bottom: 0;
   }
 }
 </style>

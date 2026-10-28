@@ -1,7 +1,9 @@
 package apps
 
 import (
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -93,8 +95,9 @@ func (h *AppHandlers) listVolumeBackups(c *gin.Context) {
 	if page == nil {
 		page = []*VolumeArchive{}
 	}
-	// The s3 block tells the UI where new archives would go and whether the
-	// backup button can work at all (no default target -> 400 on POST).
+	// The s3 block reports the default target for display; the backup
+	// button itself is gated by the destination the user picks on the page
+	// (an unknown target or no target at all -> 400 on POST).
 	c.JSON(http.StatusOK, gin.H{
 		"data": page, "total": total, "offset": offset, "page_size": pageSize,
 		"s3": h.engine.S3Status(),
@@ -112,8 +115,9 @@ func (h *AppHandlers) createVolumeBackup(c *gin.Context) {
 		return
 	}
 	var req struct {
-		Volumes []string `json:"volumes"`
-		Note    string   `json:"note"`
+		Volumes  []string `json:"volumes"`
+		Note     string   `json:"note"`
+		TargetID string   `json:"target_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体格式错误"})
@@ -158,10 +162,17 @@ func (h *AppHandlers) createVolumeBackup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "备注不能超过 200 个字符"})
 		return
 	}
-	// Archives live in S3 only; without a default target there is nowhere to
-	// upload them, so reject before any agent work.
-	if !h.engine.S3Status().Ready {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "未配置默认 S3 存储目标，请先在「快照备份 → S3 存储」中添加目标并设为默认"})
+	// The destination is chosen on the app page (Dokploy-style): an explicit
+	// target_id wins, an omitted one falls back to the default target.
+	// Resolve before the slot so a bad choice fails fast without blocking
+	// other work, and so the frozen archive target is fixed up front.
+	target, err := h.engine.resolveVolumeBackupTarget(req.TargetID)
+	if err != nil {
+		if errors.Is(err, errVolumeTargetUnknown) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "所选备份位置不存在，请重新选择"})
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请先选择备份位置；若还没有存储目标，先在「快照备份 → S3 存储」中添加"})
+		}
 		return
 	}
 	// Acquire the slot synchronously: a check-then-goroutine race would answer
@@ -185,7 +196,7 @@ func (h *AppHandlers) createVolumeBackup(c *gin.Context) {
 
 	go func() {
 		defer h.engine.releaseVolumeSlot(app.ID)
-		if _, err := h.engine.runBackupAppVolumes(app, specs, note); err != nil {
+		if _, err := h.engine.runBackupAppVolumesWith(app, specs, note, target, volumeRetention); err != nil {
 			h.engine.log.Warn("volume backup failed", "app", app.ID, "err", err)
 		}
 	}()
@@ -304,4 +315,239 @@ func (h *AppHandlers) downloadVolumeBackup(c *gin.Context) {
 		return
 	}
 	c.Redirect(http.StatusFound, url)
+}
+
+// uploadVolumeBackupRestore accepts a backup file the operator uploads and
+// restores it into one declared volume of the app. The bytes land on the
+// panel first (the browser cannot reach the managed host); the agent pulls
+// them back over a one-time token URL, then the run follows the shared
+// restore core (volume-dir check, stop, safety copy, unpack, restart).
+// Preflight order mirrors restoreVolumeBackup: slot, then deploying, then
+// offline — and the slot stays held through the whole upload + restore, so a
+// second volume operation cannot interleave with either half.
+func (h *AppHandlers) uploadVolumeBackupRestore(c *gin.Context) {
+	app, ok := h.store.GetApp(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
+		return
+	}
+	if h.engine == nil || h.engine.vols == nil || h.engine.volUploads == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "上传恢复暂不可用"})
+		return
+	}
+	if !volumeBackupSupported(app) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Compose 应用的挂载卷在编排文件中声明，暂不支持应用级上传恢复"})
+		return
+	}
+	if h.volumeWindowsRejected(app) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "数据卷恢复暂仅支持 Linux 主机"})
+		return
+	}
+	// Same pre-flight order as restore: atomic slot, then deploy check, then
+	// offline (see restoreVolumeBackup).
+	if !h.engine.acquireVolumeSlot(app.ID) {
+		c.JSON(http.StatusConflict, gin.H{"error": "该应用已有备份或恢复任务在执行"})
+		return
+	}
+	if h.engine.IsRunning(app.ID) {
+		h.engine.releaseVolumeSlot(app.ID)
+		c.JSON(http.StatusConflict, gin.H{"error": "应用正在部署，暂不能恢复数据卷"})
+		return
+	}
+	hub := h.appHub(app.HostID)
+	if hub == nil {
+		h.engine.releaseVolumeSlot(app.ID)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "目标主机 Agent 不在线"})
+		return
+	}
+
+	archiveID := "vbk_" + randomToken(8)
+	fileSaved := false
+	// cleanup drops the staged file (if any) and releases the slot. It runs
+	// on every failure path before the 202; after the 202 the restore
+	// goroutine owns both.
+	cleanup := func() {
+		if fileSaved {
+			h.engine.volUploads.RemoveFile(archiveID)
+		}
+		h.engine.releaseVolumeSlot(app.ID)
+	}
+
+	// Stream the multipart body straight to disk: a 2GB file must never sit
+	// in panel memory. Fields may arrive in any order, so the file is saved
+	// as it streams and validated after the body is fully read.
+	mr, err := c.Request.MultipartReader()
+	if err != nil {
+		cleanup()
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求不是 multipart 上传"})
+		return
+	}
+	var spec, sha string
+	var fileSize int64
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			cleanup()
+			c.JSON(http.StatusBadRequest, gin.H{"error": "读取上传内容失败"})
+			return
+		}
+		switch part.FormName() {
+		case "volume_spec":
+			b, _ := io.ReadAll(io.LimitReader(part, 4096))
+			spec = strings.TrimSpace(string(b))
+		case "sha256":
+			b, _ := io.ReadAll(io.LimitReader(part, 4096))
+			sha = strings.TrimSpace(strings.ToLower(string(b)))
+		case "file":
+			if fileSaved {
+				cleanup()
+				c.JSON(http.StatusBadRequest, gin.H{"error": "只能上传一个备份文件"})
+				return
+			}
+			size, err := h.engine.volUploads.Save(archiveID, part)
+			if err != nil {
+				cleanup()
+				if errors.Is(err, errVolumeUploadTooLarge) {
+					c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
+				} else {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "保存上传文件失败"})
+				}
+				return
+			}
+			fileSaved = true
+			fileSize = size
+		default:
+			io.Copy(io.Discard, part)
+		}
+	}
+	if !fileSaved {
+		cleanup()
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请上传备份文件"})
+		return
+	}
+
+	// Only declared volumes may be restored into: the upload + restore path
+	// must not become a way to write arbitrary host directories.
+	declared := false
+	for _, v := range app.Volumes {
+		if strings.TrimSpace(v) == spec {
+			declared = true
+			break
+		}
+	}
+	if spec == "" || !declared {
+		cleanup()
+		c.JSON(http.StatusBadRequest, gin.H{"error": "只能恢复到应用已声明的挂载卷"})
+		return
+	}
+	src, dst, _, specOK := parseVolumeSpec(spec)
+	if !specOK || src == "" || dst == "" {
+		cleanup()
+		c.JSON(http.StatusBadRequest, gin.H{"error": "挂载卷规格无效"})
+		return
+	}
+	if sha != "" {
+		if len(sha) != 64 {
+			cleanup()
+			c.JSON(http.StatusBadRequest, gin.H{"error": "SHA256 格式无效（应为 64 位十六进制）"})
+			return
+		}
+		if _, err := hex.DecodeString(sha); err != nil {
+			cleanup()
+			c.JSON(http.StatusBadRequest, gin.H{"error": "SHA256 格式无效（应为 64 位十六进制）"})
+			return
+		}
+	}
+	// Resolve the host directory up front so the record carries the same
+	// HostPath the restore core re-validates against (bind: the declared
+	// path; named: the current docker mountpoint).
+	hostPath := src
+	if !volumeIsBindMount(src) {
+		res, err := execOnAgent(hub, "volupath-"+randomToken(4), volumeResolveMountpointScript(src), 30)
+		if err != nil {
+			cleanup()
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "查询 Docker 卷挂载点失败"})
+			return
+		}
+		if res.GetExitCode() != 0 || strings.TrimSpace(string(res.GetStdout())) == "" {
+			cleanup()
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Docker 卷 %s 不存在，卷配置已变更", src)})
+			return
+		}
+		hostPath = strings.TrimSpace(string(res.GetStdout()))
+	}
+
+	arch := &VolumeArchive{
+		ID:            archiveID,
+		AppID:         app.ID,
+		HostID:        app.HostID,
+		VolumeSpec:    spec,
+		HostPath:      hostPath,
+		ContainerPath: dst,
+		Size:          fileSize,
+		SHA256:        sha,
+		Status:        VolumeBackupUploaded,
+		Source:        VolumeArchiveSourceUpload,
+		Note:          "上传文件恢复",
+		CreatedAt:     time.Now(),
+	}
+	if err := h.engine.vols.AddArchive(arch); err != nil {
+		cleanup()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存上传恢复记录失败"})
+		return
+	}
+	tok, err := h.engine.volUploads.IssueToken(app.ID, archiveID)
+	if err != nil {
+		cleanup()
+		h.engine.vols.DeleteArchive(app.ID, archiveID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成下载链接失败"})
+		return
+	}
+	// The agent downloads from the panel address the browser used. The
+	// agent must be able to reach the panel over HTTP at that address
+	// (same derivation family as the upgrade download URL); if it cannot,
+	// the run fails at its download step, before any downtime.
+	scheme := "http"
+	if c.Request.TLS != nil {
+		scheme = "https"
+	}
+	downloadURL := fmt.Sprintf("%s://%s/api/v1/volume-uploads/%s", scheme, c.Request.Host, tok)
+
+	go func() {
+		defer h.engine.releaseVolumeSlot(app.ID)
+		if _, err := h.engine.runRestoreUploadedVolume(app, arch, downloadURL, sha); err != nil {
+			h.engine.log.Warn("volume upload restore failed", "app", app.ID, "archive", arch.ID, "err", err)
+		}
+	}()
+	c.JSON(http.StatusAccepted, gin.H{
+		"ok": true, "archive_id": archiveID,
+		"message": "上传完成，恢复任务已开始：将自动停机、恢复数据并在完成后重启应用容器",
+	})
+}
+
+// downloadVolumeUpload serves an operator-uploaded restore file to the
+// managed host's agent: the token in the path is the only credential
+// (single-use, 2h TTL), mirroring the webhook token-in-path pattern. No JWT:
+// the agent holds no panel session. The secure-entry guard exempts this
+// prefix (see secentry.exemptPath); without the exemption an enabled entry
+// gate would 404 the agent's download mid-restore.
+func (h *AppHandlers) downloadVolumeUpload(c *gin.Context) {
+	if h.engine == nil || h.engine.volUploads == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "上传恢复暂不可用"})
+		return
+	}
+	archiveID, _, ok := h.engine.volUploads.ConsumeToken(c.Param("token"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "下载链接无效或已过期"})
+		return
+	}
+	if err := h.engine.volUploads.Serve(c.Writer, archiveID); err != nil {
+		h.engine.log.Warn("volume upload serve failed", "archive", archiveID, "err", err)
+		if !c.Writer.Written() {
+			c.JSON(http.StatusNotFound, gin.H{"error": "上传文件不存在或已被清理"})
+		}
+	}
 }

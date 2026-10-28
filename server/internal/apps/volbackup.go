@@ -83,6 +83,18 @@ const (
 	VolumeBackupRunning = "running"
 	VolumeBackupSuccess = "success"
 	VolumeBackupFailed  = "failed"
+	// VolumeBackupUploaded marks a record created from a file the operator
+	// uploaded for a restore (not from a panel backup). It is never a
+	// downloadable/restorable S3 archive: it has no StoragePath, its restore
+	// runs from the panel's temporary upload, and its Status stays "uploaded"
+	// for life — the restore outcome lives only in LastRestore* (the normal
+	// restore/download handlers gate on Status == success, so they reject it
+	// without any special case).
+	VolumeBackupUploaded = "uploaded"
+
+	// VolumeArchiveSourceUpload marks a record created by an upload-restore
+	// (Source field). Empty means a panel backup, the historical default.
+	VolumeArchiveSourceUpload = "upload"
 
 	// Restore outcome recorded on the archive itself: a restore is an async
 	// agent run like a backup, so without this the operator only saw a 202 and
@@ -98,23 +110,27 @@ const (
 // VolumeArchive is one tar.gz backup of an application volume. The object is
 // stored in S3; ID carries the "vbk_" prefix.
 type VolumeArchive struct {
-	ID            string    `json:"id"`
-	AppID         string    `json:"app_id"`
-	HostID        string    `json:"host_id"`
-	VolumeSpec    string    `json:"volume_spec"`    // original "host:container[:ro]" spec
-	HostPath      string    `json:"host_path"`      // resolved data dir (bind path or volume mountpoint)
-	ContainerPath string    `json:"container_path"` // path inside the container
+	ID            string `json:"id"`
+	AppID         string `json:"app_id"`
+	HostID        string `json:"host_id"`
+	VolumeSpec    string `json:"volume_spec"`    // original "host:container[:ro]" spec
+	HostPath      string `json:"host_path"`      // resolved data dir (bind path or volume mountpoint)
+	ContainerPath string `json:"container_path"` // path inside the container
 	// StorageTarget/StorageTargetName are frozen at backup time: switching the
 	// default target later must not orphan older archives.
-	StorageTarget     string    `json:"storage_target"`
-	StorageTargetName string    `json:"storage_target_name,omitempty"`
-	StoragePath       string    `json:"storage_path"` // full S3 object key, target prefix included
-	Size              int64     `json:"size"`         // bytes
-	SHA256            string    `json:"sha256,omitempty"`
-	Status            string    `json:"status"` // running | success | failed
-	Error             string    `json:"error,omitempty"`
-	Note              string    `json:"note,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
+	StorageTarget     string `json:"storage_target"`
+	StorageTargetName string `json:"storage_target_name,omitempty"`
+	StoragePath       string `json:"storage_path"` // full S3 object key, target prefix included
+	Size              int64  `json:"size"`         // bytes
+	SHA256            string `json:"sha256,omitempty"`
+	Status            string `json:"status"` // running | success | failed | uploaded
+	// Source distinguishes panel backups ("", historical) from records
+	// created by an upload-restore ("upload"): the latter have no S3 object
+	// and their bytes live only as a temporary panel upload until restored.
+	Source    string    `json:"source,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	Note      string    `json:"note,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 
 	// Restore outcome lives on the archive so the panel can show whether the
 	// last restore from this archive succeeded without a separate history.
@@ -448,6 +464,13 @@ func volumeSHA256Script(localPath string) string {
 	return fmt.Sprintf("sha256sum %s | awk '{print $1}'", shellQuote(localPath))
 }
 
+// volumeTarProbeScript lists a tar.gz without extracting it: an upload with
+// no operator-supplied SHA is still rejected before any downtime when it is
+// not a gzip tar at all.
+func volumeTarProbeScript(localPath string) string {
+	return fmt.Sprintf("tar -tzf %s >/dev/null", shellQuote(localPath))
+}
+
 // volumeRestoreScript takes a safety copy of the current data, then unpacks the
 // archive over it. The safety copy is best-effort (a fresh volume has nothing
 // to preserve but the restore itself must not be blocked by that).
@@ -555,6 +578,34 @@ func (e *Engine) s3TargetByID(id string) (*snapshots.S3Target, error) {
 	t, ok := e.s3.GetS3Target(id)
 	if !ok || t == nil {
 		return nil, errVolumeS3TargetMissing
+	}
+	return t, nil
+}
+
+// errVolumeTargetUnknown is returned when the caller names an S3 target that
+// no longer exists; errVolumeTargetNone when no target was named and no
+// default is configured. The HTTP front door maps them to distinct 400
+// messages so the panel can tell "pick another one" from "configure one".
+var (
+	errVolumeTargetUnknown = errors.New("所选备份位置不存在")
+	errVolumeTargetNone    = errors.New("未选择备份位置且未配置默认目标")
+)
+
+// resolveVolumeBackupTarget picks the destination for a manual backup,
+// Dokploy-style: an explicit target_id wins, an omitted one falls back to
+// the default target. Snapshot jobs bypass this — they pass their own target
+// to runBackupAppVolumesWith directly.
+func (e *Engine) resolveVolumeBackupTarget(targetID string) (*snapshots.S3Target, error) {
+	if id := strings.TrimSpace(targetID); id != "" {
+		t, err := e.s3TargetByID(id)
+		if err != nil {
+			return nil, errVolumeTargetUnknown
+		}
+		return t, nil
+	}
+	t, err := e.defaultS3Target()
+	if err != nil {
+		return nil, errVolumeTargetNone
 	}
 	return t, nil
 }
@@ -932,29 +983,38 @@ func (e *Engine) resolveRestoreVolumeDir(hub *rpc.Hub, app *Application, arch *V
 	return hostDir, nil
 }
 
-// runRestoreAppVolume assumes the caller already holds the app's volume slot.
-func (e *Engine) runRestoreAppVolume(app *Application, arch *VolumeArchive) (restarted bool, err error) {
-	// Record the outcome on the archive: the HTTP layer answers 202 and the
-	// operator's only way to learn the result is polling this record.
-	if arch != nil && e.vols != nil {
-		defer func() {
-			now := time.Now()
-			arch.LastRestoreAt = &now
-			if err != nil {
-				arch.LastRestoreStatus = VolumeRestoreFailed
-				arch.LastRestoreError = err.Error()
-			} else {
-				arch.LastRestoreStatus = VolumeRestoreSuccess
-				arch.LastRestoreError = ""
-			}
-			if perr := e.vols.PutArchive(arch); perr != nil {
-				e.log.Warn("record volume restore result failed", "app", app.ID, "archive", arch.ID, "err", perr)
-			}
-		}()
+// recordVolumeRestoreOutcome writes the restore result back to the archive:
+// the HTTP layer answers 202 and the operator's only way to learn the result
+// is polling this record.
+func (e *Engine) recordVolumeRestoreOutcome(app *Application, arch *VolumeArchive, err error) {
+	if arch == nil || e.vols == nil {
+		return
 	}
+	now := time.Now()
+	arch.LastRestoreAt = &now
+	if err != nil {
+		arch.LastRestoreStatus = VolumeRestoreFailed
+		arch.LastRestoreError = err.Error()
+	} else {
+		arch.LastRestoreStatus = VolumeRestoreSuccess
+		arch.LastRestoreError = ""
+	}
+	if perr := e.vols.PutArchive(arch); perr != nil {
+		e.log.Warn("record volume restore result failed", "app", app.ID, "archive", arch.ID, "err", perr)
+	}
+}
 
-	hub := e.volumeHub(app)
-	if hub == nil {
+// runRestoreAppVolume restores an S3-backed archive: S3-specific preflight
+// (complete success record, frozen target, mandatory SHA) plus a presigned
+// download, then the shared stop/restore core. The caller already holds the
+// app's volume slot.
+func (e *Engine) runRestoreAppVolume(app *Application, arch *VolumeArchive) (restarted bool, err error) {
+	defer func() { e.recordVolumeRestoreOutcome(app, arch, err) }()
+	// Offline wins over every record-level complaint (same precedence as
+	// before the core split): a transient outage must not mask itself as a
+	// permanent record defect. The core re-checks for the race where the
+	// host drops between spawn and execution.
+	if e.volumeHub(app) == nil {
 		return false, snapshots.ErrVolumeRestoreOffline
 	}
 	if arch == nil || arch.StoragePath == "" || arch.HostPath == "" {
@@ -972,6 +1032,51 @@ func (e *Engine) runRestoreAppVolume(app *Application, arch *VolumeArchive) (res
 		// records can only exist from backups taken before marker validation
 		// was enforced in backupAppVolume — re-backup instead of trusting them.
 		return false, fmt.Errorf("归档缺少 SHA256 标记，无法校验完整性，请重新备份")
+	}
+	target, err := e.s3TargetByID(arch.StorageTarget)
+	if err != nil {
+		return false, fmt.Errorf("归档的 S3 存储目标已不存在，无法下载归档")
+	}
+	getURL, err := snapshots.NewS3Client(target).PresignGet(arch.StoragePath, 2*time.Hour)
+	if err != nil {
+		return false, fmt.Errorf("生成 S3 下载地址失败: %v", err)
+	}
+	return e.runRestoreCore(app, arch, getURL, arch.SHA256, "从 S3 下载归档失败")
+}
+
+// runRestoreUploadedVolume restores a record created by an upload-restore:
+// the bytes come from the panel's one-time download URL instead of S3, and
+// the SHA check is optional (only when the operator supplied one); without
+// it the download is probed as a gzip tar before any downtime. The panel
+// temporary file and its download token are dropped when the run ends,
+// whatever the outcome — a failed run is retried by re-uploading. The caller
+// already holds the app's volume slot.
+func (e *Engine) runRestoreUploadedVolume(app *Application, arch *VolumeArchive, downloadURL, expectedSHA string) (restarted bool, err error) {
+	defer func() { e.recordVolumeRestoreOutcome(app, arch, err) }()
+	if arch == nil || arch.HostPath == "" {
+		return false, fmt.Errorf("上传恢复记录不完整，无法恢复")
+	}
+	// Registered after the nil check: the cleanup below dereferences arch.
+	defer func() {
+		if e.volUploads != nil {
+			e.volUploads.RemoveFile(arch.ID)
+			e.volUploads.DropTokenByArchive(arch.ID)
+		}
+	}()
+	if arch.HostID != app.HostID {
+		return false, fmt.Errorf("归档所属主机与应用不一致")
+	}
+	return e.runRestoreCore(app, arch, downloadURL, expectedSHA, "从面板下载归档失败")
+}
+
+// runRestoreCore is the shared tail of both restore paths: volume-dir
+// resolution, deploy mutual exclusion, download + verification, then
+// stop → safety copy → unpack → restart. Download/verification failures
+// never cost downtime: the container is only touched after they pass.
+func (e *Engine) runRestoreCore(app *Application, arch *VolumeArchive, downloadURL, expectedSHA, dlFail string) (restarted bool, err error) {
+	hub := e.volumeHub(app)
+	if hub == nil {
+		return false, snapshots.ErrVolumeRestoreOffline
 	}
 	// The archive must still point at a volume the app declares: restoring
 	// into a path the app no longer owns would overwrite another
@@ -991,38 +1096,46 @@ func (e *Engine) runRestoreAppVolume(app *Application, arch *VolumeArchive) (res
 	if container == "" {
 		return false, fmt.Errorf("应用尚未部署过，无法恢复数据卷")
 	}
-	target, err := e.s3TargetByID(arch.StorageTarget)
-	if err != nil {
-		return false, fmt.Errorf("归档的 S3 存储目标已不存在，无法下载归档")
-	}
-	getURL, err := snapshots.NewS3Client(target).PresignGet(arch.StoragePath, 2*time.Hour)
-	if err != nil {
-		return false, fmt.Errorf("生成 S3 下载地址失败: %v", err)
-	}
 
 	// Download and verify before touching the container: a missing or corrupt
 	// object must not cost any downtime.
 	staging := volumeRestorePath(app.ID, arch.ID)
 	defer e.cleanupHostPaths(hub, staging)
-	dlRes, dlErr := execOnAgent(hub, "voldl-"+arch.ID, volumeDownloadScript(getURL, staging), volumeS3OpTimeout)
+	dlRes, dlErr := execOnAgent(hub, "voldl-"+arch.ID, volumeDownloadScript(downloadURL, staging), volumeS3OpTimeout)
 	if dlErr != nil {
-		return false, fmt.Errorf("从 S3 下载归档失败: %v", dlErr)
+		return false, fmt.Errorf("%s: %v", dlFail, dlErr)
 	}
 	if dlRes.GetExitCode() != 0 {
 		msg := strings.TrimSpace(string(dlRes.GetStderr()))
 		if msg == "" {
-			msg = fmt.Sprintf("从 S3 下载归档失败 (exit %d)", dlRes.GetExitCode())
+			msg = fmt.Sprintf("%s (exit %d)", dlFail, dlRes.GetExitCode())
 		}
 		return false, fmt.Errorf("%s", msg)
 	}
-	// SHA256 is guaranteed non-empty by the preflight above, so verification
-	// is unconditional: a missing digest must never silently skip this check.
-	shaRes, shaErr := execOnAgent(hub, "volsha-"+arch.ID, volumeSHA256Script(staging), 120)
-	if shaErr != nil {
-		return false, fmt.Errorf("校验下载归档失败: %v", shaErr)
-	}
-	if got := strings.TrimSpace(string(shaRes.GetStdout())); got != arch.SHA256 {
-		return false, fmt.Errorf("归档校验失败：SHA256 不匹配（期望 %s，实际 %s）", arch.SHA256, got)
+	if expectedSHA != "" {
+		// S3 restores always carry a SHA (the entry preflight enforces it);
+		// upload restores verify only when the operator supplied one.
+		shaRes, shaErr := execOnAgent(hub, "volsha-"+arch.ID, volumeSHA256Script(staging), 120)
+		if shaErr != nil {
+			return false, fmt.Errorf("校验下载归档失败: %v", shaErr)
+		}
+		if got := strings.TrimSpace(string(shaRes.GetStdout())); got != expectedSHA {
+			return false, fmt.Errorf("归档校验失败：SHA256 不匹配（期望 %s，实际 %s）", expectedSHA, got)
+		}
+	} else {
+		// No digest to compare against: at least prove the bytes are a gzip
+		// tar before stopping the container for them.
+		probeRes, probeErr := execOnAgent(hub, "volprobe-"+arch.ID, volumeTarProbeScript(staging), 120)
+		if probeErr != nil {
+			return false, fmt.Errorf("校验上传文件失败: %v", probeErr)
+		}
+		if probeRes.GetExitCode() != 0 {
+			msg := strings.TrimSpace(string(probeRes.GetStderr()))
+			if msg == "" {
+				msg = "不是有效的 tar.gz 归档"
+			}
+			return false, fmt.Errorf("上传文件校验失败：%s", msg)
+		}
 	}
 
 	stateRes, serr := execOnAgent(hub, "volst-"+randomToken(4), volumeContainerStateScript(container), 30)
@@ -1092,6 +1205,14 @@ func (e *Engine) deleteAppVolumeArchive(app *Application, arch *VolumeArchive) e
 	if err != nil {
 		e.log.Warn("volume archive S3 target gone, dropping record", "app", app.ID, "archive", arch.ID)
 	}
+	// Uploaded records have no S3 object (deleteVolumeObject already no-ops
+	// on the empty StoragePath); their bytes are the panel's temporary file
+	// plus its download token, dropped here when the operator deletes the
+	// record instead of restoring it.
+	if arch.Source == VolumeArchiveSourceUpload && e.volUploads != nil {
+		e.volUploads.RemoveFile(arch.ID)
+		e.volUploads.DropTokenByArchive(arch.ID)
+	}
 	if hub := e.volumeHub(app); hub != nil {
 		e.cleanupHostPaths(hub,
 			volumeStagingPath(app.ID, arch.ID),
@@ -1128,6 +1249,12 @@ func (e *Engine) PurgeVolumeArchives(app *Application) error {
 	}
 	var firstErr error
 	for _, a := range e.vols.ListArchives(app.ID) {
+		// Uploaded records carry no S3 object; their panel temporary files
+		// and download tokens go with the application.
+		if a.Source == VolumeArchiveSourceUpload && e.volUploads != nil {
+			e.volUploads.RemoveFile(a.ID)
+			e.volUploads.DropTokenByArchive(a.ID)
+		}
 		err := e.deleteVolumeObject(a)
 		if err == nil {
 			continue
@@ -1200,6 +1327,12 @@ func (e *Engine) VolumeBusy(appID string) bool {
 // SetVolumeStore injects the app volume archive metadata store.
 func (e *Engine) SetVolumeStore(vs *VolumeStore) {
 	e.vols = vs
+}
+
+// SetVolumeUploadStore injects the panel-side upload staging store for
+// upload-restores (volupload.go).
+func (e *Engine) SetVolumeUploadStore(us *VolumeUploadStore) {
+	e.volUploads = us
 }
 
 // VolumeArchives lists an application's volume archives (nil store → empty).
@@ -1316,6 +1449,7 @@ func (e *Engine) ListAppVolumeArchives(appID, spec string) []*snapshots.AppVolum
 			Size:              a.Size,
 			SHA256:            a.SHA256,
 			Status:            a.Status,
+			Source:            a.Source,
 			Error:             a.Error,
 			Note:              a.Note,
 			CreatedAt:         a.CreatedAt,

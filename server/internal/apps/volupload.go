@@ -169,9 +169,9 @@ func (s *VolumeUploadStore) Serve(w http.ResponseWriter, archiveID string) error
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
+		f.Close()
 		return err
 	}
 	w.Header().Set("Content-Type", "application/gzip")
@@ -179,6 +179,9 @@ func (s *VolumeUploadStore) Serve(w http.ResponseWriter, archiveID string) error
 	w.Header().Set("Content-Length", strconv.FormatInt(st.Size(), 10))
 	w.WriteHeader(http.StatusOK)
 	_, err = io.Copy(w, f)
+	// Close before removing: Windows refuses to delete an open file, which
+	// would leave the staged archive behind after every successful transfer.
+	f.Close()
 	os.Remove(s.Path(archiveID))
 	return err
 }

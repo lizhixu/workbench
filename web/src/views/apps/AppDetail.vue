@@ -661,16 +661,24 @@ async function loadStatus() {
   }
 }
 
+// 部署历史有轮询、页面切换、点击部署后刷新等多个并发来源，响应乱序时
+// 以最后发起的请求为准——否则切回页签的旧请求晚到，会把刚触发部署的
+// 新记录整列表覆盖回去，表现为“点了重新部署却没有新记录”。
+let deploymentsReqSeq = 0
+
 async function loadDeployments() {
+  const seq = ++deploymentsReqSeq
   loading.value = true
   try {
     const res = await listDeployments(appId.value, (page.value - 1) * pageSize.value, pageSize.value)
+    if (seq !== deploymentsReqSeq) return
     deployments.value = res.data
     total.value = res.total
   } catch (e: any) {
+    if (seq !== deploymentsReqSeq) return
     message.error(e.message || '获取部署历史失败')
   } finally {
-    loading.value = false
+    if (seq === deploymentsReqSeq) loading.value = false
   }
 }
 
@@ -688,9 +696,27 @@ async function doDeploy(force = false) {
     // 下面 watch(newestDeployment) 会自动弹出安装提醒。
     if (dep?.id) seenActiveDepIds.add(dep.id)
     message.success(force ? '已终止当前任务并重新启动部署' : '已开始部署')
-    await Promise.all([loadStatus(), loadDeployments(), refreshNewestDeployment()])
+    if (page.value !== 1) {
+      // 新记录永远落在第 1 页顶部，翻着旧页时先切回第 1 页（watch 会拉取）
+      page.value = 1
+      await Promise.all([loadStatus(), refreshNewestDeployment()])
+    } else {
+      // 接口返回的 queued 记录就是事实：先插到列表顶部立即可见，
+      // 后续刷新再以服务端结果对齐（即使刷新失败也不至于“看不到记录”）。
+      if (dep?.id && !deployments.value.some((d) => d.id === dep.id)) {
+        deployments.value = [dep, ...deployments.value]
+        total.value += 1
+      }
+      await Promise.all([loadStatus(), loadDeployments(), refreshNewestDeployment()])
+    }
   } catch (e: any) {
-    message.error(e.message || '触发部署失败')
+    const alreadyRunning = e?.status === 409 && /already running/i.test(String(e?.message ?? ''))
+    message.error(
+      alreadyRunning
+        ? '当前已有部署任务正在执行，请稍候刷新状态，或再次点击「重新部署」强制替换'
+        : e.message || '触发部署失败',
+    )
+    if (alreadyRunning) loadStatus()
   } finally {
     acting.value = false
   }

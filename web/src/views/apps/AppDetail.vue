@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, h, onActivated, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
+import { computed, h, nextTick, onActivated, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   NAlert, NButton, NCode, NDataTable, NDescriptions, NDescriptionsItem,
   NEmpty, NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPopconfirm, NRadio, NRadioGroup,
-  NSelect, NSpace, NSwitch, NTabPane, NTabs, NUpload,
+  NSelect, NSpace, NSpin, NSwitch, NTabPane, NTabs, NUpload,
   NTag, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns, UploadCustomRequestOptions, UploadFileInfo } from 'naive-ui'
@@ -741,6 +741,14 @@ const showDockerInstallPrompt = ref(false)
 const installingDocker = ref(false)
 const dockerInstallOutput = ref('')
 const dockerInstallDone = ref<'success' | 'failed' | null>(null)
+const dockerLogRef = ref<HTMLPreElement | null>(null)
+// 安装输出是一次性整段追加的，追加后跟到日志底部，否则用户看到的是
+// 几分钟前的开头几行，还得自己往下滚。
+watch(dockerInstallOutput, async () => {
+  await nextTick()
+  const el = dockerLogRef.value
+  if (el) el.scrollTop = el.scrollHeight
+})
 watch(newestDeployment, (dep) => {
   if (
     !dep || dep.status !== 'failed' ||
@@ -2616,22 +2624,38 @@ onDeactivated(() => {
       v-model:show="showDockerInstallPrompt"
       preset="card"
       title="目标主机未安装 Docker"
-      style="width: 640px; max-width: 94vw"
+      style="width: 760px; max-width: 94vw"
       :mask-closable="!installingDocker"
       :closable="!installingDocker"
+      :close-on-esc="!installingDocker"
     >
-      <div v-if="dockerInstallDone === null && !installingDocker">
-        <p>本次部署在前置检查就失败了：目标主机上没有 Docker，无法拉起任何容器。是否立即为该主机安装 Docker？</p>
-        <p class="muted">将执行服务端内置的官方一键安装脚本（curl -fsSL https://get.docker.com | sh），耗时约几分钟。</p>
-      </div>
-      <div v-else>
-        <pre class="log-pre">{{ dockerInstallOutput }}</pre>
-        <NAlert v-if="dockerInstallDone === 'success'" type="success" style="margin-top: 10px">
-          Docker 安装完成，可以重新部署了。
-        </NAlert>
-        <NAlert v-if="dockerInstallDone === 'failed'" type="error" style="margin-top: 10px">
-          安装未成功，请检查输出日志，或到主机详情 Docker 页签手动安装。
-        </NAlert>
+      <div class="docker-install-body">
+        <template v-if="dockerInstallDone === null && !installingDocker">
+          <p class="docker-install-lead">
+            本次部署在前置检查就失败了：目标主机上没有 Docker，无法拉起任何容器。是否立即为该主机安装 Docker？
+          </p>
+          <div class="docker-install-cmd"><code>curl -fsSL https://get.docker.com | sh</code></div>
+          <p class="docker-install-hint">
+            将执行服务端内置的官方一键安装脚本，依赖网络下载，通常需要 1~3 分钟。
+          </p>
+        </template>
+        <template v-else>
+          <div class="docker-install-status">
+            <template v-if="installingDocker">
+              <NSpin :size="14" />
+              <span>正在安装 Docker，依赖网络下载，通常需要 1~3 分钟，请耐心等待…</span>
+            </template>
+            <template v-else-if="dockerInstallDone === 'success'">
+              <NTag type="success" size="small" :bordered="false">安装完成</NTag>
+              <span>Docker 已就绪，可以立即重新部署该应用。</span>
+            </template>
+            <template v-else>
+              <NTag type="error" size="small" :bordered="false">安装失败</NTag>
+              <span>请检查下方输出，或到主机详情 Docker 页签手动安装。</span>
+            </template>
+          </div>
+          <pre ref="dockerLogRef" class="docker-install-log">{{ dockerInstallOutput }}</pre>
+        </template>
       </div>
       <template #footer>
         <NSpace justify="end">
@@ -3001,6 +3025,80 @@ onDeactivated(() => {
   white-space: pre-wrap;
   word-break: break-all;
   margin: 0;
+}
+
+/* 未安装 Docker 弹窗：介绍态与安装日志。日志面板限高滚动，
+   弹窗高度可控、底部操作按钮始终可见；面板固定深色终端底，
+   与浅色/暗色主题下的命令块保持同一视觉。 */
+.docker-install-lead {
+  margin: 0 0 12px;
+  line-height: 1.7;
+}
+
+.docker-install-cmd {
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--cmd-box-bg);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  overflow-x: auto;
+
+  code {
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    font-size: 12px;
+    color: #e2e8f0;
+    white-space: nowrap;
+  }
+}
+
+.docker-install-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.docker-install-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.docker-install-log {
+  margin: 0;
+  height: min(46vh, 420px);
+  min-height: 200px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--cmd-box-bg);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 14px 16px;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  color: #dbe4f0;
+  white-space: pre-wrap;
+  word-break: break-all;
+
+  &::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.16);
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
 }
 
 :deep(.n-tabs .n-tab-pane) {

@@ -1,0 +1,8 @@
+# Shell 脚本与 git 钩子在 Linux CI / macOS 上必须是 LF 行尾，
+# 否则会报 "bad interpreter: /usr/bin/env bash^M"（本机 core.autocrlf=true）。
+*.sh            text eol=lf
+.githooks/*     text eol=lf
+
+# Windows 批处理保持 CRLF
+*.bat           text eol=crlf
+*.cmd           text eol=crlf

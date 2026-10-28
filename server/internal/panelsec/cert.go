@@ -100,7 +100,12 @@ func (cp *CertProvider) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certifi
 		if c == nil && sec.PanelDomain != "" {
 			c, _ = cp.certHub.FindByDomain(sec.PanelDomain)
 		}
-		if c == nil {
+		// The arbitrary first-certificate fallback only applies when no domain
+		// is bound. With a domain bound, serving an unrelated certificate would
+		// make TLS fail with a hostname mismatch anyway — better to fail the
+		// handshake explicitly (or use the static fallback pair) than to serve
+		// a certificate that can never validate for the bound host.
+		if c == nil && sec.PanelDomain == "" {
 			list := cp.certHub.List()
 			if len(list) > 0 {
 				c, _ = cp.certHub.Get(list[0].ID)
@@ -165,7 +170,12 @@ func (cp *CertProvider) InspectActiveCert() (*CertSummary, error) {
 		if c == nil && sec.PanelDomain != "" {
 			c, _ = cp.certHub.FindByDomain(sec.PanelDomain)
 		}
-		if c == nil {
+		// The arbitrary first-certificate fallback only applies when no domain
+		// is bound. With a domain bound, serving an unrelated certificate would
+		// make TLS fail with a hostname mismatch anyway — better to fail the
+		// handshake explicitly (or use the static fallback pair) than to serve
+		// a certificate that can never validate for the bound host.
+		if c == nil && sec.PanelDomain == "" {
 			list := cp.certHub.List()
 			if len(list) > 0 {
 				c, _ = cp.certHub.Get(list[0].ID)
@@ -177,6 +187,9 @@ func (cp *CertProvider) InspectActiveCert() (*CertSummary, error) {
 	}
 
 	if certPEM == "" {
+		if sec.PanelDomain != "" && sec.SSLMode != "custom" {
+			return nil, fmt.Errorf("未找到覆盖面板域名 %q 的证书，请重新签发或绑定证书", sec.PanelDomain)
+		}
 		return nil, errors.New("certificate content not found")
 	}
 

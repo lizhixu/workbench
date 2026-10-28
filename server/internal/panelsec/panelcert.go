@@ -154,7 +154,7 @@ func (p *PanelCertIssuer) StartIssue(mode, ip, challenge string) (*IssueJob, err
 	}
 	p.jobs[job.ID] = job
 	cp := *job
-	go p.run(job.ID, target, ch)
+	go p.run(job.ID, mode, target, ch)
 	return &cp, nil
 }
 
@@ -195,6 +195,12 @@ func (p *PanelCertIssuer) ConfirmIssue(id string) (*IssueJob, error) {
 
 func (p *PanelCertIssuer) runManualConfirm(id, pendingID string) {
 	p.log.Info("panel manual dns-01 confirmation started", "job", id, "pending", pendingID)
+	p.mu.Lock()
+	mode, target := "", ""
+	if j, ok := p.jobs[id]; ok {
+		mode, target = j.Mode, j.Target
+	}
+	p.mu.Unlock()
 	c, err := p.certHub.ConfirmManualDNSOrder(pendingID)
 	if err != nil {
 		p.log.Warn("panel manual dns-01 confirmation failed", "job", id, "err", err)
@@ -210,7 +216,7 @@ func (p *PanelCertIssuer) runManualConfirm(id, pendingID string) {
 		}
 		return
 	}
-	if err := p.bindPanelCertificate(c.ID); err != nil {
+	if err := p.bindPanelCertificate(c.ID, mode, target); err != nil {
 		p.log.Warn("panel certificate issued but panel config update failed", "job", id, "cert", c.ID, "err", err)
 		p.finish(id, c.ID, "证书签发成功，但写入面板配置失败: "+err.Error())
 		return
@@ -277,7 +283,7 @@ func (p *PanelCertIssuer) finish(id, certID, errMsg string) {
 	}
 }
 
-func (p *PanelCertIssuer) run(id, target string, ch cert.ChallengePreference) {
+func (p *PanelCertIssuer) run(id, mode, target string, ch cert.ChallengePreference) {
 	p.log.Info("panel certificate issuance started", "job", id, "target", target, "challenge", string(ch))
 	c, err := p.certHub.IssueWithChallenge([]string{target}, "", ch)
 	if err != nil {
@@ -286,7 +292,7 @@ func (p *PanelCertIssuer) run(id, target string, ch cert.ChallengePreference) {
 		return
 	}
 	// Bind the new certificate to the panel and enable HTTPS.
-	if err := p.bindPanelCertificate(c.ID); err != nil {
+	if err := p.bindPanelCertificate(c.ID, mode, target); err != nil {
 		p.log.Warn("panel certificate issued but panel config update failed", "job", id, "cert", c.ID, "err", err)
 		p.finish(id, c.ID, "证书签发成功，但写入面板配置失败: "+err.Error())
 		return
@@ -296,8 +302,20 @@ func (p *PanelCertIssuer) run(id, target string, ch cert.ChallengePreference) {
 }
 
 // bindPanelCertificate switches the panel to cert_center mode using the
-// given certificate and enables HTTPS.
-func (p *PanelCertIssuer) bindPanelCertificate(certID string) error {
+// given certificate and enables HTTPS. The issuance target must still match
+// the panel configuration: a certificate for a domain that has since been
+// unbound or replaced (or an IP certificate once a domain is bound) is
+// produced asynchronously by ACME and must not be bound to the panel, or the
+// panel would serve material for the wrong host.
+func (p *PanelCertIssuer) bindPanelCertificate(certID, mode, target string) error {
+	sec := p.settings.PanelSecurity()
+	if mode == "domain" {
+		if !strings.EqualFold(strings.TrimSpace(sec.PanelDomain), strings.TrimSpace(target)) {
+			return fmt.Errorf("面板域名已变更为 %q，与证书域名 %q 不匹配，未绑定该证书", sec.PanelDomain, target)
+		}
+	} else if strings.TrimSpace(sec.PanelDomain) != "" {
+		return fmt.Errorf("面板已绑定域名 %q，IP 证书不再适用，未绑定该证书", sec.PanelDomain)
+	}
 	raw := func(s string) json.RawMessage {
 		b, _ := json.Marshal(s)
 		return b

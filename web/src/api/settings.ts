@@ -126,6 +126,13 @@ export function saveSystemSettings(data: SettingsData) {
   return unwrap<SettingsResponse>(http.put('/settings', { data }))
 }
 
+export interface StandardPortStatus {
+  port: number
+  desired: boolean
+  listening: boolean
+  error?: string
+}
+
 export interface PanelCertStatus {
   ssl_enabled: boolean
   ssl_mode: string
@@ -142,6 +149,9 @@ export interface PanelCertStatus {
   not_after?: string
   days_left: number
   error?: string
+  // 面板主监听端口与标准端口（域名绑定时 :80，面板 SSL 开启时 :443）监听状态。
+  panel_http_port?: string
+  standard_ports?: StandardPortStatus[]
 }
 
 export function getPanelCertStatus() {

@@ -646,6 +646,12 @@ func (h *handlers) getPanelCertStatus(c *gin.Context) {
 		"force_https":   sec.ForceHTTPS,
 		"public_url":    sec.PublicURL,
 		"active":        false,
+		// Portless access: the primary panel port plus the health of the
+		// standard-port listeners (:80 while a domain is bound, :443 while
+		// panel SSL is on). The UI uses these for fallback links and to
+		// surface port conflicts (e.g. an app reverse proxy holding :80).
+		"panel_http_port": panelsec.PanelHTTPPort(),
+		"standard_ports":  panelsec.StandardPortStatus(),
 	}
 	if h.certHub != nil || sec.SSLMode == "custom" {
 		cp := panelsec.NewCertProvider(h.settings, h.certHub, nil, h.log)

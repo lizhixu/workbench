@@ -140,7 +140,7 @@
     - **多域名 Nginx Virtual Host 渲染**：统一生成至单文件 `watchman-<appID>.conf`，为每个域名独立渲染 HTTP 80 重定向块与 HTTPS 443 反代 server 块，各自引用专用证书与密钥文件（`/opt/apps/nginx/certs/<domain>.crt` 与 `<domain>.key`）。解绑应用反代或彻底删除应用时，联动清理全部绑定域名的证书与配置文件。
     - **身份优先证书回推（Identity-First Re-push）**：证书自动化续期成功后，`ProxyHandler.RepushAppCerts` 遍历各应用，优先匹配 `binding.CertID == crt.ID`（或存量未物化空 CertID 条目且域名覆盖）；更新并热重载 Nginx，杜绝多厂商/新签证书跨应用漂移劫持。
     - **确定性最佳证书匹配（Deterministic SAN Ranking）**：`FindByDomain` 改为绝对确定性排序：精确 SAN 匹配 > 通配符覆盖；通配符按标签深度（label count）多者优先；再按剩余有效期 `NotAfter` 新者优先；证书 ID 字典序作为确定性 tie-breaker。驱动覆盖探测端点、存量条目解析与面板 SNI 降级。`storeResult` 保存续期证书时严格保留管理员既有 `Remark`。
-    - **证书删除守卫与强制清绑（Delete Guard & Force Override）**：`DELETE /certs/:id` 检查证书是否正被任何应用的 `ProxyDomains` 显式引用；若有引用则返回 409 Conflict 并列出占用方应用名称，防止误删生产在线证书；支持传入 `?force=true` 强制删除，删除时通过回调解耦将相关应用的绑定 `cert_id` 安全置空（降级存量语义，不破坏正在运行的 Nginx 实例）并完成删除。**面板守卫（2026-10-25）**：面板显式绑定的证书（`panelCertInfo` 返回的 `SSLCertID`）另受面板守卫，一律 409，`?force=true` **不可绕过**——面板绑定只能从「系统设置 → 面板域名与证书」解除后才能删除（cert 包内无安全的反向解绑入口，放行 force 会回到删证后面板静默换证）。**守卫触发条件收紧（2026-10-25）**：仅当面板 SSL 启用且证书来源模式为 `cert_center` 时拦截；切到 custom PEM 或关闭 SSL 后残留的 `SSLCertID` 不再拦删除（面板此时并不实际服务该证书）。残留风险：面板 SSL 开启但未显式绑定时，面板实际服务的是 `FindByDomain(panelDomain)` 或 `list[0]` 的证书，删掉那张证书不会被守卫拦截（回退链本身未收紧，属下一批）。
+    - **证书删除守卫与强制清绑（Delete Guard & Force Override）**：`DELETE /certs/:id` 检查证书是否正被任何应用的 `ProxyDomains` 显式引用；若有引用则返回 409 Conflict 并列出占用方应用名称，防止误删生产在线证书；支持传入 `?force=true` 强制删除，删除时通过回调解耦将相关应用的绑定 `cert_id` 安全置空（降级存量语义，不破坏正在运行的 Nginx 实例）并完成删除。**面板守卫（2026-10-25）**：面板显式绑定的证书（`panelCertInfo` 返回的 `SSLCertID`）另受面板守卫，一律 409，`?force=true` **不可绕过**——面板绑定只能从「系统设置 → 面板域名与证书」解除后才能删除（cert 包内无安全的反向解绑入口，放行 force 会回到删证后面板静默换证）。**守卫触发条件收紧（2026-10-25）**：仅当面板 SSL 启用且证书来源模式为 `cert_center` 时拦截；切到 custom PEM 或关闭 SSL 后残留的 `SSLCertID` 不再拦删除（面板此时并不实际服务该证书）。残留风险：面板 SSL 开启但未显式绑定时，面板实际服务的是 `FindByDomain(panelDomain)` 命中的证书，删掉那张证书仍不会被守卫拦截（2026-10-28 已收紧回退链：已绑定域名时不再回退 `List()[0]` 任意证书，仅无域名时保留该兜底）。
     - **存量数据平滑迁移与物化冻结**：Store 加载 `apps.json` 时自动将历史 `Domain` 字段迁移为 `ProxyDomains=[{domain: Domain, cert_id: ""}]`；存量空 `cert_id` 条目在首次证书回推或迁移同步时，由 `BestCertForDomain` 自动解析并**立即物化冻结回写**到应用元数据，实现无缝平滑升级。
     - **前端多域名行式编辑器与交互**：`AppDetail.vue` 与 `AppCreate.vue` 均升级为多域名动态行式编辑器（域名输入 + 独立证书选择 NSelect + 删行 + 加行），证书选项显式格式化为 `SAN 列表 · 颁发者 · 剩余天数`，彻底移除「自动匹配」虚假占位。创建页在域名输入时防抖 500ms 探测覆盖，已覆盖时可见地自动预选；存在未选择证书域名时引导 ACME 签发并显式绑定新证书 ID。`AppMigrateModal` 与 `AppTopologyPreview` 支持多域名展示与拓扑节点证书状态联动。
   - 网关主机 ID 持久化在 `Application.proxy_gateway_host_id`，解绑时同时清理应用主机与网关主机两侧配置，并清空该字段（2026-10-20 修复：此前解绑残留旧网关 ID 的脏字段）。
@@ -171,6 +171,7 @@
 - **系统设置面板安全与应用反代职责彻底解耦**（2026-09-28）：
   - 应用中心独立负责业务容器的反向代理与域名绑定（在应用详情 `AppDetail.vue` 的「域名与反代」页签中配置，经 Nginx 容器路由流量到应用容器或网关节点）；
   - 「系统设置 → 面板域名与证书」（`web/src/views/settings/CertDomain.vue`，`sections.ts` 注册 `key: 'cert-domain'`，`adminOnly` 仅管理员可见）**专用于 Watchman 控制台/面板自身的访问与安全配置**，与应用反向代理彻底解耦，采用宝塔式简化模型。**域名绑定**：`security.panel_domain` 为空表示通过 IP 访问；一旦绑定域名即**自动启用严格域名限制**（无独立开关），面板只能通过该域名访问，直接 IP/其他域名请求被 403 拦截（回环地址与 Agent 注册/数据接口等基础设施路径豁免）。**面板证书**：已绑定域名时「为绑定域名申请免费证书」（经证书中心 ACME 签发：普通域名优先 HTTP-01，需服务器 80 端口可被 CA 访问、签发时临时监听；80 端口不可用或 HTTP-01 验证失败时自动回退 DNS-01，需预先在证书中心配置 ACME 账户与 dns-mng；通配符域名仅支持 DNS-01；另支持「DNS-01（手动解析）」两阶段签发——服务端创建订单并展示 TXT 记录，管理员手动到 DNS 服务商添加解析后确认，CA 验证通过后自动绑定，不依赖 dns-mng）；未绑定域名时「为 IP 申请免费证书」（为公网 IP 签发 Let's Encrypt 等免费 IP 证书，走 HTTP-01 验证，签发期间临时监听 80 端口，证书有效期短、自动续期阈值按有效期 1/3 自适应，基准天数可在「系统设置 → 证书时间设置」中配置 `certs.auto_renew_days`）；签发成功后自动写入证书中心并绑定为面板证书、开启 HTTPS。另支持手动上传已有证书（先导入证书中心并校验、私钥不再直存 settings，再以 cert_center 模式绑定）与「强制 HTTPS 访问」（`security.panel_force_https`，明文 HTTP 自动 301 重定向至 HTTPS）。
+  - **免端口访问与换域名自动清证书（2026-10-28）**：绑定域名后控制端自动追加标准端口监听——绑定即监听 `:80`，面板 SSL 启用时另监听 `:443`，与主端口共用同一处理器（`server/internal/panelsec/standardports.go`，settings 变更即时协调、另有 30 秒巡检；监听失败不影响主端口，错误经 `panel-cert` 状态接口上报，端口释放后自动恢复）。因此面板可直接用 `http(s)://<域名>` 访问，无需在地址后带面板端口；未绑定域名时不监听 80/443。**换域名即原子清除旧证书配置**：`settings.SetMany` 在 system 作用域检测 `security.panel_domain` 变化（大小写不敏感），变更时在同一次原子写入中把 `security.panel_ssl_enabled`/`security.panel_force_https` 置 false、`security.panel_ssl_mode` 复位 `cert_center`、`security.panel_ssl_cert_id` 与 custom PEM 清空，避免旧证书与新域名不匹配导致面板不可访问；同值（含仅大小写差异）重写不触发清除。证书回退链同步收紧：已绑定域名时不再回退 `List()[0]` 任意证书（仅 `SSLCertID` → SNI → `PanelDomain` 覆盖匹配）；签发任务绑定时校验目标仍是当前域名（域名已变更、或 IP 证书遇到已绑定域名，均拒绝绑定并报错）。三个 CLI 救援开关直接改写 `settings.json` 后退出，运行中的 watchman-server 需重启才会应用。
   - 面板服务采用**端口级协议动态嗅探（Dynamic Listener）**技术，在控制台默认端口（18789）上原生自适应处理 HTTP 明文与 TLS 握手，热重载或开关 SSL 无需重启服务或更改端口。
   - **防失联与紧急恢复**：若配置错误域名或无效证书导致无法登录，提供控制机命令行救援开关：`watchman-server -reset-panel-domain -data <数据目录>`（解绑面板域名；绑定即严格，解绑后恢复 IP 访问）以及 `watchman-server -reset-panel-ssl -data <数据目录>`（关闭面板 SSL 与强制 HTTPS 重定向）。
   - 独立「证书中心」（`/certs`，`CertList.vue` + `CertManager.vue`）保持作为全局基础设施，管理 ACME 自动化证书与证书凭证，供面板及各业务应用按需选用；另提供只读覆盖探测端点 `GET /certs/cover?domain=`（登录即可、免操作审计，与 `FindByDomain` 同源匹配，见 §3.7「创建时证书配置与签发编排」）。已签发证书列表每行提供「详情」弹窗：只读端点 `GET /certs/:id/detail`（登录即可、免操作审计）对存储的证书链现场解析 leaf（序列号、SHA-256 指纹、密钥算法/长度、签名算法、链张数，解析失败降级为基本元信息 + `parse_error`），并反查用途（面板证书显式绑定或按 `panel_domain` 兜底匹配 `panel_bound`/`panel_fallback`、应用按域名经 `hub.FindByDomain` 同源规则匹配 `used_by_apps`）及来源推断（`source` = acme / manual_dns01 / manual_upload）；弹窗内可展开查看并复制证书链 PEM 与私钥（2026-10-20 起「证书材料」区并列展示）：私钥明文经显式查看端点 `POST /certs/:id/key` 返回（adminOnly + 审计 `cert_key_reveal`/high，与 AI API Key 明文查看同惯例；用 POST 是因为共享审计中间件跳过 GET），打开详情弹窗时随证书链一并拉取、每次查看各落一条审计；常规响应（列表/单查/详情/下载）仍一律剥离私钥，该端点是唯一出口。证书列表「操作」列提供「下载证书」按钮：`GET /certs/:id/download`（登录即可、只读免操作审计、浏览器导航下载、JWT 走 `?token=` 查询参数——与审计导出/备份下载同惯例，鉴权中间件为无法带 header 的导航请求提供查询参数回退）以附件返回存储的公钥链，文件名取主域名 `<域名>.crt`（通配符 `*` 置换为 `_wildcard`、其余文件名不安全字符折叠为 `_`、无域名回退证书 id），下载仅公钥链、不打包私钥（私钥查看/复制走上述显式端点）。操作列「续期」按钮仅对有 ACME 账户的证书展示：手动上传（`manual_upload`）的证书无账户，服务端续期会回落到默认账户重新签发并覆盖上传材料，其续命方式应为「重新上传」，故不展示续期按钮（`manual_dns01` 两阶段证书有账户，保留续期）。（2026-10-20 详情弹窗视觉打磨）弹窗为 `NModal preset="card"` 自定义头部：主域名 + 状态标签一行可读；内容按「指纹与算法 / 有效期与续期 / 使用情况」三区展示（分区标题 13px 加品牌色强调条；原第四区「基本信息」2026-10-20 移除——来源/颁发机构/备注/SAN/最近错误与列表列及弹窗头部全重复，失败原因全文已由日志列悬停弹层承载），序列号与 SHA-256 指纹行内提供一键复制，有效期以进度条呈现（颜色随剩余天数分档：>30 天绿 / >7 天琥珀 / 其余红），PEM 折叠区冠以与三区同一视觉语言的「证书材料」分区标题（2026-10-20 补充，自渲染节点复刻 13px + 品牌色竖条样式），等宽字体 + 主题变量底色；内容区 `maxHeight calc(100vh - 120px)` 内部滚动、头部固定。注意 scoped CSS 锚定：`NModal` teleport 到 body 后卡片根节点不带组件 `data-v` 作用域，`:deep()` 必须锚定在模板内自渲染的 `.cert-detail-body` 包裹层上才能命中 Naive 内部节点。（2026-10-20）已签发证书列表为宝塔式 11 列：域名 / 其他域名 / 申请方式 / ACME 账号 / 状态 / 日志 / 颁发组织 / 备注 / 自动续签 / 过期时间 / 操作；其中「申请方式」「ACME 账号」由服务端在列表响应中派生（`source`/`account_name`，与 detail 端点同一推断规则，前端不再自行推断），「日志」列为最近一次失败原因 `last_error` 摘要（暂无逐次签发日志），悬停单元格以 `NPopover` 限宽弹层展示全文（小标题「最近一次失败原因」+ 12px 小字、`break-all` 换行、内容区 `max-width: 340px`、`max-height: 200px` 超长内部滚动，单元格内自行省略截断）——不用内置省略 tooltip（对长错误实测单行铺出 1088px 宽、溢出屏幕），「状态」在续期中/异常之外按有效期给出已过期/未生效。每张证书带管理员备注字段 `Certificate.remark`（≤200 字，仅元信息，不影响证书）；行内铅笔按钮弹层编辑，经 `PUT /certs/:id/remark` 保存（adminOnly + 审计 `cert_remark`/medium，2026-10-25 补齐此前缺失的审计规则，前端 `audit.ts` 标签同批补齐，另含 `cert_key_reveal`、`ai_config_key_reveal` 两处同类缺口；列表/详情/导入/签发等响应不再回显私钥的既有约束不变）。（2026-10-20）
@@ -967,8 +968,9 @@ Agent internal/shell
 控制端为单个静态编译的 Go 二进制文件（`watchman-server`），Web 控制台前端产物在构建阶段经 `go:embed` 完整嵌入二进制（`server/web/embed.go`）。控制端启动后直接通过内置 HTTP 引擎提供 Web 页面（含 SPA 路由兜底）、RESTful API 与 WebSocket 终端/文件流，**无需任何外部 Nginx 或独立前端反代容器**。
 
 - **默认监听端口**：
-  - `HTTP / Web 控制台`：`:18789`（通过 `-http :18789` 指定，采用冷门高位端口，不占用宿主机 80/443/8080 等常用 Web 业务端口）。
+  - `HTTP / Web 控制台`：`:18789`（通过 `-http :18789` 指定，采用冷门高位端口，默认不触碰宿主机 80/443/8080 等常用 Web 业务端口）。
   - `gRPC 被控端长连接`：`:9090`（通过 `-grpc :9090` 指定，所有被纳管 Agent 均主动出站回连该端口）。
+  - `标准端口（按域名条件启用）`：绑定面板域名后自动在 `:80` 提供同一控制台/API（免端口访问），面板 SSL 启用时另在 `:443` 提供 HTTPS；未绑定域名时不监听。端口被其他服务（如应用反代容器）占用时仅该端口失败并写入状态（`standard_ports[].error`），主端口不受影响，30 秒巡检自动重试。
   - `TLS / HTTPS`：支持 `-http-tls` 配合 `-tls-cert` 与 `-tls-key` 启用控制端 HTTPS 与加密 gRPC 通道。
 - **文件与目录布局**：
   - 安装根目录：`/opt/watchman`
@@ -1072,6 +1074,8 @@ Agent internal/shell
 | `-reset-panel-ssl` | `false` | — | 应急工具开关：关闭面板 SSL 与强制 HTTPS 重定向（置 `security.panel_ssl_enabled=false` 与 `security.panel_force_https=false`）后退出 |
 | `-reset-panel-domain` | `false` | — | 应急工具开关：解绑面板绑定域名（置 `security.panel_domain=""`；绑定即自动严格，解绑后恢复 IP 访问）后退出 |
 
+> 三个 `-reset-*` 救援开关直接改写 `settings.json` 后退出，不会影响正在运行的进程，须重启 watchman-server 服务后才生效。
+
 #### 2. 系统与用户统一设置（`settings.json`）
 
 系统配置采用点分命名空间注册表统一校验，分 `system`（管理员全局）与 `user`（当前用户独立）双作用域，秘密（AI Key / Git Token）存放于加密 Vault。
@@ -1080,7 +1084,7 @@ Agent internal/shell
 | --- | --- | --- | --- |
 | `server.public_url` | `system` | `""` | 面板公网根访问地址（URL 格式，如 `https://panel.example.com:18789`，用于 Agent 一键安装与分享链接） |
 | `server.timezone` | `system` | `""` | 面板时区（IANA 名称，如 `Asia/Shanghai`；空 = 跟随服务器系统时区，`time.LoadLocation` 校验）。控制端进程本地时间（日志、API 时间戳）与面板全部时间展示（告警/审计/会话/图表）统一按此时区；经 `GET /version` 的 `timezone` 字段下发给所有登录用户，前端 `utils/time.ts` 统一格式化，未设置时前端回退浏览器本地时区。保存即时生效（启动与每次系统设置保存后 `ApplyTimezone`）。Agent 月流量计费周期仍按各 Agent 主机本地时间，不受此项影响 |
-| `security.panel_domain` | `system` | `""` | 面板绑定域名（主机名格式，如 `panel.example.com`）；绑定后自动启用严格域名限制，面板只能通过该域名访问 |
+| `security.panel_domain` | `system` | `""` | 面板绑定域名（主机名格式，如 `panel.example.com`）；绑定后自动启用严格域名限制并自动监听 `:80`（SSL 开启时另含 `:443`）提供免端口访问；**变更该值会在同一次原子写入中清除面板 SSL / 强制 HTTPS / 证书绑定（`ssl_mode` 复位 `cert_center`、`ssl_cert_id` 与 custom PEM 清空）**，同值（含仅大小写差异）重写不清除 |
 | `security.panel_ssl_enabled` | `system` | `false` | 面板 SSL / HTTPS 总开关（通过端口级协议动态嗅探实现零停机热重载） |
 | `security.panel_ssl_mode` | `system` | `"cert_center"` | 证书来源模式（`cert_center` 从证书中心选取 / `custom` 自定义 PEM 证书与私钥） |
 | `security.panel_ssl_cert_id` | `system` | `""` | 证书中心证书 ID（`cert_center` 模式下选取） |
@@ -1385,7 +1389,7 @@ DELETE /api/v1/certs/manual/:id            # 取消待处理的手动订单（ve
 # 签发弹窗与面板一键签发均提供「验证方式」显式选择（自动 / HTTP-01 / DNS-01 / DNS-01 手动解析），显式指定后不再自动回退。
 
 # 面板证书（宝塔式一键签发，admin）
-GET    /api/v1/system/panel-cert          # 面板证书状态（ssl_enabled/panel_domain/strict_domain/active/source/subject/issuer/dns_names/days_left）
+GET    /api/v1/system/panel-cert          # 面板证书状态（ssl_enabled/panel_domain/strict_domain/active/source/subject/issuer/dns_names/days_left/panel_http_port/standard_ports[{port,desired,listening,error?}]）
 POST   /api/v1/system/panel-cert/issue    # 启动异步签发 {mode: domain|ip, ip?, challenge?}；domain 走 HTTP-01 优先（临时监听 80）、失败或无 80 时回退 DNS-01（需证书中心 dns-mng；通配符仅 DNS-01），ip 走 HTTP-01（临时监听 80）；challenge 显式指定验证方式（含 "dns-01-manual" 手动两阶段：202 返回 awaiting_dns job 并携带 dns_records）；202 返回 job
 GET    /api/v1/system/panel-cert/issue/:job_id  # 签发任务进度 {status: running|awaiting_dns|done|error, cert_id?, error?, pending_id?, dns_records?}
 POST   /api/v1/system/panel-cert/issue/:job_id/confirm  # 手动 DNS-01 任务：管理员添加 TXT 解析后通知 CA 开始验证（异步 202；成功自动绑定面板并启用 HTTPS）

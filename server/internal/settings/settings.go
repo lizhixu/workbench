@@ -416,11 +416,12 @@ type document struct {
 
 // Store persists settings keyed by scope (and username for user scope).
 type Store struct {
-	mu      sync.Mutex
-	dataDir string
-	log     *slog.Logger
-	system  map[string]json.RawMessage
-	users   map[string]map[string]json.RawMessage
+	mu       sync.Mutex
+	dataDir  string
+	log      *slog.Logger
+	system   map[string]json.RawMessage
+	users    map[string]map[string]json.RawMessage
+	onChange func()
 }
 
 // NewStore loads settings from disk, migrating the legacy term_prefs.json on
@@ -669,6 +670,15 @@ func (s *Store) StoredKeys(scope Scope, username string) []string {
 	return s.storedKeysAll(scope, username)
 }
 
+// SetOnChange registers a callback fired after every successful system-scope
+// write, outside the store lock. The panel security layer uses it to reconcile
+// the standard-port listeners (:80/:443) with the new domain/SSL state.
+func (s *Store) SetOnChange(fn func()) {
+	s.mu.Lock()
+	s.onChange = fn
+	s.mu.Unlock()
+}
+
 // SetMany validates every item first and then applies them atomically: if any
 // key is unknown or any value is invalid, nothing is written. The update is
 // also atomic against the in-memory state: candidate maps are built as copies
@@ -677,21 +687,43 @@ func (s *Store) StoredKeys(scope Scope, username string) []string {
 // therefore every subsequent read — untouched.
 func (s *Store) SetMany(scope Scope, username string, items map[string]json.RawMessage) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	hook, err := s.setManyLocked(scope, username, items)
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if hook != nil && scope == ScopeSystem {
+		hook()
+	}
+	return nil
+}
+
+func (s *Store) setManyLocked(scope Scope, username string, items map[string]json.RawMessage) (func(), error) {
 	normed := make(map[string]json.RawMessage, len(items))
 	for key, raw := range items {
 		def, ok := defByKey[key]
 		if !ok {
-			return fmt.Errorf("未知的配置项: %s", key)
+			return nil, fmt.Errorf("未知的配置项: %s", key)
 		}
 		if def.Scope != scope {
-			return fmt.Errorf("配置项 %s 不属于 %s 作用域", key, scope)
+			return nil, fmt.Errorf("配置项 %s 不属于 %s 作用域", key, scope)
 		}
 		n, err := def.normalize(raw)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		normed[key] = n
+	}
+	// Changing the panel domain invalidates any certificate bound to the old
+	// domain: serving it on the new hostname breaks TLS, and force-HTTPS then
+	// locks the admin out of the panel. Clear the binding and HTTPS in the same
+	// atomic write as the domain itself, so a stale certificate can never
+	// outlive the domain it was issued for.
+	if scope == ScopeSystem {
+		if s.resetPanelCertOnDomainChange(normed) {
+			s.log.Info("panel domain changed; panel certificate binding cleared and HTTPS disabled",
+				"domain", string(normed["security.panel_domain"]))
+		}
 	}
 	// Build the candidate document as copies: the live maps must not be
 	// mutated until the write has succeeded.
@@ -718,14 +750,44 @@ func (s *Store) SetMany(scope Scope, username string, items map[string]json.RawM
 		}
 		newUsers[username] = kv
 	default:
-		return fmt.Errorf("未知的作用域: %s", scope)
+		return nil, fmt.Errorf("未知的作用域: %s", scope)
 	}
 	if err := writeDocument(s.dataDir, document{System: newSystem, Users: newUsers}); err != nil {
-		return err
+		return nil, err
 	}
 	s.system = newSystem
 	s.users = newUsers
-	return nil
+	return s.onChange, nil
+}
+
+// resetPanelCertOnDomainChange inspects a system-scope write: if it changes
+// security.panel_domain (including unbinding), it overwrites the SSL keys in
+// place so the same atomic write also clears the certificate binding, disables
+// panel SSL and force-HTTPS, and drops custom PEMs. Returns whether the reset
+// fired.
+func (s *Store) resetPanelCertOnDomainChange(normed map[string]json.RawMessage) bool {
+	rawNew, ok := normed["security.panel_domain"]
+	if !ok {
+		return false
+	}
+	var next string
+	if json.Unmarshal(rawNew, &next) != nil {
+		return false
+	}
+	var prev string
+	if oldRaw, ok := s.system["security.panel_domain"]; ok {
+		_ = json.Unmarshal(oldRaw, &prev)
+	}
+	if strings.EqualFold(strings.TrimSpace(next), strings.TrimSpace(prev)) {
+		return false
+	}
+	normed["security.panel_ssl_enabled"] = json.RawMessage("false")
+	normed["security.panel_force_https"] = json.RawMessage("false")
+	normed["security.panel_ssl_mode"] = json.RawMessage(`"cert_center"`)
+	normed["security.panel_ssl_cert_id"] = json.RawMessage(`""`)
+	normed["security.panel_ssl_cert_pem"] = json.RawMessage(`""`)
+	normed["security.panel_ssl_key_pem"] = json.RawMessage(`""`)
+	return true
 }
 
 // DeleteUser drops every user-scope setting of a username, so a recreated

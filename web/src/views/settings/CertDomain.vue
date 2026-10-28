@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, h, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref } from 'vue'
 import {
   NAlert,
   NButton,
@@ -75,12 +75,12 @@ function stopJobPoll() {
   }
 }
 
-async function refreshStatus() {
+async function refreshStatus(showError = false) {
   try {
     certStatus.value = await getPanelCertStatus()
     domainInput.value = certStatus.value.panel_domain || ''
-  } catch {
-    // ignore
+  } catch (e: any) {
+    if (showError) message.error(e?.message || '刷新面板状态失败，请刷新页面重试')
   }
 }
 
@@ -124,34 +124,165 @@ async function detectIP() {
   }
 }
 
-async function bindDomain() {
+const standardPortErrors = computed(() =>
+  (certStatus.value?.standard_ports || [])
+    .filter((p) => !p.listening && p.error)
+    .map((p) => `:${p.port} ${p.error}`)
+    .join('；'),
+)
+
+// 绑定域名后标准端口（:80，面板 SSL 开启时含 :443）的免端口访问地址；
+// 主监听端口作为无法免端口访问时的回退。
+function portlessURL(domain: string, scheme: 'http' | 'https' = 'http'): string {
+  return `${scheme}://${domain}`
+}
+
+function fallbackURL(domain: string, scheme: 'http' | 'https' = 'http'): string {
+  const port = (certStatus.value?.panel_http_port || '').trim()
+  if (!port || (scheme === 'http' && port === '80') || (scheme === 'https' && port === '443')) {
+    return `${scheme}://${domain}`
+  }
+  return `${scheme}://${domain}:${port}`
+}
+
+// 绑定/解绑后当前地址立即失效（严格域名限制，旧地址的接口请求会被 403，
+// 无法再回读状态）或 TLS 已关闭，必须直接引导管理员到新地址，而不是留在
+// 旧页面里对着 403 / 连接失败发呆。
+function showMoveDialog(domain: string, opts: { title: string; sslReset?: boolean }) {
+  const primary = portlessURL(domain)
+  const fallback = fallbackURL(domain)
+  const children = [
+    h('p', `请使用以下地址重新打开面板：`),
+    h('p', { style: 'margin-top:8px;font-family:monospace;font-size:13px' }, primary),
+  ]
+  if (fallback !== primary) {
+    children.push(
+      h(
+        'p',
+        { style: 'margin-top:6px;font-size:12px;color:var(--text-secondary)' },
+        `若该地址无法打开（:80 可能被其他服务占用），可临时使用 ${fallback}`,
+      ),
+    )
+  }
+  if (opts.sslReset) {
+    children.push(
+      h(
+        'p',
+        { style: 'margin-top:8px;color:#d03050;font-size:12px' },
+        '原域名证书绑定、面板 SSL 与强制 HTTPS 已自动清除，避免旧证书与新域名不匹配导致无法访问。请在新地址下重新签发或绑定证书，再按需开启 HTTPS。',
+      ),
+    )
+  }
+  dialog.warning({
+    title: opts.title,
+    content: () => h('div', { style: 'line-height:1.8' }, children),
+    positiveText: '立即前往新地址',
+    negativeText: '稍后手动切换',
+    onPositiveClick: () => {
+      window.location.href = primary
+    },
+  })
+}
+
+async function doBind(v: string, sslWasReset: boolean) {
+  try {
+    await saveSystemSettings({ [SETTING_KEYS.panelDomain]: v })
+  } catch (e: any) {
+    message.error(e?.message || '绑定域名失败')
+    await refreshStatus(true)
+    return
+  }
+  const current = window.location.hostname.toLowerCase()
+  if (current !== v.toLowerCase()) {
+    // 旧地址的后续请求会被严格域名限制拦截，这里不再回读状态。
+    showMoveDialog(v, { title: '面板域名已绑定', sslReset: sslWasReset })
+    return
+  }
+  await refreshStatus()
+  message.success(`已绑定域名 ${v}`)
+  if (sslWasReset) {
+    message.info('面板 SSL 与证书绑定已清除，请重新签发或绑定证书，并按需开启强制 HTTPS')
+  }
+}
+
+function bindDomain() {
   const v = domainInput.value.trim()
   if (!v) {
     message.warning('请先填写要绑定的域名')
     return
   }
-  try {
-    await saveSystemSettings({ [SETTING_KEYS.panelDomain]: v })
-    message.success(`已绑定域名 ${v}，面板现在只能通过该域名访问`)
-    await refreshStatus()
-  } catch (e: any) {
-    message.error(e?.message || '绑定域名失败')
+  const current = (certStatus.value?.panel_domain || '').trim()
+  const changing = current !== '' && current.toLowerCase() !== v.toLowerCase()
+  const sslActive = !!(certStatus.value?.ssl_enabled || certStatus.value?.force_https)
+  const children = [
+    h(
+      'p',
+      `绑定后面板只能通过 ${v} 访问，通过 IP 或其他域名发起的请求将被 403 拦截。请确认 DNS 已解析到本服务器。`,
+    ),
+  ]
+  if (changing) {
+    children.push(h('p', { style: 'margin-top:8px' }, `当前绑定域名为 ${current}，绑定后将切换为 ${v}。`))
   }
+  if (sslActive) {
+    children.push(
+      h(
+        'p',
+        { style: 'margin-top:8px;color:#d03050' },
+        '当前已开启面板 SSL / 强制 HTTPS：更换域名时原证书绑定、面板 SSL 与强制 HTTPS 会被自动清除，否则旧证书与域名不匹配将导致无法访问。请在新域名下重新签发或绑定证书。',
+      ),
+    )
+  }
+  dialog.warning({
+    title: changing ? '更换面板域名' : '绑定面板域名',
+    content: () => h('div', { style: 'line-height:1.8' }, children),
+    positiveText: changing ? '确认更换' : '确认绑定',
+    negativeText: '取消',
+    onPositiveClick: () => doBind(v, sslActive),
+  })
 }
 
 function unbindDomain() {
+  const sslActive = !!(certStatus.value?.ssl_enabled || certStatus.value?.force_https)
+  const children = [
+    h('p', '解绑后面板将恢复为通过 IP 访问，且不再拦截直接 IP 访问。'),
+  ]
+  if (sslActive) {
+    children.push(
+      h(
+        'p',
+        { style: 'margin-top:8px;color:#d03050' },
+        '解绑会同步关闭面板 SSL、清除证书绑定与强制 HTTPS（避免残留证书拦截访问），端口 :443 的 HTTPS 监听也会停止。',
+      ),
+    )
+  }
   dialog.warning({
     title: '解绑面板域名',
-    content: '解绑后面板将恢复为通过 IP 访问，且不再拦截直接 IP 访问。确定继续？',
+    content: () => h('div', { style: 'line-height:1.8' }, children),
     positiveText: '确定解绑',
     negativeText: '取消',
     onPositiveClick: async () => {
       try {
         await saveSystemSettings({ [SETTING_KEYS.panelDomain]: '' })
         domainInput.value = ''
-        message.success('已解绑，面板恢复 IP 访问')
         await refreshStatus()
+        message.success('已解绑，面板恢复 IP 访问')
         void detectIP()
+        if (window.location.protocol === 'https:') {
+          const target = fallbackURL(window.location.hostname)
+          dialog.info({
+            title: 'HTTPS 已关闭，请切换访问地址',
+            content: () =>
+              h('div', { style: 'line-height:1.8' }, [
+                h('p', '面板 SSL 已随域名解绑一同关闭，请使用以下地址访问（也可使用服务器 IP）：'),
+                h('p', { style: 'margin-top:8px;font-family:monospace;font-size:13px' }, target),
+              ]),
+            positiveText: '立即前往',
+            negativeText: '稍后手动切换',
+            onPositiveClick: () => {
+              window.location.href = target
+            },
+          })
+        }
       } catch (e: any) {
         message.error(e?.message || '解绑失败')
       }
@@ -160,6 +291,39 @@ function unbindDomain() {
 }
 
 async function setSSLEnabled(v: boolean) {
+  if (!v && window.location.protocol === 'https:') {
+    dialog.warning({
+      title: '关闭面板 HTTPS',
+      content:
+        '当前页面通过 HTTPS 访问，关闭后 HTTPS 监听（含 :443 免端口访问）会停止，本页面将无法继续使用。确定关闭？',
+      positiveText: '确定关闭',
+      negativeText: '取消',
+      onPositiveClick: async () => {
+        try {
+          await saveSystemSettings({ [SETTING_KEYS.panelSSLEnabled]: v })
+          message.success('已关闭面板 HTTPS')
+          const target = fallbackURL(window.location.hostname)
+          dialog.info({
+            title: 'HTTPS 已关闭，请切换访问地址',
+            content: () =>
+              h('div', { style: 'line-height:1.8' }, [
+                h('p', '请使用以下地址继续访问面板：'),
+                h('p', { style: 'margin-top:8px;font-family:monospace;font-size:13px' }, target),
+              ]),
+            positiveText: '立即前往',
+            negativeText: '稍后手动切换',
+            onPositiveClick: () => {
+              window.location.href = target
+            },
+          })
+        } catch (e: any) {
+          message.error(e?.message || '保存失败')
+          await refreshStatus(true)
+        }
+      },
+    })
+    return
+  }
   try {
     await saveSystemSettings({ [SETTING_KEYS.panelSSLEnabled]: v })
     message.success(v ? '已启用面板 HTTPS' : '已关闭面板 HTTPS')
@@ -173,6 +337,11 @@ async function setSSLEnabled(v: boolean) {
 async function setForceHTTPS(v: boolean) {
   if (v && !certStatus.value?.ssl_enabled) {
     message.warning('请先启用面板 HTTPS，再开启强制跳转')
+    await refreshStatus()
+    return
+  }
+  if (v && !certStatus.value?.active) {
+    message.warning('当前没有生效的 HTTPS 证书，开启强制跳转后 HTTP 会被重定向到不可用的 HTTPS，导致面板无法访问；请先签发或绑定证书')
     await refreshStatus()
     return
   }
@@ -356,8 +525,23 @@ onUnmounted(stopJobPoll)
               <template #icon><NIcon><CheckmarkCircleOutline /></NIcon></template>
               已绑定：{{ certStatus.panel_domain }}
             </NTag>
-            <span class="muted">面板只能通过该域名访问，直接使用 IP 访问将被拦截（回环地址除外）。<br />注意：绑定后「系统升级」中批量升级 Agent 时，安装包下载地址将使用该域名，请确保 Agent 所在主机能解析该域名；纯内网环境可在服务端启动参数加 <code>-public-url http://&lt;内网IP&gt;:18789</code> 覆盖为 IP 地址。</span>
+            <NTag
+              v-for="p in certStatus.standard_ports || []"
+              :key="p.port"
+              size="small"
+              :type="p.listening ? 'success' : 'warning'"
+              :title="p.error || ''"
+            >
+              :{{ p.port }} {{ p.listening ? '已监听（免端口）' : '未监听' }}
+            </NTag>
             <NButton size="small" type="error" ghost @click="unbindDomain">解绑</NButton>
+            <span class="muted">
+              面板只能通过该域名访问，直接使用 IP 访问将被拦截（回环地址除外）。绑定后自动在
+              <code>:80</code>{{ certStatus.ssl_enabled ? '（HTTPS 开启时含 :443）' : '' }}
+              提供免端口访问，可用 <code>{{ portlessURL(certStatus.panel_domain) }}</code> 直接打开；端口被其他服务（如应用反代容器）占用时会监听失败，释放后自动恢复。<br />
+              注意：绑定后「系统升级」中批量升级 Agent 时，安装包下载地址将使用该域名，请确保 Agent 所在主机能解析该域名；纯内网环境可在服务端启动参数加 <code>-public-url http://&lt;内网IP&gt;:18789</code> 覆盖为 IP 地址。
+            </span>
+            <span v-if="standardPortErrors" class="muted port-error">{{ standardPortErrors }}</span>
           </div>
           <NForm v-else label-placement="top" :show-feedback="false">
             <NFormItem label="绑定域名后，面板只能通过该域名访问">
@@ -370,22 +554,22 @@ onUnmounted(stopJobPoll)
                 />
                 <NButton type="primary" @click="bindDomain">绑定域名</NButton>
               </NSpace>
-              <template #feedback>
-                <span class="muted tip-hint">
-                  绑定后自动启用严格域名限制：任何通过服务器 IP 或其他域名发起的面板请求将被 403 拦截；
-                  Agent 注册与数据接口不受影响。不绑定则保持通过 IP 访问。<br />
-                  注意：绑定后「系统升级」中批量升级 Agent 时，安装包下载地址将使用该域名，请确保 Agent 所在主机能解析该域名；
-                  纯内网环境可在服务端启动参数加 <code>-public-url http://&lt;内网IP&gt;:18789</code> 覆盖为 IP 地址。
-                </span>
-              </template>
             </NFormItem>
           </NForm>
+          <p class="muted tip-hint" style="margin: 8px 0 0">
+            绑定后自动启用严格域名限制：任何通过服务器 IP 或其他域名发起的面板请求将被 403 拦截；
+            Agent 注册与数据接口不受影响。绑定后自动在 :80 提供免端口访问（HTTPS 开启时另含 :443），
+            无需在地址后带面板端口；不绑定则保持通过 IP 访问。<br />
+            注意：更换域名会自动清除原证书绑定并关闭面板 SSL 与强制 HTTPS，避免旧证书与新域名不匹配导致无法访问；
+            绑定后「系统升级」中批量升级 Agent 时，安装包下载地址将使用该域名，请确保 Agent 所在主机能解析该域名；
+            纯内网环境可在服务端启动参数加 <code>-public-url http://&lt;内网IP&gt;:18789</code> 覆盖为 IP 地址。
+          </p>
 
           <NAlert type="warning" :show-icon="true" class="emergency-alert">
             <template #header>域名防失联与紧急恢复</template>
             若绑定域名后无法访问面板（如 DNS 未生效），可在服务器终端执行：
             <code>watchman-server -reset-panel-domain -data /opt/watchman/data</code>
-            立即解绑域名、恢复 IP 访问。
+            立即解绑域名、恢复 IP 访问（同时关闭面板 SSL 与强制 HTTPS，清除证书绑定）。执行后需重启 watchman-server 服务生效。
           </NAlert>
         </div>
 
@@ -607,6 +791,9 @@ onUnmounted(stopJobPoll)
               </NSpace>
             </NFormItem>
           </NForm>
+          <p class="muted tip-hint" style="margin: 8px 0 0; font-size: 12px">
+            启用 HTTPS 后面板会在 :443 同步提供 HTTPS 免端口访问（需已绑定域名）；端口被占用时会监听失败并在上方显示原因。
+          </p>
 
           <!-- 上传已有证书 -->
           <NCollapse style="margin-top: 8px">
@@ -641,7 +828,7 @@ onUnmounted(stopJobPoll)
             <template #header>SSL 异常与紧急恢复</template>
             若证书配置错误导致 HTTPS 无法访问，可在服务器终端执行：
             <code>watchman-server -reset-panel-ssl -data /opt/watchman/data</code>
-            立即关闭面板 SSL，恢复 HTTP 访问。
+            立即关闭面板 SSL，恢复 HTTP 访问。执行后需重启 watchman-server 服务生效。
           </NAlert>
         </div>
       </NSpace>
@@ -670,6 +857,11 @@ onUnmounted(stopJobPoll)
   gap: 12px;
   flex-wrap: wrap;
   margin-bottom: 4px;
+
+  .port-error {
+    color: #d03050;
+    font-size: 12px;
+  }
 }
 
 .switch-item {

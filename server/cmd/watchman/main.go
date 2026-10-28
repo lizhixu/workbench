@@ -99,7 +99,7 @@ func main() {
 			log.Error("reset secure entry", "err", err)
 			os.Exit(1)
 		}
-		log.Info("secure entry disabled; panel login is open again")
+		log.Info("secure entry disabled; restart watchman-server to apply, panel login is open again")
 		os.Exit(0)
 	}
 
@@ -117,7 +117,7 @@ func main() {
 			log.Error("reset panel ssl", "err", err)
 			os.Exit(1)
 		}
-		log.Info("panel SSL disabled and force HTTPS turned off; HTTP login is restored")
+		log.Info("panel SSL disabled and force HTTPS turned off; restart watchman-server to apply, HTTP login is restored")
 		os.Exit(0)
 	}
 
@@ -134,7 +134,7 @@ func main() {
 			log.Error("reset panel domain", "err", err)
 			os.Exit(1)
 		}
-		log.Info("panel domain unbound (strict domain check is automatic when bound); direct IP access is restored")
+		log.Info("panel domain unbound; panel SSL, force HTTPS and the certificate binding were cleared as well; restart watchman-server to apply, direct IP access is restored")
 		os.Exit(0)
 	}
 
@@ -650,6 +650,22 @@ func main() {
 		}
 	}()
 
+	// Portless access: while a panel domain is bound, also serve the panel on
+	// :80 (and :443 when panel SSL is on), sharing the same handler. These
+	// listeners follow the domain/SSL settings live — started when the domain
+	// is bound, torn down when it is cleared — and retry on a timer so a port
+	// freed by another service is picked up without a restart. Bind failures
+	// (e.g. an app reverse proxy already holding :80) are reported via the
+	// panel cert status endpoint instead of failing the server.
+	if _, port, err := net.SplitHostPort(*httpAddr); err == nil {
+		panelsec.SetPanelHTTPPort(port)
+	}
+	stdPorts := panelsec.NewStandardPorts(settingsStore, hs.Handler, panelTLSConfig, *httpAddr, log)
+	panelsec.SetStandardPorts(stdPorts)
+	stdPorts.Reconcile()
+	go stdPorts.Run(ctx)
+	settingsStore.SetOnChange(stdPorts.Reconcile)
+
 	// Wait for shutdown signal.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -661,6 +677,7 @@ func main() {
 
 	// Cancel background worker tasks.
 	cancel()
+	stdPorts.Stop()
 
 	shutdownCtx, sc := context.WithTimeout(context.Background(), 5*time.Second)
 	defer sc()

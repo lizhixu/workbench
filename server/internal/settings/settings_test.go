@@ -481,17 +481,24 @@ func TestSnapshotConsistentUnderConcurrency(t *testing.T) {
 			t.Fatal("expected error on invalid public URL")
 		}
 
-		// Valid update
+		// Valid update: public URL and the domain binding itself.
 		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
-			"server.public_url":            raw(t, "https://panel.example.com:18789"),
-			"security.panel_domain":        raw(t, "panel.example.com"),
-			"security.panel_ssl_enabled":   raw(t, true),
-			"security.panel_ssl_mode":      raw(t, "custom"),
-			"security.panel_ssl_cert_pem":  raw(t, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"),
-			"security.panel_ssl_key_pem":   raw(t, "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"),
-			"security.panel_force_https":   raw(t, true),
+			"server.public_url":     raw(t, "https://panel.example.com:18789"),
+			"security.panel_domain": raw(t, "panel.example.com"),
 		}); err != nil {
 			t.Fatalf("SetMany valid panel security: %v", err)
+		}
+
+		// SSL settings are a separate write (the certificate is chosen after
+		// the domain is bound).
+		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+			"security.panel_ssl_enabled":  raw(t, true),
+			"security.panel_ssl_mode":     raw(t, "custom"),
+			"security.panel_ssl_cert_pem": raw(t, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"),
+			"security.panel_ssl_key_pem":  raw(t, "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"),
+			"security.panel_force_https":  raw(t, true),
+		}); err != nil {
+			t.Fatalf("SetMany valid panel ssl settings: %v", err)
 		}
 
 		updated := s.PanelSecurity()
@@ -506,6 +513,90 @@ func TestSnapshotConsistentUnderConcurrency(t *testing.T) {
 		}
 		if updated.SSLMode != "custom" {
 			t.Errorf("ssl_mode = %q, want custom", updated.SSLMode)
+		}
+
+		// Re-writing the same domain (case-insensitive) is not a change: the
+		// SSL configuration must survive.
+		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+			"security.panel_domain": raw(t, "Panel.Example.COM"),
+		}); err != nil {
+			t.Fatalf("SetMany same domain: %v", err)
+		}
+		if got := s.PanelSecurity(); !got.SSLEnabled || !got.ForceHTTPS || got.SSLMode != "custom" || got.SSLCertPEM == "" {
+			t.Fatalf("same-domain write cleared SSL config: %+v", got)
+		}
+
+		// Changing the domain clears the certificate binding, panel SSL and
+		// force-HTTPS in the same atomic write: a certificate issued for the
+		// old domain must not be served for the new one (it would break TLS
+		// and, with force-HTTPS on, lock the administrator out).
+		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+			"security.panel_ssl_cert_id": raw(t, "crt_123"),
+		}); err != nil {
+			t.Fatalf("SetMany cert id: %v", err)
+		}
+		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+			"security.panel_domain": raw(t, "new.example.com"),
+		}); err != nil {
+			t.Fatalf("SetMany domain change: %v", err)
+		}
+		changed := s.PanelSecurity()
+		if changed.PanelDomain != "new.example.com" {
+			t.Errorf("panel_domain = %q, want new.example.com", changed.PanelDomain)
+		}
+		if changed.SSLEnabled || changed.ForceHTTPS {
+			t.Errorf("domain change left SSL/force-HTTPS enabled: %+v", changed)
+		}
+		if changed.SSLMode != "cert_center" || changed.SSLCertID != "" || changed.SSLCertPEM != "" || changed.SSLKeyPEM != "" {
+			t.Errorf("domain change did not clear certificate binding: %+v", changed)
+		}
+
+		// Unbinding clears SSL as well (the certificate was issued for a
+		// domain that is no longer the panel's identity).
+		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+			"security.panel_ssl_enabled": raw(t, true),
+			"security.panel_force_https": raw(t, true),
+		}); err != nil {
+			t.Fatalf("SetMany re-enable ssl: %v", err)
+		}
+		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+			"security.panel_domain": raw(t, ""),
+		}); err != nil {
+			t.Fatalf("SetMany unbind: %v", err)
+		}
+		if got := s.PanelSecurity(); got.PanelDomain != "" || got.SSLEnabled || got.ForceHTTPS {
+			t.Errorf("unbind did not clear SSL: %+v", got)
+		}
+	}
+
+	func TestSetManyOnChangeHook(t *testing.T) {
+		s := newTestStore(t)
+		calls := 0
+		s.SetOnChange(func() { calls++ })
+
+		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+			"server.timezone": raw(t, "UTC"),
+		}); err != nil {
+			t.Fatalf("SetMany timezone: %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("onChange calls = %d after successful system write, want 1", calls)
+		}
+		// Failed writes must not fire the hook.
+		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{"nope": raw(t, 1)}); err == nil {
+			t.Fatal("expected error for unknown key")
+		}
+		if calls != 1 {
+			t.Fatalf("onChange fired on failed write: calls = %d", calls)
+		}
+		// User-scope writes do not affect panel-wide state; no hook.
+		if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{
+			"appearance.theme_mode": raw(t, "light"),
+		}); err != nil {
+			t.Fatalf("SetMany user theme: %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("onChange fired on user-scope write: calls = %d", calls)
 		}
 	}
 

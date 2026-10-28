@@ -1123,6 +1123,7 @@ Agent internal/shell
 - tag 规范：`v1.2.3` 为正式版；`v1.3.0-rc.1` / `v1.3.0-beta.1`（带 `-` 后缀）由 CI 自动标记为 pre-release。
 - **必须是附注 tag（annotated），严禁轻量 tag（2026-10-28 事故根因）**：`git tag v1.2.3` 这类轻量 tag 在 `git tag -l --format='%(contents)'` 下会**静默退化为指向 commit 的 message**，而 CI 只判断附注是否非空，于是发出去的 Release 正文变成「最近一条提交的描述」，该版本其余变更全部丢失，`--generate-notes` 兜底也因正文非空而永不触发。历史遗留的轻量 tag：`v0.0.0-ci-test`、`v0.1.0-beta.2`、`v0.1.0-beta.5`、`v0.1.0-beta.6`（已发布 Release 不可变，保留原样，仅作已知异常记录）。
 - **发版前必须本地校验**：`make tag-check TAG=v0.2.0-beta.1`（等价于 `bash scripts/verify-tag.sh`）。校验四件事：命名严格匹配 semver、对象类型必须是 `tag`（非 `commit`）、附注非空且 ≥3 行、附注带可识别的变更条目。CI 在 `Verify release tag` 步骤执行同一脚本，不通过直接中止发布。
+- **CI 必须拉取 tag 对象（2026-10-28 二次事故）**：`actions/checkout@v4` 的 `fetch-tags` 默认为 `false`，即使 `fetch-depth: 0` 也不保证本地有 `refs/tags/<tag>`。缺少该 ref 时 `git cat-file -t` 会报 `Not a valid object name`、`git tag -l --format='%(contents)'` 返回空，校验会误判为轻量 tag 并使 Release 正文退化为自动生成。因此 checkout 必须显式配置 `fetch-tags: true`；`verify-tag.sh` 也会在 ref 缺失时先尝试从 origin 拉取，仍缺失则明确报「本地不存在 refs/tags/...」而不是误报轻量 tag。排查时不要只看「对象类型 unknown」就断定 tag 打错了，先确认 ref 是否存在。
 - 构建矩阵：server（linux amd64/arm64）+ agent（linux amd64/arm64、windows amd64）+ watchmanctl（linux amd64/arm64、windows amd64、darwin amd64/arm64），全部 `CGO_ENABLED=0` 静态编译。
 - **发布产物规范（双轨发布体系：独立单二进制 + 完整安装包）**：
   每次发布直出以下完整资产列表，满足直接运行与自动化安装双重需求：

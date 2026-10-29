@@ -72,6 +72,12 @@ type Engine struct {
 	mu      sync.Mutex
 	running map[string]*activeDeployment // app_id -> in-flight deployment
 
+	// liveLogs holds the in-flight build output of running deployments
+	// (deployment id -> *logBuffer). A deployment record only carries the
+	// final BuildLog once the pipeline ends, so this is what makes the log
+	// viewer usable during a build: GET /deployments/:depID overlays it.
+	liveLogs sync.Map
+
 	// volMu/volBusy serialize volume backup+restore per app: two concurrent
 	// agent scripts over the same data dir would interleave tar with untar.
 	volMu   sync.Mutex
@@ -189,6 +195,28 @@ func (e *Engine) IsRunning(appID string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.running[appID] != nil
+}
+
+// LiveLog returns the build output accumulated so far for a deployment that
+// is still running. The second return value is false once the run finished
+// (the final log then lives on the record itself).
+func (e *Engine) LiveLog(depID string) (string, bool) {
+	v, ok := e.liveLogs.Load(depID)
+	if !ok {
+		return "", false
+	}
+	buf, ok := v.(*logBuffer)
+	if !ok || buf == nil {
+		return "", false
+	}
+	return buf.String(), true
+}
+
+// trackLog registers the in-flight buffer for the API to read. The returned
+// done func must be deferred by the pipeline so the map does not grow.
+func (e *Engine) trackLog(depID string, buf *logBuffer) func() {
+	e.liveLogs.Store(depID, buf)
+	return func() { e.liveLogs.Delete(depID) }
 }
 
 // registerRunning claims the single-slot build queue for one app: returns
@@ -364,6 +392,7 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 	}
 
 	logBuf := &logBuffer{}
+	defer e.trackLog(dep.ID, logBuf)()
 	fail := func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
 		e.fail(app, dep, logBuf, msg)
@@ -1200,8 +1229,14 @@ func (e *Engine) checkDockerReady(hub *rpc.Hub) error {
 
 // logBuffer accumulates build output with a hard bound so one chatty build
 // cannot bloat the JSONL history.
+//
+// The mutex exists because the same buffer is read by the API while the
+// pipeline goroutine keeps appending: GET /deployments/:depID overlays the
+// in-flight buffer so operators can watch a build before the final log is
+// written onto the record.
 type logBuffer struct {
-	b strings.Builder
+	mu sync.Mutex
+	b  strings.Builder
 }
 
 // forwarderImage is the OCI image for 组网转发 (source_type=forward) apps:
@@ -1212,11 +1247,15 @@ const forwarderImage = "alpine/socat"
 const maxBuildLogBytes = 64 * 1024
 
 func (l *logBuffer) WriteString(s string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.b.WriteString(s)
 }
 
 // WriteResult appends a step's stdout/stderr, redacted, bounded.
 func (l *logBuffer) WriteResult(res *agentpb.ExecResult, stdoutRedacted, stderr []byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	out := stdoutRedacted
 	if out == nil {
 		out = res.GetStdout()
@@ -1232,6 +1271,7 @@ func (l *logBuffer) WriteResult(res *agentpb.ExecResult, stdoutRedacted, stderr 
 	}
 }
 
+// appendBounded trims at maxBuildLogBytes; callers must hold l.mu.
 func (l *logBuffer) appendBounded(b []byte) {
 	if l.b.Len() >= maxBuildLogBytes {
 		return
@@ -1244,6 +1284,8 @@ func (l *logBuffer) appendBounded(b []byte) {
 }
 
 func (l *logBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return l.b.String()
 }
 

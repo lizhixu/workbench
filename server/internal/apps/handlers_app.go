@@ -1061,6 +1061,12 @@ func (h *AppHandlers) listDeployments(c *gin.Context) {
 	if list == nil {
 		list = []*Deployment{}
 	}
+	// 列表只带元信息：BuildLog 单条上限 64KB，20 条就是兆级 payload，
+	// 而部署进行中前端每 2 秒轮询一次列表，带上日志会把轮询变成流量灾难。
+	// 日志正文由 GET /deployments/:depID 单独取。
+	for _, d := range list {
+		d.BuildLog = ""
+	}
 	c.JSON(http.StatusOK, gin.H{"data": list, "total": total, "offset": offset, "page_size": pageSize})
 }
 
@@ -1069,6 +1075,14 @@ func (h *AppHandlers) getDeployment(c *gin.Context) {
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "deployment not found"})
 		return
+	}
+	// 构建中的记录只在管线结束时才把整段日志写到记录上；这里叠加运行中
+	// 缓冲，前端轮询同一个接口就能看到实时输出（任务结束后缓冲移除，
+	// 以记录里的终态日志为准）。
+	if h.engine != nil {
+		if live, ok := h.engine.LiveLog(dep.ID); ok && len(live) > len(dep.BuildLog) {
+			dep.BuildLog = live
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": dep})
 }

@@ -277,6 +277,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 	}
 
 	logBuf := &logBuffer{}
+	defer e.trackLog(dep.ID, logBuf)()
 	fail := func(format string, args ...any) {
 		e.fail(app, dep, logBuf, fmt.Sprintf(format, args...))
 	}

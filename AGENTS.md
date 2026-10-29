@@ -182,6 +182,8 @@
     - **安全清理（零停机保障）**：若新容器（`watchman-app-<appID>-next`）已被拉起，取消时异步调用 `removeContainer` 仅清理半拉起容器，在线服务容器全程不受影响；部署记录状态置为 `cancelled`，记录 `CancelledBy` 操作员与 `FinishedAt`；
     - **强制重新部署（`force=true`）**：在已有部署执行时，`POST /apps/:id/deploy` 支持 `force=true`（Query 或 JSON Body），服务端自动先终止当前在途任务、释放槽位并立即启动全新部署，前端弹窗确认「当前已有部署任务正在进行中，继续将终止当前任务并启动全新部署」；
     - **历史记录与多点控制**：顶部操作栏展示醒目「终止部署」按钮与二次确认；部署历史列表针对 `queued`/`building`/`deploying` 记录提供行内「停止」按钮；部署状态 Tag 增加「已取消」（warning 琥珀色），提交信息列展示取消人。
+    - **部署历史页签（重做）**：独立工具栏（共 N 次部署 / N 个进行中 / 最近一次时间，右侧「刷新」与「重新部署」，空态给「立即部署」CTA）+ 标准表格布局（`NCard.table-flex-fill` + `flex-height` NDataTable + 独立 `.table-pagination-bar` NPagination，符合 §8.2）。状态列对非终态记录带转圈；触发列第二行显示发起人；耗时列对进行中记录按当前时间滚动累加；开始时间统一走 `fmtDateTime`（面板时区，零值时间显示 `-`）；操作列 `fixed: 'right'`。**自动刷新**以「列表/最新记录里是否存在 queued/building/deploying」为依据每 2 秒静默拉一次（`loadDeployments(true)` 不点亮 loading、失败不弹错），全部落终态即停表，并有 30 分钟有界窗口防止脏记录永久轮询；不再依赖 `status.deploying`——前置检查类失败 1 秒内落终态，5 秒状态轮询可能一次都没看到“部署中”，新记录会永远停在“排队”。换页/改每页条数显式重新请求：改条数会把页码重置为 1，若只 `watch(page)`，用户本来就在第 1 页时不会触发任何请求。**布局根因**：此前 `NDataTable flex-height` 直接放进自建 flex 列，表格自身没有 `flex: 1`，`flex-height` 拿到的可用高度是 0，页签里只剩表头和分页条、所有记录都渲染在 0 高滚动区里——这是「部署历史完全没法用」的直接原因。
+    - **部署日志弹窗**：列表接口不返回日志正文（`build_log` 单条上限 64KB，20 条 × 2 秒轮询会变成兆级流量），打开弹窗时按 depID 单独取全文；运行中的记录随上述 2 秒轮询刷新（`GET /apps/:id/deployments/:depID` 在记录尚未落终态时叠加引擎内存中的实时构建缓冲 `Engine.LiveLog`，任务结束移除缓冲，以记录里的终态 `build_log` 为准；`logBuffer` 读写加锁，API 读取与管线写入不再有数据竞争）。弹窗头部展示状态 Tag、触发方式与发起人、耗时、开始时间；提供「自动跟随」（新内容贴底，可关闭）、刷新、复制；构建中尚无输出时提示「等待构建输出…」。
     - **取消与终态加固**：Compose 部署取消时自动 `compose down` 清理已上线栈（raw_compose 与 git-compose 两分支；清理失败时记录 Error 明确标注栈仍在运行，请手动 down，禁止静默记干净取消）；部署记录终态守卫——success/failed/cancelled 一旦写入，任何后续阶段/取消/成功路径不得重写（此前探活取消可被 fail 覆盖丢 `CancelledBy`、swap 后取消可翻 success）；`-next` 容器名带 depID 后缀（`watchman-app-<id>-next-dep_<8字符>`，新旧两 run 容器名必然不同，旧管线清理删不掉新容器，purge 与迁移清理同步覆盖新旧两种命名）；swap 前与 `finishDeploySuccess` 入口查应用存活，已删则删 `-next` 并 fail（不建中继）；`deployApp` 补 engine nil 守卫（503）。
   - **部署 Docker 前置检查**：管线在 Agent 在线校验通过后、拉取代码/构建之前，先对目标主机执行 Docker 可用性检查（`command -v docker` 与 `docker info` 两段、退出码区分，复用反代保障的分类口径）：未安装 → 快速失败「目标主机未安装 Docker：请先在主机详情 Docker 页一键安装 Docker 后重试」；daemon 未起 → 「目标主机 Docker 服务未运行：请先启动 Docker 服务后重试」；检查本身传输失败（Agent 断连/exec 超时）不归类为 Docker 问题。覆盖全部来源（git/镜像/模板/Compose 终点都是 docker），此前缺失该检查时，无 Docker 主机会一路跑到起容器才以裸 `docker: command not found`（exit 127）失败。创建即部署同样走该检查，失败时经 `deploy_warning` 带出同一文案。不覆盖：`docker compose` 插件缺失（`docker info` 通过但 compose 子命令不存在）仍在 Compose 步骤以原错误失败，属后续缺口。**前端安装提醒**：光给文字提示不够便捷，`AppDetail.vue` 在最新一次部署死于“未安装 Docker”时给两条路——详情页眉与正文之间的常驻警告横幅（一键安装 Docker 按钮）与本页会话内发起的部署刚失败时的自动弹窗（问是否安装，安装中禁关、装完给「立即重新部署」）；安装走现有 `POST /hosts/:id/docker/install-script`（服务端内置官方脚本，前端 330 秒超时）。识别靠部署记录 `error` 含固定文案“未安装 Docker”（记录无 error_code 字段，改后端文案须同步前端）；提醒状态取最新一条记录（单独拉第 1 页第 1 条，不依赖历史页签当前页码）；部署结束（部署中→非部署中）时补刷一次历史与最新记录，否则 1 秒内落终态的快速失败永远刷不出来。
   - **创建即部署**：`POST /apps` 持久化成功后立即 `engine.StartDeployment(app, "create", …)` 入队首轮部署（`Deployment.trigger` 新增 `create`，详情页展示为「创建」），响应附 `deployment`；引擎忙/启动失败不失败创建本身，仅附 `deploy_warning`（应用记录合法，可手动重试）。前端创建页提示「已创建，正在部署…」，详情页既有轮询自然展示 排队→构建→发布→成功/失败 与日志。
@@ -897,8 +899,8 @@ POST   /api/v1/apps/:id/rollback          # 版本回滚
 POST   /api/v1/apps/:id/stop
 POST   /api/v1/apps/:id/start
 POST   /api/v1/apps/:id/restart
-GET    /api/v1/apps/:id/deployments
-GET    /api/v1/apps/:id/deployments/:depID
+GET    /api/v1/apps/:id/deployments        # 列表不含 build_log（正文走单条接口）
+GET    /api/v1/apps/:id/deployments/:depID # 运行中时 build_log 叠加引擎内存缓冲（实时日志）
 POST   /api/v1/apps/:id/deployments/:depID/diagnose # AI 排障
 GET    /api/v1/apps/:id/status
 POST   /api/v1/apps/:id/webhook/sync
@@ -1541,6 +1543,8 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 6. 全局提供可复用类（见 `web/src/styles/global.scss`）：`.page-flex-column`、`.table-flex-fill`、`.table-pagination-bar`。新页面直接套用，避免每处重复写 flex 三件套。
 
 7. **不要用原生 `<NTable>` 承载不定长列表**。`NTable` 只是带样式的 `<table>`，没有 `flex-height`、没有分页、没有固定表头，写出来的页面一定违反本节。需要表格就用 `NDataTable` + `columns` render 函数；单元格样式因此由 render 生成，scoped 样式要用 `:deep()` 穿透。
+
+8. **`flex-height` 只对「自身拿到高度」的表格生效**：`.table-flex-fill` 已经给内部 `.n-data-table` 设了 `flex: 1; min-height: 0`。若自己另写一个 `display: flex; flex-direction: column` 的容器，却只给 `NDataTable` 加 `flex-height` 而没给它 `flex: 1`，表格高度会按内容算成「表头 + 分页条」，数据区 `clientHeight` 为 0——整张表看起来是空的（部署历史页签此前即此因，页签里只剩表头和分页条，所有记录不可见）。验收口径：表格数据区 `clientHeight` 必须明显大于表头高度。
 
 **例外**：卡片内的辅助性小表格（常用命令库、备份列表、批量执行的主机勾选框、告警规则清单、单个分组的授权名单等），数据量天然有限且不是页面主体，可继续用固定 `:max-height` 限高、不分页，但**必须在代码注释里写明它属于本例外**，便于后续 review 区分「有意为之」和「漏了」。
 

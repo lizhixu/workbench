@@ -131,6 +131,16 @@ const standardPortErrors = computed(() =>
     .join('；'),
 )
 
+// 标准端口监听失败时的可用入口：:443 不在监听时，服务端会自动跳过强制 HTTPS
+// 跳转，避免把浏览器 301 到一个打不开的地址；此时 :80 仍可正常打开面板。
+const standardPortHint = computed(() => {
+  const ports = certStatus.value?.standard_ports || []
+  if (!ports.some((p) => !p.listening)) return ''
+  const https = ports.find((p) => p.port === 443)
+  if (https?.listening) return '面板仍可通过 https://域名 访问'
+  return '强制 HTTPS 跳转已自动跳过，面板仍可通过 http://域名 访问'
+})
+
 // 绑定域名后标准端口（:80，面板 SSL 开启时含 :443）的免端口访问地址；
 // 主监听端口作为无法免端口访问时的回退。
 function portlessURL(domain: string, scheme: 'http' | 'https' = 'http'): string {
@@ -542,6 +552,11 @@ onUnmounted(stopJobPoll)
               注意：绑定后「系统升级」中批量升级 Agent 时，安装包下载地址将使用该域名，请确保 Agent 所在主机能解析该域名；纯内网环境可在服务端启动参数加 <code>-public-url http://&lt;内网IP&gt;:18789</code> 覆盖为 IP 地址。
             </span>
             <span v-if="standardPortErrors" class="muted port-error">{{ standardPortErrors }}</span>
+            <NAlert v-if="standardPortErrors" type="warning" :show-icon="true" class="port-alert">
+              <template #header>标准端口监听失败</template>
+              {{ standardPortErrors }}。{{ standardPortHint }}；端口释放后 30 秒内自动恢复监听。
+              若 :443 一直被占用，强制 HTTPS 会保持跳过（否则会把浏览器跳到打不开的地址）。
+            </NAlert>
           </div>
           <NForm v-else label-placement="top" :show-feedback="false">
             <NFormItem label="绑定域名后，面板只能通过该域名访问">
@@ -861,6 +876,11 @@ onUnmounted(stopJobPoll)
   .port-error {
     color: #d03050;
     font-size: 12px;
+  }
+
+  .port-alert {
+    width: 100%;
+    margin-top: 4px;
   }
 }
 

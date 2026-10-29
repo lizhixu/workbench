@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"watchman/server/internal/settings"
@@ -14,6 +16,9 @@ import (
 type Guard struct {
 	settings *settings.Store
 	log      *slog.Logger
+
+	mu       sync.Mutex
+	lastWarn time.Time
 }
 
 // NewGuard builds a panel security guard.
@@ -119,6 +124,51 @@ func (g *Guard) DomainMiddleware() gin.HandlerFunc {
 	}
 }
 
+// redirectPort returns the port a forced HTTPS redirect would land on: the
+// explicit port in the Host header, or 443 when the browser omitted it.
+func redirectPort(r *http.Request) string {
+	if _, port, err := net.SplitHostPort(r.Host); err == nil && port != "" {
+		return port
+	}
+	return "443"
+}
+
+// httpsReachable reports whether the panel actually terminates TLS on the port
+// a forced redirect would target. The portless :80 endpoint can only redirect
+// to :443 when that listener is really serving; without it the redirect would
+// land on a closed port.
+func httpsReachable(r *http.Request) bool {
+	switch port := redirectPort(r); port {
+	case "80":
+		// No TLS on the plaintext standard port.
+		return false
+	case "443":
+		if main := PanelHTTPPort(); main == "443" {
+			return true
+		}
+		return StandardPortListening(443)
+	default:
+		// An explicit non-standard port is the panel's primary listener (its
+		// dynamic listener sniffs TLS in place), so HTTPS there is available.
+		return true
+	}
+}
+
+// warnThrottled logs a degraded-access warning at most once a minute so a
+// browser stuck in a redirect loop cannot flood the log.
+func (g *Guard) warnThrottled(msg string, args ...any) {
+	g.mu.Lock()
+	now := time.Now()
+	emit := now.Sub(g.lastWarn) > time.Minute
+	if emit {
+		g.lastWarn = now
+	}
+	g.mu.Unlock()
+	if emit {
+		g.log.Warn(msg, args...)
+	}
+}
+
 // HTTPSMiddleware redirects plaintext HTTP requests to HTTPS when panel SSL
 // and force HTTPS are enabled.
 func (g *Guard) HTTPSMiddleware() gin.HandlerFunc {
@@ -141,6 +191,19 @@ func (g *Guard) HTTPSMiddleware() gin.HandlerFunc {
 
 		isTLS := c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https"
 		if !isTLS {
+			// Redirecting is only safe when the target really serves TLS. When
+			// the portless :443 listener failed to bind (the port is held by
+			// another service, or the deployment does not publish it), a blind
+			// 301 sends every browser to a dead endpoint — the panel then looks
+			// unreachable on both 80 and 443 even though :80 is fine. Keep
+			// serving over HTTP in that degraded state and let the settings UI
+			// report the listener error.
+			if !httpsReachable(c.Request) {
+				g.warnThrottled("panel force-HTTPS redirect skipped: standard :443 listener is not serving; panel stays reachable over HTTP",
+					"host", c.Request.Host, "path", path)
+				c.Next()
+				return
+			}
 			target := "https://" + c.Request.Host + c.Request.RequestURI
 			c.Redirect(http.StatusMovedPermanently, target)
 			c.Abort()

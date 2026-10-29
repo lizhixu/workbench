@@ -114,7 +114,7 @@ func (p *StandardPorts) Reconcile() {
 		}
 		srv, err := p.startLocked(port)
 		if err != nil {
-			msg := fmt.Sprintf("监听 :%d 失败: %v", port, err)
+			msg := standardPortError(port, err)
 			if p.errs[port] != msg {
 				p.errs[port] = msg
 				p.log.Warn("panel standard port listener failed", "port", port, "err", err)
@@ -151,12 +151,29 @@ func (p *StandardPorts) startLocked(port int) (*http.Server, error) {
 		// port; a concurrent stop/replace must not be clobbered.
 		if p.servers[port] == srv {
 			delete(p.servers, port)
-			p.errs[port] = fmt.Sprintf("监听 :%d 失败: %v", port, err)
+			p.errs[port] = standardPortError(port, err)
 		}
 		p.mu.Unlock()
 		p.log.Warn("panel standard port listener exited", "port", port, "err", err)
 	}()
 	return srv, nil
+}
+
+// standardPortError renders a bind/serve failure with an actionable hint:
+// the two realistic causes are another service holding the port and a process
+// without privileged-port rights.
+func standardPortError(port int, err error) string {
+	msg := fmt.Sprintf("监听 :%d 失败: %v", port, err)
+	lower := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(lower, "address already in use"),
+		strings.Contains(lower, "only one usage of each socket address"):
+		msg += "（端口已被其他服务占用，如应用容器映射、已有 Web 服务；释放后 30 秒内自动恢复）"
+	case strings.Contains(lower, "permission denied"),
+		strings.Contains(lower, "access is denied"):
+		msg += "（需要 root 或 CAP_NET_BIND_SERVICE 权限）"
+	}
+	return msg
 }
 
 // Run retries failed listeners on a fixed interval until ctx is cancelled.
@@ -234,6 +251,28 @@ func SetStandardPorts(p *StandardPorts) {
 	stdPortsMu.Lock()
 	stdPorts = p
 	stdPortsMu.Unlock()
+}
+
+// StandardPortListening reports whether the published reconciler is currently
+// serving the given standard port. It answers false when no reconciler is
+// wired (tests, embedded usage) — callers use it to decide whether a redirect
+// to the portless HTTPS endpoint can actually be followed.
+func StandardPortListening(port int) bool {
+	stdPortsMu.Lock()
+	p := stdPorts
+	stdPortsMu.Unlock()
+	if p == nil {
+		return false
+	}
+	return p.listening(port)
+}
+
+// listening reports whether port is served either by the primary panel
+// listener (skip set) or by a live standard-port listener.
+func (p *StandardPorts) listening(port int) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.skip[port] || p.servers[port] != nil
 }
 
 // StandardPortStatus reports the published reconciler's state; nil when none

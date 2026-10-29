@@ -192,6 +192,61 @@ func TestHTTPSMiddleware(t *testing.T) {
 	}
 }
 
+// A forced redirect from the portless :80 endpoint must not fire when the
+// standard :443 listener failed to bind: the browser would land on a closed
+// port and the panel would look down on both ports.
+func TestHTTPSMiddlewareSkipsDeadPort443Redirect(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	st := newTestSettings(t)
+	if err := st.SetMany(settings.ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_ssl_enabled": rawJSON(t, true),
+		"security.panel_force_https": rawJSON(t, true),
+	}); err != nil {
+		t.Fatalf("SetMany: %v", err)
+	}
+	guard := NewGuard(st, nil)
+	r := gin.New()
+	r.Use(guard.HTTPSMiddleware())
+	r.GET("/dashboard", func(c *gin.Context) { c.String(http.StatusOK, "dashboard-ok") })
+
+	// No reconciler wired (tests): :443 is treated as not serving.
+	req := httptest.NewRequest("GET", "/dashboard", nil)
+	req.Host = "panel.example.com"
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("portless HTTP with dead :443: got status %d, want 200 (no redirect)", w.Code)
+	}
+
+	// Publish a reconciler whose :443 listener is live -> redirect is restored.
+	p := NewStandardPorts(st, http.NotFoundHandler(), &tls.Config{}, ":18789", nil)
+	p.mu.Lock()
+	p.servers[443] = &http.Server{}
+	p.mu.Unlock()
+	SetStandardPorts(p)
+	t.Cleanup(func() { SetStandardPorts(nil) })
+
+	req = httptest.NewRequest("GET", "/dashboard", nil)
+	req.Host = "panel.example.com"
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusMovedPermanently {
+		t.Fatalf("portless HTTP with live :443: got status %d, want 301", w.Code)
+	}
+	if loc := w.Header().Get("Location"); loc != "https://panel.example.com/dashboard" {
+		t.Fatalf("Location = %q, want https://panel.example.com/dashboard", loc)
+	}
+
+	// An explicit :80 target would need TLS on the plaintext port: stay on HTTP.
+	req = httptest.NewRequest("GET", "/dashboard", nil)
+	req.Host = "panel.example.com:80"
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("explicit :80 with force https: got status %d, want 200 (no redirect)", w.Code)
+	}
+}
+
 func TestCertProviderCustomPEM(t *testing.T) {
 	st := newTestSettings(t)
 	certPEM, keyPEM := generateTestCertPEM(t, "panel.example.com")

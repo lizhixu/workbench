@@ -849,40 +849,43 @@ onUnmounted(() => {
 
 <template>
   <div class="cert-manager">
-    <!-- 工具栏（嵌入设置页等场景不再渲染页面级标题） -->
-    <div class="cert-toolbar">
-      <NSpace align="center" :size="10">
-        <NButton secondary @click="showConfig = true">
-          <template #icon>
-            <NIcon><LockClosedOutline /></NIcon>
-          </template>
-          dns-mng 集成{{ configReady ? ' (已配置)' : ' (未配置)' }}
-        </NButton>
-        <NButton :loading="loadingCerts || loadingAccounts" @click="() => { loadAccounts(); loadCerts() }">
-          <template #icon>
-            <NIcon><RefreshOutline /></NIcon>
-          </template>
-          刷新
-        </NButton>
-        <NButton v-if="activeMainTab === 'certs'" @click="openImport">
-          <template #icon>
-            <NIcon><CloudUploadOutline /></NIcon>
-          </template>
-          上传证书
-        </NButton>
-        <NButton v-if="activeMainTab === 'accounts'" type="primary" @click="openCreateAccount">
-          <template #icon>
-            <NIcon><AddCircleOutline /></NIcon>
-          </template>
-          添加 ACME 机构
-        </NButton>
-        <NButton v-else type="primary" @click="openIssue">
-          <template #icon>
-            <NIcon><ShieldCheckmarkOutline /></NIcon>
-          </template>
-          申请 SSL 证书
-        </NButton>
-      </NSpace>
+    <!-- 标题与全局操作同一行：此前按钮单独占一行、左侧整片空白，标题下方显得很空 -->
+    <div class="page-header">
+      <h2 class="page-title">证书中心</h2>
+      <div class="cert-toolbar">
+        <NSpace align="center" :size="10">
+          <NButton secondary @click="showConfig = true">
+            <template #icon>
+              <NIcon><LockClosedOutline /></NIcon>
+            </template>
+            dns-mng 集成{{ configReady ? ' (已配置)' : ' (未配置)' }}
+          </NButton>
+          <NButton :loading="loadingCerts || loadingAccounts" @click="() => { loadAccounts(); loadCerts() }">
+            <template #icon>
+              <NIcon><RefreshOutline /></NIcon>
+            </template>
+            刷新
+          </NButton>
+          <NButton v-if="activeMainTab === 'certs'" @click="openImport">
+            <template #icon>
+              <NIcon><CloudUploadOutline /></NIcon>
+            </template>
+            上传证书
+          </NButton>
+          <NButton v-if="activeMainTab === 'accounts'" type="primary" @click="openCreateAccount">
+            <template #icon>
+              <NIcon><AddCircleOutline /></NIcon>
+            </template>
+            添加 ACME 机构
+          </NButton>
+          <NButton v-else type="primary" @click="openIssue">
+            <template #icon>
+              <NIcon><ShieldCheckmarkOutline /></NIcon>
+            </template>
+            申请 SSL 证书
+          </NButton>
+        </NSpace>
+      </div>
     </div>
 
     <NAlert v-if="!configReady" type="warning" :show-icon="true" style="flex-shrink: 0">
@@ -1365,11 +1368,25 @@ onUnmounted(() => {
     padding: 4px 8px;
   }
 
+  .page-header {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .page-title {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
   .cert-toolbar {
     flex-shrink: 0;
     display: flex;
     align-items: center;
-    justify-content: flex-end;
   }
 
   .tabs-container {

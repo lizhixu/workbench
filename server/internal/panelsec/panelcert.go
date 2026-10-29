@@ -31,8 +31,8 @@ type IssueJob struct {
 	// Terminal mirrors the underlying manual order: when true the CA already
 	// reached a final verdict and the job must not be confirmed again — start
 	// a new issuance instead.
-	Terminal   bool             `json:"terminal,omitempty"`
-	CreatedAt  time.Time        `json:"created_at"`
+	Terminal  bool      `json:"terminal,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // PanelCertIssuer runs one-click panel certificate issuance and binds the

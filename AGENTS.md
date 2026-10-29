@@ -1765,6 +1765,22 @@ AI 助手页（`web/src/views/ai/AiChat.vue`，页面标题「AI 运维助手」
 4. **窄屏（≤768px）禁用拖拽**：把手 `display: none`，输入框回到固定 64px，并恢复输入区的 `padding-top` 与 `border-top` 分隔线。
 5. **只改外壳高度**：高度写在 NInput 根元素（`.fixed-chat-input`）上，`textarea` 用 `height: 100%` 撑满并保持 `resize: none`；不要再启用 naive 原生 resize 把手，否则右下角把手会与发送按钮重叠。输入区 `.input-row` 用 `align-items: flex-end` 让发送按钮贴底，不随输入框拉长变形。
 
+### 8.13 关闭 feedback 的表单必须显式补间距（2026-10-29）
+
+`NForm` 加 `:show-feedback="false"` 后，naive-ui 不再给 `.n-form-item` 任何 `margin-bottom`（实测为 `0px`），多个字段会紧贴在一起，只剩 `label` 自身高度做分隔。凡是使用紧凑表单的地方（如 CertDomain 的「上传已有证书」、开关区），必须在表单容器上加类名并显式补齐：
+
+```scss
+.upload-cert-form {
+  :deep(.n-form-item) { margin-bottom: 14px; }
+  :deep(.n-form-item:last-child) { margin-top: 2px; margin-bottom: 0; } // 末项是提交按钮
+  :deep(.n-form-item-label) { padding-bottom: 8px; }                    // label 与控件
+}
+```
+
+- 折叠面板内还需给 `.n-collapse-item__content-inner` 补 `padding: 16px 0 8px`，否则内容顶到标题、按钮贴折叠底边。
+- 参照口径：`label`→控件 8px、控件间 14px（加上 label 行高后视觉约 40px）、按钮上方 14px、面板底部 8px；不要在页面里逐个写 inline `style="margin-top"`。
+
+
 
 
 

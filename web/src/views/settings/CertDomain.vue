@@ -829,9 +829,9 @@ onUnmounted(stopJobPoll)
           </p>
 
           <!-- 上传已有证书 -->
-          <NCollapse style="margin-top: 8px">
+          <NCollapse class="upload-cert-collapse" style="margin-top: 8px">
             <NCollapseItem title="上传已有证书（其他渠道申请的证书，自动进入证书中心）" name="upload">
-              <NForm label-placement="top" :show-feedback="false">
+              <NForm class="upload-cert-form" label-placement="top" :show-feedback="false">
                 <NFormItem label="证书内容 (PEM)">
                   <NInput
                     v-model:value="customCert.cert_pem"
@@ -913,6 +913,30 @@ onUnmounted(stopJobPoll)
 
 .switch-item {
   margin-bottom: 12px;
+}
+
+/* 上传已有证书表单：NForm 关闭 feedback 后 naive 不再给 item 间距，
+   这里显式补齐 label 与控件、控件与下一项、按钮与控件之间的留白。 */
+.upload-cert-collapse {
+  :deep(.n-collapse-item__content-inner) {
+    padding: 16px 0 8px;
+  }
+}
+
+.upload-cert-form {
+  :deep(.n-form-item) {
+    margin-bottom: 14px;
+  }
+
+  /* 最后一项是提交按钮，与上方私钥框留出与其他项一致的间距 */
+  :deep(.n-form-item:last-child) {
+    margin-top: 2px;
+    margin-bottom: 0;
+  }
+
+  :deep(.n-form-item-label) {
+    padding-bottom: 8px;
+  }
 }
 
 .switch-label {

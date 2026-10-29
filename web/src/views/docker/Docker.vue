@@ -61,6 +61,9 @@ const images = ref<any[]>([])
 const logsContainer = ref('')
 const logsText = ref('')
 const pullImageName = ref('')
+// 大镜像拉取可耗时数分钟（服务端预算 5 分钟），按钮转圈让执行过程可见，
+// 也防止重复点击并发拉取。
+const pulling = ref(false)
 const dockerNotInstalled = ref(false)
 
 // 应用中心部署的容器带 watchman.app=<appID> 标签（Labels 在 docker ps
@@ -178,10 +181,10 @@ async function loadContainers() {
 }
 
 async function loadImages() {
-  // Images are already populated by loadAll; only re-fetch if missing.
-  if (images.value.length === 0) {
-    await loadAll()
-  }
+  // dockerAll 一次往返同时带回容器与镜像，没有单独的镜像列表接口；镜像操作
+  // （拉取/删除/清理）后与手动刷新都必须无条件重拉，此前仅当列表为空才刷新，
+  // 导致操作成功后页面停留在旧数据。
+  await loadAll()
 }
 
 async function doOp(op: string, container: string) {
@@ -261,6 +264,8 @@ async function pullImage() {
     message.warning('请输入镜像名称')
     return
   }
+  if (pulling.value) return
+  pulling.value = true
   try {
     await dockerOp(hostId, 'pull', '', pullImageName.value)
     message.success(`镜像 ${pullImageName.value} 拉取成功`)
@@ -268,6 +273,8 @@ async function pullImage() {
     await loadImages()
   } catch (e: any) {
     message.error(e.message)
+  } finally {
+    pulling.value = false
   }
 }
 
@@ -573,7 +580,12 @@ onMounted(() => {
                   size="small"
                   style="width: 200px"
                 />
-                <NButton size="small" type="primary" @click="pullImage">
+                <NButton
+                  size="small"
+                  type="primary"
+                  :loading="pulling"
+                  @click="pullImage"
+                >
                   <template #icon><NIcon :component="DownloadOutline" /></template>
                   拉取
                 </NButton>

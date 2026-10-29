@@ -319,8 +319,14 @@ export function dockerAll(hostId: string): Promise<{ containers: any[]; images: 
   ).then((r) => r.data || { containers: [], images: [] })
 }
 
+// dockerOp 的客户端超时必须长于服务端同操作预算（router.go dockerOpTimeout：
+// pull/run 5 分钟、其余 30 秒），否则大镜像拉取时浏览器先在 15s 默认超时处
+// 中断报错，而 Agent 侧仍在继续执行，列表也就等不到结果。
 export function dockerOp(hostId: string, op: string, container = '', image = '') {
-  return unwrap<any>(http.post(`/hosts/${hostId}/docker/${op}`, { container, image }))
+  const timeout = op === 'pull' || op === 'run' ? 320000 : 40000
+  return unwrap<any>(
+    http.post(`/hosts/${hostId}/docker/${op}`, { container, image }, { timeout }),
+  )
 }
 
 export function dockerGetMirrors(hostId: string) {

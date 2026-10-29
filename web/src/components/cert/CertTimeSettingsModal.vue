@@ -1,21 +1,16 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import {
-  NAlert, NButton, NCard, NForm, NFormItem, NIcon, NInputNumber,
-  NSpace, NSpin, useMessage,
+  NAlert, NButton, NForm, NFormItem, NInputNumber, NModal, NSpace, NSpin, useMessage,
 } from 'naive-ui'
-import { TimeOutline, RefreshOutline } from '@vicons/ionicons5'
-import {
-  SETTING_KEYS, getSystemSettings, saveSystemSettings,
-} from '../../api/settings'
+import { SETTING_KEYS, getSystemSettings, saveSystemSettings } from '../../api/settings'
 
-// 系统设置 → 证书时间设置（仅管理员可见）。
-// 自动续期提前天数：ACME 自动续期在到期前 N 天触发；
-// 手动证书到期提醒提前天数：手动签发 / 手动上传的证书不会自动续期，
-// 到期前 N 天经告警中心（builtin-cert-expiry）提醒一次。
-// 两者对短期证书都按有效期 1/3 自适应收紧（取较小者），修改即时生效，无需重启。
-// 后端见 server/internal/settings（certs.auto_renew_days / certs.expiry_reminder_days）。
-defineOptions({ name: 'CertSettings' })
+// 证书时间策略：自动续期提前天数 + 手动证书到期提醒提前天数。
+// 这两个值只影响证书生命周期，入口从「系统设置」收进证书中心，与列表、
+// 续期操作同屏；底层仍是系统级设置（certs.auto_renew_days /
+// certs.expiry_reminder_days），读写接口为管理员专用，入口仅对管理员展示。
+const props = defineProps<{ show: boolean }>()
+const emit = defineEmits<{ (e: 'update:show', value: boolean): void }>()
 
 const message = useMessage()
 const loading = ref(false)
@@ -56,6 +51,7 @@ async function save() {
   try {
     await saveSystemSettings(payload)
     message.success('证书时间设置已保存，即时生效')
+    emit('update:show', false)
   } catch (e: any) {
     message.error(e?.message || '保存失败')
     await load()
@@ -64,31 +60,30 @@ async function save() {
   }
 }
 
-load()
+// 每次打开都重新拉一次，避免显示上一次停留时的旧值。
+watch(
+  () => props.show,
+  (visible) => {
+    if (visible) load()
+  },
+)
 </script>
 
 <template>
-  <NCard :bordered="false" size="small">
-    <template #header>
-      <span style="font-size: 16px; font-weight: 700">
-        <NIcon style="vertical-align: middle; margin-right: 6px"><TimeOutline /></NIcon>
-        证书时间设置
-      </span>
-    </template>
-    <template #header-extra>
-      <NButton size="small" quaternary :loading="loading" @click="load">
-        <template #icon><NIcon><RefreshOutline /></NIcon></template>
-        重新加载
-      </NButton>
-    </template>
-
+  <NModal
+    :show="props.show"
+    preset="card"
+    title="证书时间设置"
+    style="width: 620px; max-width: 94vw"
+    @update:show="(v: boolean) => emit('update:show', v)"
+  >
+    <NAlert type="info" :bordered="false" style="margin-bottom: 16px">
+      控制自动续期与手动证书到期提醒的提前天数，保存后即时生效，无需重启服务。
+    </NAlert>
     <NSpin :show="loading">
-      <NAlert type="info" :bordered="false" style="margin-bottom: 16px">
-        控制自动续期与手动证书到期提醒的提前天数，保存后即时生效，无需重启服务。
-      </NAlert>
-      <NForm label-placement="left" label-width="220px">
+      <NForm label-placement="top">
         <NFormItem label="自动续期提前天数">
-          <NSpace vertical :size="4">
+          <NSpace vertical :size="4" style="width: 100%">
             <NInputNumber
               v-model:value="form.autoRenewDays"
               :min="1" :max="90" :step="1"
@@ -98,7 +93,7 @@ load()
           </NSpace>
         </NFormItem>
         <NFormItem label="手动证书到期提醒提前天数">
-          <NSpace vertical :size="4">
+          <NSpace vertical :size="4" style="width: 100%">
             <NInputNumber
               v-model:value="form.expiryReminderDays"
               :min="1" :max="90" :step="1"
@@ -107,10 +102,13 @@ load()
             <p class="muted tip-hint">手动签发 / 手动上传的证书不会自动续期，到期前 N 天经告警中心提醒一次（默认 30 天）。短期证书同样按 1/3 收紧；续期、替换或删除后提醒自动解除。</p>
           </NSpace>
         </NFormItem>
-        <NFormItem label=" ">
-          <NButton type="primary" :loading="saving" @click="save">保存</NButton>
-        </NFormItem>
       </NForm>
     </NSpin>
-  </NCard>
+    <template #footer>
+      <NSpace justify="end">
+        <NButton @click="emit('update:show', false)">取消</NButton>
+        <NButton type="primary" :loading="saving" :disabled="loading" @click="save">保存</NButton>
+      </NSpace>
+    </template>
+  </NModal>
 </template>

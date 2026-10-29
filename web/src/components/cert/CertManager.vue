@@ -10,7 +10,7 @@ import type { DataTableColumns } from 'naive-ui'
 import {
   AddCircleOutline, CloudUploadOutline, CopyOutline, CreateOutline,
   DownloadOutline, LockClosedOutline, RefreshOutline, ShieldCheckmarkOutline,
-  TrashOutline,
+  TimeOutline, TrashOutline,
 } from '@vicons/ionicons5'
 import {
   certDownloadUrl, createACMEAccount, deleteACMEAccount, deleteCert, getCertConfig,
@@ -23,11 +23,17 @@ import {
 import { useRouter } from 'vue-router'
 import { useTablePagination } from '../../composables/useTablePagination'
 import { fmtDate } from '../../utils/time'
+import { useAuthStore } from '../../stores/auth'
+import CertTimeSettingsModal from './CertTimeSettingsModal.vue'
 
 defineOptions({ name: 'CertManager' })
 
 const message = useMessage()
 const dialog = useDialog()
+const auth = useAuthStore()
+// 证书时间设置写的是系统级配置（/settings 仅管理员可读写），入口随之只给管理员。
+const isAdmin = computed(() => auth.role === 'admin')
+const showTimeSettings = ref(false)
 
 const activeMainTab = ref<'certs' | 'accounts'>('certs')
 
@@ -860,6 +866,12 @@ onUnmounted(() => {
             </template>
             dns-mng 集成{{ configReady ? ' (已配置)' : ' (未配置)' }}
           </NButton>
+          <NButton v-if="isAdmin" secondary @click="showTimeSettings = true">
+            <template #icon>
+              <NIcon><TimeOutline /></NIcon>
+            </template>
+            证书时间设置
+          </NButton>
           <NButton :loading="loadingCerts || loadingAccounts" @click="() => { loadAccounts(); loadCerts() }">
             <template #icon>
               <NIcon><RefreshOutline /></NIcon>
@@ -961,6 +973,9 @@ onUnmounted(() => {
         </NSpace>
       </template>
     </NModal>
+
+    <!-- 证书时间设置：自动续期 / 到期提醒的提前天数（系统级配置，管理员） -->
+    <CertTimeSettingsModal v-if="isAdmin" v-model:show="showTimeSettings" />
 
     <!-- 添加/编辑 ACME 机构账户弹窗 -->
     <NModal

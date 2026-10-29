@@ -19,6 +19,7 @@ import { listHosts, setHostGroup } from '../../api/hosts'
 import type { Host, UserRecord } from '../../api/types'
 import { useAuthStore } from '../../stores/auth'
 import { useTablePagination } from '../../composables/useTablePagination'
+import { fmtDateTime } from '../../utils/time'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'GroupList' })
@@ -76,10 +77,6 @@ function groupNameById(id?: string): string {
   return groups.value.find((g) => g.id === id)?.name ?? id
 }
 
-function fmtTime(s: string): string {
-  if (!s) return '-'
-  return s.slice(0, 19).replace('T', ' ')
-}
 
 const columns = computed<DataTableColumns<HostGroup>>(() => [
   { title: '分组名称', key: 'name', minWidth: 150, render: (g) => h('span', { class: 'group-name' }, g.name) },
@@ -97,7 +94,7 @@ const columns = computed<DataTableColumns<HostGroup>>(() => [
     width: 100,
     render: (g) => h(NTag, { size: 'small', bordered: false, type: g.user_count > 0 ? 'success' : 'default' }, { default: () => String(g.user_count) }),
   },
-  { title: '创建时间', key: 'created_at', width: 170, render: (g) => h('span', { class: 'muted' }, fmtTime(g.created_at)) },
+  { title: '创建时间', key: 'created_at', width: 170, render: (g) => h('span', { class: 'muted' }, fmtDateTime(g.created_at)) },
   {
     title: '操作',
     key: 'actions',
@@ -403,7 +400,7 @@ onMounted(() => {
                       @update:value="(v: GrantRole) => changeGrantRole(gr, v)"
                     />
                   </td>
-                  <td class="muted">{{ fmtTime(gr.granted_at) }}</td>
+                  <td class="muted">{{ fmtDateTime(gr.granted_at) }}</td>
                   <td>
                     <NPopconfirm @positive-click="removeGrant(gr)">
                       <template #trigger>

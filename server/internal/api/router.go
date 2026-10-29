@@ -1387,12 +1387,27 @@ func (h *handlers) getMetricsHistory(c *gin.Context) {
 	toStr := c.Query("to")
 	stepStr := c.Query("step")
 
+	// from/to 统一按 RFC3339 解析（与审计接口同口径）；同时兼容早期的
+	// Unix 秒写法，避免旧前端/脚本调用失效。
+	parseTimeParam := func(s string) (int64, bool) {
+		if s == "" {
+			return 0, false
+		}
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			return t.Unix(), true
+		}
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return v, true
+		}
+		return 0, false
+	}
+
 	var from, to int64
 	var step int
-	if v, err := strconv.ParseInt(fromStr, 10, 64); err == nil {
+	if v, ok := parseTimeParam(fromStr); ok {
 		from = v
 	}
-	if v, err := strconv.ParseInt(toStr, 10, 64); err == nil {
+	if v, ok := parseTimeParam(toStr); ok {
 		to = v
 	}
 	if v, err := strconv.Atoi(stepStr); err == nil {

@@ -9,6 +9,7 @@ import {
   CloseCircleOutline,
 } from '@vicons/ionicons5'
 import { useHostsStore } from '../../stores/hosts'
+import { fmtDateTime } from '../../utils/time'
 
 export interface MessageEvent {
   id: string
@@ -29,7 +30,7 @@ const events = computed<MessageEvent[]>(() => {
     id: h.id,
     title: `${h.status === 'online' ? '主机上线' : '主机离线'} - ${h.hostname}`,
     subtitle: h.group || '默认分组',
-    time: (h.last_seen || h.registered || '').slice(0, 19).replace('T', ' ') || '-',
+    time: fmtDateTime(h.last_seen || h.registered),
     type: (h.status === 'online' ? 'online' : 'offline') as 'online' | 'offline',
   }))
 })

@@ -201,7 +201,8 @@ export interface MetricsHistoryResponse {
   points: MetricPoint[]
 }
 
-export function getMetricsHistory(hostId: string, params: { from?: number; to?: number; step?: number } = {}) {
+// from / to 传 RFC3339（与审计接口一致）；服务端仍兼容旧的 Unix 秒写法。
+export function getMetricsHistory(hostId: string, params: { from?: string; to?: string; step?: number } = {}) {
   return unwrap<MetricsHistoryResponse>(http.get(`/hosts/${hostId}/metrics/history`, { params }))
 }
 

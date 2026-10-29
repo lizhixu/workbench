@@ -12,6 +12,7 @@ import type { Role, UserRecord } from '../../api/types'
 import { listUsers, createUser, updateUserRole, deleteUser, resetPassword } from '../../api/users'
 import { useAuthStore } from '../../stores/auth'
 import { useTablePagination } from '../../composables/useTablePagination'
+import { fmtDateTime } from '../../utils/time'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'UserList' })
@@ -85,7 +86,7 @@ const columns = computed<DataTableColumns<UserRecord>>(() => [
     title: '创建时间',
     key: 'created_at',
     width: 180,
-    render: (u) => h('span', { class: 'muted' }, u.created_at?.slice(0, 19).replace('T', ' ') || '-'),
+    render: (u) => h('span', { class: 'muted' }, fmtDateTime(u.created_at)),
   },
   {
     title: '操作',

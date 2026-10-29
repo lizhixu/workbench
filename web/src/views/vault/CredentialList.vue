@@ -16,6 +16,7 @@ import { listCredentials, createCredential, updateCredential, deleteCredential, 
 import { listHosts } from '../../api/hosts'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useTablePagination } from '../../composables/useTablePagination'
+import { fmtDateTime } from '../../utils/time'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'CredentialList' })
@@ -71,10 +72,6 @@ function typeMeta(t: string): { label: string; tagType: 'default' | 'info' | 'su
   }
 }
 
-function fmtTime(s: string): string {
-  if (!s) return '-'
-  return s.slice(0, 19).replace('T', ' ')
-}
 
 // 快速生成 20 位高强度随机密码
 function generateRandomPassword() {
@@ -202,7 +199,7 @@ const columns = computed<DataTableColumns<Credential>>(() => [
     title: '更新时间',
     key: 'updated_at',
     width: 170,
-    render: (c) => h('span', { class: 'time-cell' }, fmtTime(c.updated_at)),
+    render: (c) => h('span', { class: 'time-cell' }, fmtDateTime(c.updated_at)),
   },
   {
     title: '操作',
@@ -510,10 +507,10 @@ onMounted(refresh)
           </NSpace>
         </NDescriptionsItem>
         <NDescriptionsItem label="创建时间">
-          <span class="time-cell">{{ fmtTime(viewingCred.created_at) }}</span>
+          <span class="time-cell">{{ fmtDateTime(viewingCred.created_at) }}</span>
         </NDescriptionsItem>
         <NDescriptionsItem label="最后更新">
-          <span class="time-cell">{{ fmtTime(viewingCred.updated_at) }}</span>
+          <span class="time-cell">{{ fmtDateTime(viewingCred.updated_at) }}</span>
         </NDescriptionsItem>
         <NDescriptionsItem label="备注说明" :span="2">
           <span v-if="viewingCred.description">{{ viewingCred.description }}</span>

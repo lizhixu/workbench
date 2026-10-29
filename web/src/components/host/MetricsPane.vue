@@ -486,7 +486,11 @@ async function fetchHistoricalMetrics() {
       step = 900
     }
 
-    const res = await getMetricsHistory(props.hostId, { from, to: now, step })
+    const res = await getMetricsHistory(props.hostId, {
+      from: new Date(from * 1000).toISOString(),
+      to: new Date(now * 1000).toISOString(),
+      step,
+    })
     loading.value = false
     errorMsg.value = ''
 

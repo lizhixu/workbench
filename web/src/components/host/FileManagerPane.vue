@@ -54,6 +54,7 @@ import { useAuthStore } from '../../stores/auth'
 import { useSettingsStore } from '../../stores/settings'
 import { SETTING_KEYS } from '../../api/settings'
 import { useTablePagination } from '../../composables/useTablePagination'
+import { fmtDateTime } from '../../utils/time'
 
 const props = defineProps<{
   hostId: string
@@ -563,7 +564,7 @@ const columns: DataTableColumns<FileInfo> = [
     key: 'mod_time',
     width: 150,
     render(row) {
-      return row.mod_time?.slice(0, 19) || '-'
+      return fmtDateTime(row.mod_time)
     },
   },
   {

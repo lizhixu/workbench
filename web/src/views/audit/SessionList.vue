@@ -10,6 +10,7 @@ import {
 } from '@vicons/ionicons5'
 import { listSessions, deleteSession, sessionRecordingUrl } from '../../api/hosts'
 import type { SessionRecord } from '../../api/types'
+import { fmtDateTime } from '../../utils/time'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'SessionList' })
@@ -45,10 +46,6 @@ interface ReplayStats {
 }
 const replayStats = ref<ReplayStats | null>(null)
 
-function fmtTime(s: string): string {
-  if (!s) return '-'
-  return s.slice(0, 19).replace('T', ' ')
-}
 
 function fmtDuration(sec: number): string {
   if (sec === 0) return '0s'
@@ -74,8 +71,8 @@ const columns = [
         ? h(NTag, { type: 'success', size: 'small', round: true }, { default: () => '进行中' })
         : h(NTag, { type: 'default', size: 'small', round: true }, { default: () => '已结束' }),
   },
-  { title: '开始时间', key: 'started_at', width: 170, render: (row: SessionRecord) => fmtTime(row.started_at) },
-  { title: '结束时间', key: 'ended_at', width: 170, render: (row: SessionRecord) => fmtTime(row.ended_at) },
+  { title: '开始时间', key: 'started_at', width: 170, render: (row: SessionRecord) => fmtDateTime(row.started_at) },
+  { title: '结束时间', key: 'ended_at', width: 170, render: (row: SessionRecord) => fmtDateTime(row.ended_at) },
   { title: '时长', key: 'duration_sec', width: 80, render: (row: SessionRecord) => fmtDuration(row.duration_sec) },
   {
     title: '操作',
@@ -410,8 +407,8 @@ onBeforeUnmount(() => {
     <div class="replay-footer-meta" v-if="replaySession">
       <div class="meta-left">
         <span>操作账号: <code>{{ replaySession.operator }}</code></span>
-        <span>连接开始: {{ fmtTime(replaySession.started_at) }}</span>
-        <span v-if="replaySession.ended_at">连接结束: {{ fmtTime(replaySession.ended_at) }}</span>
+        <span>连接开始: {{ fmtDateTime(replaySession.started_at) }}</span>
+        <span v-if="replaySession.ended_at">连接结束: {{ fmtDateTime(replaySession.ended_at) }}</span>
       </div>
       <div class="meta-right" v-if="replayStats && replayStats.idleSec > 5 && skipIdle">
         <span class="skip-hint">

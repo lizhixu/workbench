@@ -9,6 +9,7 @@ import {
   NTabs,
   NTabPane,
   NTag,
+  NEllipsis,
   NPopconfirm,
   NInput,
   NIcon,
@@ -363,13 +364,16 @@ const containerColumns = [
   {
     title: '状态',
     key: 'Status',
-    width: 120,
+    width: 180,
     render: (row: any) => {
       const running = row.Status?.includes('Up') || row.State === 'running'
       return h(
         NTag,
-        { type: running ? 'success' : 'default', size: 'small', round: true },
-        { default: () => row.Status || row.State || '-' },
+        { type: running ? 'success' : 'default', size: 'small', round: true, class: 'container-status-tag' },
+        {
+          default: () =>
+            h(NEllipsis, { tooltip: true }, { default: () => row.Status || row.State || '-' }),
+        },
       )
     },
   },
@@ -548,7 +552,7 @@ onMounted(() => {
               :bordered="false"
               size="small"
               :loading="loading"
-              :scroll-x="700"
+              :scroll-x="900"
             >
               <template #empty>无容器或 Docker 未运行</template>
             </NDataTable>
@@ -761,6 +765,17 @@ onMounted(() => {
   :deep(.n-data-table) {
     flex: 1;
     min-height: 0;
+  }
+}
+
+/* 状态标签默认按内容撑开，长状态串（如 Up 13 hours (healthy)）会溢出
+   定宽列压住端口列，这里让它收缩到列宽内并由 NEllipsis 出省略号。 */
+:deep(.container-status-tag) {
+  max-width: 100%;
+
+  .n-tag__content {
+    min-width: 0;
+    overflow: hidden;
   }
 }
 

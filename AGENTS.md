@@ -1755,6 +1755,17 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 - **样式**：`v-html` 注入的节点没有 scoped 属性，容器样式必须用 `:deep()` 下发给 h4~h6 / ul / li / p / code / pre / a / blockquote / hr，参考 `SystemUpgrade.vue` 的 `.changelog-body`。
 - **AI 对话**（`AiChat.vue`）目前仍是组件内的简易实现（仅加粗、代码块、换行），行为未变；后续如需标题与列表，改为调用同一函数并传 `codeBlockClass` / `inlineCodeClass` 保持现有类名即可。
 
+### 8.12 AI 助手页输入框拖拽调整高度（2026-10-29）
+
+AI 助手页（`web/src/views/ai/AiChat.vue`，页面标题「AI 运维助手」）的对话输入框默认 64px 高，输入区顶部提供拖拽把手（`.chat-resize-handle`）：
+
+1. **方向与复位**：向上拖增高、向下拖回落；双击把手复位到 64px。把手带 `role="separator"`、`aria-orientation="horizontal"` 与 `aria-valuemin/valuemax/valuenow`，分隔线由把手自身绘制，输入区不再单独写 `border-top`。
+2. **必须有上下限**：下限 `MIN_INPUT_H = 64`；上限 = `.chat-body` 高度 − `INPUT_MIN_LIST_H(180)`，保证消息列表至少留 180px，不允许把对话区挤没。容器高度变化（窗口缩放、侧栏展开）由 `ResizeObserver` 监听，已拖高的输入框要自动收敛回上限内。
+3. **必须用指针捕获（`setPointerCapture`）收尾**：`pointermove/pointerup/pointercancel` 绑在把手自身而不是 `window`。否则鼠标拖出浏览器窗口后松开收不到 `pointerup`，监听残留会让后续鼠标移动继续改高度（表现为「输入框自己越拖越大」）。拖拽期间 `body` 临时 `cursor: row-resize` / `user-select: none`，结束与组件卸载时必须还原。
+4. **窄屏（≤768px）禁用拖拽**：把手 `display: none`，输入框回到固定 64px，并恢复输入区的 `padding-top` 与 `border-top` 分隔线。
+5. **只改外壳高度**：高度写在 NInput 根元素（`.fixed-chat-input`）上，`textarea` 用 `height: 100%` 撑满并保持 `resize: none`；不要再启用 naive 原生 resize 把手，否则右下角把手会与发送按钮重叠。输入区 `.input-row` 用 `align-items: flex-end` 让发送按钮贴底，不随输入框拉长变形。
+
+
 
 
 

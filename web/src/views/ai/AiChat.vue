@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, nextTick, onMounted } from 'vue'
+import { ref, nextTick, onBeforeUnmount, onMounted } from 'vue'
 import {
   NInput,
   NButton,
@@ -23,6 +23,78 @@ const inputText = ref('')
 const loading = ref(false)
 const conversations = ref<{ role: 'user' | 'assistant'; content: string }[]>([])
 const chatListRef = ref<HTMLElement | null>(null)
+const chatBodyRef = ref<HTMLElement | null>(null)
+
+// ---- 输入框高度拖拽 ----
+// 输入框默认单行高度；拖住上方把手向上拉可增高，消息列表相应让出空间。
+// 下限 MIN_INPUT_H，上限保证消息列表至少留 INPUT_MIN_LIST_H，避免拖到把对话区挤没。
+const MIN_INPUT_H = 64
+const INPUT_MIN_LIST_H = 180
+const inputH = ref(MIN_INPUT_H)
+const resizingInput = ref(false)
+
+function maxInputHeight(): number {
+  const bodyH = chatBodyRef.value?.clientHeight ?? 0
+  return Math.max(bodyH - INPUT_MIN_LIST_H, MIN_INPUT_H)
+}
+
+function startInputResize(e: PointerEvent) {
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  // 窄屏下输入区固定高度，不参与拖拽（把手也被 CSS 隐藏）。
+  if (window.innerWidth <= 768) return
+  const handle = e.currentTarget as HTMLElement
+  const startY = e.clientY
+  const startH = inputH.value
+  const maxH = maxInputHeight()
+  // 拖动前列表若停在底部，拖动后继续保持贴底，避免压缩后看不到最新消息。
+  const listEl = chatListRef.value
+  const stickBottom = listEl
+    ? listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 8
+    : false
+
+  // 必须做指针捕获：鼠标拖出窗口后直接松开时仍能收到 pointerup，
+  // 否则监听残留会让之后的鼠标移动继续改高度（表现为「对话框自己越拖越大」）。
+  try {
+    handle.setPointerCapture(e.pointerId)
+  } catch {
+    /* 部分浏览器对合成事件不支持捕获，退化为普通监听 */
+  }
+  resizingInput.value = true
+  document.body.style.cursor = 'row-resize'
+  document.body.style.userSelect = 'none'
+
+  const onMove = (ev: PointerEvent) => {
+    // 向上拖（clientY 变小）增高，向下拖还原。
+    const next = startH + (startY - ev.clientY)
+    inputH.value = Math.min(Math.max(next, MIN_INPUT_H), maxH)
+  }
+  const onEnd = (ev: PointerEvent) => {
+    try {
+      handle.releasePointerCapture(ev.pointerId)
+    } catch {
+      /* 捕获已被浏览器释放 */
+    }
+    handle.removeEventListener('pointermove', onMove)
+    handle.removeEventListener('pointerup', onEnd)
+    handle.removeEventListener('pointercancel', onEnd)
+    resizingInput.value = false
+    document.body.style.cursor = ''
+    document.body.style.userSelect = ''
+    if (stickBottom) void scrollToBottom()
+  }
+
+  handle.addEventListener('pointermove', onMove)
+  handle.addEventListener('pointerup', onEnd)
+  handle.addEventListener('pointercancel', onEnd)
+}
+
+// 双击把手恢复单行高度（拖大后想快速复位）。
+function resetInputHeight() {
+  inputH.value = MIN_INPUT_H
+}
+
+// 窗口/容器变矮时把已拖高的输入框收敛回可用范围，避免撑破布局。
+let bodyObserver: ResizeObserver | null = null
 
 const suggestedQuestions = [
   '哪台机器磁盘快满了？',
@@ -102,6 +174,26 @@ onMounted(() => {
     path: '/ai/chat',
     closable: true,
   })
+
+  // 容器高度变化时（窗口缩放、侧栏展开）收敛输入框高度。
+  if (chatBodyRef.value) {
+    bodyObserver = new ResizeObserver(() => {
+      // KeepAlive 切走时容器高度会变成 0，此时不能拿它当上限，否则
+      // 用户拖高的输入框会被重置（违反 §8.4 页签状态不丢）。
+      const bodyH = chatBodyRef.value?.clientHeight ?? 0
+      if (bodyH === 0) return
+      const max = maxInputHeight()
+      if (inputH.value > max) inputH.value = max
+    })
+    bodyObserver.observe(chatBodyRef.value)
+  }
+})
+
+onBeforeUnmount(() => {
+  bodyObserver?.disconnect()
+  bodyObserver = null
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
 })
 </script>
 
@@ -111,7 +203,7 @@ onMounted(() => {
       <h2 class="page-title">AI 运维助手</h2>
     </div>
 
-    <div class="chat-body">
+    <div ref="chatBodyRef" class="chat-body">
       <!-- Conversation list -->
       <div ref="chatListRef" class="chat-list">
         <NEmpty v-if="conversations.length === 0" description="开始提问吧" class="chat-empty">
@@ -166,6 +258,20 @@ onMounted(() => {
 
       <!-- Input area -->
       <div class="chat-input-area">
+        <div
+          class="chat-resize-handle"
+          :class="{ active: resizingInput }"
+          role="separator"
+          aria-orientation="horizontal"
+          :aria-valuemin="MIN_INPUT_H"
+          :aria-valuemax="maxInputHeight()"
+          :aria-valuenow="Math.round(inputH)"
+          title="上下拖拽调整输入框高度，双击恢复"
+          @pointerdown.prevent="startInputResize"
+          @dblclick="resetInputHeight"
+        >
+          <span class="grip" />
+        </div>
         <div class="input-row">
           <NInput
             v-model:value="inputText"
@@ -173,6 +279,7 @@ onMounted(() => {
             :rows="2"
             placeholder="输入你的运维问题，例如：哪台机器磁盘快满了？最近有哪些异常告警？（Shift+Enter 换行，Enter 发送）"
             class="fixed-chat-input"
+            :style="{ height: `${inputH}px` }"
             @keydown.enter.exact.prevent="send()"
           />
           <NButton
@@ -359,19 +466,60 @@ onMounted(() => {
 
   .chat-input-area {
     flex-shrink: 0;
-    padding: 10px 0 2px;
-    border-top: 1px solid var(--border-color);
+    padding: 0 0 2px;
+
+    /* 输入框上方的拖拽把手：向上拖增高，双击复位。分隔线由把手绘制，
+       避免与 input-area 的 border-top 叠成双线。 */
+    .chat-resize-handle {
+      position: relative;
+      flex-shrink: 0;
+      height: 12px;
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: row-resize;
+      touch-action: none;
+      user-select: none;
+
+      &::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 1px;
+        background: var(--border-color);
+      }
+
+      .grip {
+        width: 36px;
+        height: 3px;
+        border-radius: 2px;
+        background: var(--border-color);
+        transition: background-color 0.15s;
+      }
+
+      &:hover .grip,
+      &.active .grip {
+        background: rgba(99, 102, 241, 0.6);
+      }
+    }
 
     .input-row {
       display: flex;
-      align-items: stretch;
+      align-items: flex-end;
       gap: 10px;
       width: 100%;
 
       .fixed-chat-input {
         flex: 1;
         min-width: 0;
-        height: 64px;
+        min-height: 64px;
+
+        :deep(.n-input__textarea) {
+          height: 100%;
+        }
 
         :deep(.n-input-wrapper) {
           height: 100%;
@@ -414,6 +562,14 @@ onMounted(() => {
     }
 
     .chat-input-area {
+      /* 窄屏不提供拖拽把手，恢复原来的分隔线与内边距 */
+      padding-top: 10px;
+      border-top: 1px solid var(--border-color);
+
+      .chat-resize-handle {
+        display: none;
+      }
+
       :deep(.n-input-group) {
         flex-wrap: wrap;
       }

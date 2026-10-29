@@ -167,3 +167,26 @@ func TestManifestSubmitURL(t *testing.T) {
 		t.Fatalf("org submit url = %q", got)
 	}
 }
+
+func TestDefaultAppNameFormatAndUniqueness(t *testing.T) {
+	seen := make(map[string]bool, 200)
+	for i := 0; i < 200; i++ {
+		name, err := DefaultAppName()
+		if err != nil {
+			t.Fatal(err)
+		}
+		parts := strings.SplitN(name, "-", 2)
+		if len(parts) != 2 || parts[0] != "watchman" || len(parts[1]) != 8 {
+			t.Fatalf("unexpected generated name %q", name)
+		}
+		for _, r := range parts[1] {
+			if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+				t.Fatalf("suffix is not lowercase hex: %q", name)
+			}
+		}
+		if seen[name] {
+			t.Fatalf("duplicate generated name %q", name)
+		}
+		seen[name] = true
+	}
+}

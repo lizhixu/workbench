@@ -106,7 +106,7 @@
   - `raw_compose`：在线编写 Docker Compose YAML 编排微服务栈。
   - `git`：链接 Git 仓库（GitHub 授权选择或手动 URL），Dockerfile / Compose 构建，支持推送自动部署（Webhook；GitHub App 路径见下条）。
 - **GitHub App 自动部署（github.com 主推路径，逐仓 Webhook 降级为备选）**：
-  - **一次安装覆盖全部/部分仓库**：面板「系统设置 → 代码源集成」新建 GitHub App（Manifest 两步流：填名称 + 目标（个人/组织）→ 跳 GitHub 创建 → 回调换 code（1 小时内，state 防 CSRF，state 嵌在 redirect_url 的 `github_app_state` 参数里带回——submit URL 的 query GitHub 不保证透传）→ 配置落盘；或手动填已有 App 的 App ID/私钥/Webhook Secret）→ 到 GitHub 安装页选账号/组织与仓库范围 → 面板「同步安装」拉取安装与仓库清单。
+  - **一次安装覆盖全部/部分仓库**：面板「系统设置 → 代码源集成」新建 GitHub App（Manifest 两步流：填名称 + 目标（个人/组织）→ 跳 GitHub 创建 → 回调换 code（1 小时内，state 防 CSRF，state 嵌在 redirect_url 的 `github_app_state` 参数里带回——submit URL 的 query GitHub 不保证透传）→ 配置落盘；或手动填已有 App 的 App ID/私钥/Webhook Secret）→ 到 GitHub 安装页选账号/组织与仓库范围 → 面板「同步安装」拉取安装与仓库清单。**名称可留空**：GitHub App 名称在 GitHub 全站唯一，手填常用名极易被占用，留空时服务端生成 `watchman-<8 位小写 hex>`（`DefaultAppName`）并随 manifest 一起提交，响应 `name` 字段回传实际取值、前端回填输入框以便重试；填了名称则原样使用。
   - **事件入口**：公开端点 `POST /api/v1/github-app/webhook`（HMAC-SHA256 验签、恒时比较、`X-GitHub-Delivery` 去重、body 4MB 上限；未配置 503；ping 200；仅 `refs/heads/` 分支推送触发，tag 推送跳过；push 按 `repository.full_name` 归一化匹配应用，分支匹配 + auto_deploy 门 + 在途 409，复用 `StartDeployment`，`trigger=github-app`；`installation`/`installation_repositories` 事件同步安装状态与仓库清单，卸载则相关应用降级提示；安装事件的仓库清单刷新走异步，upsert 本身同步落盘，持久化失败返回 5xx 供 GitHub 重投）。安全入口开启时该端点仍可达（secentry 豁免）。
   - **部署取数优先级**：应用 vault 凭据 > installation token（现取现用、内存缓存 1h、过期前 5 分钟刷新；仓库不在安装范围时全量刷新后重试）> 现有 provider token。**刷新合并语义**：部分安装刷新失败时保留其旧缓存（只丢 GitHub 侧已不存在的安装），失败数如实返回调用方；配置变更/断开时清空内存 token 缓存。
   - **凭据存储**：App ID/私钥/Webhook Secret 存 `github_app.json`（dataDir、0600、tmp+rename 原子写、API 永不回显），**不用 Vault**——Vault 是用户自管凭据的 UI，程序性塞入系统私钥反而会暴露在 Vault 界面；与 `git_provider.json` 同款先例。
@@ -909,7 +909,7 @@ POST   /api/v1/apps/:id/github-app/switch # 切换到 GitHub App 触发（非 gi
 GET    /api/v1/github-app/status
 GET    /api/v1/github-app/installations/repos
 GET    /api/v1/github-app/repos/:owner/:repo/branches
-POST   /api/v1/github-app/manifest        # 生成 Manifest（state 内存 15 分钟过期）
+POST   /api/v1/github-app/manifest        # 生成 Manifest（name 可空 → 自动生成唯一名；state 内存 15 分钟过期）
 POST   /api/v1/github-app/manifest/exchange # 验 state 后换 code 落盘（私钥可用性校验）
 POST   /api/v1/github-app/config          # 手动填写 App ID/私钥/Webhook Secret（私钥可用性校验）
 POST   /api/v1/github-app/installations/sync # 同步安装与仓库清单

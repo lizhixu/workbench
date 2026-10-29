@@ -89,6 +89,8 @@ export interface GitHubAppInstalledRepo {
 
 export interface GitHubAppManifest {
   manifest: Record<string, unknown>
+  /** 实际用于 manifest 的名称：请求未填时由服务端生成唯一值。 */
+  name: string
   state: string
   submit_url: string
   panel_url: string

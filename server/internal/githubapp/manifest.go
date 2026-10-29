@@ -2,6 +2,7 @@ package githubapp
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -42,6 +43,19 @@ func BuildManifest(panelURL, appName, state string) map[string]any {
 		},
 		"default_events": []string{"push"},
 	}
+}
+
+// DefaultAppName generates a name for the manifest flow when the operator
+// leaves the field empty. GitHub App names are unique across all of GitHub
+// (not just the current account), so a random suffix is what makes the
+// generated value usable without a round-trip to check availability; the
+// manifest form still shows it as an editable value before submission.
+func DefaultAppName() (string, error) {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "watchman-" + hex.EncodeToString(b), nil
 }
 
 // ManifestSubmitURL returns the GitHub page the manifest form posts to.

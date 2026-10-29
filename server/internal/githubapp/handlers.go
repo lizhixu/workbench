@@ -174,8 +174,14 @@ func (h *Handlers) createManifest(c *gin.Context) {
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请填写 GitHub App 名称（全局唯一）"})
-		return
+		// 名称留空时生成一个带随机后缀的默认值：GitHub App 名称全站唯一，
+		// 纯固定名（如 watchman）大概率已被占用，随机后缀才能一次建成。
+		name, err := DefaultAppName()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "生成 App 名称失败"})
+			return
+		}
+		req.Name = name
 	}
 	if req.Target == "organization" && strings.TrimSpace(req.Org) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "组织目标需要填写组织名"})
@@ -207,6 +213,7 @@ func (h *Handlers) createManifest(c *gin.Context) {
 	h.mu.Unlock()
 	c.JSON(http.StatusOK, gin.H{
 		"manifest":              BuildManifest(base, req.Name, state),
+		"name":                  req.Name,
 		"state":                 state,
 		"submit_url":            ManifestSubmitURL(req.Target, strings.TrimSpace(req.Org)),
 		"panel_url":             base,

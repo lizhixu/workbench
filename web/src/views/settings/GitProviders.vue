@@ -124,10 +124,6 @@ async function loadAppStatus() {
 }
 
 async function doCreateApp() {
-  if (!appNameInput.value.trim()) {
-    message.warning('请填写 GitHub App 名称（全局唯一）')
-    return
-  }
   if (appTarget.value === 'organization' && !appOrgInput.value.trim()) {
     message.warning('组织目标需要填写组织名')
     return
@@ -142,6 +138,9 @@ async function doCreateApp() {
     if (!res.public_url_configured) {
       message.warning('面板公网地址未配置，事件地址将使用本次请求地址，GitHub 可能无法访问，请先到系统设置配置 server.public_url')
     }
+    // 名称留空时服务端生成唯一值：回填输入框，万一 GitHub 创建页没打开
+    // （弹窗拦截/网络异常），用户能看到实际用了什么名字再重试。
+    appNameInput.value = res.name
     // GitHub Manifest 流程要求浏览器以表单 POST 提交 manifest，换 code 回调。
     const form = document.createElement('form')
     form.method = 'POST'
@@ -381,7 +380,7 @@ onMounted(() => {
           <NSpace align="center">
             <NInput
               v-model:value="appNameInput"
-              placeholder="GitHub App 名称，如 Watchman-App（全局唯一）"
+              placeholder="GitHub App 名称（留空自动生成）"
               style="width: 320px"
             />
             <NSelect
@@ -404,7 +403,7 @@ onMounted(() => {
             <NButton secondary @click="showAppManualModal = true">手动填写已有 App</NButton>
           </NSpace>
           <p class="muted tip-hint" style="font-size: 12px">
-            点「创建」会跳到 GitHub 建 App（权限只要内容只读与元数据只读、只订阅 push 事件），建好自动跳回面板完成配置；第二步再点「安装到账号或组织」选仓库范围。老的手动逐仓 Webhook 方式仍可继续用。
+            名称留空会自动生成一个全局唯一的名字（<code>watchman-随机后缀</code>）——GitHub App 名称在全站唯一，手填的常用名很可能已被占用。点「创建」会跳到 GitHub 建 App（权限只要内容只读与元数据只读、只订阅 push 事件），建好自动跳回面板完成配置；第二步再点「安装到账号或组织」选仓库范围。老的手动逐仓 Webhook 方式仍可继续用。
           </p>
         </NSpace>
       </template>

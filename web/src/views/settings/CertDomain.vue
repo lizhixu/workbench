@@ -124,25 +124,38 @@ async function detectIP() {
   }
 }
 
-const standardPortErrors = computed(() =>
-  (certStatus.value?.standard_ports || [])
-    .filter((p) => !p.listening && p.error)
-    .map((p) => `:${p.port} ${p.error}`)
-    .join('；'),
+const failedPorts = computed(() =>
+  (certStatus.value?.standard_ports || []).filter((p) => !p.listening),
 )
 
-// 标准端口监听失败时的可用入口：:443 不在监听时，服务端会自动跳过强制 HTTPS
-// 跳转，避免把浏览器 301 到一个打不开的地址；此时 :80 仍可正常打开面板。
-const standardPortHint = computed(() => {
+// 当前可用的免端口入口：优先 HTTPS，其次 HTTP；都不可用时为空（主端口回退）。
+const activeEntryURL = computed(() => {
+  const domain = (certStatus.value?.panel_domain || '').trim()
+  if (!domain) return ''
   const ports = certStatus.value?.standard_ports || []
-  if (!ports.some((p) => !p.listening)) return ''
-  const https = ports.find((p) => p.port === 443)
-  if (https?.listening) return '面板仍可通过 https://域名 访问'
-  return '强制 HTTPS 跳转已自动跳过，面板仍可通过 http://域名 访问'
+  if (certStatus.value?.ssl_enabled && ports.some((p) => p.port === 443 && p.listening)) {
+    return `https://${domain}`
+  }
+  if (ports.some((p) => p.port === 80 && p.listening)) return `http://${domain}`
+  return ''
+})
+
+// 标准端口监听失败时的可用入口：:443 不在监听时服务端会自动跳过强制 HTTPS
+// 跳转，避免把浏览器 301 到一个打不开的地址。
+const availableEntryHint = computed(() => {
+  const domain = (certStatus.value?.panel_domain || '').trim()
+  if (!domain || !failedPorts.value.length) return ''
+  if (activeEntryURL.value) {
+    const hint = `面板仍可通过 ${activeEntryURL.value} 访问`
+    return certStatus.value?.ssl_enabled && activeEntryURL.value.startsWith('http://')
+      ? `${hint}（:443 不可用，强制 HTTPS 跳转已自动跳过）`
+      : hint
+  }
+  return `免端口入口暂不可用，面板回退到 ${fallbackURL(domain)}`
 })
 
 // 绑定域名后标准端口（:80，面板 SSL 开启时含 :443）的免端口访问地址；
-// 主监听端口作为无法免端口访问时的回退。
+// 主监听端口仅在标准端口不可用时作为回退（标准端口一旦监听，主端口对远程关闭）。
 function portlessURL(domain: string, scheme: 'http' | 'https' = 'http'): string {
   return `${scheme}://${domain}`
 }
@@ -153,6 +166,15 @@ function fallbackURL(domain: string, scheme: 'http' | 'https' = 'http'): string 
     return `${scheme}://${domain}`
   }
   return `${scheme}://${domain}:${port}`
+}
+
+// 关闭 HTTPS 后要引导到的地址：域名仍绑定且 :80 在监听时优先免端口地址，
+// 否则回落到「域名 + 主端口」（标准端口不可用时主端口才是合法回退）。
+function preferredPanelURL(): string {
+  const domain = (certStatus.value?.panel_domain || '').trim()
+  const port80 = (certStatus.value?.standard_ports || []).some((p) => p.port === 80 && p.listening)
+  if (domain && port80) return portlessURL(domain)
+  return fallbackURL(window.location.hostname)
 }
 
 // 绑定/解绑后当前地址立即失效（严格域名限制，旧地址的接口请求会被 403，
@@ -170,7 +192,7 @@ function showMoveDialog(domain: string, opts: { title: string; sslReset?: boolea
       h(
         'p',
         { style: 'margin-top:6px;font-size:12px;color:var(--text-secondary)' },
-        `若该地址无法打开（:80 可能被其他服务占用），可临时使用 ${fallback}`,
+        `若该地址无法打开（:80/:443 被其他服务占用或防火墙未放行），可在服务器本机用 ${fallback} 访问（回环地址始终放行），或执行「域名防失联与紧急恢复」中的解绑命令恢复 IP 访问。`,
       ),
     )
   }
@@ -312,7 +334,7 @@ async function setSSLEnabled(v: boolean) {
         try {
           await saveSystemSettings({ [SETTING_KEYS.panelSSLEnabled]: v })
           message.success('已关闭面板 HTTPS')
-          const target = fallbackURL(window.location.hostname)
+          const target = preferredPanelURL()
           dialog.info({
             title: 'HTTPS 已关闭，请切换访问地址',
             content: () =>
@@ -542,21 +564,23 @@ onUnmounted(stopJobPoll)
               :type="p.listening ? 'success' : 'warning'"
               :title="p.error || ''"
             >
-              :{{ p.port }} {{ p.listening ? '已监听（免端口）' : '未监听' }}
+              :{{ p.port }} {{ p.listening ? '已监听' : '监听失败' }}
             </NTag>
             <NButton size="small" type="error" ghost @click="unbindDomain">解绑</NButton>
-            <span class="muted">
-              面板只能通过该域名访问，直接使用 IP 访问将被拦截（回环地址除外）。绑定后自动在
-              <code>:80</code>{{ certStatus.ssl_enabled ? '（HTTPS 开启时含 :443）' : '' }}
-              提供免端口访问，可用 <code>{{ portlessURL(certStatus.panel_domain) }}</code> 直接打开；端口被其他服务（如应用反代容器）占用时会监听失败，释放后自动恢复。<br />
-              注意：绑定后「系统升级」中批量升级 Agent 时，安装包下载地址将使用该域名，请确保 Agent 所在主机能解析该域名；纯内网环境可在服务端启动参数加 <code>-public-url http://&lt;内网IP&gt;:18789</code> 覆盖为 IP 地址。
-            </span>
-            <span v-if="standardPortErrors" class="muted port-error">{{ standardPortErrors }}</span>
-            <NAlert v-if="standardPortErrors" type="warning" :show-icon="true" class="port-alert">
+
+            <NAlert v-if="failedPorts.length" type="warning" :show-icon="true" class="port-alert">
               <template #header>标准端口监听失败</template>
-              {{ standardPortErrors }}。{{ standardPortHint }}；端口释放后 30 秒内自动恢复监听。
-              若 :443 一直被占用，强制 HTTPS 会保持跳过（否则会把浏览器跳到打不开的地址）。
+              <div v-for="p in failedPorts" :key="p.port">
+                <code>:{{ p.port }}</code> {{ p.error }}
+              </div>
+              <div v-if="availableEntryHint" class="port-error-hint">{{ availableEntryHint }}。</div>
             </NAlert>
+
+            <p class="muted tip-hint bound-tip">
+              面板仅可通过该域名访问：IP / 其他域名返回 403，「域名 + 主端口」在免端口入口可用时自动跳转。
+              <template v-if="activeEntryURL">免端口入口：<code>{{ activeEntryURL }}</code>。</template>
+              批量升级 Agent 的安装包地址使用该域名，内网环境请确保能解析或配置 <code>-public-url</code>。
+            </p>
           </div>
           <NForm v-else label-placement="top" :show-feedback="false">
             <NFormItem label="绑定域名后，面板只能通过该域名访问">
@@ -572,19 +596,15 @@ onUnmounted(stopJobPoll)
             </NFormItem>
           </NForm>
           <p class="muted tip-hint" style="margin: 8px 0 0">
-            绑定后自动启用严格域名限制：任何通过服务器 IP 或其他域名发起的面板请求将被 403 拦截；
-            Agent 注册与数据接口不受影响。绑定后自动在 :80 提供免端口访问（HTTPS 开启时另含 :443），
-            无需在地址后带面板端口；不绑定则保持通过 IP 访问。<br />
-            注意：更换域名会自动清除原证书绑定并关闭面板 SSL 与强制 HTTPS，避免旧证书与新域名不匹配导致无法访问；
-            绑定后「系统升级」中批量升级 Agent 时，安装包下载地址将使用该域名，请确保 Agent 所在主机能解析该域名；
-            纯内网环境可在服务端启动参数加 <code>-public-url http://&lt;内网IP&gt;:18789</code> 覆盖为 IP 地址。
+            绑定后只能通过该域名访问（IP / 其他域名返回 403），自动在 :80（HTTPS 开启时含 :443）提供免端口访问；
+            更换域名会解除原证书绑定并关闭 HTTPS。Agent 注册与数据接口不受影响。
           </p>
 
           <NAlert type="warning" :show-icon="true" class="emergency-alert">
-            <template #header>域名防失联与紧急恢复</template>
-            若绑定域名后无法访问面板（如 DNS 未生效），可在服务器终端执行：
+            <template #header>无法访问面板？</template>
+            在服务器终端执行
             <code>watchman-server -reset-panel-domain -data /opt/watchman/data</code>
-            立即解绑域名、恢复 IP 访问（同时关闭面板 SSL 与强制 HTTPS，清除证书绑定）。执行后需重启 watchman-server 服务生效。
+            解绑域名并恢复 IP 访问（同时关闭面板 SSL），重启 watchman-server 后生效。
           </NAlert>
         </div>
 
@@ -643,8 +663,7 @@ onUnmounted(stopJobPoll)
           <!-- 一键签发 -->
           <div class="issue-block">
             <NAlert type="info" :show-icon="true" size="small" style="margin-bottom: 12px">
-              签发使用「证书中心」的默认 ACME 账户；账户联系邮箱为选填，留空则不向 CA 提交。
-              如签发报错 invalidContact，请到「证书中心」检查账户邮箱是否为有效公网域名邮箱。
+              使用证书中心的默认 ACME 账户签发；报错 invalidContact 时请检查该账户邮箱是否为有效公网域名邮箱。
             </NAlert>
             <template v-if="certStatus?.panel_domain">
               <NSpace align="center" style="width: 100%">
@@ -666,9 +685,8 @@ onUnmounted(stopJobPoll)
                 </NRadioGroup>
               </NSpace>
               <p class="muted tip-hint" style="margin: 8px 0 0">
-                通过证书中心 ACME 为 {{ certStatus.panel_domain }} 签发证书，成功后自动绑定并启用 HTTPS。
-                自动：优先 HTTP-01（需 80 端口可被 CA 访问），失败时回退 DNS-01；选择 DNS-01 需先在「证书中心」配置并启用 dns-mng；
-                选择「手动解析」则由您到 DNS 服务商手动添加 TXT 记录，无需 dns-mng。
+                为 {{ certStatus.panel_domain }} 签发证书，成功后自动绑定并启用 HTTPS。自动模式优先 HTTP-01
+                （需 :80 可被 CA 访问），失败回退 DNS-01（需在证书中心启用 dns-mng）；「手动解析」由您自行添加 TXT 记录。
               </p>
             </template>
             <template v-else>
@@ -691,8 +709,8 @@ onUnmounted(stopJobPoll)
                 <NButton text size="small" @click="detectIP" :loading="ipDetecting">重新检测 IP</NButton>
               </NSpace>
               <p class="muted tip-hint" style="margin: 8px 0 0">
-                为公网 IP 签发 Let's Encrypt 免费证书（HTTP-01 验证，签发期间需临时开放 80 端口），
-                成功后自动绑定并启用 HTTPS。证书有效期较短，系统会自动续期。
+                为公网 IP 签发免费证书（HTTP-01 验证，签发期间需临时开放 :80），成功后自动绑定并启用 HTTPS；
+                证书有效期较短，系统自动续期。
               </p>
             </template>
 
@@ -807,7 +825,7 @@ onUnmounted(stopJobPoll)
             </NFormItem>
           </NForm>
           <p class="muted tip-hint" style="margin: 8px 0 0; font-size: 12px">
-            启用 HTTPS 后面板会在 :443 同步提供 HTTPS 免端口访问（需已绑定域名）；端口被占用时会监听失败并在上方显示原因。
+            启用 HTTPS 后同时在 :443 提供免端口 HTTPS（需已绑定域名）；端口被占用时上方会显示占用进程。
           </p>
 
           <!-- 上传已有证书 -->
@@ -840,10 +858,10 @@ onUnmounted(stopJobPoll)
           </NCollapse>
 
           <NAlert type="warning" :show-icon="true" class="emergency-alert">
-            <template #header>SSL 异常与紧急恢复</template>
-            若证书配置错误导致 HTTPS 无法访问，可在服务器终端执行：
+            <template #header>HTTPS 无法访问？</template>
+            在服务器终端执行
             <code>watchman-server -reset-panel-ssl -data /opt/watchman/data</code>
-            立即关闭面板 SSL，恢复 HTTP 访问。执行后需重启 watchman-server 服务生效。
+            关闭面板 SSL 并恢复 HTTP 访问，重启 watchman-server 后生效。
           </NAlert>
         </div>
       </NSpace>
@@ -873,14 +891,23 @@ onUnmounted(stopJobPoll)
   flex-wrap: wrap;
   margin-bottom: 4px;
 
-  .port-error {
-    color: #d03050;
-    font-size: 12px;
-  }
-
   .port-alert {
     width: 100%;
     margin-top: 4px;
+
+    code {
+      margin-right: 4px;
+    }
+  }
+
+  .port-error-hint {
+    margin-top: 6px;
+    font-size: 12px;
+  }
+
+  .bound-tip {
+    width: 100%;
+    margin: 0;
   }
 }
 

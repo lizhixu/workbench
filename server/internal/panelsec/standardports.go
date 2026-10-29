@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -37,9 +36,10 @@ type StandardPorts struct {
 	log       *slog.Logger
 	skip      map[int]bool
 
-	mu      sync.Mutex
-	servers map[int]*http.Server
-	errs    map[int]string
+	mu       sync.Mutex
+	servers  map[int]*http.Server
+	errs     map[int]string
+	baseErrs map[int]string
 }
 
 // NewStandardPorts builds a reconciler. mainAddr is the panel's primary listen
@@ -63,6 +63,7 @@ func NewStandardPorts(st *settings.Store, handler http.Handler, tlsConfig *tls.C
 		skip:      skip,
 		servers:   map[int]*http.Server{},
 		errs:      map[int]string{},
+		baseErrs:  map[int]string{},
 	}
 }
 
@@ -98,6 +99,7 @@ func (p *StandardPorts) Reconcile() {
 		}
 		delete(p.servers, port)
 		delete(p.errs, port)
+		delete(p.baseErrs, port)
 		// Drain rather than hard-close: the settings write that disabled SSL
 		// may be in flight on this very listener (unbind / SSL off), and its
 		// response must still reach the browser that triggered it.
@@ -114,15 +116,22 @@ func (p *StandardPorts) Reconcile() {
 		}
 		srv, err := p.startLocked(port)
 		if err != nil {
-			msg := standardPortError(port, err)
-			if p.errs[port] != msg {
-				p.errs[port] = msg
+			base := standardPortError(err)
+			if p.baseErrs[port] != base {
+				p.baseErrs[port] = base
+				p.errs[port] = base
 				p.log.Warn("panel standard port listener failed", "port", port, "err", err)
+			}
+			if isAddrInUse(err) {
+				// Name the process holding the port; detection shells out, so
+				// it must not run while the reconciler lock is held.
+				go p.enrichPortError(port, base)
 			}
 			continue
 		}
 		p.servers[port] = srv
 		delete(p.errs, port)
+		delete(p.baseErrs, port)
 		p.log.Info("panel standard port listener started", "port", port)
 	}
 }
@@ -146,34 +155,67 @@ func (p *StandardPorts) startLocked(port int) (*http.Server, error) {
 		if err == nil || errors.Is(err, http.ErrServerClosed) {
 			return
 		}
+		base := standardPortError(err)
 		p.mu.Lock()
 		// Only retire the entry if this server is still the live one for the
 		// port; a concurrent stop/replace must not be clobbered.
 		if p.servers[port] == srv {
 			delete(p.servers, port)
-			p.errs[port] = standardPortError(port, err)
+			p.baseErrs[port] = base
+			p.errs[port] = base
 		}
 		p.mu.Unlock()
 		p.log.Warn("panel standard port listener exited", "port", port, "err", err)
+		if isAddrInUse(err) {
+			p.enrichPortError(port, base)
+		}
 	}()
 	return srv, nil
 }
 
-// standardPortError renders a bind/serve failure with an actionable hint:
-// the two realistic causes are another service holding the port and a process
-// without privileged-port rights.
-func standardPortError(port int, err error) string {
-	msg := fmt.Sprintf("监听 :%d 失败: %v", port, err)
+// standardPortError renders a bind/serve failure as a short hint for the
+// settings page. The raw error stays in the log; the user needs to know the
+// cause and who holds the port (filled in by enrichPortError).
+func standardPortError(err error) string {
 	lower := strings.ToLower(err.Error())
 	switch {
-	case strings.Contains(lower, "address already in use"),
-		strings.Contains(lower, "only one usage of each socket address"):
-		msg += "（端口已被其他服务占用，如应用容器映射、已有 Web 服务；释放后 30 秒内自动恢复）"
+	case isAddrInUse(err):
+		return "端口被其他服务占用（释放后 30 秒内自动恢复）"
 	case strings.Contains(lower, "permission denied"),
 		strings.Contains(lower, "access is denied"):
-		msg += "（需要 root 或 CAP_NET_BIND_SERVICE 权限）"
+		return "无权限监听（需要 root 或 CAP_NET_BIND_SERVICE 权限）"
+	default:
+		return "监听失败：" + err.Error()
 	}
-	return msg
+}
+
+func isAddrInUse(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "address already in use") ||
+		strings.Contains(lower, "only one usage of each socket address")
+}
+
+// enrichPortError upgrades the generic "port in use" message with the owning
+// process name and PID. The listener may have started (or the cause changed)
+// by the time detection finishes, so the update is guarded by the same base
+// message that triggered it.
+func (p *StandardPorts) enrichPortError(port int, base string) {
+	msg := portErrorWithOwners(base, detectPortOwner(port))
+	if msg == base {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.baseErrs[port] != base || p.servers[port] != nil {
+		return
+	}
+	if p.errs[port] != msg {
+		p.errs[port] = msg
+		p.log.Warn("panel standard port occupied", "port", port, "detail", msg)
+	}
 }
 
 // Run retries failed listeners on a fixed interval until ctx is cancelled.

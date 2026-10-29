@@ -78,7 +78,7 @@ watch(
     @update:show="(v: boolean) => emit('update:show', v)"
   >
     <NAlert type="info" :bordered="false" style="margin-bottom: 16px">
-      控制自动续期与手动证书到期提醒的提前天数，保存后即时生效，无需重启服务。
+      以下为全局策略，对本面板所有证书生效；实际触发阈值按各证书有效期 1/3 收紧。保存后即时生效，无需重启服务。
     </NAlert>
     <NSpin :show="loading">
       <NForm label-placement="top">

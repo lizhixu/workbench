@@ -1,6 +1,7 @@
 package panelsec
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -14,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,6 +144,119 @@ func TestDomainMiddleware(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("loopback host %q: got status %d, want 200", h, w.Code)
 		}
+	}
+}
+
+// setLocalPort stamps the listener port onto a test request the way net/http
+// does in production (http.LocalAddrContextKey). httptest requests carry no
+// local address, which the guard treats as "unknown, do not restrict".
+func setLocalPort(req *http.Request, port int) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey,
+		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}))
+}
+
+// publishStandardPort makes the process-wide standard-port reconciler report
+// the given port as serving, without opening a real socket.
+func publishStandardPort(t *testing.T, st *settings.Store, port int) {
+	t.Helper()
+	p := NewStandardPorts(st, http.NotFoundHandler(), &tls.Config{}, ":18789", nil)
+	p.mu.Lock()
+	p.servers[port] = &http.Server{}
+	p.mu.Unlock()
+	SetStandardPorts(p)
+	t.Cleanup(func() { SetStandardPorts(nil) })
+}
+
+// Binding a domain makes the portless entry the only one: requests that reach
+// the panel's primary port are rejected (the Host header alone cannot tell
+// them apart from the portless entry, so the listener port is authoritative).
+// The primary port must stay usable as the documented fallback while no
+// standard listener serves, and same-host proxies/tunnels must keep working.
+func TestDomainMiddlewareBlocksPrimaryPortWhenPortlessServing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	st := newTestSettings(t)
+	if err := st.SetMany(settings.ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_domain": rawJSON(t, "panel.example.com"),
+	}); err != nil {
+		t.Fatalf("SetMany: %v", err)
+	}
+	t.Cleanup(func() { SetPanelHTTPPort("") })
+	SetPanelHTTPPort("18789")
+	SetStandardPorts(nil)
+
+	guard := NewGuard(st, nil)
+	r := gin.New()
+	r.Use(guard.DomainMiddleware())
+	r.GET("/dashboard", func(c *gin.Context) { c.String(http.StatusOK, "dashboard-ok") })
+
+	serve := func(req *http.Request) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	// No standard listener serving: the primary port is the fallback -> 200.
+	req := setLocalPort(httptest.NewRequest("GET", "/dashboard", nil), 18789)
+	req.Host = "panel.example.com:18789"
+	if w := serve(req); w.Code != http.StatusOK {
+		t.Fatalf("primary port without portless listener: got %d, want 200", w.Code)
+	}
+
+	// :80 serving -> the primary port is no longer an entry: browsers are
+	// moved to http://<domain>, other methods get an explicit 403.
+	publishStandardPort(t, st, 80)
+	w := serve(req)
+	if w.Code != http.StatusMovedPermanently {
+		t.Fatalf("primary port with :80 serving: got %d, want 301", w.Code)
+	}
+	if loc := w.Header().Get("Location"); loc != "http://panel.example.com/dashboard" {
+		t.Fatalf("Location = %q, want http://panel.example.com/dashboard", loc)
+	}
+	apiReq := setLocalPort(httptest.NewRequest("POST", "/dashboard", nil), 18789)
+	apiReq.Host = "panel.example.com:18789"
+	w = serve(apiReq)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("POST on primary port: got %d, want 403", w.Code)
+	} else if body := w.Body.String(); !strings.Contains(body, "http://panel.example.com") {
+		t.Fatalf("403 body should name the portless entry, got %s", body)
+	}
+
+	// Rewriting Host to drop the port does not get around the check.
+	spoofed := setLocalPort(httptest.NewRequest("GET", "/dashboard", nil), 18789)
+	spoofed.Host = "panel.example.com"
+	if w := serve(spoofed); w.Code != http.StatusMovedPermanently {
+		t.Fatalf("host without port on primary listener: got %d, want 301", w.Code)
+	}
+
+	// Requests actually accepted on :80 are the portless entry -> 200.
+	onStandard := setLocalPort(httptest.NewRequest("GET", "/dashboard", nil), 80)
+	onStandard.Host = "panel.example.com"
+	if w := serve(onStandard); w.Code != http.StatusOK {
+		t.Fatalf("portless :80 request: got %d, want 200", w.Code)
+	}
+
+	// A same-host reverse proxy (peer 127.0.0.1) may keep forwarding to the
+	// primary port; a remote client cannot fake the peer address.
+	localPeer := setLocalPort(httptest.NewRequest("GET", "/dashboard", nil), 18789)
+	localPeer.Host = "panel.example.com:18789"
+	localPeer.RemoteAddr = "127.0.0.1:55555"
+	if w := serve(localPeer); w.Code != http.StatusOK {
+		t.Fatalf("loopback peer on primary port: got %d, want 200", w.Code)
+	}
+
+	// SSL on + :443 serving -> the redirect points at the https entry.
+	if err := st.SetMany(settings.ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_ssl_enabled": rawJSON(t, true),
+	}); err != nil {
+		t.Fatalf("SetMany ssl: %v", err)
+	}
+	publishStandardPort(t, st, 443)
+	w = serve(req)
+	if w.Code != http.StatusMovedPermanently {
+		t.Fatalf("primary port with :443 serving: got %d, want 301", w.Code)
+	}
+	if loc := w.Header().Get("Location"); loc != "https://panel.example.com/dashboard" {
+		t.Fatalf("Location = %q, want https://panel.example.com/dashboard", loc)
 	}
 }
 

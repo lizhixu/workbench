@@ -2,8 +2,8 @@
 import { computed, h, nextTick, onActivated, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
-  NAlert, NButton, NCode, NDataTable, NDescriptions, NDescriptionsItem,
-  NEmpty, NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPopconfirm, NRadio, NRadioGroup,
+  NAlert, NButton, NCard, NCode, NDataTable, NDescriptions, NDescriptionsItem,
+  NEmpty, NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPagination, NPopconfirm, NRadio, NRadioGroup,
   NSelect, NSpace, NSpin, NSwitch, NTabPane, NTabs, NUpload,
   NTag, useMessage,
 } from 'naive-ui'
@@ -16,7 +16,7 @@ import {
 } from '@vicons/ionicons5'
 import { useTablePagination } from '../../composables/useTablePagination'
 import {
-  cancelDeployment, deployApp, diagnoseDeployment, getApp, getAppStatus, listDeployments, restartApp,
+  cancelDeployment, deployApp, diagnoseDeployment, getApp, getAppStatus, getDeployment, listDeployments, restartApp,
   rollbackApp, startApp, stopApp, updateApp, syncAppWebhook, type AppEntity, type AppStatus, type Deployment,
   type AIDiagnosis,
   backupAppVolumes, listVolumeBackups, restoreVolumeArchive, deleteVolumeArchive,
@@ -34,6 +34,7 @@ import {
   getGitHubAppStatus, switchAppToGitHubApp, type GitHubAppStatus,
 } from '../../api/git'
 import { bothMeshed } from '../../utils/mesh'
+import { fmtDateTime } from '../../utils/time'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useAuthStore } from '../../stores/auth'
 import OpsTunnelModal from '../../components/tunnels/OpsTunnelModal.vue'
@@ -666,9 +667,11 @@ async function loadStatus() {
 // 新记录整列表覆盖回去，表现为“点了重新部署却没有新记录”。
 let deploymentsReqSeq = 0
 
-async function loadDeployments() {
+async function loadDeployments(silent = false) {
   const seq = ++deploymentsReqSeq
-  loading.value = true
+  // 后台轮询用 silent：2 秒一次的自动刷新若每次都点亮表格 loading，
+  // 遮罩会不停闪，正在看日志/找记录时非常干扰。
+  if (!silent) loading.value = true
   try {
     const res = await listDeployments(appId.value, (page.value - 1) * pageSize.value, pageSize.value)
     if (seq !== deploymentsReqSeq) return
@@ -676,7 +679,8 @@ async function loadDeployments() {
     total.value = res.total
   } catch (e: any) {
     if (seq !== deploymentsReqSeq) return
-    message.error(e.message || '获取部署历史失败')
+    // 静默轮询失败不弹提示：否则后端短暂不可用时每 2 秒刷一个错误弹窗。
+    if (!silent) message.error(e.message || '获取部署历史失败')
   } finally {
     if (seq === deploymentsReqSeq) loading.value = false
   }
@@ -684,6 +688,29 @@ async function loadDeployments() {
 
 async function refreshAll() {
   await Promise.all([loadApp(), loadStatus(), loadDeployments(), loadVolumeBackups(), loadS3Targets(), loadAppBackupJobs(), refreshNewestDeployment()])
+}
+
+// 换页与改每页条数都显式重新请求：改条数会把页码重置为 1，若只靠
+// watch(page) 兜底，用户本来就在第 1 页时不会触发任何请求，表格会
+// 停留在旧页大小的那一页数据上。
+function changeDeployPage(p: number) {
+  if (p === page.value) return
+  page.value = p
+  loadDeployments()
+}
+
+function changeDeployPageSize(size: number) {
+  if (size === pageSize.value) return
+  pageSize.value = size
+  page.value = 1
+  loadDeployments()
+}
+
+function reloadDeployments() {
+  loadDeployments()
+  refreshNewestDeployment()
+  // 手动刷新的同时给已停表（超过有界窗口）的轮询续一次期。
+  if (hasActiveDeployments.value) startDeployPolling()
 }
 
 const cancellingDeploy = ref(false)
@@ -696,10 +723,14 @@ async function doDeploy(force = false) {
     // 下面 watch(newestDeployment) 会自动弹出安装提醒。
     if (dep?.id) seenActiveDepIds.add(dep.id)
     message.success(force ? '已终止当前任务并重新启动部署' : '已开始部署')
+    // 从受理那一刻起就盯着这批记录，直到列表里没有非终态行为止。
+    // 不能等 status.deploying：前置检查类失败 1 秒内就落终态，
+    // 5 秒的状态轮询很可能一次都没看到“部署中”。
+    if (dep?.id) startDeployPolling()
     if (page.value !== 1) {
-      // 新记录永远落在第 1 页顶部，翻着旧页时先切回第 1 页（watch 会拉取）
+      // 新记录永远落在第 1 页顶部，翻着旧页时先切回第 1 页再拉取
       page.value = 1
-      await Promise.all([loadStatus(), refreshNewestDeployment()])
+      await Promise.all([loadStatus(), loadDeployments(), refreshNewestDeployment()])
     } else {
       // 接口返回的 queued 记录就是事实：先插到列表顶部立即可见，
       // 后续刷新再以服务端结果对齐（即使刷新失败也不至于“看不到记录”）。
@@ -758,6 +789,53 @@ const dockerMissingFailed = computed(() =>
   newestDeployment.value?.status === 'failed' &&
   (newestDeployment.value.error ?? '').includes(DOCKER_MISSING_MARK),
 )
+
+// ---- 部署进行中的自动刷新 ----
+// 部署历史过去只在 status.deploying 为真时刷新，而前置检查类失败
+// （未安装 Docker、Agent 离线）在 1 秒内就落终态：5 秒一次的状态轮询
+// 很可能一次都没看到“部署中”，列表里的新记录就永远停在“排队”，
+// 用户只能手动切页签才能看到结果。这里改为以列表/最新记录里是否存在
+// 非终态行为依据，2 秒一次小步刷新，全部落终态后自动停表。
+const ACTIVE_DEPLOY_STATUSES = new Set(['queued', 'building', 'deploying'])
+const isActiveDep = (d: Deployment) => ACTIVE_DEPLOY_STATUSES.has(d.status)
+
+const activeDeploymentCount = computed(() => deployments.value.filter(isActiveDep).length)
+const hasActiveDeployments = computed(
+  () => deployments.value.some(isActiveDep) || (!!newestDeployment.value && isActiveDep(newestDeployment.value)),
+)
+
+let deployPollTimer: ReturnType<typeof setInterval> | null = null
+// 有界窗口：留下一条永远停在 building 的脏记录时，不能 2 秒一次轮询到天荒地老。
+// 单次部署超时是 15 分钟，30 分钟足够覆盖排队 + 构建 + 发布。
+const DEPLOY_POLL_MAX_MS = 30 * 60_000
+let deployPollDeadline = 0
+
+function stopDeployPolling() {
+  if (deployPollTimer) {
+    clearInterval(deployPollTimer)
+    deployPollTimer = null
+  }
+}
+
+function startDeployPolling() {
+  // 每次触发部署都给窗口续期（可能已有一个因旧记录在跑的表）。
+  deployPollDeadline = Date.now() + DEPLOY_POLL_MAX_MS
+  if (deployPollTimer) return
+  deployPollTimer = setInterval(async () => {
+    if (route.name !== 'app-detail') return
+    if (Date.now() > deployPollDeadline) {
+      stopDeployPolling()
+      return
+    }
+    await Promise.all([loadDeployments(true), refreshNewestDeployment(), refreshLogDeployment()])
+    if (!hasActiveDeployments.value) stopDeployPolling()
+  }, 2000)
+}
+
+watch(hasActiveDeployments, (active) => {
+  if (active) startDeployPolling()
+  else stopDeployPolling()
+})
 
 // 本页会话内发起、随后失败为未安装 Docker 的任务才自动弹窗：
 // 直接打开详情页时历史里已有的旧失败只由横幅提示，不自动打扰。
@@ -1603,13 +1681,96 @@ async function doSwitchToGitHubApp() {
 
 function openLog(dep: Deployment) {
   logDeployment.value = dep
+  followLog.value = true
   showLog.value = true
+  nextTick(scrollLogToEnd)
+  // 列表接口不返回日志正文（避免轮询时传输兆级 payload），
+  // 打开弹窗时按 depID 单独取全文；运行中的记录随后由轮询继续刷新。
+  reloadLog()
 }
 
+// 日志弹窗与部署轮询共用同一条 2 秒节奏：运行中的记录由
+// refreshLogDeployment 拉到最新状态与日志，落终态后自然停止。
+const followLog = ref(true)
+const logRefreshing = ref(false)
+const logPreRef = ref<HTMLElement | null>(null)
+
+async function refreshLogDeployment() {
+  const cur = logDeployment.value
+  if (!cur || !showLog.value) return
+  if (!isActiveDep(cur)) return
+  try {
+    logDeployment.value = await getDeployment(appId.value, cur.id)
+  } catch {
+    // 日志刷新是 best-effort：失败保留现有内容，不打断正在看的日志。
+  }
+}
+
+async function reloadLog() {
+  const cur = logDeployment.value
+  if (!cur) return
+  logRefreshing.value = true
+  try {
+    logDeployment.value = await getDeployment(appId.value, cur.id)
+  } catch (e: any) {
+    message.error(e.message || '刷新日志失败')
+  } finally {
+    logRefreshing.value = false
+  }
+}
+
+function scrollLogToEnd() {
+  const el = logPreRef.value
+  if (!el || !followLog.value) return
+  el.scrollTop = el.scrollHeight
+}
+
+// 新内容到达后贴底；用户关掉「自动跟随」时保持当前位置不动。
+watch(
+  () => logDeployment.value?.build_log,
+  async () => {
+    await nextTick()
+    scrollLogToEnd()
+  },
+)
+
+async function copyLog() {
+  const text = logDeployment.value?.build_log ?? ''
+  if (!text) {
+    message.warning('当前没有可复制的日志')
+    return
+  }
+  const ok = await copyToClipboard(text)
+  if (ok) message.success('日志已复制')
+  else message.error('复制失败，请手动选择文本复制')
+}
+
+const logEmptyText = computed(() => {
+  if (logRefreshing.value) return '正在加载日志…'
+  const d = logDeployment.value
+  if (d && isActiveDep(d)) return '等待构建输出…'
+  return '（此部署记录没有日志）'
+})
+
+const depStatusType = (s: string) =>
+  s === 'success' ? 'success' : s === 'failed' ? 'error' : s === 'cancelled' ? 'warning' : 'info'
+
+const depStatusLabel = (s: string) =>
+  s === 'success' ? '成功'
+    : s === 'failed' ? '失败'
+      : s === 'cancelled' ? '已取消'
+        : s === 'queued' ? '排队'
+          : s === 'building' ? '构建中'
+            : s === 'deploying' ? '发布中'
+              : s
+
 const depStatusTag = (s: string) => {
-  const type = s === 'success' ? 'success' : s === 'failed' ? 'error' : s === 'cancelled' ? 'warning' : 'info'
-  const label = s === 'success' ? '成功' : s === 'failed' ? '失败' : s === 'cancelled' ? '已取消' : s === 'queued' ? '排队' : s === 'building' ? '构建中' : s === 'deploying' ? '发布中' : s
-  return h(NTag, { size: 'small', type, bordered: false }, { default: () => label })
+  const tag = h(NTag, { size: 'small', type: depStatusType(s), bordered: false }, { default: () => depStatusLabel(s) })
+  // 进行中的记录带一个转圈，静态 Tag 与“卡住了”难以区分。
+  if (!ACTIVE_DEPLOY_STATUSES.has(s)) return tag
+  return h(NSpace, { size: 4, align: 'center', wrap: false }, {
+    default: () => [h(NSpin, { size: 12, strokeWidth: 2 }), tag],
+  })
 }
 
 const triggerLabel = (t: string) =>
@@ -1620,15 +1781,25 @@ const triggerLabel = (t: string) =>
           : '手动'
 
 const columns = computed<DataTableColumns<Deployment>>(() => [
-  { title: '状态', key: 'status', width: 90, render: (r) => depStatusTag(r.status) },
-  { title: '触发', key: 'trigger', width: 90, render: (r) => triggerLabel(r.trigger) },
+  { title: '状态', key: 'status', width: 100, render: (r) => depStatusTag(r.status) },
+  {
+    title: '触发',
+    key: 'trigger',
+    width: 104,
+    render: (r) => h('div', { style: 'line-height: 1.35' }, [
+      h('div', null, triggerLabel(r.trigger)),
+      r.started_by
+        ? h('div', { style: 'font-size: 11px; color: var(--text-muted)' }, r.started_by)
+        : null,
+    ]),
+  },
   {
     title: 'Commit',
     key: 'commit_hash',
-    width: 120,
+    width: 118,
     render: (r) => r.commit_hash
-      ? h(NTag, { size: 'small', bordered: false, type: 'info' }, { default: () => r.commit_hash })
-      : '-',
+      ? h(NTag, { size: 'small', bordered: false, type: 'info', class: 'mono-font' }, { default: () => r.commit_hash })
+      : '—',
   },
   {
     title: '提交信息',
@@ -1639,32 +1810,33 @@ const columns = computed<DataTableColumns<Deployment>>(() => [
         const who = r.cancelled_by ? ` (由 ${r.cancelled_by} 取消)` : ''
         return (r.commit_message ? `${r.commit_message} · ` : '') + (r.error || '部署已取消') + who
       }
-      return r.commit_message || (r.error ?? '-')
+      return r.commit_message || r.error || '—'
     },
   },
   {
     title: '耗时',
     key: 'duration_ms',
-    width: 100,
-    render: (r) => (r.duration_ms ? `${(r.duration_ms / 1000).toFixed(1)}s` : '-'),
+    width: 96,
+    render: (r) => depDuration(r),
   },
   {
     title: '开始时间',
     key: 'started_at',
-    width: 150,
-    render: (r) => formatTime(r.started_at),
+    width: 166,
+    render: (r) => h('span', { class: 'mono-font' }, formatTime(r.started_at)),
   },
   {
     title: '操作',
     key: 'actions',
-    width: 200,
+    width: 236,
+    fixed: 'right',
     render: (r) =>
-      h(NSpace, { size: 6 }, {
+      h(NSpace, { size: 6, wrap: false }, {
         default: () => {
           const btns = [
             h(NButton, { size: 'tiny', secondary: true, onClick: () => openLog(r) }, { default: () => '日志' }),
           ]
-          if (canWrite.value && (r.status === 'queued' || r.status === 'building' || r.status === 'deploying')) {
+          if (canWrite.value && isActiveDep(r)) {
             btns.push(
               h(
                 NPopconfirm,
@@ -1722,22 +1894,46 @@ const columns = computed<DataTableColumns<Deployment>>(() => [
   },
 ])
 
+// 时间统一走面板时区（AGENTS.md 8.14）；零值时间（0001-01-01）是“还没发生”。
 function formatTime(v?: string) {
   if (!v) return '-'
   const d = new Date(v)
-  if (Number.isNaN(d.getTime())) return '-'
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  if (Number.isNaN(d.getTime()) || d.getUTCFullYear() < 1970) return '-'
+  return fmtDateTime(d)
+}
+
+function fmtDuration(ms?: number) {
+  if (!ms || ms < 0) return '-'
+  const total = Math.round(ms / 1000)
+  if (total < 60) return `${total}s`
+  const m = Math.floor(total / 60)
+  const s = total % 60
+  if (m < 60) return s ? `${m}m ${s}s` : `${m}m`
+  const h = Math.floor(m / 60)
+  const rm = m % 60
+  return rm ? `${h}h ${rm}m` : `${h}h`
+}
+
+// 进行中的记录没有 duration_ms，用当前时间减开始时间算个活的耗时；
+// 列表由 2 秒轮询驱动重渲染，所以这个值会自己往前走。
+function depDuration(d: Deployment) {
+  if (d.duration_ms) return fmtDuration(d.duration_ms)
+  if (!isActiveDep(d)) return '-'
+  const start = new Date(d.started_at).getTime()
+  if (Number.isNaN(start) || new Date(d.started_at).getUTCFullYear() < 1970) return '-'
+  return fmtDuration(Date.now() - start)
 }
 
 // 仅当仍是当前路由时才响应 tab 变化（组件被 KeepAlive 缓存，route 可能
 // 已指向别的页面，见 AGENTS.md 8.4-6）。
-watch(activeTab, () => {
+watch(activeTab, (tab) => {
   if (route.name !== 'app-detail') return
-})
-watch(page, () => {
-  if (route.name !== 'app-detail') return
-  loadDeployments()
+  // 切到部署历史时补拉一次：页签缓存期间可能有 webhook 或他人触发的部署。
+  if (tab === 'deployments') {
+    loadDeployments()
+    refreshNewestDeployment()
+    if (hasActiveDeployments.value) startDeployPolling()
+  }
 })
 
 // 部署结束（部署中 → 非部署中）时刷新一次部署历史与最新记录：
@@ -1789,6 +1985,7 @@ onActivated(() => {
   // 页签切走期间轮询窗口可能已过期，仍在执行的任务需要重新开启观察。
   if (volumeBusy.value) volumePollUntil.value = Date.now() + 60_000
   startPolling()
+  if (hasActiveDeployments.value) startDeployPolling()
 })
 
 onDeactivated(() => {
@@ -1796,6 +1993,7 @@ onDeactivated(() => {
     clearInterval(pollTimer)
     pollTimer = null
   }
+  stopDeployPolling()
 })
 </script>
 
@@ -2297,23 +2495,85 @@ onDeactivated(() => {
 
         <NTabPane name="deployments" tab="部署历史">
           <div class="deployments-pane">
-            <NDataTable
-              flex-height
-              :columns="columns"
-              :data="deployments"
-              :loading="loading"
-              :row-key="(r: Deployment) => r.id"
-              :pagination="{
-                page: page,
-                pageSize: pageSize,
-                itemCount: total,
-                showSizePicker: true,
-                pageSizes: [10, 20, 50],
-                'onUpdate:page': (p: number) => (page = p),
-                'onUpdate:pageSize': (s: number) => { pageSize = s; page = 1 },
-              }"
-              remote
-            />
+            <div class="deploy-toolbar">
+              <div class="deploy-summary">
+                <span class="deploy-total">共 {{ total }} 次部署</span>
+                <template v-if="activeDeploymentCount > 0">
+                  <NTag type="info" size="small" :bordered="false">
+                    {{ activeDeploymentCount }} 个进行中
+                  </NTag>
+                  <span class="deploy-hint">状态与日志每 2 秒自动刷新</span>
+                </template>
+                <span v-else-if="newestDeployment" class="deploy-hint">
+                  最近一次 {{ formatTime(newestDeployment.started_at) }}
+                </span>
+              </div>
+              <NSpace :size="8" align="center">
+                <NButton size="small" secondary :loading="loading" @click="reloadDeployments">
+                  <template #icon>
+                    <NIcon><RefreshOutline /></NIcon>
+                  </template>
+                  刷新
+                </NButton>
+                <NButton
+                  v-if="canWrite"
+                  size="small"
+                  type="primary"
+                  :loading="acting"
+                  :disabled="deploying"
+                  @click="doDeploy(false)"
+                >
+                  <template #icon>
+                    <NIcon><CloudUploadOutline /></NIcon>
+                  </template>
+                  {{ status?.state === 'undeployed' ? '部署' : '重新部署' }}
+                </NButton>
+              </NSpace>
+            </div>
+
+            <!-- 表头与分页固定、仅数据区滚动（AGENTS.md 8.2）。
+              早前这里把 NDataTable 直接塞进 flex 列，表格没有 flex: 1，
+              flex-height 拿到的可用高度是 0：只剩表头和分页条，所有
+              记录都渲染在 0 高的滚动区里，整块看起来完全是空的。 -->
+            <NCard size="small" :bordered="false" class="deploy-card table-flex-fill">
+              <NDataTable
+                flex-height
+                size="small"
+                :bordered="false"
+                :columns="columns"
+                :data="deployments"
+                :loading="loading"
+                :row-key="(r: Deployment) => r.id"
+                :scroll-x="1120"
+              >
+                <template #empty>
+                  <NEmpty :description="loading ? '正在加载部署记录…' : '还没有部署记录'">
+                    <template #extra>
+                      <NButton
+                        v-if="canWrite && !loading"
+                        size="small"
+                        type="primary"
+                        :loading="acting"
+                        @click="doDeploy(false)"
+                      >
+                        立即部署
+                      </NButton>
+                    </template>
+                  </NEmpty>
+                </template>
+              </NDataTable>
+              <div class="table-pagination-bar">
+                <NPagination
+                  :page="page"
+                  :page-size="pageSize"
+                  :item-count="total"
+                  :page-sizes="[10, 20, 50]"
+                  show-size-picker
+                  @update:page="changeDeployPage"
+                  @update:page-size="changeDeployPageSize"
+                />
+              </div>
+            </NCard>
           </div>
         </NTabPane>
 
@@ -2632,11 +2892,49 @@ onDeactivated(() => {
     <NModal
       v-model:show="showLog"
       preset="card"
-      :title="`构建日志 · ${logDeployment?.commit_hash ?? ''}`"
-      style="width: 860px; max-width: 94vw"
+      :title="`部署日志${logDeployment?.commit_hash ? ' · ' + logDeployment.commit_hash : ''}`"
+      style="width: 920px; max-width: 94vw"
     >
+      <template #header-extra>
+        <NSpace :size="10" align="center">
+          <NSpace :size="5" align="center">
+            <NSwitch v-model:value="followLog" size="small" />
+            <span class="log-follow-label">自动跟随</span>
+          </NSpace>
+          <NButton size="tiny" secondary :loading="logRefreshing" @click="reloadLog">
+            <template #icon>
+              <NIcon><RefreshOutline /></NIcon>
+            </template>
+            刷新
+          </NButton>
+          <NButton size="tiny" secondary @click="copyLog">
+            <template #icon>
+              <NIcon><CopyOutline /></NIcon>
+            </template>
+            复制
+          </NButton>
+        </NSpace>
+      </template>
+
+      <div v-if="logDeployment" class="log-meta">
+        <NSpace :size="8" align="center" :wrap="true">
+          <NTag size="small" :type="depStatusType(logDeployment.status)" :bordered="false">
+            {{ depStatusLabel(logDeployment.status) }}
+          </NTag>
+          <span class="log-meta-item">
+            {{ triggerLabel(logDeployment.trigger) }}<template v-if="logDeployment.started_by"> · {{ logDeployment.started_by }}</template>
+          </span>
+          <span class="log-meta-item">耗时 {{ depDuration(logDeployment) }}</span>
+          <span class="log-meta-item">{{ formatTime(logDeployment.started_at) }}</span>
+        </NSpace>
+      </div>
+
       <div class="log-body">
-        <pre class="log-pre">{{ logDeployment?.build_log || '（此部署记录没有日志）' }}</pre>
+        <div v-if="logDeployment && isActiveDep(logDeployment)" class="log-live-hint">
+          <NSpin :size="12" />
+          <span>部署进行中，构建输出每 2 秒自动刷新</span>
+        </div>
+        <pre ref="logPreRef" class="log-pre">{{ logDeployment?.build_log || logEmptyText }}</pre>
         <NAlert v-if="logDeployment?.error" type="error" style="margin-top: 10px">
           {{ logDeployment.error }}
         </NAlert>
@@ -2864,7 +3162,35 @@ onDeactivated(() => {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  gap: 10px;
   padding-top: 10px;
+}
+
+.deploy-toolbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 32px;
+  flex-wrap: wrap;
+}
+
+.deploy-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.deploy-total {
+  font-weight: 600;
+}
+
+.deploy-hint {
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 .mono {
@@ -3038,8 +3364,33 @@ onDeactivated(() => {
   flex-direction: column;
 }
 
+.log-meta {
+  margin-bottom: 10px;
+}
+
+.log-meta-item {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.log-follow-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.log-live-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
 .log-pre {
   flex: 1;
+  min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
   background: rgba(128, 128, 128, 0.08);

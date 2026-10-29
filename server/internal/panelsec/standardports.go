@@ -203,7 +203,7 @@ func isAddrInUse(err error) bool {
 // by the time detection finishes, so the update is guarded by the same base
 // message that triggered it.
 func (p *StandardPorts) enrichPortError(port int, base string) {
-	msg := portErrorWithOwners(base, detectPortOwner(port))
+	msg := portErrorWithOwnerDetail(base, port, detectPortOwner(port))
 	if msg == base {
 		return
 	}

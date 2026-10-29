@@ -71,6 +71,36 @@ func TestStoreWebhookLookup(t *testing.T) {
 	}
 }
 
+func TestStoreFindByContainer(t *testing.T) {
+	s := newTestStore(t)
+	_ = s.PutApp(&Application{ID: "app_term", Name: "终端演示", ContainerName: "watchman-app-app_term", CreatedAt: time.Now()})
+	_ = s.PutApp(&Application{ID: "app_named", Name: "自定义", ContainerName: "watchman-app-my-nginx", CreatedAt: time.Now()})
+
+	cases := []struct {
+		container string
+		appID     string
+	}{
+		{"watchman-app-app_term", "app_term"},
+		{"watchman-app-app_term-next-dep_12345678", "app_term"},
+		{"watchman-app-app_term-prev", "app_term"},
+		{"watchman-fwd-app_term", "app_term"},
+		{"watchman-app-my-nginx", "app_named"},
+		{"watchman-fwd-app_named", "app_named"},
+	}
+	for _, tc := range cases {
+		app, ok := s.FindByContainer(tc.container)
+		if !ok || app.ID != tc.appID {
+			t.Errorf("FindByContainer(%q) = %v/%v, want %s", tc.container, app, ok, tc.appID)
+		}
+	}
+	if _, ok := s.FindByContainer("traefik"); ok {
+		t.Error("foreign container must not resolve to an app")
+	}
+	if _, ok := s.FindByContainer(""); ok {
+		t.Error("empty name must not resolve")
+	}
+}
+
 func TestStoreDeploymentsPagination(t *testing.T) {
 	s := newTestStore(t)
 	for i := 0; i < 25; i++ {

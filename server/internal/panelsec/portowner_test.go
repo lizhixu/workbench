@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -72,6 +73,67 @@ func TestPortErrorWithOwners(t *testing.T) {
 	})
 	if !strings.Contains(got, "a (pid 1)") || !strings.Contains(got, "等 4 个进程") {
 		t.Fatalf("many owners = %q, want first three plus a count", got)
+	}
+}
+
+func TestParseDockerPSPublishing(t *testing.T) {
+	const out = "watchman-app-abcd1234\t0.0.0.0:443->443/tcp, [::]:443->443/tcp\n" +
+		"other-app\t0.0.0.0:1443->1443/tcp\n" +
+		"multi\t127.0.0.1:80->80/tcp, 0.0.0.0:443->8443/tcp\n" +
+		"no-tab-line\n"
+	got := parseDockerPSPublishing(out, 443)
+	want := []string{"multi", "watchman-app-abcd1234"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseDockerPSPublishing(:443) = %v, want %v (no :1443 false positive)", got, want)
+	}
+	if got := parseDockerPSPublishing(out, 8080); len(got) != 0 {
+		t.Fatalf("parseDockerPSPublishing(:8080) = %v, want empty", got)
+	}
+}
+
+func TestDockerProxyOwners(t *testing.T) {
+	if dockerProxyOwners([]portOwner{{PID: 1, Name: "nginx"}}) {
+		t.Fatal("nginx must not be treated as a docker proxy")
+	}
+	if !dockerProxyOwners([]portOwner{{PID: 1, Name: "docker-proxy"}}) {
+		t.Fatal("docker-proxy must be detected")
+	}
+	if !dockerProxyOwners([]portOwner{{PID: 1, Name: "com.docker.backend"}}) {
+		t.Fatal("Docker Desktop backend must be detected")
+	}
+}
+
+func TestPortErrorWithOwnerDetailFallsBackForNonDocker(t *testing.T) {
+	base := "端口被其他服务占用（释放后 30 秒内自动恢复）"
+	if got := portErrorWithOwnerDetail(base, 443, nil); got != base {
+		t.Fatalf("no owners = %q, want base message", got)
+	}
+	got := portErrorWithOwnerDetail(base, 443, []portOwner{{PID: 1234, Name: "nginx"}})
+	want := "端口被 nginx (pid 1234) 占用（释放后 30 秒内自动恢复）"
+	if got != want {
+		t.Fatalf("non-docker owner = %q, want %q", got, want)
+	}
+}
+
+func TestPortErrorWithContainers(t *testing.T) {
+	base := "端口被其他服务占用（释放后 30 秒内自动恢复）"
+	SetContainerAppResolver(func(container string) string {
+		if container == "watchman-app-app_shop" {
+			return "商城"
+		}
+		return ""
+	})
+	defer SetContainerAppResolver(nil)
+
+	got := portErrorWithContainers(base, []string{"watchman-app-app_shop", "traefik"})
+	want := "端口被应用「商城」（容器 watchman-app-app_shop）、容器 traefik 占用（释放后 30 秒内自动恢复）"
+	if got != want {
+		t.Fatalf("mixed owners = %q, want %q", got, want)
+	}
+
+	got = portErrorWithContainers(base, []string{"a", "b", "c", "d"})
+	if !strings.Contains(got, "容器 a、容器 b、容器 c 等 4 个容器占用") {
+		t.Fatalf("many containers = %q, want first three plus a count", got)
 	}
 }
 

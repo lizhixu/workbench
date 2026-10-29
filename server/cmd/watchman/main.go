@@ -662,6 +662,12 @@ func main() {
 	}
 	stdPorts := panelsec.NewStandardPorts(settingsStore, hs.Handler, panelTLSConfig, *httpAddr, log)
 	panelsec.SetStandardPorts(stdPorts)
+	panelsec.SetContainerAppResolver(func(container string) string {
+		if app, ok := appStore.FindByContainer(container); ok {
+			return app.Name
+		}
+		return ""
+	})
 	stdPorts.Reconcile()
 	go stdPorts.Run(ctx)
 	settingsStore.SetOnChange(stdPorts.Reconcile)

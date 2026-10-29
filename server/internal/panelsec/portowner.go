@@ -11,7 +11,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // portOwner identifies one process listening on a TCP port.
@@ -245,6 +247,124 @@ func parseLsofListeners(data string) []portOwner {
 	flush()
 	sort.Slice(owners, func(i, j int) bool { return owners[i].PID < owners[j].PID })
 	return owners
+}
+
+// dockerProxyOwners reports whether any owner is Docker's port-forwarding
+// shim (docker-proxy / Docker Desktop backend). Those processes only exist to
+// forward a published container port, so the container itself is the
+// actionable identity for the user.
+func dockerProxyOwners(owners []portOwner) bool {
+	for _, o := range owners {
+		if strings.Contains(strings.ToLower(o.Name), "docker") {
+			return true
+		}
+	}
+	return false
+}
+
+// dockerContainersPublishing names the containers publishing hostPort. Best
+// effort: a missing docker CLI (or timeout) yields no names and the caller
+// falls back to the raw process list.
+func dockerContainersPublishing(port int) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "ps", "--format", "{{.Names}}\t{{.Ports}}").Output()
+	if err != nil {
+		return nil
+	}
+	return parseDockerPSPublishing(string(out), port)
+}
+
+// parseDockerPSPublishing extracts container names whose published ports
+// include hostPort, from `docker ps --format '{{.Names}}\t{{.Ports}}'` rows
+// (`name<TAB>0.0.0.0:443->443/tcp, [::]:443->443/tcp`).
+func parseDockerPSPublishing(data string, hostPort int) []string {
+	needle := fmt.Sprintf(":%d->", hostPort)
+	seen := map[string]bool{}
+	var names []string
+	for _, line := range strings.Split(data, "\n") {
+		name, ports, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(strings.TrimPrefix(name, "/"))
+		if name == "" || seen[name] || !strings.Contains(ports, needle) {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// containerAppResolver maps a panel-managed container name (watchman-app-* /
+// watchman-fwd-*) to its application display name. main wires it to the app
+// store; nil (tests, watchmanctl) keeps the raw container name.
+var (
+	containerAppMu       sync.RWMutex
+	containerAppResolver func(container string) string
+)
+
+// SetContainerAppResolver installs the container-to-application name lookup.
+func SetContainerAppResolver(fn func(container string) string) {
+	containerAppMu.Lock()
+	defer containerAppMu.Unlock()
+	containerAppResolver = fn
+}
+
+func containerAppName(container string) string {
+	containerAppMu.RLock()
+	fn := containerAppResolver
+	containerAppMu.RUnlock()
+	if fn == nil {
+		return ""
+	}
+	return fn(container)
+}
+
+// portErrorWithOwnerDetail prefers the container name over docker-proxy PIDs
+// (two proxies per port — IPv4 and IPv6 — are pure noise to the operator).
+func portErrorWithOwnerDetail(base string, port int, owners []portOwner) string {
+	if len(owners) == 0 {
+		return base
+	}
+	if dockerProxyOwners(owners) {
+		if names := dockerContainersPublishing(port); len(names) > 0 {
+			return portErrorWithContainers(base, names)
+		}
+	}
+	return portErrorWithOwners(base, owners)
+}
+
+// portErrorWithContainers names the containers publishing the port. Panel's
+// own app containers are upgraded to their application name so the operator
+// knows which app to move off the port.
+func portErrorWithContainers(base string, names []string) string {
+	const maxNames = 3
+	shown := names
+	if len(shown) > maxNames {
+		shown = shown[:maxNames]
+	}
+	labels := make([]string, 0, len(shown))
+	for _, name := range shown {
+		if appName := containerAppName(name); appName != "" {
+			labels = append(labels, fmt.Sprintf("应用「%s」（容器 %s）", appName, name))
+			continue
+		}
+		labels = append(labels, "容器 "+name)
+	}
+	holders := strings.Join(labels, "、")
+	if len(names) > maxNames {
+		holders += fmt.Sprintf(" 等 %d 个容器", len(names))
+	}
+	// Keep a space before 占用 when the name ends in ASCII (容器 traefik 占用),
+	// omit it after CJK punctuation (应用「x」（容器 y）占用).
+	sep := ""
+	if last, _ := utf8.DecodeLastRuneInString(holders); last < 0x2E80 {
+		sep = " "
+	}
+	return fmt.Sprintf("端口被%s%s占用（释放后 30 秒内自动恢复）", holders, sep)
 }
 
 // portErrorWithOwners turns the generic "port in use" message into one that

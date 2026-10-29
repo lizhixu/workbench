@@ -236,6 +236,34 @@ func (s *Store) GetApp(id string) (*Application, bool) {
 	return cloneApplication(a), true
 }
 
+// FindByContainer resolves a panel-managed container name back to its
+// application: the recorded container name (including the rolling
+// -next-<dep> / -prev variants) or the derived watchman-app-<id> /
+// watchman-fwd-<id> names.
+func (s *Store) FindByContainer(name string) (*Application, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, false
+	}
+	base := strings.TrimSuffix(name, "-prev")
+	if i := strings.Index(base, "-next-"); i > 0 {
+		base = base[:i]
+	} else {
+		base = strings.TrimSuffix(base, "-next")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, a := range s.apps {
+		if a.ContainerName != "" && (a.ContainerName == name || a.ContainerName == base) {
+			return cloneApplication(a), true
+		}
+		if base == "watchman-app-"+a.ID || base == "watchman-fwd-"+a.ID {
+			return cloneApplication(a), true
+		}
+	}
+	return nil, false
+}
+
 // PutApp inserts or replaces one application and persists the snapshot.
 func (s *Store) PutApp(a *Application) error {
 	s.mu.Lock()

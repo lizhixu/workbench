@@ -79,9 +79,9 @@ func newAppVolumeHandlerTest(t *testing.T, host *fakeAppVolumeHost) (*gin.Engine
 func TestRestoreArchivePreflightRejects(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cases := []struct {
-		name     string
+		name      string
 		preflight error
-		want     int
+		want      int
 	}{
 		{"busy", ErrVolumeRestoreBusy, http.StatusConflict},
 		{"deploying", ErrVolumeRestoreDeploying, http.StatusConflict},
@@ -136,6 +136,29 @@ func TestRestoreArchiveAcceptedAfterPreflight(t *testing.T) {
 	}
 	if len(dispatched) != 1 || dispatched[0] != "vbk_ok" {
 		t.Fatalf("restore not dispatched: %v", dispatched)
+	}
+}
+
+func TestUpdateAppVolumeJobRefreshesHostID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	host := &fakeAppVolumeHost{hostID: "host_new", volumes: []string{"/opt/a:/a"}}
+	r, store := newAppVolumeHandlerTest(t, host)
+	job := &Job{ID: "bk_1", Name: "j", HostID: "host_old", Kind: KindAppVolume, AppID: "app1",
+		Target: "/opt/a:/a", StorageTarget: "default", Retention: 7, Enabled: true}
+	if err := store.PutJob(job); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"enabled":false}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/backups/jobs/bk_1", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update app_volume job: code=%d body=%s", w.Code, w.Body.String())
+	}
+	got, ok := store.GetJob("bk_1")
+	if !ok || got.HostID != "host_new" {
+		t.Fatalf("app_volume job HostID = %q, want host_new", got.HostID)
 	}
 }
 

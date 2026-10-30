@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"watchman/server/internal/githubapp"
 	"watchman/server/internal/rpc"
+	"watchman/server/internal/settings"
 )
 
 // AIDiagnoseFunc is a pluggable analyzer for failed deployment logs.
@@ -23,6 +24,7 @@ type AppHandlers struct {
 	reg         *rpc.Registry
 	store       *Store
 	engine      *Engine
+	settings    *settings.Store
 	ai          AIDiagnoseFunc
 	gitProvider GitWebhookManager
 	ghAppStore  *githubapp.Store
@@ -40,6 +42,11 @@ type GitWebhookManager interface {
 // NewAppHandlers creates the application management handlers.
 func NewAppHandlers(reg *rpc.Registry, store *Store, engine *Engine) *AppHandlers {
 	return &AppHandlers{reg: reg, store: store, engine: engine}
+}
+
+// SetSettings supplies the trusted public URL used for upload restore callbacks.
+func (h *AppHandlers) SetSettings(s *settings.Store) {
+	h.settings = s
 }
 
 // SetAI injects the AI assistant for deployment failure diagnosis.

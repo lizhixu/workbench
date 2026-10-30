@@ -167,6 +167,7 @@ func main() {
 	// Agent-facing public URL for download links handed to agents.
 	if *publicURL != "" {
 		api.SetPublicURL(*publicURL)
+		apps.SetPublicURL(*publicURL)
 		log.Info("public URL configured", "url", *publicURL)
 	}
 
@@ -331,10 +332,12 @@ func main() {
 
 	// Panel-side staging for upload-restores (volupload.go): operator files
 	// land here first, then the agent pulls them back over one-time tokens.
+	// This is an auxiliary capability: a broken staging directory must not
+	// stop the console from booting. The handlers return 503 when the store
+	// is nil.
 	volumeUploadStore, err := apps.NewVolumeUploadStore(appStore.Dir(), log)
 	if err != nil {
-		log.Error("volume upload store init", "err", err)
-		os.Exit(1)
+		log.Warn("volume upload staging unavailable; upload-restore disabled", "err", err)
 	}
 	appEngine.SetVolumeUploadStore(volumeUploadStore)
 
@@ -605,12 +608,19 @@ func main() {
 	installHandler.UpgradePubKey = api.UpgradePubKeyHex
 	installHandler.ManifestPath = *manifestPath
 	installHandler.RegisterRoutes(hr)
+	// Allow up to 2100MB for the application volume backup upload-restore
+	// route (which accepts archives up to 2GB + multipart overhead).
+	// All other endpoints retain the 512MB body ceiling.
+	maxBytesHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		limit := int64(512 << 20)
+		if strings.HasSuffix(r.URL.Path, "/volume-backups/upload-restore") {
+			limit = 2100 << 20
+		}
+		http.MaxBytesHandler(hr, limit).ServeHTTP(w, r)
+	})
 	hs := &http.Server{
-		Addr: *httpAddr,
-		// No reverse proxy in front anymore (the web console is embedded
-		// via go:embed and served by this process): keep the 512m request
-		// body ceiling nginx used to enforce for file uploads.
-		Handler:           http.MaxBytesHandler(hr, 512<<20),
+		Addr:              *httpAddr,
+		Handler:           maxBytesHandler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

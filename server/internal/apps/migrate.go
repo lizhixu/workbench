@@ -23,6 +23,49 @@ import (
 	"watchman/server/internal/snapshots"
 )
 
+// appVolumeJobHostStore is optional so the app engine keeps accepting the
+// legacy snapshot cleanup interface used by volume-backup tests and embedders.
+// The production snapshots.Store implements it to keep scheduled app_volume
+// jobs aligned with the application's persisted host binding.
+type appVolumeJobHostStore interface {
+	UpdateAppVolumeJobHost(appID, hostID string) error
+}
+
+// persistMigrationHost keeps the run's copy behind the persisted binding.
+// A job-sync failure is returned to the caller, which must roll back the move.
+func (e *Engine) persistMigrationHost(app *Application, hostID string) error {
+	var failures []string
+	persisted, found := e.store.GetApp(app.ID)
+	if !found {
+		failures = append(failures, "应用记录已不存在")
+	} else if persisted.HostID != hostID {
+		if err := e.store.UpdateApp(app.ID, func(a *Application) error {
+			a.HostID = hostID
+			return nil
+		}); err != nil {
+			failures = append(failures, fmt.Sprintf("保存应用主机绑定失败: %v", err))
+		}
+		persisted, found = e.store.GetApp(app.ID)
+		if !found {
+			failures = append(failures, "应用记录已不存在")
+		}
+	}
+	persistedHostID := ""
+	if found {
+		persistedHostID = persisted.HostID
+		app.HostID = persistedHostID
+	}
+	if jobs, ok := e.snapJobs.(appVolumeJobHostStore); ok && persistedHostID != "" {
+		if err := jobs.UpdateAppVolumeJobHost(app.ID, persistedHostID); err != nil {
+			failures = append(failures, fmt.Sprintf("同步应用数据卷备份任务主机失败: %v", err))
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("%s", strings.Join(failures, "；"))
+	}
+	return nil
+}
+
 // StartMigration enqueues a cross-host migration deployment. It validates the
 // request synchronously (target host reachable, Linux, no conflicting volume
 // op) so the caller gets a precise error instead of a queued run that fails.
@@ -327,23 +370,29 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 	rollback := func(cause error) []string {
 		var issues []string
 		logBuf.WriteString(fmt.Sprintf("\n[ROLLBACK] 迁移失败: %v\n[ROLLBACK] 回滚应用至源主机 %s\n", cause, oldHostID))
-		if app.HostID != oldHostID {
-			_ = e.store.UpdateApp(app.ID, func(a *Application) error {
-				a.HostID = oldHostID
-				return nil
-			})
-			app.HostID = oldHostID
+		if err := e.persistMigrationHost(app, oldHostID); err != nil {
+			issues = append(issues, fmt.Sprintf("回滚源主机绑定失败: %v", err))
+			logBuf.WriteString(fmt.Sprintf("WARN: 回滚源主机绑定失败: %v\n", err))
 		}
-		if e.proxy != nil && len(app.ProxyDomains) > 0 {
-			if err := e.proxy.SyncProxyForHost(app, targetHostID); err != nil {
+		rollbackApp, appFound := e.store.GetApp(app.ID)
+		bindingRestored := appFound && rollbackApp.HostID == oldHostID
+		if !appFound {
+			issues = append(issues, "应用记录已不存在，无法同步回滚路由")
+			logBuf.WriteString("WARN: 应用记录已不存在，跳过反向代理与组网转发回滚\n")
+		} else if !bindingRestored {
+			issues = append(issues, fmt.Sprintf("应用主机仍绑定到 %s，跳过回滚路由", rollbackApp.HostID))
+			logBuf.WriteString(fmt.Sprintf("WARN: 应用主机仍绑定到 %s，跳过反向代理与组网转发回滚\n", rollbackApp.HostID))
+		}
+		if bindingRestored && e.proxy != nil && len(rollbackApp.ProxyDomains) > 0 {
+			if err := e.proxy.SyncProxyForHost(rollbackApp, targetHostID); err != nil {
 				issues = append(issues, fmt.Sprintf("反向代理指回失败: %v", err))
 				logBuf.WriteString(fmt.Sprintf("WARN: 回滚反向代理失败: %v\n", err))
 			} else {
 				logBuf.WriteString("[ROLLBACK] 反向代理已指回源主机\n")
 			}
 		}
-		if app.MeshForwardEnabled {
-			if err := e.syncMeshForwarder(app, logBuf); err != nil {
+		if bindingRestored && rollbackApp.MeshForwardEnabled {
+			if err := e.syncMeshForwarder(rollbackApp, logBuf); err != nil {
 				issues = append(issues, fmt.Sprintf("组网转发重定向失败: %v", err))
 			}
 		}
@@ -640,11 +689,10 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 
 	// ---- Stage 3: rebind the app to the target host and reroute traffic.
 	logBuf.WriteString("$ 切换应用主机绑定与网络路由\n")
-	_ = e.store.UpdateApp(app.ID, func(a *Application) error {
-		a.HostID = targetHostID
-		return nil
-	})
-	app.HostID = targetHostID
+	if err := e.persistMigrationHost(app, targetHostID); err != nil {
+		failRollback("保存应用目标主机绑定或同步数据卷备份任务失败: %v", err)
+		return
+	}
 
 	// A failed reroute must fail the migration (and roll back): the source
 	// container is already stopped, so "success with a WARN" would leave

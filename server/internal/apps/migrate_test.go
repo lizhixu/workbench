@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -483,5 +485,75 @@ func TestStartMigrationRejectsWindowsSource(t *testing.T) {
 	_, err = engine.StartMigration(app, MigrateAppReq{TargetHostID: "host_tgt"}, "tester")
 	if err == nil || !strings.Contains(err.Error(), "源主机为 Windows") {
 		t.Errorf("expected Windows-source rejection, got %v", err)
+	}
+}
+
+func TestPersistMigrationHostUpdatesAppAndScheduledJob(t *testing.T) {
+	engine, store := newMigrateTestEngine(t, nil)
+	jobStore, err := snapshots.NewStore(t.TempDir(), slog.Default())
+	if err != nil {
+		t.Fatalf("snapshots.NewStore: %v", err)
+	}
+	engine.snapJobs = jobStore
+	app := putMigrateApp(t, store, &Application{HostID: "host_src"})
+	if err := jobStore.PutJob(&snapshots.Job{
+		ID: "job_app_volume", Kind: snapshots.KindAppVolume, AppID: app.ID, HostID: "host_src",
+	}); err != nil {
+		t.Fatalf("PutJob: %v", err)
+	}
+
+	for _, hostID := range []string{"host_dst", "host_src"} {
+		if err := engine.persistMigrationHost(app, hostID); err != nil {
+			t.Fatalf("persistMigrationHost(%q): %v", hostID, err)
+		}
+		persisted, ok := store.GetApp(app.ID)
+		if !ok || persisted.HostID != hostID || app.HostID != hostID {
+			t.Fatalf("app host after persist = stored:%q local:%q, want %q", persisted.HostID, app.HostID, hostID)
+		}
+		job, ok := jobStore.GetJob("job_app_volume")
+		if !ok || job.HostID != hostID {
+			t.Fatalf("scheduled job host = %q/%v, want %q", job.HostID, ok, hostID)
+		}
+	}
+}
+
+func TestPersistMigrationHostPersistenceFailureKeepsStoredHost(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir, slog.Default())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	app := putMigrateApp(t, store, &Application{HostID: "host_src"})
+	jobStore, err := snapshots.NewStore(t.TempDir(), slog.Default())
+	if err != nil {
+		t.Fatalf("snapshots.NewStore: %v", err)
+	}
+	if err := jobStore.PutJob(&snapshots.Job{
+		ID: "job_app_volume", Kind: snapshots.KindAppVolume, AppID: app.ID, HostID: "host_src",
+	}); err != nil {
+		t.Fatalf("PutJob: %v", err)
+	}
+	engine := NewEngine(nil, store, nil, slog.Default())
+	engine.snapJobs = jobStore
+
+	appsPath := filepath.Join(dir, appsFile)
+	if err := os.Remove(appsPath); err != nil {
+		t.Fatalf("remove apps file: %v", err)
+	}
+	if err := os.Mkdir(appsPath, 0o700); err != nil {
+		t.Fatalf("make apps path a directory: %v", err)
+	}
+	defer os.RemoveAll(appsPath)
+
+	if err := engine.persistMigrationHost(app, "host_dst"); err == nil {
+		t.Fatal("expected persistence failure")
+	}
+	persisted, ok := store.GetApp(app.ID)
+	if !ok || persisted.HostID != "host_src" || app.HostID != "host_src" {
+		t.Fatalf("failed host update changed app binding: stored:%q local:%q", persisted.HostID, app.HostID)
+	}
+	job, ok := jobStore.GetJob("job_app_volume")
+	if !ok || job.HostID != "host_src" {
+		t.Fatalf("failed host update desynchronized scheduled job: host=%q found=%v", job.HostID, ok)
 	}
 }

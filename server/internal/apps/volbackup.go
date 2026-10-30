@@ -152,7 +152,7 @@ type S3TargetStore interface {
 // cron sweep keeps firing jobs whose application is gone, writing a failing
 // archive record every run.
 type SnapshotJobStore interface {
-	DeleteJobsByApp(appID string) int
+	DeleteJobsByApp(appID string) (int, error)
 }
 
 // S3DestinationStatus is the read-only S3 readiness block the UI uses to show
@@ -214,6 +214,13 @@ func NewVolumeStore(dataDir string, log *slog.Logger) (*VolumeStore, error) {
 			a.Error = "控制端重启，任务已中断"
 			stale = true
 		}
+		if a.Source == VolumeArchiveSourceUpload && a.Status == VolumeBackupUploaded && a.LastRestoreStatus == "" {
+			now := time.Now()
+			a.LastRestoreAt = &now
+			a.LastRestoreStatus = VolumeBackupFailed
+			a.LastRestoreError = "控制端重启，上传恢复已中断"
+			stale = true
+		}
 		s.byID[volumeArchiveKey(a.AppID, a.ID)] = a
 	}
 	if stale {
@@ -241,20 +248,38 @@ func cloneArchive(a *VolumeArchive) *VolumeArchive {
 	return &c
 }
 
+func cloneArchivesMap(m map[string]*VolumeArchive) map[string]*VolumeArchive {
+	out := make(map[string]*VolumeArchive, len(m))
+	for k, v := range m {
+		out[k] = cloneArchive(v)
+	}
+	return out
+}
+
 // AddArchive records a freshly created archive (status running).
 func (s *VolumeStore) AddArchive(a *VolumeArchive) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.byID[volumeArchiveKey(a.AppID, a.ID)] = cloneArchive(a)
-	return s.saveLocked()
+	candidate := cloneArchivesMap(s.byID)
+	candidate[volumeArchiveKey(a.AppID, a.ID)] = cloneArchive(a)
+	if err := s.saveCandidateLocked(candidate); err != nil {
+		return err
+	}
+	s.byID = candidate
+	return nil
 }
 
 // PutArchive updates a stored record (status migration, size/sha, error).
 func (s *VolumeStore) PutArchive(a *VolumeArchive) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.byID[volumeArchiveKey(a.AppID, a.ID)] = cloneArchive(a)
-	return s.saveLocked()
+	candidate := cloneArchivesMap(s.byID)
+	candidate[volumeArchiveKey(a.AppID, a.ID)] = cloneArchive(a)
+	if err := s.saveCandidateLocked(candidate); err != nil {
+		return err
+	}
+	s.byID = candidate
+	return nil
 }
 
 // GetArchive returns one archive of an application.
@@ -286,25 +311,35 @@ func (s *VolumeStore) ListArchives(appID string) []*VolumeArchive {
 func (s *VolumeStore) DeleteArchive(appID, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.byID, volumeArchiveKey(appID, id))
-	return s.saveLocked()
+	candidate := cloneArchivesMap(s.byID)
+	delete(candidate, volumeArchiveKey(appID, id))
+	if err := s.saveCandidateLocked(candidate); err != nil {
+		return err
+	}
+	s.byID = candidate
+	return nil
 }
 
 // DeleteAppArchives drops every archive record of an application (purge).
 func (s *VolumeStore) DeleteAppArchives(appID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for k, a := range s.byID {
+	candidate := cloneArchivesMap(s.byID)
+	for k, a := range candidate {
 		if a.AppID == appID {
-			delete(s.byID, k)
+			delete(candidate, k)
 		}
 	}
-	return s.saveLocked()
+	if err := s.saveCandidateLocked(candidate); err != nil {
+		return err
+	}
+	s.byID = candidate
+	return nil
 }
 
-func (s *VolumeStore) saveLocked() error {
-	doc := appVolumeArchives{Archives: make([]*VolumeArchive, 0, len(s.byID))}
-	for _, a := range s.byID {
+func (s *VolumeStore) saveCandidateLocked(candidate map[string]*VolumeArchive) error {
+	doc := appVolumeArchives{Archives: make([]*VolumeArchive, 0, len(candidate))}
+	for _, a := range candidate {
 		doc.Archives = append(doc.Archives, a)
 	}
 	sort.Slice(doc.Archives, func(i, j int) bool { return doc.Archives[i].CreatedAt.After(doc.Archives[j].CreatedAt) })
@@ -315,9 +350,8 @@ func (s *VolumeStore) saveLocked() error {
 	for _, a := range doc.Archives {
 		perApp[a.AppID]++
 		if perApp[a.AppID] > volumeArchiveMetaCap {
-			// Drop it from memory too, otherwise the map regains its old size on
-			// the next save and the cap only ever trims the file.
-			delete(s.byID, volumeArchiveKey(a.AppID, a.ID))
+			// Drop it from candidate map too, so memory matches the saved file.
+			delete(candidate, volumeArchiveKey(a.AppID, a.ID))
 			continue
 		}
 		kept = append(kept, a)
@@ -335,6 +369,10 @@ func (s *VolumeStore) saveLocked() error {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(s.dir, appVolumeArchivesFile))
+}
+
+func (s *VolumeStore) saveLocked() error {
+	return s.saveCandidateLocked(s.byID)
 }
 
 // parseVolumeSpec splits a docker -v spec into source / container path / mode.
@@ -486,11 +524,29 @@ tar -C %s -xzf %s`,
 		shellQuote(hostDir), shellQuote(archivePath))
 }
 
-// volumeContainerStateScript reports whether a container is running, without
-// failing when it does not exist (docker inspect exits non-zero then).
+// volumeContainerStateScript reports a container state and fails closed when
+// docker inspect cannot determine it. Treating inspect failures as STOPPED is
+// unsafe: restore would overwrite a live container's data without arranging a
+// restart.
 func volumeContainerStateScript(container string) string {
-	return fmt.Sprintf(`if docker inspect --format '{{.State.Running}}' %s 2>/dev/null | grep -qi '^true$'; then echo RUNNING; else echo STOPPED; fi`,
-		shellQuote(container))
+	return fmt.Sprintf(`set -e
+STATE=$(docker inspect --format '{{.State.Running}}' %s)
+case "$STATE" in
+  true) echo RUNNING ;;
+  false) echo STOPPED ;;
+  *) echo "无法确定容器运行状态" >&2; exit 1 ;;
+esac`, shellQuote(container))
+}
+
+func parseVolumeContainerState(stdout []byte) (running bool, err error) {
+	switch strings.TrimSpace(strings.ToUpper(string(stdout))) {
+	case "RUNNING":
+		return true, nil
+	case "STOPPED":
+		return false, nil
+	default:
+		return false, fmt.Errorf("Agent 返回了无法识别的容器状态")
+	}
 }
 
 // volumeRemoveScript deletes staging files from the host (best effort).
@@ -857,13 +913,14 @@ func (e *Engine) runBackupAppVolumesWith(app *Application, specs []string, note 
 			firstErr = err
 		}
 	}
-	if firstErr != nil {
-		return out, firstErr
-	}
-	// Retention prune per volume spec: older successful archives beyond the
-	// keep-count lose both their S3 objects and metadata.
+	// Retention is per volume and must run even when another volume failed. A
+	// partial multi-volume backup still creates successful archives that need
+	// pruning; otherwise failed runs can permanently bypass the retention cap.
 	for _, spec := range deduped {
 		e.pruneVolumeArchives(hub, app.ID, spec, keep)
+	}
+	if firstErr != nil {
+		return out, firstErr
 	}
 	return out, nil
 }
@@ -1142,7 +1199,17 @@ func (e *Engine) runRestoreCore(app *Application, arch *VolumeArchive, downloadU
 	if serr != nil {
 		return false, fmt.Errorf("查询容器状态失败: %v", serr)
 	}
-	wasRunning := strings.Contains(strings.ToUpper(string(stateRes.GetStdout())), "RUNNING")
+	if stateRes.GetExitCode() != 0 {
+		msg := strings.TrimSpace(string(stateRes.GetStderr()))
+		if msg == "" {
+			msg = fmt.Sprintf("Agent 返回状态检查失败 (exit %d)", stateRes.GetExitCode())
+		}
+		return false, fmt.Errorf("查询容器状态失败: %s", msg)
+	}
+	wasRunning, stateErr := parseVolumeContainerState(stateRes.GetStdout())
+	if stateErr != nil {
+		return false, fmt.Errorf("查询容器状态失败: %v", stateErr)
+	}
 
 	if wasRunning {
 		stopRes, stopErr := execOnAgent(hub, "volstop-"+randomToken(4), "docker stop "+shellQuote(container), 300)
@@ -1158,11 +1225,69 @@ func (e *Engine) runRestoreCore(app *Application, arch *VolumeArchive, downloadU
 		defer func() {
 			startRes, startErr := execOnAgent(hub, "volstart-"+randomToken(4), "docker start "+shellQuote(container), 120)
 			if startErr != nil {
-				e.log.Error("volume restore: container restart failed", "app", app.ID, "container", container, "err", startErr)
+				restartErr := fmt.Errorf("恢复后重启应用容器失败: %v", startErr)
+				e.log.Error("volume restore: container restart failed", "app", app.ID, "container", container, "err", restartErr)
+				if err == nil {
+					err = restartErr
+				} else {
+					err = fmt.Errorf("%v；%w", err, restartErr)
+				}
 				return
 			}
 			if startRes.GetExitCode() != 0 {
-				e.log.Error("volume restore: container restart exited non-zero", "app", app.ID, "container", container, "exit", startRes.GetExitCode())
+				msg := strings.TrimSpace(string(startRes.GetStderr()))
+				if msg == "" {
+					msg = fmt.Sprintf("exit %d", startRes.GetExitCode())
+				}
+				restartErr := fmt.Errorf("恢复后重启应用容器失败: %s", msg)
+				e.log.Error("volume restore: container restart exited non-zero", "app", app.ID, "container", container, "exit", startRes.GetExitCode(), "err", restartErr)
+				if err == nil {
+					err = restartErr
+				} else {
+					err = fmt.Errorf("%v；%w", err, restartErr)
+				}
+				return
+			}
+			// docker start may return zero and still leave a container that exits
+			// immediately. Check the resulting state; failure is part of the
+			// restore outcome rather than a warning-only condition.
+			checkRes, checkErr := execOnAgent(hub, "volstate-"+randomToken(4), volumeContainerStateScript(container), 30)
+			if checkErr != nil {
+				restartErr := fmt.Errorf("恢复后检查应用容器状态失败: %v", checkErr)
+				e.log.Error("volume restore: container state check failed", "app", app.ID, "container", container, "err", restartErr)
+				if err == nil {
+					err = restartErr
+				} else {
+					err = fmt.Errorf("%v；%w", err, restartErr)
+				}
+				return
+			}
+			if checkRes.GetExitCode() != 0 {
+				msg := strings.TrimSpace(string(checkRes.GetStderr()))
+				if msg == "" {
+					msg = fmt.Sprintf("exit %d", checkRes.GetExitCode())
+				}
+				restartErr := fmt.Errorf("恢复后检查应用容器状态失败: %s", msg)
+				e.log.Error("volume restore: container state check exited non-zero", "app", app.ID, "container", container, "exit", checkRes.GetExitCode(), "err", restartErr)
+				if err == nil {
+					err = restartErr
+				} else {
+					err = fmt.Errorf("%v；%w", err, restartErr)
+				}
+				return
+			}
+			running, parseErr := parseVolumeContainerState(checkRes.GetStdout())
+			if parseErr != nil || !running {
+				if parseErr == nil {
+					parseErr = errors.New("容器启动后立即退出")
+				}
+				restartErr := fmt.Errorf("恢复后应用容器未保持运行: %v", parseErr)
+				e.log.Error("volume restore: container exited after restart", "app", app.ID, "container", container, "err", restartErr)
+				if err == nil {
+					err = restartErr
+				} else {
+					err = fmt.Errorf("%v；%w", err, restartErr)
+				}
 				return
 			}
 			restarted = true
@@ -1236,18 +1361,24 @@ func (e *Engine) deleteAppVolumeArchive(app *Application, arch *VolumeArchive) e
 // function must NOT try to acquire it again — the slot is non-reentrant and
 // a self-acquire would always fail and skip the cleanup entirely.
 func (e *Engine) PurgeVolumeArchives(app *Application) error {
+	var firstErr error
 	// Scheduled app_volume jobs live in the snapshot module; with the app gone
 	// each cron sweep would fail on 「应用不存在」and append a failing archive
-	// record forever, so drop them together with the archives.
+	// record forever, so drop them together with the archives. A failure here
+	// must not skip the archive cleanup below: the application is deleted
+	// either way, and bailing out would strand paid S3 objects behind
+	// metadata nobody can reach anymore.
 	if e.snapJobs != nil {
-		if n := e.snapJobs.DeleteJobsByApp(app.ID); n > 0 {
+		n, err := e.snapJobs.DeleteJobsByApp(app.ID)
+		if err != nil {
+			firstErr = fmt.Errorf("删除应用数据卷备份任务失败: %w", err)
+		} else if n > 0 {
 			e.log.Info("dropped app_volume snapshot jobs with the application", "app", app.ID, "jobs", n)
 		}
 	}
 	if e.vols == nil {
-		return nil
+		return firstErr
 	}
-	var firstErr error
 	for _, a := range e.vols.ListArchives(app.ID) {
 		// Uploaded records carry no S3 object; their panel temporary files
 		// and download tokens go with the application.

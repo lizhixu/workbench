@@ -117,3 +117,68 @@ func TestVolumeUploadDropTokenByArchive(t *testing.T) {
 		t.Fatalf("dropped token must fail")
 	}
 }
+
+func TestVolumeUploadTokenBindsFullRecord(t *testing.T) {
+	s := newTestUploadStore(t)
+	tok, err := s.IssueTokenForRecord("app1", "vbk_1", VolumeArchiveSourceUpload, VolumeBackupUploaded)
+	if err != nil {
+		t.Fatalf("IssueTokenForRecord: %v", err)
+	}
+	if s.ConsumeTokenForRecord(tok, "app2", "vbk_1", VolumeArchiveSourceUpload, VolumeBackupUploaded) {
+		t.Fatal("token must reject another app")
+	}
+	if s.ConsumeTokenForRecord(tok, "app1", "vbk_2", VolumeArchiveSourceUpload, VolumeBackupUploaded) {
+		t.Fatal("token must reject another archive")
+	}
+	if s.ConsumeTokenForRecord(tok, "app1", "vbk_1", "backup", VolumeBackupUploaded) {
+		t.Fatal("token must reject another source")
+	}
+	if s.ConsumeTokenForRecord(tok, "app1", "vbk_1", VolumeArchiveSourceUpload, VolumeBackupSuccess) {
+		t.Fatal("token must reject another lifecycle status")
+	}
+	if !s.ConsumeTokenForRecord(tok, "app1", "vbk_1", VolumeArchiveSourceUpload, VolumeBackupUploaded) {
+		t.Fatal("correct full record binding must consume token")
+	}
+	if s.ConsumeTokenForRecord(tok, "app1", "vbk_1", VolumeArchiveSourceUpload, VolumeBackupUploaded) {
+		t.Fatal("consumed token must not be replayed")
+	}
+}
+
+func TestVolumeUploadLookupTokenReturnsFullBinding(t *testing.T) {
+	s := newTestUploadStore(t)
+	tok, err := s.IssueTokenForRecord("app1", "vbk_1", VolumeArchiveSourceUpload, VolumeBackupUploaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveID, appID, source, status, ok := s.peekToken(tok)
+	if !ok || archiveID != "vbk_1" || appID != "app1" || source != VolumeArchiveSourceUpload || status != VolumeBackupUploaded {
+		t.Fatalf("peekToken = (%q,%q,%q,%q,%v)", archiveID, appID, source, status, ok)
+	}
+}
+
+func TestUploadRestoreBaseURLRequiresTrustedHTTPURL(t *testing.T) {
+	for _, raw := range []string{
+		"",
+		"//panel.example.com",
+		"ftp://panel.example.com",
+		"https://user:pass@panel.example.com",
+		"https://panel.example.com/path?token=x",
+		"https://panel.example.com#fragment",
+		"https://:443",
+		"https://panel.example.com:70000",
+		"https://panel.example.com:0",
+	} {
+		if got, err := uploadRestoreBaseURL(raw); err == nil {
+			t.Errorf("uploadRestoreBaseURL(%q) = %q, want error", raw, got)
+		}
+	}
+	for raw, want := range map[string]string{
+		"https://panel.example.com/": "https://panel.example.com",
+		"http://panel.example.com:18789/base": "http://panel.example.com:18789/base",
+	} {
+		got, err := uploadRestoreBaseURL(raw)
+		if err != nil || got != want {
+			t.Errorf("uploadRestoreBaseURL(%q) = (%q,%v), want (%q,nil)", raw, got, err, want)
+		}
+	}
+}

@@ -60,6 +60,35 @@ func TestStoreAppRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUpdateAppPersistenceErrorRollsBack(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := store.PutApp(&Application{ID: "app1", Name: "before", HostID: "host1"}); err != nil {
+		t.Fatal(err)
+	}
+	appsPath := filepath.Join(dir, appsFile)
+	if err := os.Remove(appsPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(appsPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(appsPath)
+	if err := store.UpdateApp("app1", func(a *Application) error {
+		a.Name = "after"
+		return nil
+	}); err == nil {
+		t.Fatal("expected persistence error")
+	}
+	got, ok := store.GetApp("app1")
+	if !ok || got.Name != "before" {
+		t.Fatalf("failed update changed in-memory app: %+v", got)
+	}
+}
+
 func TestStoreWebhookLookup(t *testing.T) {
 	s := newTestStore(t)
 	_ = s.PutApp(&Application{ID: "a1", Name: "x", WebhookToken: "tok1", CreatedAt: time.Now()})

@@ -34,8 +34,8 @@ func TestParseVolumeSpec(t *testing.T) {
 		{spec: ":/data", ok: false},
 		{spec: "/data:", ok: false},
 		{spec: "/a/../b:/data", ok: false},
-		{spec: "/opt/data:data", ok: false},  // container path must be absolute
-		{spec: "volname:data", ok: false},    // same for named volumes
+		{spec: "/opt/data:data", ok: false},    // container path must be absolute
+		{spec: "volname:data", ok: false},      // same for named volumes
 		{spec: "/opt/data:/data:z", ok: false}, // unknown third segment is not a mode
 		{spec: "/opt/data:/data:ro:rw", ok: false},
 	}
@@ -132,8 +132,30 @@ func TestVolumeContainerStateScript(t *testing.T) {
 	if !strings.Contains(script, `docker inspect --format '{{.State.Running}}' 'app1'`) {
 		t.Errorf("state script wrong:\n%s", script)
 	}
-	if !strings.Contains(script, "RUNNING") || !strings.Contains(script, "STOPPED") {
-		t.Errorf("state script must echo RUNNING/STOPPED:\n%s", script)
+	if !strings.Contains(script, "set -e") || !strings.Contains(script, "RUNNING") || !strings.Contains(script, "STOPPED") {
+		t.Errorf("state script must fail closed and echo RUNNING/STOPPED:\n%s", script)
+	}
+}
+
+func TestParseVolumeContainerStateFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		output string
+		want   bool
+	}{
+		{output: "RUNNING", want: true},
+		{output: "STOPPED", want: false},
+		{output: "", want: false},
+		{output: "false\\nerror", want: false},
+		{output: "unknown", want: false},
+	} {
+		got, err := parseVolumeContainerState([]byte(tc.output))
+		if tc.output == "RUNNING" || tc.output == "STOPPED" {
+			if err != nil || got != tc.want {
+				t.Errorf("parseVolumeContainerState(%q) = (%v,%v), want (%v,nil)", tc.output, got, err, tc.want)
+			}
+		} else if err == nil {
+			t.Errorf("parseVolumeContainerState(%q) accepted invalid state", tc.output)
+		}
 	}
 }
 
@@ -253,6 +275,57 @@ func TestVolumeStoreReconcilesInterruptedRunning(t *testing.T) {
 	}
 	if got, _ := s2.GetArchive("app1", "vbk_1"); got.Status != VolumeBackupFailed {
 		t.Fatalf("reconciled status not persisted: %+v", got)
+	}
+}
+
+func TestVolumeStoreReconcilesInterruptedUploadedRestore(t *testing.T) {
+	dir := t.TempDir()
+	doc := `{"archives":[{"id":"vbk_up1","app_id":"app1","status":"uploaded","source":"upload","created_at":"2026-10-22T00:00:00Z"}]}`
+	if err := os.WriteFile(filepath.Join(dir, appVolumeArchivesFile), []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewVolumeStore(dir, nil)
+	if err != nil {
+		t.Fatalf("NewVolumeStore: %v", err)
+	}
+	got, ok := s.GetArchive("app1", "vbk_up1")
+	if !ok || got.LastRestoreStatus != VolumeBackupFailed || !strings.Contains(got.LastRestoreError, "中断") {
+		t.Fatalf("interrupted upload record not reconciled: %+v", got)
+	}
+	s2, err := NewVolumeStore(dir, nil)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if got2, _ := s2.GetArchive("app1", "vbk_up1"); got2.LastRestoreStatus != VolumeBackupFailed {
+		t.Fatalf("reconciled status not persisted: %+v", got2)
+	}
+}
+
+func TestVolumeStoreTransactionalOnSaveFailure(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewVolumeStore(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arch1 := &VolumeArchive{ID: "vbk_1", AppID: "app1", VolumeSpec: "/data:/data", Status: VolumeBackupSuccess, CreatedAt: time.Now()}
+	if err := s.AddArchive(arch1); err != nil {
+		t.Fatal(err)
+	}
+	// Point to an inaccessible nested path so Mkdir/write fails
+	s.dir = filepath.Join(dir, "invalid-file")
+	if err := os.WriteFile(s.dir, []byte("blocker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	arch2 := &VolumeArchive{ID: "vbk_2", AppID: "app1", VolumeSpec: "/data:/data", Status: VolumeBackupSuccess, CreatedAt: time.Now()}
+	if err := s.AddArchive(arch2); err == nil {
+		t.Fatal("expected save error on invalid directory")
+	}
+	// In-memory store must not retain arch2
+	if _, ok := s.GetArchive("app1", "vbk_2"); ok {
+		t.Fatal("unpersisted archive retained in memory after save failure")
+	}
+	if _, ok := s.GetArchive("app1", "vbk_1"); !ok {
+		t.Fatal("existing archive lost from memory after failed save")
 	}
 }
 
@@ -872,11 +945,17 @@ func TestVolumeBackupNoteLengthLimit(t *testing.T) {
 }
 
 // fakeSnapshotJobStore records which app's scheduled backup jobs were dropped.
-type fakeSnapshotJobStore struct{ deleted []string }
+type fakeSnapshotJobStore struct {
+	deleted []string
+	err     error
+}
 
-func (f *fakeSnapshotJobStore) DeleteJobsByApp(appID string) int {
+func (f *fakeSnapshotJobStore) DeleteJobsByApp(appID string) (int, error) {
 	f.deleted = append(f.deleted, appID)
-	return 1
+	if f.err != nil {
+		return 0, f.err
+	}
+	return 1, nil
 }
 
 func TestPurgeVolumeArchivesDropsSnapshotJobs(t *testing.T) {
@@ -901,6 +980,42 @@ func TestPurgeVolumeArchivesDropsSnapshotJobs(t *testing.T) {
 	// Unwired cleaner (unit tests, store-less engines) must stay harmless.
 	if err := NewEngine(nil, store, nil, nil).PurgeVolumeArchives(app); err != nil {
 		t.Fatalf("purge without cleanup hook: %v", err)
+	}
+}
+
+// A failing job-store save must not skip archive cleanup: the application is
+// deleted either way, and bailing out would leave paid S3 objects behind
+// metadata nobody can reach anymore.
+func TestPurgeVolumeArchivesStillCleansArchivesWhenJobCleanupFails(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	vols, err := NewVolumeStore(dir, nil)
+	if err != nil {
+		t.Fatalf("NewVolumeStore: %v", err)
+	}
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image"}
+	if err := vols.AddArchive(&VolumeArchive{
+		AppID: app.ID, ID: "vbk_1", VolumeSpec: "/opt/a:/a",
+		Status: VolumeBackupSuccess, StorageTarget: "default", StoragePath: "apps/app1/vbk_1.tar.gz",
+	}); err != nil {
+		t.Fatalf("AddArchive: %v", err)
+	}
+
+	e := NewEngine(nil, store, nil, nil)
+	e.SetVolumeStore(vols)
+	e.SetSnapshotJobStore(&fakeSnapshotJobStore{err: errors.New("disk full")})
+
+	err = e.PurgeVolumeArchives(app)
+	if err == nil || !strings.Contains(err.Error(), "删除应用数据卷备份任务失败") {
+		t.Fatalf("purge must surface the job-cleanup failure, got %v", err)
+	}
+	// The missing S3 target is tolerated (object unreachable), and the
+	// metadata must still be dropped: no unreachable records may survive.
+	if got := vols.ListArchives(app.ID); len(got) != 0 {
+		t.Fatalf("archives must be dropped despite job-cleanup failure, left %d", len(got))
 	}
 }
 

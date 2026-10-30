@@ -361,6 +361,27 @@ func (h *AppHandlers) uploadVolumeBackupRestore(c *gin.Context) {
 		return
 	}
 
+	// Validate the public URL before reading any uploaded data: an operator
+	// uploading a 2GB archive should fail fast if the server cannot form the
+	// agent download URL. Do not derive this from Request.Host: behind a proxy
+	// that header is client-controlled and may point the agent at an attacker.
+	configuredURL := ""
+	if h.settings != nil {
+		configuredURL = h.settings.PanelSecurity().PublicURL
+	}
+	if strings.TrimSpace(configuredURL) == "" {
+		configuredURL = agentPublicURL
+	}
+	baseURL, err := uploadRestoreBaseURL(configuredURL)
+	if err != nil {
+		h.engine.releaseVolumeSlot(app.ID)
+		// Surface the concrete reason: "not configured" and "configured but
+		// unusable" need different fixes, and the validator's messages are
+		// already operator-facing Chinese.
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无法生成 Agent 下载地址：" + err.Error()})
+		return
+	}
+
 	archiveID := "vbk_" + randomToken(8)
 	fileSaved := false
 	// cleanup drops the staged file (if any) and releases the slot. It runs
@@ -502,19 +523,13 @@ func (h *AppHandlers) uploadVolumeBackupRestore(c *gin.Context) {
 	tok, err := h.engine.volUploads.IssueToken(app.ID, archiveID)
 	if err != nil {
 		cleanup()
-		h.engine.vols.DeleteArchive(app.ID, archiveID)
+		if derr := h.engine.vols.DeleteArchive(app.ID, archiveID); derr != nil {
+			h.engine.log.Warn("cleanup volume archive failed", "app", app.ID, "archive", archiveID, "err", derr)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成下载链接失败"})
 		return
 	}
-	// The agent downloads from the panel address the browser used. The
-	// agent must be able to reach the panel over HTTP at that address
-	// (same derivation family as the upgrade download URL); if it cannot,
-	// the run fails at its download step, before any downtime.
-	scheme := "http"
-	if c.Request.TLS != nil {
-		scheme = "https"
-	}
-	downloadURL := fmt.Sprintf("%s://%s/api/v1/volume-uploads/%s", scheme, c.Request.Host, tok)
+	downloadURL := fmt.Sprintf("%s/api/v1/volume-uploads/%s", baseURL, tok)
 
 	go func() {
 		defer h.engine.releaseVolumeSlot(app.ID)
@@ -535,12 +550,25 @@ func (h *AppHandlers) uploadVolumeBackupRestore(c *gin.Context) {
 // prefix (see secentry.exemptPath); without the exemption an enabled entry
 // gate would 404 the agent's download mid-restore.
 func (h *AppHandlers) downloadVolumeUpload(c *gin.Context) {
-	if h.engine == nil || h.engine.volUploads == nil {
+	if h.engine == nil || h.engine.volUploads == nil || h.engine.vols == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "上传恢复暂不可用"})
 		return
 	}
-	archiveID, _, ok := h.engine.volUploads.ConsumeToken(c.Param("token"))
+	token := c.Param("token")
+	archiveID, appID, source, status, ok := h.engine.volUploads.peekToken(token)
 	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "下载链接无效或已过期"})
+		return
+	}
+	arch, ok := h.engine.GetVolumeArchive(appID, archiveID)
+	if !ok || source != VolumeArchiveSourceUpload || status != VolumeBackupUploaded || arch.AppID != appID || arch.ID != archiveID || arch.Source != VolumeArchiveSourceUpload || arch.Status != VolumeBackupUploaded {
+		// Burn a token that points at an invalid lifecycle record so it cannot be
+		// replayed after an operator deletes or changes the archive.
+		h.engine.volUploads.ConsumeToken(token)
+		c.JSON(http.StatusNotFound, gin.H{"error": "下载链接无效或已过期"})
+		return
+	}
+	if !h.engine.volUploads.ConsumeTokenForRecord(token, appID, archiveID, arch.Source, arch.Status) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "下载链接无效或已过期"})
 		return
 	}

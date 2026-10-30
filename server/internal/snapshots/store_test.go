@@ -1,6 +1,88 @@
 package snapshots
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestListJobsReturnsCopies(t *testing.T) {
+	s, err := NewStore(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if err := s.PutJob(&Job{ID: "job_1", Name: "original", Kind: KindDir, CreatedAt: timeNowForTest()}); err != nil {
+		t.Fatal(err)
+	}
+	jobs := s.ListJobs()
+	if len(jobs) != 1 {
+		t.Fatalf("ListJobs = %d, want 1", len(jobs))
+	}
+	jobs[0].Name = "mutated"
+	got, ok := s.GetJob("job_1")
+	if !ok || got.Name != "original" {
+		t.Fatalf("ListJobs leaked live job pointer: %+v", got)
+	}
+}
+
+func TestDeleteJobsByAppPersistenceErrorRollsBack(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	job := &Job{ID: "job_1", Kind: KindAppVolume, AppID: "app_1", HostID: "host_1"}
+	if err := s.PutJob(job); err != nil {
+		t.Fatal(err)
+	}
+	jobsPath := filepath.Join(dir, jobsFile)
+	if err := os.Remove(jobsPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(jobsPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(jobsPath)
+	if n, err := s.DeleteJobsByApp("app_1"); err == nil || n != 0 {
+		t.Fatalf("DeleteJobsByApp = (%d, %v), want (0, error)", n, err)
+	}
+	if _, ok := s.GetJob(job.ID); !ok {
+		t.Fatal("failed deletion removed the in-memory job")
+	}
+	if _, err := os.Stat(jobsPath); err != nil {
+		t.Fatalf("jobs file disappeared after failed deletion: %v", err)
+	}
+}
+
+func TestUpdateAppVolumeJobHost(t *testing.T) {
+	s, err := NewStore(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	for _, job := range []*Job{
+		{ID: "app_job", Kind: KindAppVolume, AppID: "app_1", HostID: "old"},
+		{ID: "other_job", Kind: KindDir, AppID: "app_1", HostID: "old"},
+	} {
+		if err := s.PutJob(job); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.UpdateAppVolumeJobHost("app_1", "new"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetJob("app_job")
+	if got.HostID != "new" {
+		t.Fatalf("app_volume job host = %q, want new", got.HostID)
+	}
+	other, _ := s.GetJob("other_job")
+	if other.HostID != "old" {
+		t.Fatalf("non-app_volume job host changed to %q", other.HostID)
+	}
+}
+
+// timeNowForTest keeps the fixture explicit without relying on zero-value ties.
+func timeNowForTest() time.Time { return time.Now() }
 
 func TestDeleteJobsByApp(t *testing.T) {
 	dir := t.TempDir()
@@ -22,11 +104,11 @@ func TestDeleteJobsByApp(t *testing.T) {
 		}
 	}
 
-	if got := s.DeleteJobsByApp("app_1"); got != 2 {
-		t.Fatalf("DeleteJobsByApp = %d, want 2", got)
+	if got, err := s.DeleteJobsByApp("app_1"); err != nil || got != 2 {
+		t.Fatalf("DeleteJobsByApp = (%d, %v), want (2, nil)", got, err)
 	}
-	if got := s.DeleteJobsByApp("app_missing"); got != 0 {
-		t.Fatalf("DeleteJobsByApp on unknown app = %d, want 0", got)
+	if got, err := s.DeleteJobsByApp("app_missing"); err != nil || got != 0 {
+		t.Fatalf("DeleteJobsByApp on unknown app = (%d, %v), want (0, nil)", got, err)
 	}
 	for _, id := range []string{"job_a1_data", "job_a1_pg"} {
 		if _, ok := s.GetJob(id); ok {

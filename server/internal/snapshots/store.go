@@ -155,9 +155,25 @@ func (s *Store) loadJobs() error {
 	return nil
 }
 
-func (s *Store) saveJobsLocked() error {
-	list := make([]*Job, 0, len(s.jobs))
-	for _, j := range s.jobs {
+func cloneJob(j *Job) *Job {
+	if j == nil {
+		return nil
+	}
+	cp := *j
+	return &cp
+}
+
+func cloneJobs(jobs map[string]*Job) map[string]*Job {
+	out := make(map[string]*Job, len(jobs))
+	for id, j := range jobs {
+		out[id] = cloneJob(j)
+	}
+	return out
+}
+
+func (s *Store) saveJobsSnapshotLocked(jobs map[string]*Job) error {
+	list := make([]*Job, 0, len(jobs))
+	for _, j := range jobs {
 		list = append(list, j)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
@@ -172,13 +188,19 @@ func (s *Store) saveJobsLocked() error {
 	return os.Rename(tmp, filepath.Join(s.dir, jobsFile))
 }
 
+func (s *Store) saveJobsLocked() error {
+	return s.saveJobsSnapshotLocked(s.jobs)
+}
+
 // ListJobs returns all jobs ordered by creation time.
+// Each returned job is a copy so callers cannot mutate the live store without
+// going through an explicit update method.
 func (s *Store) ListJobs() []*Job {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	list := make([]*Job, 0, len(s.jobs))
 	for _, j := range s.jobs {
-		list = append(list, j)
+		list = append(list, cloneJob(j))
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.Before(list[j].CreatedAt) })
 	return list
@@ -192,30 +214,43 @@ func (s *Store) GetJob(id string) (*Job, bool) {
 	if !ok {
 		return nil, false
 	}
-	cp := *j
-	return &cp, true
+	return cloneJob(j), true
 }
 
-// PutJob inserts or replaces one job.
+// PutJob inserts or replaces one job. The candidate snapshot is persisted
+// before becoming the live map, so a failed write cannot split memory from disk.
 func (s *Store) PutJob(j *Job) error {
+	if j == nil {
+		return fmt.Errorf("job is nil")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.jobs[j.ID] = j
-	return s.saveJobsLocked()
+	candidate := cloneJobs(s.jobs)
+	candidate[j.ID] = cloneJob(j)
+	if err := s.saveJobsSnapshotLocked(candidate); err != nil {
+		return err
+	}
+	s.jobs = candidate
+	return nil
 }
 
-// UpdateJob mutates one job under the write lock and persists.
+// UpdateJob mutates a candidate job under the write lock and commits it only
+// after the candidate snapshot has been persisted.
 func (s *Store) UpdateJob(id string, mutate func(*Job) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	j, ok := s.jobs[id]
-	if !ok {
+	if _, ok := s.jobs[id]; !ok {
 		return fmt.Errorf("job %s not found", id)
 	}
-	if err := mutate(j); err != nil {
+	candidate := cloneJobs(s.jobs)
+	if err := mutate(candidate[id]); err != nil {
 		return err
 	}
-	return s.saveJobsLocked()
+	if err := s.saveJobsSnapshotLocked(candidate); err != nil {
+		return err
+	}
+	s.jobs = candidate
+	return nil
 }
 
 // DeleteJob removes one job. Its archives on the host stay untouched until
@@ -226,35 +261,67 @@ func (s *Store) DeleteJob(id string) error {
 	if _, ok := s.jobs[id]; !ok {
 		return fmt.Errorf("job %s not found", id)
 	}
-	delete(s.jobs, id)
-	return s.saveJobsLocked()
+	candidate := cloneJobs(s.jobs)
+	delete(candidate, id)
+	if err := s.saveJobsSnapshotLocked(candidate); err != nil {
+		return err
+	}
+	s.jobs = candidate
+	return nil
 }
 
 // DeleteJobsByApp removes the app_volume jobs bound to one application and
-// returns how many were dropped. The scheduler re-reads ListJobs every minute,
-// so deleting here is enough to stop the cron entries from firing against an
-// application that no longer exists. Their archives live in the apps volume
-// store and are purged with the application.
-func (s *Store) DeleteJobsByApp(appID string) int {
+// returns both the number removed and any persistence error. A failed save
+// leaves the live map untouched.
+func (s *Store) DeleteJobsByApp(appID string) (int, error) {
 	if appID == "" {
-		return 0
+		return 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	candidate := cloneJobs(s.jobs)
 	n := 0
-	for id, j := range s.jobs {
+	for id, j := range candidate {
 		if j.Kind == KindAppVolume && j.AppID == appID {
-			delete(s.jobs, id)
+			delete(candidate, id)
 			n++
 		}
 	}
 	if n == 0 {
-		return 0
+		return 0, nil
 	}
-	if err := s.saveJobsLocked(); err != nil {
-		s.log.Warn("persist app_volume job cleanup failed", "app", appID, "err", err)
+	if err := s.saveJobsSnapshotLocked(candidate); err != nil {
+		return 0, err
 	}
-	return n
+	s.jobs = candidate
+	return n, nil
+}
+
+// UpdateAppVolumeJobHost updates the derived host binding for every app_volume
+// job of an application. It uses the same candidate-snapshot transaction as
+// the other job mutations.
+func (s *Store) UpdateAppVolumeJobHost(appID, hostID string) error {
+	if appID == "" || hostID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate := cloneJobs(s.jobs)
+	changed := false
+	for _, j := range candidate {
+		if j.Kind == KindAppVolume && j.AppID == appID && j.HostID != hostID {
+			j.HostID = hostID
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	if err := s.saveJobsSnapshotLocked(candidate); err != nil {
+		return err
+	}
+	s.jobs = candidate
+	return nil
 }
 
 // AddArchive records a completed archive (JSONL append).

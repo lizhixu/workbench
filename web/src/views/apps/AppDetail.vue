@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, nextTick, onActivated, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
+import { computed, h, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   NAlert, NButton, NCard, NCode, NDataTable, NDescriptions, NDescriptionsItem,
@@ -14,7 +14,6 @@ import {
   GitCommitOutline, MoveOutline, PlayOutline, RefreshOutline, SparklesOutline, StopOutline,
   SwapHorizontalOutline, TrashOutline,
 } from '@vicons/ionicons5'
-import { useTablePagination } from '../../composables/useTablePagination'
 import {
   cancelDeployment, deployApp, diagnoseDeployment, getApp, getAppStatus, getDeployment, listDeployments, restartApp,
   rollbackApp, startApp, stopApp, updateApp, syncAppWebhook, type AppEntity, type AppStatus, type Deployment,
@@ -34,7 +33,7 @@ import {
   getGitHubAppStatus, switchAppToGitHubApp, type GitHubAppStatus,
 } from '../../api/git'
 import { bothMeshed } from '../../utils/mesh'
-import { fmtDateTime } from '../../utils/time'
+import { fmtDate, fmtDateTime, fmtTime } from '../../utils/time'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useAuthStore } from '../../stores/auth'
 import OpsTunnelModal from '../../components/tunnels/OpsTunnelModal.vue'
@@ -926,25 +925,17 @@ async function doRollback(dep?: Deployment) {
 // 覆盖运行中的数据）。
 const volumeBackups = ref<VolumeArchive[]>([])
 const volumeBackupTotal = ref(0)
+const volumePage = ref(1)
+const volumePageSize = ref(10)
 // 备份位置选项（NSelect 空值约定 §8.3.1：未选 = null，不用 ''）。
 const s3Targets = ref<S3Target[]>([])
 const selectedBackupTargetId = ref<string | null>(null)
 const volBackupNote = ref('')
 const selectedVolumeSpecs = ref<string[]>([])
 const backingVolumes = ref(false)
+const uploadingRestore = ref(false)
 const restoringArchive = ref('')
 const volumeListLoading = ref(false)
-// 归档体量有界（每卷保留 5 份成功归档），仅在行数超过一屏时启用分页，
-// 避免少量归档也常驻一条分页栏。
-const volumeArchiveRowCount = computed(() => volumeBackups.value.length)
-const { pagination: volumeArchivePagination } = useTablePagination({
-  pageSize: 10,
-  pageSizes: [10, 20, 50],
-  rowCount: volumeArchiveRowCount,
-})
-const volumeArchiveTablePagination = computed(
-  () => (volumeArchiveRowCount.value > 10 ? volumeArchivePagination : false),
-)
 // 备份/恢复都是 202 受理的异步 agent 任务，没有推送通道，只能轮询归档列表。
 // 备份的 running 记录可能晚于 202 几百毫秒才落库、恢复只在终态回写归档，因此
 // 用一个有界轮询窗口覆盖「已受理但记录尚未反映」的空窗，而不是只看 running。
@@ -1017,7 +1008,10 @@ const showJobModal = ref(false)
 const editingJobId = ref<string | null>(null)
 const savingJob = ref(false)
 const runningJobId = ref('')
+const deletingJobId = ref('')
+let refreshJobsTimer: ReturnType<typeof setTimeout> | null = null
 const togglingJobId = ref('')
+let appBackupJobsReqSeq = 0
 const jobForm = reactive({
   name: '',
   target: null as string | null,
@@ -1051,19 +1045,29 @@ function jobStorageLabel(job: BackupJob): string {
   return target ? `S3: ${target.name}` : 'S3 (未知)'
 }
 
-async function loadAppBackupJobs() {
+function clearRefreshJobsTimer() {
+  if (refreshJobsTimer) {
+    clearTimeout(refreshJobsTimer)
+    refreshJobsTimer = null
+  }
+}
+
+async function loadAppBackupJobs(silent = true) {
+  const seq = ++appBackupJobsReqSeq
   try {
     const all = await listBackupJobs()
+    if (seq !== appBackupJobsReqSeq) return
     appBackupJobs.value = all.filter((j) => j.kind === 'app_volume' && j.app_id === appId.value)
-  } catch {
-    // 任务列表失败不弹错：归档与手动备份不受影响。
+  } catch (e: any) {
+    // 任务列表失败不弹错：归档与手动备份不受影响；手动刷新仍给出反馈。
+    if (!silent && seq === appBackupJobsReqSeq) message.error(e.message || '获取备份任务失败')
   }
 }
 
 async function refreshBackupJobs() {
   backupJobsLoading.value = true
   try {
-    await loadAppBackupJobs()
+    await loadAppBackupJobs(false)
   } finally {
     backupJobsLoading.value = false
   }
@@ -1092,6 +1096,7 @@ function openJobModal(job?: BackupJob) {
 }
 
 async function submitJob() {
+  if (!canWrite.value || volumeBusy.value || deploying.value) return
   if (!jobForm.name.trim()) {
     message.warning('请填写任务名称')
     return
@@ -1141,6 +1146,7 @@ async function submitJob() {
 }
 
 async function doRunTask(job: BackupJob) {
+  if (!canWrite.value || volumeBusy.value || deploying.value) return
   runningJobId.value = job.id
   try {
     await runBackupJob(job.id)
@@ -1148,7 +1154,11 @@ async function doRunTask(job: BackupJob) {
     // 复用归档轮询的有界窗口：任务运行同样产生 running 归档，窗口内
     // 轮询会同时刷新归档与任务的最近执行。
     volumePollUntil.value = Date.now() + 30 * 60_000
-    setTimeout(loadAppBackupJobs, 3000)
+    clearRefreshJobsTimer()
+    refreshJobsTimer = setTimeout(() => {
+      refreshJobsTimer = null
+      if (route.name === 'app-detail') loadAppBackupJobs()
+    }, 3000)
   } catch (e: any) {
     message.error(e.message || '触发失败')
   } finally {
@@ -1157,6 +1167,7 @@ async function doRunTask(job: BackupJob) {
 }
 
 async function doToggleTask(job: BackupJob) {
+  if (!canWrite.value || volumeBusy.value || deploying.value) return
   togglingJobId.value = job.id
   try {
     await updateBackupJob(job.id, { enabled: !job.enabled })
@@ -1169,12 +1180,16 @@ async function doToggleTask(job: BackupJob) {
 }
 
 async function doDeleteTask(job: BackupJob) {
+  if (!canWrite.value || volumeBusy.value || deploying.value) return
+  deletingJobId.value = job.id
   try {
     await deleteBackupJob(job.id)
     message.success('备份任务已删除')
     await loadAppBackupJobs()
   } catch (e: any) {
     message.error(e.message || '删除失败')
+  } finally {
+    deletingJobId.value = ''
   }
 }
 
@@ -1224,10 +1239,22 @@ const backupJobColumns = computed<DataTableColumns<BackupJob>>(() => [
     render: (r) => canWrite.value
       ? h(NSpace, { size: 6 }, {
         default: () => [
-          h(NButton, { size: 'tiny', secondary: true, type: 'primary', loading: runningJobId.value === r.id, onClick: () => doRunTask(r) }, { default: () => '立即备份' }),
-          h(NButton, { size: 'tiny', secondary: true, onClick: () => openJobModal(r) }, { default: () => '编辑' }),
+          h(NButton, {
+            size: 'tiny', secondary: true, type: 'primary', loading: runningJobId.value === r.id,
+            disabled: volumeBusy.value && runningJobId.value !== r.id,
+            onClick: () => doRunTask(r),
+          }, { default: () => '立即备份' }),
+          h(NButton, {
+            size: 'tiny', secondary: true,
+            disabled: volumeBusy.value || deploying.value,
+            onClick: () => openJobModal(r),
+          }, { default: () => '编辑' }),
           h(NPopconfirm, { onPositiveClick: () => doDeleteTask(r) }, {
-            trigger: () => h(NButton, { size: 'tiny', secondary: true, type: 'error' }, { default: () => '删除' }),
+            trigger: () => h(NButton, {
+              size: 'tiny', secondary: true, type: 'error',
+              loading: deletingJobId.value === r.id,
+              disabled: volumeBusy.value || deploying.value,
+            }, { default: () => '删除' }),
             default: () => `确定删除备份任务「${r.name}」？`,
           }),
         ],
@@ -1236,11 +1263,36 @@ const backupJobColumns = computed<DataTableColumns<BackupJob>>(() => [
   },
 ])
 
-async function loadVolumeBackups() {
+let volumeBackupsReqSeq = 0
+
+function clearVolumeRestoreState() {
+  restoringArchiveID.value = ''
+  restoreBaseline.value = ''
+}
+
+function expireVolumePollWindow() {
+  if (volumeBackupRunning.value) return
+  if (Date.now() >= volumePollUntil.value) {
+    clearVolumeRestoreState()
+    volumePollUntil.value = 0
+  }
+}
+
+async function loadVolumeBackups(silent = false) {
+  const seq = ++volumeBackupsReqSeq
+  if (!silent) volumeListLoading.value = true
   // 不依赖 app.value：首屏 refreshAll 与 loadApp 并行，应用详情尚未返回时
   // 归档列表同样可以加载（只需路由里的 appId）。
   try {
-    const res = await listVolumeBackups(appId.value, { page_size: 100 })
+    const res = await listVolumeBackups(appId.value, {
+      offset: (volumePage.value - 1) * volumePageSize.value,
+      page_size: volumePageSize.value,
+    })
+    if (seq !== volumeBackupsReqSeq) return
+    if (res.total > 0 && res.data.length === 0 && volumePage.value > 1) {
+      volumePage.value = Math.max(1, Math.ceil(res.total / volumePageSize.value))
+      return loadVolumeBackups(silent)
+    }
     volumeBackups.value = res.data
     volumeBackupTotal.value = res.total
     if (volumeBackupRunning.value) {
@@ -1248,39 +1300,75 @@ async function loadVolumeBackups() {
       volumePollUntil.value = Math.max(volumePollUntil.value, Date.now() + 60_000)
     } else if (restoringArchiveID.value) {
       // 恢复结束会回写 last_restore_at；一旦变化即停止窗口与按钮 loading。
-      const target = volumeBackups.value.find((a) => a.id === restoringArchiveID.value)
-      if (target && (target.last_restore_at || '') !== restoreBaseline.value) {
-        restoringArchiveID.value = ''
-        restoreBaseline.value = ''
-        volumePollUntil.value = 0
+      let target = volumeBackups.value.find((a) => a.id === restoringArchiveID.value)
+      let listedAll = false
+      if (!target) {
+        // 目标归档不在当前分页（恢复后翻页，或上传恢复时停在第 2 页）：
+        // 只看当前页永远观测不到恢复结束，按钮会锁到窗口过期，故全量查一
+        // 次。应用归档上限 100 条，一个请求即可覆盖。
+        try {
+          const all = await listVolumeBackups(appId.value, { offset: 0, page_size: 100 })
+          if (seq !== volumeBackupsReqSeq) return
+          target = all.data.find((a) => a.id === restoringArchiveID.value)
+          listedAll = true
+        } catch {
+          // 查询失败不改变现状，下次轮询再试。
+        }
       }
+      if (target && (target.last_restore_at || '') !== restoreBaseline.value) {
+        clearVolumeRestoreState()
+        volumePollUntil.value = 0
+      } else if (listedAll && !target) {
+        // 全量列表里也没有：归档已被删除（例如他人操作），没有可等待的记录。
+        clearVolumeRestoreState()
+        volumePollUntil.value = 0
+      } else {
+        expireVolumePollWindow()
+      }
+    } else {
+      expireVolumePollWindow()
     }
   } catch (e: any) {
-    message.error(e.message || '获取备份归档失败')
+    if (seq === volumeBackupsReqSeq && !silent) message.error(e.message || '获取备份归档失败')
+  } finally {
+    if (seq === volumeBackupsReqSeq) volumeListLoading.value = false
   }
 }
 
 const volumeBackupRunning = computed(() => volumeBackups.value.some((a) => a.status === 'running'))
-const volumeBusy = computed(() => volumeBackupRunning.value || !!restoringArchiveID.value)
+const volumeBusy = computed(() =>
+  volumeBackupRunning.value
+  || !!restoringArchiveID.value
+  || backingVolumes.value
+  || uploadingRestore.value
+  || !!runningJobId.value,
+)
+
+function changeVolumePage(p: number) {
+  if (p === volumePage.value) return
+  volumePage.value = p
+  loadVolumeBackups()
+}
+
+function changeVolumePageSize(size: number) {
+  if (size === volumePageSize.value) return
+  volumePageSize.value = size
+  volumePage.value = 1
+  loadVolumeBackups()
+}
 
 async function refreshVolumeBackups() {
-  volumeListLoading.value = true
-  try {
-    await loadVolumeBackups()
-  } finally {
-    volumeListLoading.value = false
-  }
+  await loadVolumeBackups()
 }
 
 // 归档时间按「日期 / 时刻」两行排版：日期弱化，时刻保持等宽可扫读。
 function formatShortTime(v?: string) {
   if (!v) return { date: '—', clock: '' }
   const d = new Date(v)
-  if (Number.isNaN(d.getTime())) return { date: '—', clock: '' }
-  const pad = (n: number) => String(n).padStart(2, '0')
+  if (Number.isNaN(d.getTime()) || d.getUTCFullYear() < 1970) return { date: '—', clock: '' }
   return {
-    date: `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
-    clock: `${pad(d.getHours())}:${pad(d.getMinutes())}`,
+    date: fmtDate(d).slice(5),
+    clock: fmtTime(d).slice(0, 5),
   }
 }
 
@@ -1302,6 +1390,7 @@ async function copyArchiveSHA(sha: string) {
 }
 
 async function doBackupVolumes() {
+  if (!canWrite.value || volumeBusy.value || deploying.value) return
   const targetId = selectedBackupTargetId.value
   if (!targetId) {
     message.warning('请先选择备份位置；若还没有存储目标，先在「快照备份 → S3 存储」中添加')
@@ -1325,6 +1414,7 @@ async function doBackupVolumes() {
 }
 
 async function doRestoreArchive(a: VolumeArchive) {
+  if (!canWrite.value || a.status !== 'success' || volumeBusy.value || deploying.value) return
   restoringArchive.value = a.id
   restoringArchiveID.value = a.id
   restoreBaseline.value = a.last_restore_at || ''
@@ -1343,6 +1433,7 @@ async function doRestoreArchive(a: VolumeArchive) {
 }
 
 async function doDeleteArchive(a: VolumeArchive) {
+  if (!canWrite.value || volumeBusy.value || a.status === 'running') return
   try {
     await deleteVolumeArchive(appId.value, a.id)
     message.success('归档已删除')
@@ -1366,7 +1457,6 @@ const uploadTargetVolume = ref<string | null>(null)
 const uploadFileList = ref<UploadFileInfo[]>([])
 const uploadFile = ref<File | null>(null)
 const uploadSha = ref('')
-const uploadingRestore = ref(false)
 
 function handleUploadSelect({ file, onFinish }: UploadCustomRequestOptions) {
   if (file.file) uploadFile.value = file.file
@@ -1380,6 +1470,7 @@ function handleUploadRemove() {
 }
 
 async function doUploadRestore() {
+  if (!canWrite.value || volumeBusy.value || deploying.value) return
   if (!uploadTargetVolume.value) {
     message.warning('请选择要恢复到的挂载卷')
     return
@@ -1418,9 +1509,11 @@ async function doUploadRestore() {
 }
 
 const volArchiveStatusTag = (s: string) => {
+  if (s === 'success') return h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => '成功' })
   if (s === 'running') return h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '备份中' })
   if (s === 'failed') return h(NTag, { size: 'small', type: 'error', bordered: false }, { default: () => '失败' })
-  return h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => '成功' })
+  if (s === 'uploaded') return h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '上传' })
+  return h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => '未知状态' })
 }
 
 function formatBytes(b: number) {
@@ -1546,7 +1639,7 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
   {
     title: '操作', key: 'actions', width: 208, fixed: 'right',
     render: (r) => h(NSpace, { size: 6, wrap: false }, () => [
-      r.status === 'success'
+      canWrite.value && r.status === 'success'
         ? h(
           NPopconfirm,
           { onPositiveClick: () => doRestoreArchive(r) },
@@ -1577,26 +1670,28 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
           },
         )
         : null,
-      h(
-        NPopconfirm,
-        { onPositiveClick: () => doDeleteArchive(r) },
-        {
-          trigger: () => h(
-            NButton,
-            {
-              size: 'tiny', secondary: true, type: 'error',
-              disabled: r.status === 'running' || volumeBusy.value,
-            },
-            {
-              default: () => '删除',
-              icon: () => h(NIcon, null, { default: () => h(TrashOutline) }),
-            },
-          ),
-          default: () => r.source === 'upload'
-            ? '删除该上传恢复记录？此操作不可恢复。'
-            : '删除归档（含 S3 上的归档对象）？此操作不可恢复。',
-        },
-      ),
+      canWrite.value
+        ? h(
+          NPopconfirm,
+          { onPositiveClick: () => doDeleteArchive(r) },
+          {
+            trigger: () => h(
+              NButton,
+              {
+                size: 'tiny', secondary: true, type: 'error',
+                disabled: r.status === 'running' || volumeBusy.value,
+              },
+              {
+                default: () => '删除',
+                icon: () => h(NIcon, null, { default: () => h(TrashOutline) }),
+              },
+            ),
+            default: () => r.source === 'upload'
+              ? '删除该上传恢复记录？此操作不可恢复。'
+              : '删除归档（含 S3 上的归档对象）？此操作不可恢复。',
+          },
+        )
+        : null,
     ].filter(Boolean) as any),
   },
 ])
@@ -1933,6 +2028,11 @@ watch(activeTab, (tab) => {
     loadDeployments()
     refreshNewestDeployment()
     if (hasActiveDeployments.value) startDeployPolling()
+  } else if (tab === 'volumes') {
+    loadVolumeBackups()
+    loadS3Targets()
+    loadAppBackupJobs()
+    if (volumeBusy.value) volumePollUntil.value = Date.now() + 60_000
   }
 })
 
@@ -1956,8 +2056,10 @@ function startPolling() {
       // 备份归档里的 running 记录由异步 agent tar 推进，轮询直到落终态；
       // 恢复只在终态回写归档，故用受理后开启的有界窗口兜底。
       if (volumeBackupRunning.value || Date.now() < volumePollUntil.value) {
-        loadVolumeBackups()
+        loadVolumeBackups(true)
         loadAppBackupJobs()
+      } else if (restoringArchiveID.value) {
+        expireVolumePollWindow()
       }
     }
   }, 5000)
@@ -1989,6 +2091,16 @@ onActivated(() => {
 })
 
 onDeactivated(() => {
+  clearRefreshJobsTimer()
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+  stopDeployPolling()
+})
+
+onUnmounted(() => {
+  clearRefreshJobsTimer()
   if (pollTimer) {
     clearInterval(pollTimer)
     pollTimer = null
@@ -2471,23 +2583,36 @@ onDeactivated(() => {
                     刷新
                   </NButton>
                 </div>
-                <NDataTable
-                  :columns="volArchiveColumns"
-                  :data="volumeBackups"
-                  size="small"
-                  :bordered="false"
-                  :loading="volumeListLoading"
-                  :pagination="volumeArchiveTablePagination"
-                  :scroll-x="1240"
-                  :row-key="(r: VolumeArchive) => r.id"
-                >
-                  <template #empty>
-                    <NEmpty
-                      :description="s3Targets.length > 0 ? '暂无备份归档，选好备份位置与挂载卷后点「开始备份」' : '暂无备份归档'"
-                      size="small"
+                <NCard size="small" :bordered="false" class="vol-archive-card table-flex-fill">
+                  <NDataTable
+                    flex-height
+                    :columns="volArchiveColumns"
+                    :data="volumeBackups"
+                    size="small"
+                    :bordered="false"
+                    :loading="volumeListLoading"
+                    :scroll-x="1240"
+                    :row-key="(r: VolumeArchive) => r.id"
+                  >
+                    <template #empty>
+                      <NEmpty
+                        :description="s3Targets.length > 0 ? '暂无备份归档，选好备份位置与挂载卷后点「开始备份」' : '暂无备份归档'"
+                        size="small"
+                      />
+                    </template>
+                  </NDataTable>
+                  <div class="table-pagination-bar">
+                    <NPagination
+                      :page="volumePage"
+                      :page-size="volumePageSize"
+                      :item-count="volumeBackupTotal"
+                      :page-sizes="[10, 20, 50]"
+                      show-size-picker
+                      @update:page="changeVolumePage"
+                      @update:page-size="changeVolumePageSize"
                     />
-                  </template>
-                </NDataTable>
+                  </div>
+                </NCard>
               </div>
             </template>
           </div>
@@ -3205,6 +3330,10 @@ onDeactivated(() => {
 
 .vol-section:last-child {
   margin-bottom: 0;
+}
+
+.vol-archive-card {
+  height: 380px;
 }
 
 .vol-section-title {

@@ -47,9 +47,9 @@ func (h *Handlers) Register(readRG, writeRG *gin.RouterGroup) {
 }
 
 type jobReq struct {
-	Name          string `json:"name"`
-	HostID        string `json:"host_id"`
-	Kind          string `json:"kind"` // dir | volume | database | app_volume
+	Name   string `json:"name"`
+	HostID string `json:"host_id"`
+	Kind   string `json:"kind"` // dir | volume | database | app_volume
 	// AppID is required for kind=app_volume; HostID is derived from it.
 	AppID         string `json:"app_id"`
 	Target        string `json:"target"`
@@ -223,10 +223,13 @@ func (h *Handlers) updateJob(c *gin.Context) {
 	if req.StorageTarget != nil {
 		storageTarget = strings.TrimSpace(*req.StorageTarget)
 	}
+	var appVolumeTarget *AppVolumeTarget
 	if existing.Kind == KindAppVolume {
 		// Re-check the allowlist: an app edit may have removed the volume, and
 		// the destination must stay an existing S3 target (archives are S3-only).
-		if _, err := h.resolveAppVolumeJob(existing.AppID, target, storageTarget); err != nil {
+		var err error
+		appVolumeTarget, err = h.resolveAppVolumeJob(existing.AppID, target, storageTarget)
+		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -241,6 +244,10 @@ func (h *Handlers) updateJob(c *gin.Context) {
 			j.DBName = strings.TrimSpace(*req.DBName)
 		}
 		j.StorageTarget = storageTarget
+		if appVolumeTarget != nil {
+			j.HostID = appVolumeTarget.HostID
+			j.AppID = appVolumeTarget.AppID
+		}
 		if req.Retention != nil {
 			j.Retention = *req.Retention
 		}

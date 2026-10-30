@@ -279,6 +279,8 @@ func (s *Store) PutApp(a *Application) error {
 // Every persisted mutation advances UpdatedAt here — the single write point,
 // so config edits, deploy results, proxy binds and relay syncs all surface in
 // the list's 最近更新 column without each call site remembering to stamp it.
+// The mutation is transactional: a failed save leaves both the in-memory
+// record and the on-disk snapshot at their previous values.
 func (s *Store) UpdateApp(id string, mutate func(*Application) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -286,12 +288,17 @@ func (s *Store) UpdateApp(id string, mutate func(*Application) error) error {
 	if !ok {
 		return fmt.Errorf("app %s not found", id)
 	}
-	prev := a.UpdatedAt
-	if err := mutate(a); err != nil {
+	candidate := cloneApplication(a)
+	if err := mutate(candidate); err != nil {
 		return err
 	}
-	a.UpdatedAt = nextUpdatedAt(prev, time.Now())
-	return s.saveAppsLocked()
+	candidate.UpdatedAt = nextUpdatedAt(a.UpdatedAt, time.Now())
+	s.apps[id] = candidate
+	if err := s.saveAppsLocked(); err != nil {
+		s.apps[id] = a
+		return err
+	}
+	return nil
 }
 
 // nextUpdatedAt keeps the timestamp monotonic: a clock that steps backwards

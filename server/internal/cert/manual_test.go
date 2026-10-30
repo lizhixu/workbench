@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -391,11 +392,24 @@ func TestCancelManualDNSOrder(t *testing.T) {
 	}
 	h.mu.Unlock()
 
+	if err := h.SaveCertLog(p.ID, "temporary order log"); err != nil {
+		t.Fatalf("save order log: %v", err)
+	}
+	certLogID := "crt_keep_after_order_cancel"
+	if err := h.SaveCertLog(certLogID, "certificate log"); err != nil {
+		t.Fatalf("save certificate log: %v", err)
+	}
 	if err := h.CancelManualDNSOrder(p.ID); err != nil {
 		t.Fatalf("cancel awaiting order: %v", err)
 	}
 	if _, err := h.GetPendingOrder(p.ID); err == nil {
 		t.Fatal("cancelled order should be gone")
+	}
+	if _, _, ok := h.GetCertLog(p.ID); ok {
+		t.Fatal("cancelled order log should be removed")
+	}
+	if _, _, ok := h.GetCertLog(certLogID); !ok {
+		t.Fatal("cancelling an order must not remove a certificate log")
 	}
 
 	// Unknown IDs are rejected.
@@ -500,6 +514,47 @@ func TestManualDNSOrderRetryableError(t *testing.T) {
 
 // TestRecoverInterruptedPending verifies a restart never leaves an order
 // stuck in "verifying": it flips to a retryable error instead.
+func TestPruneExpiredPendingRemovesOrderLogs(t *testing.T) {
+	dir := t.TempDir()
+	h, err := NewHub(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiredID := "mord_0123456789abcdef"
+	expired := &PendingOrder{
+		ID: expiredID, AccountID: "acc_1", Identifiers: []string{"example.com"},
+		Status: ManualOrderAwaitingDNS, CreatedAt: time.Now().Add(-2 * time.Hour),
+		ExpiresAt: time.Now().Add(-time.Minute),
+	}
+	h.mu.Lock()
+	if err := h.savePendingLocked(expired); err != nil {
+		h.mu.Unlock()
+		t.Fatal(err)
+	}
+	h.mu.Unlock()
+	if err := h.SaveCertLog(expiredID, "expired order log"); err != nil {
+		t.Fatal(err)
+	}
+
+	malformedID := "mord_fedcba9876543210"
+	if err := os.WriteFile(h.pendingPath(malformedID), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.SaveCertLog(malformedID, "malformed order log"); err != nil {
+		t.Fatal(err)
+	}
+
+	h.pruneExpiredPending()
+	for _, id := range []string{expiredID, malformedID} {
+		if _, err := os.Stat(h.pendingPath(id)); !os.IsNotExist(err) {
+			t.Errorf("pending order %s remains after prune: %v", id, err)
+		}
+		if _, _, ok := h.GetCertLog(id); ok {
+			t.Errorf("order log %s remains after prune", id)
+		}
+	}
+}
+
 func TestRecoverInterruptedPending(t *testing.T) {
 	dir := t.TempDir()
 	h, err := NewHub(dir, nil)

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -12,9 +12,6 @@ import (
 // Handlers mounts the certificate hub REST API.
 type Handlers struct {
 	hub *Hub
-	// issuing serializes Issue/Renew calls: ACME rate limits are strict and
-	// two concurrent wildcard orders for the same zone would race.
-	mu sync.Mutex
 	// panelCertInfo resolves the panel's certificate binding from the panel
 	// security settings for the used-by reverse lookup and the delete
 	// guard; injected at wiring time to keep the cert package decoupled
@@ -63,10 +60,13 @@ func (h *Handlers) Register(readRG, writeRG *gin.RouterGroup) {
 	readRG.GET("/certs/presets", h.listPresets)
 	readRG.GET("/certs/accounts", h.listAccounts)
 	readRG.GET("/certs/cover", h.getCertCover)
+	readRG.GET("/certs/tasks", h.listTasks)
+	readRG.GET("/certs/tasks/:taskID", h.getTask)
 	readRG.GET("/certs", h.listCerts)
 	readRG.GET("/certs/:id", h.getCert)
 	readRG.GET("/certs/:id/detail", h.getCertDetail)
 	readRG.GET("/certs/:id/download", h.downloadCert)
+	readRG.GET("/certs/:id/log", h.getCertLog)
 	readRG.GET("/certs/manual/:id", h.getManualOrder)
 
 	writeRG.PUT("/certs/config", h.putConfig)
@@ -350,9 +350,7 @@ func (h *Handlers) issueCert(c *gin.Context) {
 	// TXT records for the administrator to provision; the UI then calls
 	// confirmManualOrder after the records are in place.
 	if ch == ChallengeDNS01Manual {
-		h.mu.Lock()
 		order, err := h.hub.StartManualDNSOrder(req.Domains, req.AccountID)
-		h.mu.Unlock()
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -361,14 +359,74 @@ func (h *Handlers) issueCert(c *gin.Context) {
 		return
 	}
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	// DNS-01 + propagation takes tens of seconds; run async and let the UI
-	// poll the list.
-	go func() {
-		_, _ = h.hub.IssueWithChallenge(req.Domains, req.AccountID, ch)
-	}()
-	c.JSON(http.StatusAccepted, gin.H{"ok": true, "message": "签发请求已受理，请稍后刷新列表"})
+	task, err := h.hub.StartIssueTask(req.Domains, req.AccountID, ch)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"ok":      true,
+		"task_id": task.ID,
+		"data":    task,
+		"message": "签发请求已受理，正在后台执行",
+	})
+}
+
+func (h *Handlers) listTasks(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"data": h.hub.ListTasks()})
+}
+
+func (h *Handlers) getTask(c *gin.Context) {
+	taskID := c.Param("taskID")
+	task, ok := h.hub.GetTask(taskID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": task})
+}
+
+func (h *Handlers) getCertLog(c *gin.Context) {
+	id := c.Param("id")
+	if live, ok := h.hub.LiveLog(id); ok {
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{
+			"id":         id,
+			"running":    true,
+			"log":        live,
+			"updated_at": time.Now(),
+		}})
+		return
+	}
+
+	if logText, modTime, ok := h.hub.GetCertLog(id); ok {
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{
+			"id":         id,
+			"running":    false,
+			"log":        logText,
+			"updated_at": modTime,
+		}})
+		return
+	}
+
+	crt, ok := h.hub.Get(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "证书日志不存在"})
+		return
+	}
+	fallback := ""
+	if crt.LastError != "" {
+		fallback = fmt.Sprintf("[%s] [异常记录] %s", crt.CreatedAt.Format("2006-01-02 15:04:05"), crt.LastError)
+	} else {
+		fallback = fmt.Sprintf("[%s] [证书就绪] 证书已就绪，颁发者: %s，有效期: %s ~ %s",
+			crt.CreatedAt.Format("2006-01-02 15:04:05"), crt.Issuer,
+			crt.NotBefore.Format("2006-01-02 15:04:05"), crt.NotAfter.Format("2006-01-02 15:04:05"))
+	}
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{
+		"id":         id,
+		"running":    crt.Renewing,
+		"log":        fallback,
+		"updated_at": crt.CreatedAt,
+	}})
 }
 
 // getManualOrder returns the status and DNS records of a pending manual
@@ -400,10 +458,10 @@ func (h *Handlers) confirmManualOrder(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "CA 已对该订单作出终态判定（验证不通过），请重新发起签发"})
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	go func() {
-		_, _ = h.hub.ConfirmManualDNSOrder(id)
+		if _, err := h.hub.ConfirmManualDNSOrder(id); err != nil {
+			h.hub.log.Warn("manual dns-01 confirmation failed", "id", id, "err", err)
+		}
 	}()
 	c.JSON(http.StatusAccepted, gin.H{"ok": true, "message": "已通知 CA 开始验证，请稍后查询任务状态"})
 }
@@ -443,10 +501,10 @@ func (h *Handlers) renewCert(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "certificate not found"})
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	go func() {
-		_, _ = h.hub.Renew(id)
+		if _, err := h.hub.Renew(id); err != nil {
+			h.hub.log.Warn("certificate renewal failed", "id", id, "err", err)
+		}
 	}()
 	c.JSON(http.StatusAccepted, gin.H{"ok": true, "message": "续期请求已受理，请稍后刷新列表"})
 }

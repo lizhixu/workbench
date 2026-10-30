@@ -130,10 +130,20 @@ func (h *Hub) savePendingLocked(p *PendingOrder) error {
 		return err
 	}
 	tmp := h.pendingPath(p.ID) + fmt.Sprintf(".tmp.%d", time.Now().UnixNano())
+	written := false
+	defer func() {
+		if !written {
+			_ = os.Remove(tmp)
+		}
+	}()
 	if err := os.WriteFile(tmp, b, 0600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, h.pendingPath(p.ID))
+	if err := os.Rename(tmp, h.pendingPath(p.ID)); err != nil {
+		return err
+	}
+	written = true
+	return nil
 }
 
 func (h *Hub) loadPending(id string) (*PendingOrder, error) {
@@ -197,13 +207,16 @@ func (h *Hub) pruneExpiredPending() {
 		p, err := h.loadPending(id)
 		if err != nil || now.After(p.ExpiresAt) {
 			_ = os.Remove(h.pendingPath(id))
+			// The order log is transient and belongs to the pending order; do
+			// not leave it behind after malformed or expired order cleanup.
+			_ = os.Remove(h.certLogFile(id))
 		}
 	}
 }
 
 // manualClient builds an authenticated ACME client for the given account,
 // shared by the start and confirm phases of a manual DNS-01 order.
-func (h *Hub) manualClient(accountID string) (*acmeClient, crypto.Signer, *ACMEAccount, error) {
+func (h *Hub) manualClient(accountID string, clog *certLogger) (*acmeClient, crypto.Signer, *ACMEAccount, error) {
 	var acc *ACMEAccount
 	if accountID != "" {
 		got, ok := h.GetAccount(accountID)
@@ -233,6 +246,7 @@ func (h *Hub) manualClient(accountID string) (*acmeClient, crypto.Signer, *ACMEA
 		eabHMACKey:   acc.EABHMACKey,
 		http:         &http.Client{Timeout: 30 * time.Second},
 		log:          h.log,
+		clog:         clog,
 	}
 	if err := client.ensureAccount(accountKey); err != nil {
 		return nil, nil, nil, fmt.Errorf("acme account (%s): %w", acc.Name, err)
@@ -277,7 +291,16 @@ func (h *Hub) StartManualDNSOrder(identifiers []string, accountID string) (*Pend
 		return nil, fmt.Errorf("至少需要一个域名")
 	}
 
-	client, accountKey, acc, err := h.manualClient(accountID)
+	orderID := "mord_" + randomHex(8)
+	clog := newCertLogger(orderID, h.log)
+	h.RegisterLiveLog(orderID, clog)
+	defer h.UnregisterLiveLog(orderID)
+
+	h.acmeMu.Lock()
+	defer h.acmeMu.Unlock()
+
+	clog.Logf("准备账户", "开始创建手动 DNS-01 订单: %s", strings.Join(clean, ", "))
+	client, accountKey, acc, err := h.manualClient(accountID, clog)
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +314,7 @@ func (h *Hub) StartManualDNSOrder(identifiers []string, accountID string) (*Pend
 	}
 
 	p := &PendingOrder{
-		ID:          "mord_" + randomHex(8),
+		ID:          orderID,
 		AccountID:   acc.ID,
 		Identifiers: clean,
 		OrderURL:    orderURL,
@@ -333,13 +356,20 @@ func (h *Hub) StartManualDNSOrder(identifiers []string, accountID string) (*Pend
 			ChallengeURL:    dnsCh.URL,
 			Token:           dnsCh.Token,
 		})
+		clog.Logf("挑战呈现", "已生成 DNS TXT 记录: %s -> %s", rec.Host, rec.Domain)
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.pruneExpiredPending()
-	if err := h.savePendingLocked(p); err != nil {
-		return nil, err
+	persistErr := h.savePendingLocked(p)
+	h.mu.Unlock()
+	if persistErr != nil {
+		clog.Warnf("完成入库", "保存手动 DNS-01 订单失败: %v", persistErr)
+		return nil, persistErr
+	}
+	clog.Logf("挑战呈现", "手动 DNS-01 订单已就绪，等待管理员添加 %d 条 TXT 记录", len(p.Records))
+	if err := h.SaveCertLog(p.ID, clog.String()); err != nil {
+		h.log.Warn("persist manual dns-01 order log failed", "id", p.ID, "err", err)
 	}
 	h.log.Info("manual dns-01 order created", "id", p.ID, "identifiers", clean, "records", len(p.Records))
 	cp := *p
@@ -432,6 +462,14 @@ func (h *Hub) ConfirmManualDNSOrder(id string) (*Certificate, error) {
 	}
 	h.mu.Unlock()
 
+	clog := newCertLogger(id, h.log)
+	h.RegisterLiveLog(id, clog)
+	defer h.UnregisterLiveLog(id)
+	h.acmeMu.Lock()
+	defer h.acmeMu.Unlock()
+
+	clog.Logf("挑战呈现", "开始手动 DNS-01 验证确认: 订单ID=%s, 包含域名: %s", id, strings.Join(p.Identifiers, ", "))
+
 	// fail records the error on the pending order. terminal=false means the
 	// same order may be confirmed again (nothing was sent to the CA, or the
 	// failure was transient); terminal=true means the CA already reached a
@@ -441,6 +479,8 @@ func (h *Hub) ConfirmManualDNSOrder(id string) (*Certificate, error) {
 		if err != nil {
 			full = msg + ": " + err.Error()
 		}
+		clog.Warnf("CA验证", "手动验证失败: %s", full)
+		_ = h.SaveCertLog(id, clog.String())
 		h.mu.Lock()
 		if cur, lerr := h.loadPending(id); lerr == nil {
 			cur.Status = ManualOrderError
@@ -461,12 +501,15 @@ func (h *Hub) ConfirmManualDNSOrder(id string) (*Certificate, error) {
 	}
 	for _, az := range p.Authz {
 		host := dns01RecordHost(az.IdentifierValue)
+		clog.Logf("挑战呈现", "执行本地 DNS TXT 解析预检: %s (期望值: %s)...", host, wantByDomain[az.IdentifierValue])
 		if err := dnsTXTLookup(host, wantByDomain[az.IdentifierValue]); err != nil {
+			clog.Warnf("挑战呈现", "本地 DNS TXT 记录预检未通过: %v", err)
 			return fail("DNS 预检查未通过（尚未通知 CA，不会消耗验证机会）", err, false)
 		}
+		clog.Logf("挑战呈现", "本地 DNS TXT 记录预检命中: %s", host)
 	}
 
-	client, accountKey, acc, err := h.manualClient(p.AccountID)
+	client, accountKey, acc, err := h.manualClient(p.AccountID, clog)
 	if err != nil {
 		return fail("ACME 账户准备失败", err, false)
 	}
@@ -475,6 +518,7 @@ func (h *Hub) ConfirmManualDNSOrder(id string) (*Certificate, error) {
 	// A longer deadline is used here than in the automatic flow because the
 	// records were provisioned by hand and DNS propagation takes longer.
 	for _, az := range p.Authz {
+		clog.Logf("CA验证", "通知 CA 开始验证 DNS-01 挑战: %s (URL=%s)", az.IdentifierValue, az.ChallengeURL)
 		if err := client.triggerChallenge(az.ChallengeURL, accountKey); err != nil {
 			return fail(fmt.Sprintf("通知 CA 验证 %q 失败", az.IdentifierValue), err, false)
 		}
@@ -490,6 +534,7 @@ func (h *Hub) ConfirmManualDNSOrder(id string) (*Certificate, error) {
 			}
 			return fail(msg, err, terminal)
 		}
+		clog.Logf("CA验证", "域名 %q CA 验证通过", az.IdentifierValue)
 	}
 
 	// Re-fetch the order, wait until ready, finalize, download.
@@ -527,7 +572,10 @@ func (h *Hub) ConfirmManualDNSOrder(id string) (*Certificate, error) {
 		// order is consumed, so a fresh order is required.
 		return fail("保存证书失败", err, true)
 	}
+	clog.Logf("完成入库", "手动验证证书已成功入库: ID=%s, 有效期至 %s", certID, notAfter.Format("2006-01-02 15:04:05"))
 	h.notifyRenewed(certID)
+	_ = h.SaveCertLog(id, clog.String())
+	_ = h.SaveCertLog(certID, clog.String())
 
 	h.mu.Lock()
 	if cur, lerr := h.loadPending(id); lerr == nil {
@@ -561,7 +609,11 @@ func (h *Hub) CancelManualDNSOrder(id string) error {
 	if p.Status == ManualOrderVerifying {
 		return fmt.Errorf("任务正在验证中，请稍候")
 	}
-	return os.Remove(h.pendingPath(id))
+	if err := os.Remove(h.pendingPath(id)); err != nil {
+		return err
+	}
+	_ = os.Remove(h.certLogFile(id))
+	return nil
 }
 
 func manualOrderStatusLabel(status string) string {

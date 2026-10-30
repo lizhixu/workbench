@@ -49,6 +49,7 @@ type Certificate struct {
 	Renewing  bool      `json:"renewing,omitempty"`
 	LastError string    `json:"last_error,omitempty"`
 	Remark    string    `json:"remark,omitempty"` // admin-managed note (≤200 runes), edited via PUT /certs/:id/remark
+	LastLogAt time.Time `json:"last_log_at,omitempty"`
 }
 
 // DefaultDirectoryURL is the Let's Encrypt production ACME directory.
@@ -56,12 +57,18 @@ const DefaultDirectoryURL = "https://acme-v02.api.letsencrypt.org/directory"
 
 // Hub manages dns-mng settings, multiple ACME accounts, certificates and renewals.
 type Hub struct {
-	mu       sync.RWMutex
+	mu sync.RWMutex
+	// acmeMu serializes the actual ACME network/order/challenge work across
+	// issuance, renewal, and manual DNS-01 flows. Handler locks cannot protect
+	// background goroutines, so this lock lives at the Hub execution boundary.
+	acmeMu   sync.Mutex
 	dir      string
 	log      *slog.Logger
 	cfg      Config
 	accounts map[string]*ACMEAccount
 	certs    map[string]*Certificate
+	tasks    map[string]*IssueTask
+	liveLogs sync.Map // id (string) -> *certLogger
 	// renewBeforeDays supplies the configured "days before expiry" for
 	// automatic renewal (settings: certs.auto_renew_days). Nil means the
 	// built-in default (30 days). Injected by the server entrypoint so the
@@ -101,6 +108,11 @@ func (h *Hub) SetOnRenewed(fn func(*Certificate)) {
 // onRenewed hook. Best-effort by design: no callback, a missing certificate
 // or a panicking hook are all tolerated silently.
 func (h *Hub) notifyRenewed(id string) {
+	if ll, ok := h.liveLogs.Load(id); ok {
+		if clog, ok2 := ll.(*certLogger); ok2 {
+			clog.Logf("反代回推", "已触发应用反代 Nginx 证书分发与热重载通知 (cert=%s)", id)
+		}
+	}
 	h.mu.RLock()
 	fn := h.onRenewed
 	h.mu.RUnlock()
@@ -144,8 +156,12 @@ func NewHub(dataDir string, log *slog.Logger) (*Hub, error) {
 		log:      log,
 		accounts: make(map[string]*ACMEAccount),
 		certs:    make(map[string]*Certificate),
+		tasks:    make(map[string]*IssueTask),
 	}
 	if err := os.MkdirAll(h.dir, 0700); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(h.logsDir(), 0700); err != nil {
 		return nil, err
 	}
 	if err := h.loadConfig(); err != nil {
@@ -155,6 +171,9 @@ func NewHub(dataDir string, log *slog.Logger) (*Hub, error) {
 		return nil, err
 	}
 	if err := h.loadCerts(); err != nil {
+		return nil, err
+	}
+	if err := h.loadTasks(); err != nil {
 		return nil, err
 	}
 	// A restart must not leave manual DNS-01 orders stuck in "verifying":
@@ -475,10 +494,10 @@ func (h *Hub) FindByDomain(domain string) (*Certificate, bool) {
 // outrank wildcards, and deeper wildcards (more labels) outrank shallower
 // ones (`*.a.example.com` > `*.example.com`).
 type certMatchRank struct {
-	exact   bool
-	labels  int
+	exact    bool
+	labels   int
 	notAfter time.Time
-	id      string
+	id       string
 }
 
 func rankCertMatch(san string, c *Certificate) certMatchRank {
@@ -513,6 +532,7 @@ func (h *Hub) Delete(id string) error {
 	delete(h.certs, id)
 	_ = os.Remove(h.certFile(id))
 	_ = os.Remove(h.keyFile(id))
+	_ = os.Remove(h.certLogFile(id))
 	return h.saveCertsLocked()
 }
 
@@ -567,6 +587,7 @@ func (h *Hub) storeResult(id string, accountID string, domains []string, certPEM
 		AutoRenew: autoRenew,
 		CreatedAt: time.Now(),
 		Remark:    remark,
+		LastLogAt: time.Now(),
 	}
 	return h.saveCertsLocked()
 }
@@ -593,8 +614,15 @@ func (h *Hub) markError(id, msg string) {
 // via dns-mng when HTTP-01 is unavailable or fails; wildcards require
 // DNS-01; IP identifiers (RFC 8738) require HTTP-01. An explicit non-auto
 // challenge preference restricts the flow to that mechanism.
-func (h *Hub) issueACME(acc *ACMEAccount, identifiers []string, ch ChallengePreference) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
+func (h *Hub) issueACME(acc *ACMEAccount, identifiers []string, ch ChallengePreference, clog *certLogger) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
+	if clog != nil {
+		clog.Logf("准备账户", "使用 ACME 账户 %q (%s), 目标标识符: %s", acc.Name, acc.Email, strings.Join(identifiers, ", "))
+		clog.Logf("挑战选择", "首选验证机制: %s", string(ch))
+	}
 	if !ch.Valid() {
+		if clog != nil {
+			clog.Warnf("挑战选择", "未知的验证方式: %q", string(ch))
+		}
 		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("未知的验证方式: %q", string(ch))
 	}
 	if ch == ChallengeDNS01Manual {
@@ -604,11 +632,17 @@ func (h *Hub) issueACME(acc *ACMEAccount, identifiers []string, ch ChallengePref
 	defer solvers.stop()
 	solvers, err = solvers.applyPreference(ch)
 	if err != nil {
+		if clog != nil {
+			clog.Warnf("挑战选择", "挑战求解器筛选失败: %v", err)
+		}
 		return nil, nil, time.Time{}, time.Time{}, "", err
 	}
 	if !solvers.hasAny() {
-		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf(
-			"无法完成域名验证：HTTP-01 需要临时监听 80 端口（当前不可用），DNS-01 需要在证书中心配置并启用 dns-mng")
+		msg := "无法完成域名验证：HTTP-01 需要临时监听 80 端口（当前不可用），DNS-01 需要在证书中心配置并启用 dns-mng"
+		if clog != nil {
+			clog.Warn("挑战选择", msg)
+		}
+		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("%s", msg)
 	}
 	dirURL := acc.DirectoryURL
 	if dirURL == "" {
@@ -622,10 +656,14 @@ func (h *Hub) issueACME(acc *ACMEAccount, identifiers []string, ch ChallengePref
 		eabHMACKey:   acc.EABHMACKey,
 		http:         &http.Client{Timeout: 30 * time.Second},
 		log:          h.log,
+		clog:         clog,
 	}
 
 	accountKey, err := h.loadOrCreateAccountKey(acc.ID)
 	if err != nil {
+		if clog != nil {
+			clog.Warnf("准备账户", "加载/创建账户密钥失败: %v", err)
+		}
 		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("account key: %w", err)
 	}
 	if err := acmeClient.ensureAccount(accountKey); err != nil {
@@ -679,7 +717,10 @@ func (h *Hub) IssueWithChallenge(identifiers []string, accountID string, ch Chal
 		acc = got
 	}
 
-	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, clean, ch)
+	clog := newCertLogger("issue_"+randomHex(4), h.log)
+	h.acmeMu.Lock()
+	defer h.acmeMu.Unlock()
+	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, clean, ch, clog)
 	if err != nil {
 		return nil, err
 	}
@@ -687,9 +728,95 @@ func (h *Hub) IssueWithChallenge(identifiers []string, accountID string, ch Chal
 	if err := h.storeResult(id, acc.ID, clean, certPEM, keyPEM, notBefore, notAfter, issuer, true); err != nil {
 		return nil, err
 	}
+	clog.Logf("完成入库", "证书入库成功: ID=%s, 包含域名: %s", id, strings.Join(clean, ", "))
 	h.notifyRenewed(id)
+	_ = h.SaveCertLog(id, clog.String())
 	c, _ := h.Get(id)
 	return c, nil
+}
+
+// StartIssueTask creates a background ACME issuance task and returns its tracking record.
+func (h *Hub) StartIssueTask(identifiers []string, accountID string, ch ChallengePreference) (*IssueTask, error) {
+	clean := make([]string, 0, len(identifiers))
+	for _, d := range identifiers {
+		d = strings.TrimSpace(strings.ToLower(d))
+		if d != "" {
+			clean = append(clean, d)
+		}
+	}
+	if len(clean) == 0 {
+		return nil, fmt.Errorf("至少需要一个域名或 IP")
+	}
+
+	var acc *ACMEAccount
+	if accountID != "" {
+		got, ok := h.GetAccount(accountID)
+		if !ok {
+			return nil, fmt.Errorf("ACME 机构账户 %s 不存在", accountID)
+		}
+		acc = got
+	} else {
+		got, err := h.GetDefaultAccount()
+		if err != nil {
+			return nil, err
+		}
+		acc = got
+	}
+
+	task, err := h.CreateIssueTaskWithError(clean, acc.ID, string(ch))
+	if err != nil {
+		return nil, fmt.Errorf("保存签发任务失败: %w", err)
+	}
+
+	clog := newCertLogger(task.ID, h.log)
+	h.RegisterLiveLog(task.ID, clog)
+
+	go func() {
+		defer h.UnregisterLiveLog(task.ID)
+		h.acmeMu.Lock()
+		defer h.acmeMu.Unlock()
+		clog.Logf("准备账户", "启动证书签发任务 [%s], 域名/IP: %s, 挑战机制: %s", task.ID, strings.Join(clean, ", "), string(ch))
+		certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, clean, ch, clog)
+		if err != nil {
+			clog.Warnf("完成入库", "证书签发失败: %v", err)
+			if updateErr := h.UpdateIssueTaskWithError(task.ID, func(t *IssueTask) {
+				t.Status = TaskFailed
+				t.Error = err.Error()
+				t.Log = clog.String()
+			}); updateErr != nil {
+				h.log.Error("persist failed cert issue task state", "id", task.ID, "err", updateErr)
+			}
+			return
+		}
+		certID := "crt_" + randomHex(8)
+		clog.Logf("完成入库", "证书获取完成，正在入库: ID=%s", certID)
+		if err := h.storeResult(certID, acc.ID, clean, certPEM, keyPEM, notBefore, notAfter, issuer, true); err != nil {
+			clog.Warnf("完成入库", "证书存储失败: %v", err)
+			if updateErr := h.UpdateIssueTaskWithError(task.ID, func(t *IssueTask) {
+				t.Status = TaskFailed
+				t.CertID = certID
+				t.Error = err.Error()
+				t.Log = clog.String()
+			}); updateErr != nil {
+				h.log.Error("persist failed cert issue task state", "id", task.ID, "err", updateErr)
+			}
+			return
+		}
+		clog.Logf("完成入库", "证书已成功入库: %s", certID)
+		h.notifyRenewed(certID)
+		if err := h.SaveCertLog(certID, clog.String()); err != nil {
+			h.log.Warn("persist cert issue log failed", "id", certID, "err", err)
+		}
+		if updateErr := h.UpdateIssueTaskWithError(task.ID, func(t *IssueTask) {
+			t.Status = TaskSuccess
+			t.CertID = certID
+			t.Log = clog.String()
+		}); updateErr != nil {
+			h.log.Error("persist successful cert issue task state failed", "id", task.ID, "err", updateErr)
+		}
+	}()
+
+	return task, nil
 }
 
 // Import stores a user-supplied certificate (issued through another channel,
@@ -756,6 +883,14 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 	}
 	h.mu.Unlock()
 
+	clog := newCertLogger(id, h.log)
+	h.RegisterLiveLog(id, clog)
+	defer h.UnregisterLiveLog(id)
+	h.acmeMu.Lock()
+	defer h.acmeMu.Unlock()
+
+	clog.Logf("准备账户", "开始证书续期: %s (%s)", id, strings.Join(c.Domains, ", "))
+
 	var acc *ACMEAccount
 	if c.AccountID != "" {
 		if got, ok := h.GetAccount(c.AccountID); ok {
@@ -765,22 +900,30 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 	if acc == nil {
 		got, err := h.GetDefaultAccount()
 		if err != nil {
+			clog.Warnf("准备账户", "获取默认 ACME 账户失败: %v", err)
+			_ = h.SaveCertLog(id, clog.String())
 			h.markError(id, err.Error())
 			return nil, err
 		}
 		acc = got
 	}
 
-	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, c.Domains, ChallengeAuto)
+	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, c.Domains, ChallengeAuto, clog)
 	if err != nil {
+		clog.Warnf("完成入库", "证书续期失败: %v", err)
+		_ = h.SaveCertLog(id, clog.String())
 		h.markError(id, err.Error())
 		return nil, err
 	}
 	if err := h.storeResult(id, acc.ID, c.Domains, certPEM, keyPEM, notBefore, notAfter, issuer, true); err != nil {
+		clog.Warnf("完成入库", "证书更新存储失败: %v", err)
+		_ = h.SaveCertLog(id, clog.String())
 		h.markError(id, err.Error())
 		return nil, err
 	}
+	clog.Logf("完成入库", "证书续期成功，更新完成: ID=%s, 有效期至 %s", id, notAfter.Format("2006-01-02 15:04:05"))
 	h.notifyRenewed(id)
+	_ = h.SaveCertLog(id, clog.String())
 	updated, _ := h.Get(id)
 	return updated, nil
 }

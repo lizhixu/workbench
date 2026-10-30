@@ -8,8 +8,9 @@ import {
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import {
-  AddCircleOutline, CloudUploadOutline, CopyOutline, CreateOutline,
-  DownloadOutline, LockClosedOutline, RefreshOutline, ShieldCheckmarkOutline,
+  AddCircleOutline, CloseCircleOutline, CloudUploadOutline,
+  CopyOutline, CreateOutline, DocumentTextOutline, DownloadOutline,
+  LockClosedOutline, RefreshOutline, ShieldCheckmarkOutline, SyncOutline,
   TimeOutline, TrashOutline,
 } from '@vicons/ionicons5'
 import {
@@ -25,6 +26,7 @@ import { useTablePagination } from '../../composables/useTablePagination'
 import { fmtDate } from '../../utils/time'
 import { useAuthStore } from '../../stores/auth'
 import CertTimeSettingsModal from './CertTimeSettingsModal.vue'
+import CertLogModal from './CertLogModal.vue'
 
 defineOptions({ name: 'CertManager' })
 
@@ -91,6 +93,42 @@ let pollTimer: ReturnType<typeof setInterval> | null = null
 
 const configReady = computed(() => config.enabled && config.base_url !== '')
 
+// ---- 证书与任务日志弹窗 ----
+const showLogModal = ref(false)
+const logModalCertId = ref('')
+const logModalTaskId = ref('')
+const logModalTitle = ref('')
+const logModalDomains = ref<string[]>([])
+
+function openCertLog(cert: Certificate) {
+  logModalCertId.value = cert.id
+  logModalTaskId.value = ''
+  logModalTitle.value = `证书执行日志 · ${cert.domains[0] || cert.id}`
+  logModalDomains.value = cert.domains
+  showLogModal.value = true
+}
+
+function openTaskLog(taskId: string, domains: string[]) {
+  logModalCertId.value = ''
+  logModalTaskId.value = taskId
+  logModalTitle.value = `证书签发任务日志 · ${domains[0] || taskId}`
+  logModalDomains.value = domains
+  showLogModal.value = true
+}
+
+function openManualOrderLog() {
+  if (!manualOrder.value) return
+  logModalCertId.value = manualOrder.value.id
+  logModalTaskId.value = ''
+  logModalTitle.value = `手动 DNS-01 验证日志 · ${manualOrder.value.identifiers[0] || manualOrder.value.id}`
+  logModalDomains.value = manualOrder.value.identifiers
+  showLogModal.value = true
+}
+
+function onLogModalCompleted(_certId?: string) {
+  loadCerts()
+}
+
 const daysLeft = (cert: Certificate) =>
   Math.max(0, Math.floor((new Date(cert.not_after).getTime() - Date.now()) / 86400000))
 
@@ -146,25 +184,60 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
   {
     title: '日志',
     key: 'last_error',
-    width: 130,
+    width: 135,
     render: (r) => {
-      if (!r.last_error) return h('span', { style: 'color: #999' }, '-')
-      // 失败原因全文以限宽弹层展示（替代内置 ellipsis tooltip：后者对 300+ 字符
-      // 的错误实测会铺出 1088px 宽的巨框）；单元格内手动省略截断。
+      if (r.renewing) {
+        return h(
+          NButton,
+          {
+            size: 'tiny',
+            type: 'info',
+            secondary: true,
+            onClick: () => openCertLog(r),
+          },
+          {
+            icon: () => h(NIcon, { class: 'rotating' }, { default: () => h(SyncOutline) }),
+            default: () => '续期中 · 日志',
+          },
+        )
+      }
+      if (r.last_error) {
+        return h(
+          NPopover,
+          { trigger: 'hover', placement: 'top', showArrow: false },
+          {
+            trigger: () =>
+              h(
+                NButton,
+                {
+                  size: 'tiny',
+                  type: 'error',
+                  secondary: true,
+                  style: 'max-width: 100%',
+                  onClick: () => openCertLog(r),
+                },
+                {
+                  icon: () => h(NIcon, null, { default: () => h(CloseCircleOutline) }),
+                  default: () => '异常 · 查看日志',
+                },
+              ),
+            default: () => [
+              h('div', { style: 'font-size: 11px; color: #999; margin-bottom: 4px' }, '最近一次失败原因（点击查看完整日志）'),
+              h('div', { style: 'font-size: 12px; line-height: 1.6; word-break: break-all; max-width: 340px; max-height: 200px; overflow: auto;' }, r.last_error),
+            ],
+          },
+        )
+      }
       return h(
-        NPopover,
-        { trigger: 'hover', placement: 'top', showArrow: false },
+        NButton,
         {
-          trigger: () =>
-            h(
-              'span',
-              { style: 'color: #d03050; display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;' },
-              r.last_error,
-            ),
-          default: () => [
-            h('div', { style: 'font-size: 11px; color: #999; margin-bottom: 4px' }, '最近一次失败原因'),
-            h('div', { style: 'font-size: 12px; line-height: 1.6; word-break: break-all; max-width: 340px; max-height: 200px; overflow: auto;' }, r.last_error),
-          ],
+          size: 'tiny',
+          quaternary: true,
+          onClick: () => openCertLog(r),
+        },
+        {
+          icon: () => h(NIcon, null, { default: () => h(DocumentTextOutline) }),
+          default: () => '查看日志',
         },
       )
     },
@@ -212,17 +285,18 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
     render: (r) =>
       h(NSpace, { size: 6, wrap: false }, {
         default: () => [
+          // 文字按钮放前面（详情、续期），图标按钮放后面（下载、删除），视觉统一规整
           h(NButton, { size: 'tiny', secondary: true, onClick: () => openDetail(r) }, { default: () => '详情' }),
-          h(
-            NButton,
-            { size: 'tiny', secondary: true, title: '下载证书（.crt 公钥链，不含私钥）', onClick: () => window.open(certDownloadUrl(r.id), '_blank') },
-            { icon: () => h(NIcon, null, { default: () => h(DownloadOutline) }) },
-          ),
           // 手动上传的证书没有 ACME 账户：续期会被服务端回落到默认账户重新签发并
           // 覆盖上传的材料，语义上应为「重新上传」而非续期，故不展示续期按钮。
           ...(r.source === 'manual_upload'
             ? []
             : [h(NButton, { size: 'tiny', secondary: true, onClick: () => doRenew(r) }, { default: () => '续期' })]),
+          h(
+            NButton,
+            { size: 'tiny', secondary: true, title: '下载证书（.crt 公钥链，不含私钥）', onClick: () => window.open(certDownloadUrl(r.id), '_blank') },
+            { icon: () => h(NIcon, null, { default: () => h(DownloadOutline) }) },
+          ),
           h(
             NPopconfirm,
             { onPositiveClick: () => doDelete(r) },
@@ -675,6 +749,9 @@ async function doIssue() {
     const res = await issueCert(domains, selectedIssueAccountID.value || undefined, issueChallenge.value || undefined)
     message.success(res.message || '签发请求已受理')
     showIssue.value = false
+    if (res.task_id) {
+      openTaskLog(res.task_id, domains)
+    }
     // 签发是异步的（DNS-01 需等待 TXT 生效），签发后每 5 秒刷新一次、
     // 最长 2 分钟，直到新证书出现在列表中。
     const before = new Set(certs.value.map((c) => c.id))
@@ -781,6 +858,7 @@ async function doRenew(cert: Certificate) {
     const res = await renewCert(cert.id)
     message.success(res.message || '续期请求已受理')
     cert.renewing = true
+    openCertLog(cert)
   } catch (e: any) {
     message.error(e.message || '续期失败')
   }
@@ -1142,6 +1220,16 @@ onUnmounted(() => {
           <template v-if="manualOrder.terminal">该订单已终态失败，不可重试，请关闭后重新发起签发。</template>
           <template v-else>请检查 TXT 记录是否已正确添加并生效，然后重新验证。</template>
         </NAlert>
+
+        <div
+          v-if="manualOrder && (manualOrder.status === 'verifying' || manualOrder.status === 'error' || manualOrder.status === 'done')"
+          style="display: flex; justify-content: flex-end; margin-top: 4px"
+        >
+          <NButton size="small" secondary @click="openManualOrderLog">
+            <template #icon><NIcon><DocumentTextOutline /></NIcon></template>
+            查看验证日志
+          </NButton>
+        </div>
       </div>
 
       <template #footer>
@@ -1341,6 +1429,16 @@ onUnmounted(() => {
         </div>
       </NSpin>
     </NModal>
+
+    <!-- 证书执行日志 / 签发任务日志弹窗 -->
+    <CertLogModal
+      v-model:show="showLogModal"
+      :cert-id="logModalCertId"
+      :task-id="logModalTaskId"
+      :title="logModalTitle"
+      :domains="logModalDomains"
+      @completed="onLogModalCompleted"
+    />
   </div>
 </template>
 
@@ -1580,5 +1678,14 @@ onUnmounted(() => {
   margin: 8px 0 0;
   font-size: 12px;
   color: #d03050;
+}
+
+:deep(.rotating) {
+  animation: spin 1.2s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 </style>

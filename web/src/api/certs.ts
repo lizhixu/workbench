@@ -40,6 +40,7 @@ export interface Certificate {
   created_at: string
   renewing?: boolean
   last_error?: string
+  last_log_at?: string
   // 管理员备注（≤200 字，仅元信息；经 PUT /certs/:id/remark 编辑）
   remark?: string
   // 列表由服务端派生（与详情端点同源），前端不再自行推断：
@@ -144,10 +145,42 @@ export function certDownloadUrl(id: string): string {
 // challenge: ''（自动）| 'http-01' | 'dns-01' | 'dns-01-manual'（手动添加 DNS TXT 解析）。
 export type ChallengeMode = '' | 'http-01' | 'dns-01' | 'dns-01-manual'
 
+export interface IssueTask {
+  id: string
+  cert_id?: string
+  domains: string[]
+  account_id?: string
+  challenge?: string
+  status: 'running' | 'success' | 'failed'
+  error?: string
+  log?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface CertLog {
+  id: string
+  running: boolean
+  log: string
+  updated_at: string
+}
+
 export function issueCert(domains: string[], accountId?: string, challenge?: ChallengeMode) {
-  return unwrap<{ ok: boolean; message: string }>(
+  return unwrap<{ ok: boolean; task_id?: string; data?: IssueTask; message: string }>(
     http.post('/certs/issue', { domains, account_id: accountId, challenge: challenge || undefined }),
   )
+}
+
+export function getCertLog(id: string) {
+  return unwrap<{ data: CertLog }>(http.get(`/certs/${id}/log`)).then((r) => r.data)
+}
+
+export function listIssueTasks() {
+  return unwrap<{ data: IssueTask[] }>(http.get('/certs/tasks')).then((r) => r.data)
+}
+
+export function getIssueTask(taskId: string) {
+  return unwrap<{ data: IssueTask }>(http.get(`/certs/tasks/${taskId}`)).then((r) => r.data)
 }
 
 // ---- 手动 DNS-01（管理员手动添加 TXT 解析） ----

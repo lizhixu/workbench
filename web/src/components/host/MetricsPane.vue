@@ -9,6 +9,7 @@ import {
   NTag,
   NButton,
   NIcon,
+  NEmpty,
 } from 'naive-ui'
 import { RefreshOutline } from '@vicons/ionicons5'
 // 按需引入 echarts：整包 import 会把地图、3D、所有图表类型都打进来，这里只用到
@@ -33,6 +34,9 @@ const timeSpan = ref<TimeSpan>('realtime')
 const loading = ref(true)
 const errorMsg = ref('')
 const currentMetrics = ref<Metrics | null>(null)
+// 历史档位查询无数据时置真：明示空态而不是拿实时缓冲区顶替——否则三个
+// 历史档位画出来是同一条最近几分钟的曲线，看起来像档位切换没生效。
+const historyEmpty = ref(false)
 
 // Swap usage percent for the stats strip.
 const swapPct = computed(() => {
@@ -497,12 +501,13 @@ async function fetchHistoricalMetrics() {
     await nextTick()
     initCharts()
     if (res.points && res.points.length > 0) {
+      historyEmpty.value = false
       updateChartsWithPoints(res.points)
     } else {
-      // If historical points are empty yet, fallback to recent realtime point
-      if (realtimePoints.value.length > 0) {
-        updateChartsWithPoints(realtimePoints.value)
-      }
+      // 历史区间确实无数据（主机离线时段、服务端刚重启、Agent 从未上报等）：
+      // 显示明确空态，不再用实时缓冲区顶替——那会让所有历史档位渲染出同一条
+      // 近几分钟曲线，档位切换形同虚设。
+      historyEmpty.value = true
     }
   } catch (e: any) {
     loading.value = false
@@ -517,6 +522,7 @@ function handleTimeSpanChange() {
   }
 
   if (timeSpan.value === 'realtime') {
+    historyEmpty.value = false
     fetchRealtimeMetrics()
     timer = setInterval(fetchRealtimeMetrics, 3000)
   } else {
@@ -673,7 +679,7 @@ watch(() => settings.themeMode, () => {
       </div>
     </div>
 
-    <div v-show="!loading || cpuChart" class="grid-4-container">
+    <div v-show="!historyEmpty && (!loading || cpuChart)" class="grid-4-container">
       <NGrid cols="1 s:2" :x-gap="14" :y-gap="14" responsive="screen">
         <!-- 1. CPU 监控 -->
         <NGridItem>
@@ -719,6 +725,17 @@ watch(() => settings.themeMode, () => {
       </NGrid>
     </div>
 
+    <!-- 历史档位无数据：明示空态与数据来源，避免误以为档位切换无效 -->
+    <div v-if="timeSpan !== 'realtime' && historyEmpty && !loading" class="history-empty-box">
+      <NEmpty description="该时间段暂无历史数据">
+        <template #extra>
+          <span class="muted">
+            服务端每 15 秒自动采样并保存 7 天；主机离线时段与服务端重启后的时段不会有数据，可稍后切回「实时」等待采样积累。
+          </span>
+        </template>
+      </NEmpty>
+    </div>
+
     <NTag v-if="errorMsg" type="warning" class="error-banner">
       {{ errorMsg }}
     </NTag>
@@ -746,6 +763,21 @@ watch(() => settings.themeMode, () => {
         font-size: 12px;
         color: var(--text-secondary);
       }
+    }
+  }
+
+  .history-empty-box {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 48px 0;
+    background-color: var(--bg-card-subtle);
+    border: 1px dashed var(--border-color);
+    border-radius: 6px;
+
+    .muted {
+      font-size: 12px;
+      color: var(--text-secondary);
     }
   }
 

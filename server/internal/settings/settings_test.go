@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -267,7 +268,7 @@ func TestSchemaAndEffective(t *testing.T) {
 	}
 	for _, k := range []string{
 		"security.secure_entry_enabled", "security.secure_entry_path", "system.join_beta_program",
-		"server.public_url", "security.panel_domain",
+		"security.panel_domain",
 		"security.panel_ssl_enabled", "security.panel_ssl_mode", "security.panel_ssl_cert_id",
 		"security.panel_ssl_cert_pem", "security.panel_ssl_key_pem", "security.panel_force_https",
 		"certs.auto_renew_days", "certs.expiry_reminder_days",
@@ -451,154 +452,152 @@ func TestSnapshotConsistentUnderConcurrency(t *testing.T) {
 			}
 		}
 	}
-		close(stop)
-		wg.Wait()
+	close(stop)
+	wg.Wait()
+}
+
+func TestPanelSecuritySettings(t *testing.T) {
+	s := newTestStore(t)
+	// Check defaults
+	sec := s.PanelSecurity()
+	if sec.PanelDomain != "" || sec.SSLEnabled || sec.ForceHTTPS {
+		t.Fatalf("unexpected defaults: %+v", sec)
+	}
+	if sec.SSLMode != "cert_center" {
+		t.Fatalf("unexpected default ssl_mode: %q", sec.SSLMode)
 	}
 
-	func TestPanelSecuritySettings(t *testing.T) {
-		s := newTestStore(t)
-		// Check defaults
-		sec := s.PanelSecurity()
-		if sec.PublicURL != "" || sec.PanelDomain != "" || sec.SSLEnabled || sec.ForceHTTPS {
-			t.Fatalf("unexpected defaults: %+v", sec)
-		}
-		if sec.SSLMode != "cert_center" {
-			t.Fatalf("unexpected default ssl_mode: %q", sec.SSLMode)
-		}
-
-		// Validation errors
-		badDomain := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
-			"security.panel_domain": raw(t, "http://invalid-domain.com:18789"),
-		})
-		if badDomain == nil {
-			t.Fatal("expected error on invalid panel domain containing scheme/port")
-		}
-
-		badURL := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
-			"server.public_url": raw(t, "ftp://bad-url"),
-		})
-		if badURL == nil {
-			t.Fatal("expected error on invalid public URL")
-		}
-
-		// Valid update: public URL and the domain binding itself.
-		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
-			"server.public_url":     raw(t, "https://panel.example.com:18789"),
-			"security.panel_domain": raw(t, "panel.example.com"),
-		}); err != nil {
-			t.Fatalf("SetMany valid panel security: %v", err)
-		}
-
-		// SSL settings are a separate write (the certificate is chosen after
-		// the domain is bound).
-		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
-			"security.panel_ssl_enabled":  raw(t, true),
-			"security.panel_ssl_mode":     raw(t, "custom"),
-			"security.panel_ssl_cert_pem": raw(t, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"),
-			"security.panel_ssl_key_pem":  raw(t, "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"),
-			"security.panel_force_https":  raw(t, true),
-		}); err != nil {
-			t.Fatalf("SetMany valid panel ssl settings: %v", err)
-		}
-
-		updated := s.PanelSecurity()
-		if updated.PublicURL != "https://panel.example.com:18789" {
-			t.Errorf("public_url = %q, want https://panel.example.com:18789", updated.PublicURL)
-		}
-		if updated.PanelDomain != "panel.example.com" {
-			t.Errorf("panel_domain = %q, want panel.example.com", updated.PanelDomain)
-		}
-		if !updated.SSLEnabled || !updated.ForceHTTPS {
-			t.Errorf("expected bool flags to be true, got %+v", updated)
-		}
-		if updated.SSLMode != "custom" {
-			t.Errorf("ssl_mode = %q, want custom", updated.SSLMode)
-		}
-
-		// Re-writing the same domain (case-insensitive) is not a change: the
-		// SSL configuration must survive.
-		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
-			"security.panel_domain": raw(t, "Panel.Example.COM"),
-		}); err != nil {
-			t.Fatalf("SetMany same domain: %v", err)
-		}
-		if got := s.PanelSecurity(); !got.SSLEnabled || !got.ForceHTTPS || got.SSLMode != "custom" || got.SSLCertPEM == "" {
-			t.Fatalf("same-domain write cleared SSL config: %+v", got)
-		}
-
-		// Changing the domain clears the certificate binding, panel SSL and
-		// force-HTTPS in the same atomic write: a certificate issued for the
-		// old domain must not be served for the new one (it would break TLS
-		// and, with force-HTTPS on, lock the administrator out).
-		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
-			"security.panel_ssl_cert_id": raw(t, "crt_123"),
-		}); err != nil {
-			t.Fatalf("SetMany cert id: %v", err)
-		}
-		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
-			"security.panel_domain": raw(t, "new.example.com"),
-		}); err != nil {
-			t.Fatalf("SetMany domain change: %v", err)
-		}
-		changed := s.PanelSecurity()
-		if changed.PanelDomain != "new.example.com" {
-			t.Errorf("panel_domain = %q, want new.example.com", changed.PanelDomain)
-		}
-		if changed.SSLEnabled || changed.ForceHTTPS {
-			t.Errorf("domain change left SSL/force-HTTPS enabled: %+v", changed)
-		}
-		if changed.SSLMode != "cert_center" || changed.SSLCertID != "" || changed.SSLCertPEM != "" || changed.SSLKeyPEM != "" {
-			t.Errorf("domain change did not clear certificate binding: %+v", changed)
-		}
-
-		// Unbinding clears SSL as well (the certificate was issued for a
-		// domain that is no longer the panel's identity).
-		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
-			"security.panel_ssl_enabled": raw(t, true),
-			"security.panel_force_https": raw(t, true),
-		}); err != nil {
-			t.Fatalf("SetMany re-enable ssl: %v", err)
-		}
-		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
-			"security.panel_domain": raw(t, ""),
-		}); err != nil {
-			t.Fatalf("SetMany unbind: %v", err)
-		}
-		if got := s.PanelSecurity(); got.PanelDomain != "" || got.SSLEnabled || got.ForceHTTPS {
-			t.Errorf("unbind did not clear SSL: %+v", got)
-		}
+	// Validation errors
+	badDomain := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_domain": raw(t, "http://invalid-domain.com:18789"),
+	})
+	if badDomain == nil {
+		t.Fatal("expected error on invalid panel domain containing scheme/port")
 	}
 
-	func TestSetManyOnChangeHook(t *testing.T) {
-		s := newTestStore(t)
-		calls := 0
-		s.SetOnChange(func() { calls++ })
-
-		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
-			"server.timezone": raw(t, "UTC"),
-		}); err != nil {
-			t.Fatalf("SetMany timezone: %v", err)
-		}
-		if calls != 1 {
-			t.Fatalf("onChange calls = %d after successful system write, want 1", calls)
-		}
-		// Failed writes must not fire the hook.
-		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{"nope": raw(t, 1)}); err == nil {
-			t.Fatal("expected error for unknown key")
-		}
-		if calls != 1 {
-			t.Fatalf("onChange fired on failed write: calls = %d", calls)
-		}
-		// User-scope writes do not affect panel-wide state; no hook.
-		if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{
-			"appearance.theme_mode": raw(t, "light"),
-		}); err != nil {
-			t.Fatalf("SetMany user theme: %v", err)
-		}
-		if calls != 1 {
-			t.Fatalf("onChange fired on user-scope write: calls = %d", calls)
-		}
+	// The retired explicit-address key is no longer in the registry, so an
+	// old client still writing it gets a clear error instead of silently
+	// storing a setting nothing reads.
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"server.public_url": raw(t, "https://panel.example.com"),
+	}); err == nil {
+		t.Fatal("retired server.public_url key accepted by the registry")
 	}
+
+	// Valid update: binding the domain is the only address configuration.
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_domain": raw(t, "panel.example.com"),
+	}); err != nil {
+		t.Fatalf("SetMany valid panel security: %v", err)
+	}
+
+	// SSL settings are a separate write (the certificate is chosen after
+	// the domain is bound).
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_ssl_enabled":  raw(t, true),
+		"security.panel_ssl_mode":     raw(t, "custom"),
+		"security.panel_ssl_cert_pem": raw(t, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"),
+		"security.panel_ssl_key_pem":  raw(t, "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"),
+		"security.panel_force_https":  raw(t, true),
+	}); err != nil {
+		t.Fatalf("SetMany valid panel ssl settings: %v", err)
+	}
+
+	updated := s.PanelSecurity()
+	if updated.PanelDomain != "panel.example.com" {
+		t.Errorf("panel_domain = %q, want panel.example.com", updated.PanelDomain)
+	}
+	if !updated.SSLEnabled || !updated.ForceHTTPS {
+		t.Errorf("expected bool flags to be true, got %+v", updated)
+	}
+	if updated.SSLMode != "custom" {
+		t.Errorf("ssl_mode = %q, want custom", updated.SSLMode)
+	}
+
+	// Re-writing the same domain (case-insensitive) is not a change: the
+	// SSL configuration must survive.
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_domain": raw(t, "Panel.Example.COM"),
+	}); err != nil {
+		t.Fatalf("SetMany same domain: %v", err)
+	}
+	if got := s.PanelSecurity(); !got.SSLEnabled || !got.ForceHTTPS || got.SSLMode != "custom" || got.SSLCertPEM == "" {
+		t.Fatalf("same-domain write cleared SSL config: %+v", got)
+	}
+
+	// Changing the domain clears the certificate binding, panel SSL and
+	// force-HTTPS in the same atomic write: a certificate issued for the
+	// old domain must not be served for the new one (it would break TLS
+	// and, with force-HTTPS on, lock the administrator out).
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_ssl_cert_id": raw(t, "crt_123"),
+	}); err != nil {
+		t.Fatalf("SetMany cert id: %v", err)
+	}
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_domain": raw(t, "new.example.com"),
+	}); err != nil {
+		t.Fatalf("SetMany domain change: %v", err)
+	}
+	changed := s.PanelSecurity()
+	if changed.PanelDomain != "new.example.com" {
+		t.Errorf("panel_domain = %q, want new.example.com", changed.PanelDomain)
+	}
+	if changed.SSLEnabled || changed.ForceHTTPS {
+		t.Errorf("domain change left SSL/force-HTTPS enabled: %+v", changed)
+	}
+	if changed.SSLMode != "cert_center" || changed.SSLCertID != "" || changed.SSLCertPEM != "" || changed.SSLKeyPEM != "" {
+		t.Errorf("domain change did not clear certificate binding: %+v", changed)
+	}
+
+	// Unbinding clears SSL as well (the certificate was issued for a
+	// domain that is no longer the panel's identity).
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_ssl_enabled": raw(t, true),
+		"security.panel_force_https": raw(t, true),
+	}); err != nil {
+		t.Fatalf("SetMany re-enable ssl: %v", err)
+	}
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_domain": raw(t, ""),
+	}); err != nil {
+		t.Fatalf("SetMany unbind: %v", err)
+	}
+	if got := s.PanelSecurity(); got.PanelDomain != "" || got.SSLEnabled || got.ForceHTTPS {
+		t.Errorf("unbind did not clear SSL: %+v", got)
+	}
+}
+
+func TestSetManyOnChangeHook(t *testing.T) {
+	s := newTestStore(t)
+	calls := 0
+	s.SetOnChange(func() { calls++ })
+
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"server.timezone": raw(t, "UTC"),
+	}); err != nil {
+		t.Fatalf("SetMany timezone: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("onChange calls = %d after successful system write, want 1", calls)
+	}
+	// Failed writes must not fire the hook.
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{"nope": raw(t, 1)}); err == nil {
+		t.Fatal("expected error for unknown key")
+	}
+	if calls != 1 {
+		t.Fatalf("onChange fired on failed write: calls = %d", calls)
+	}
+	// User-scope writes do not affect panel-wide state; no hook.
+	if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{
+		"appearance.theme_mode": raw(t, "light"),
+	}); err != nil {
+		t.Fatalf("SetMany user theme: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("onChange fired on user-scope write: calls = %d", calls)
+	}
+}
 
 func TestCertTimingKeys(t *testing.T) {
 	s := newTestStore(t)
@@ -703,5 +702,221 @@ func TestTimezoneValidationAndApply(t *testing.T) {
 	s.ApplyTimezone()
 	if time.Local != osLocal {
 		t.Fatalf("time.Local = %v, want OS zone %v", time.Local, osLocal)
+	}
+}
+
+func TestPanelSecurityBaseURL(t *testing.T) {
+	cases := []struct {
+		name      string
+		sec       PanelSecurityConfig
+		reqScheme string
+		reqHost   string
+		want      string
+		wantSet   bool
+	}{
+		{
+			name:      "bound domain with ssl beats request host",
+			sec:       PanelSecurityConfig{PanelDomain: "panel.example.com", SSLEnabled: true},
+			reqScheme: "http", reqHost: "10.0.0.5:18789",
+			want: "https://panel.example.com", wantSet: true,
+		},
+		{
+			name:      "force https alone implies https",
+			sec:       PanelSecurityConfig{PanelDomain: "panel.example.com", ForceHTTPS: true},
+			reqScheme: "http", reqHost: "10.0.0.5:18789",
+			want: "https://panel.example.com", wantSet: true,
+		},
+		{
+			name:      "bound domain follows request https behind a TLS proxy",
+			sec:       PanelSecurityConfig{PanelDomain: "  panel.example.com  "},
+			reqScheme: "https", reqHost: "127.0.0.1:18789",
+			want: "https://panel.example.com", wantSet: true,
+		},
+		{
+			name:      "plain bound domain over http stays http",
+			sec:       PanelSecurityConfig{PanelDomain: "panel.example.com"},
+			reqScheme: "http", reqHost: "10.0.0.5:18789",
+			want: "http://panel.example.com", wantSet: true,
+		},
+		{
+			name:      "request fallback marks address as unset",
+			sec:       PanelSecurityConfig{},
+			reqScheme: "https", reqHost: "1.2.3.4",
+			want: "https://1.2.3.4", wantSet: false,
+		},
+		{
+			name:      "request fallback normalises unknown scheme",
+			sec:       PanelSecurityConfig{},
+			reqScheme: "", reqHost: "127.0.0.1:18789",
+			want: "http://127.0.0.1:18789", wantSet: false,
+		},
+		{
+			name:    "no host means no url",
+			sec:     PanelSecurityConfig{},
+			wantSet: false,
+		},
+	}
+	for _, tc := range cases {
+		got, set := tc.sec.BaseURL(tc.reqScheme, tc.reqHost)
+		if got != tc.want || set != tc.wantSet {
+			t.Errorf("%s: BaseURL = (%q, %v), want (%q, %v)", tc.name, got, set, tc.want, tc.wantSet)
+		}
+	}
+}
+
+func TestStoreBaseURLFromSettings(t *testing.T) {
+	s := newTestStore(t)
+	// No domain bound: the panel is reached by IP, so the request address is
+	// what external parties get.
+	if got, set := s.BaseURL("http", "10.0.0.5:18789"); got != "http://10.0.0.5:18789" || set {
+		t.Fatalf("default BaseURL = (%q, %v)", got, set)
+	}
+	// Binding the domain is the single act that changes the public address.
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_domain": raw(t, "panel.example.com"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, set := s.BaseURL("http", "10.0.0.5:18789"); got != "http://panel.example.com" || !set {
+		t.Fatalf("domain BaseURL = (%q, %v)", got, set)
+	}
+	// Panel SSL turns the derived address into https.
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_ssl_enabled": raw(t, true),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.BaseURL("http", "10.0.0.5:18789"); got != "https://panel.example.com" {
+		t.Fatalf("ssl BaseURL = %q", got)
+	}
+	// Unbinding falls back to the request address (direct IP access).
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_domain": raw(t, ""),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, set := s.BaseURL("http", "10.0.0.5:18789"); got != "http://10.0.0.5:18789" || set {
+		t.Fatalf("unbound BaseURL = (%q, %v)", got, set)
+	}
+}
+
+// writeLegacyDocument seeds settings.json the way an older panel wrote it.
+func writeLegacyDocument(t *testing.T, dir, legacy string) string {
+	t.Helper()
+	path := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestRetiredPublicURLMigratesToPanelDomain pins the upgrade path for panels
+// that only ever configured server.public_url: the hostname is folded into the
+// bound panel domain once at load, so agent install commands, Git webhooks,
+// the version endpoint and upload-restore keep advertising the domain instead
+// of degrading to whatever IP a browser used. The retired key is dropped.
+func TestRetiredPublicURLMigratesToPanelDomain(t *testing.T) {
+	dir := t.TempDir()
+	path := writeLegacyDocument(t, dir, `{"system":{"server.public_url":"https://old.example.com/"},"users":{}}`)
+
+	s, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if got := s.PanelSecurity().PanelDomain; got != "old.example.com" {
+		t.Fatalf("panel_domain = %q, want old.example.com", got)
+	}
+	if got, set := s.BaseURL("http", "10.0.0.5:18789"); got != "http://old.example.com" || !set {
+		t.Fatalf("BaseURL = (%q, %v), want the migrated domain", got, set)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "server.public_url") {
+		t.Fatalf("settings.json kept the retired key: %s", data)
+	}
+	if !strings.Contains(string(data), "old.example.com") {
+		t.Fatalf("settings.json lost the migrated domain: %s", data)
+	}
+
+	// Reopening is stable: the retired key is gone and the domain stays bound.
+	s2, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if got := s2.PanelSecurity().PanelDomain; got != "old.example.com" {
+		t.Fatalf("reopen panel_domain = %q, want old.example.com", got)
+	}
+}
+
+// A domain the admin bound explicitly wins over the retired key, which is
+// still dropped so the two sources cannot drift apart.
+func TestRetiredPublicURLDoesNotOverrideBoundDomain(t *testing.T) {
+	dir := t.TempDir()
+	writeLegacyDocument(t, dir, `{"system":{"server.public_url":"https://old.example.com","security.panel_domain":"panel.example.com"},"users":{}}`)
+
+	s, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if got := s.PanelSecurity().PanelDomain; got != "panel.example.com" {
+		t.Fatalf("panel_domain = %q, want the bound domain", got)
+	}
+	if _, ok := s.system["server.public_url"]; ok {
+		t.Fatal("retired key survived load")
+	}
+}
+
+// An IP has no domain equivalent, so the retired address is dropped (with a
+// warning) and the panel falls back to the inbound request again.
+func TestRetiredPublicURLIPIsDropped(t *testing.T) {
+	dir := t.TempDir()
+	writeLegacyDocument(t, dir, `{"system":{"server.public_url":"https://203.0.113.7:19443"},"users":{}}`)
+
+	s, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if got := s.PanelSecurity().PanelDomain; got != "" {
+		t.Fatalf("panel_domain = %q, want empty", got)
+	}
+	if _, ok := s.system["server.public_url"]; ok {
+		t.Fatal("retired key survived load")
+	}
+	if got, set := s.BaseURL("http", "10.0.0.5:18789"); got != "http://10.0.0.5:18789" || set {
+		t.Fatalf("BaseURL = (%q, %v), want the request fallback", got, set)
+	}
+}
+
+// The panel domain is served on the standard ports, so a non-standard port in
+// the retired address has no equivalent: the hostname migrates, the port does
+// not. Port 80/443 is not reported as dropped because it is the default.
+func TestRetiredPublicURLPortHandling(t *testing.T) {
+	for _, tc := range []struct {
+		legacy string
+		domain string
+	}{
+		{"https://old.example.com:443/", "old.example.com"},
+		{"http://old.example.com:80", "old.example.com"},
+		{"https://old.example.com:19443", "old.example.com"},
+	} {
+		dir := t.TempDir()
+		writeLegacyDocument(t, dir, `{"system":{"server.public_url":"`+tc.legacy+`"},"users":{}}`)
+		s, err := NewStore(dir, nil)
+		if err != nil {
+			t.Fatalf("NewStore(%s): %v", tc.legacy, err)
+		}
+		if got := s.PanelSecurity().PanelDomain; got != tc.domain {
+			t.Errorf("%s: panel_domain = %q, want %q", tc.legacy, got, tc.domain)
+		}
+	}
+	// Only absolute http(s) URLs are accepted; anything else is dropped.
+	for _, rawURL := range []string{"old.example.com", "ftp://old.example.com", "http://"} {
+		domain, _ := legacyPanelDomain(rawURL)
+		if domain != "" {
+			t.Errorf("legacyPanelDomain(%q) = %q, want empty", rawURL, domain)
+		}
 	}
 }

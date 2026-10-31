@@ -612,18 +612,9 @@ func (h *handlers) loginWithAudit(login gin.HandlerFunc) gin.HandlerFunc {
 
 func (h *handlers) enroll(c *gin.Context) {
 	token := h.reg.IssueEnrollToken()
-	serverURL := ""
-	if h.settings != nil {
-		serverURL = h.settings.PanelSecurity().PublicURL
-	}
-	if serverURL == "" {
-		scheme := "http"
-		if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-			scheme = "https"
-		}
-		serverURL = fmt.Sprintf("%s://%s", scheme, c.Request.Host)
-	}
-	serverURL = strings.TrimRight(serverURL, "/")
+	// Single resolution path for the panel's public address (AGENTS.md
+	// §3.7 / settings.BaseURL): bound panel domain → request Host.
+	serverURL, _ := settings.RequestBaseURL(c, h.settings)
 	c.JSON(http.StatusOK, gin.H{
 		"enroll_token": token,
 		"expires_in":   86400,
@@ -638,6 +629,9 @@ func (h *handlers) getPanelCertStatus(c *gin.Context) {
 		return
 	}
 	sec := h.settings.PanelSecurity()
+	// 面板对外地址（派生值，不是独立配置）：绑定域名时为其 URL，
+	// 未绑定则是本次请求的地址。
+	publicBase, _ := settings.RequestBaseURL(c, h.settings)
 	res := gin.H{
 		"ssl_enabled":  sec.SSLEnabled,
 		"ssl_mode":     sec.SSLMode,
@@ -646,7 +640,7 @@ func (h *handlers) getPanelCertStatus(c *gin.Context) {
 		// 绑定域名即自动启用严格域名限制（仅允许该域名与回环地址访问）。
 		"strict_domain": sec.PanelDomain != "",
 		"force_https":   sec.ForceHTTPS,
-		"public_url":    sec.PublicURL,
+		"public_url":    publicBase,
 		"active":        false,
 		// Portless access: the primary panel port plus the health of the
 		// standard-port listeners (:80 while a domain is bound, :443 while
@@ -1933,8 +1927,8 @@ func (h *handlers) upgradeAgent(c *gin.Context) {
 		body.Version = agentTargetVersion()
 	}
 
-	// Build the binary download URL: -public-url when configured,
-	// else the server's own address from this request.
+	// Build the binary download URL: the shared panel-URL resolver
+	// (bound panel domain → this request's address).
 	osName := strings.ToLower(a.OS)
 	if osName == "" {
 		osName = "linux"
@@ -1943,8 +1937,9 @@ func (h *handlers) upgradeAgent(c *gin.Context) {
 	if archName == "" {
 		archName = "amd64"
 	}
+	baseURL, _ := settings.RequestBaseURL(c, h.settings)
 	binaryURL := fmt.Sprintf("%s/api/v1/agent/binary?os=%s&arch=%s",
-		upgradeDownloadBase(c), osName, archName)
+		baseURL, osName, archName)
 
 	// Collect upgrade progress messages.
 	progressCh := make(chan *agentpb.UpgradeProgress, 16)
@@ -2467,6 +2462,7 @@ func (h *handlers) versionInfo(c *gin.Context) {
 	if h.settings != nil {
 		panelTZ = h.settings.Timezone()
 	}
+	publicBase, _ := settings.RequestBaseURL(c, h.settings)
 	c.JSON(http.StatusOK, gin.H{
 		"server_version":       version.Get(),
 		"server_commit":        version.Commit,
@@ -2474,7 +2470,7 @@ func (h *handlers) versionInfo(c *gin.Context) {
 		"agent_target_version": agentTargetVersion(),
 		"agent_manifest":       agentRelease != nil,
 		"upgrade_pubkey":       UpgradePubKeyHex,
-		"public_url":           publicURL,
+		"public_url":           publicBase,
 		// Panel timezone (IANA name) so every client renders times in the
 		// same zone; "" = clients fall back to their local timezone.
 		"timezone": panelTZ,
@@ -2904,10 +2900,9 @@ func (h *handlers) upgradeAgentsBatch(c *gin.Context) {
 		return
 	}
 
-	// Agent-facing download base: -public-url when configured, else this
-	// request's own address. (Resolves the old server.public_url TODO: a
-	// client-controlled Host header must not be the only source.)
-	downloadBase := upgradeDownloadBase(c)
+	// Agent-facing download base: the shared panel-URL resolver (bound panel
+	// domain → this request's address).
+	downloadBase, _ := settings.RequestBaseURL(c, h.settings)
 
 	dispatched := make([]string, 0, len(targets))
 	shaCache := make(map[string]string)

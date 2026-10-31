@@ -17,6 +17,7 @@ import (
 	"watchman/server/internal/audit"
 	"watchman/server/internal/auth"
 	"watchman/server/internal/rpc"
+	"watchman/server/internal/settings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -187,21 +188,17 @@ func (h *handlers) tunnelClientInfo(c *gin.Context) {
 }
 
 // operatorEndpoint derives the host:port of the operator data plane: the port
-// comes from the -opgrpc listen address, the host from the panel public URL
-// setting, then the -public-url flag, else from the request's Host header.
+// comes from the -opgrpc listen address, the host from the shared panel-URL
+// resolver (bound panel domain → request Host).
 func (h *handlers) operatorEndpoint(c *gin.Context) string {
 	port := "9443"
 	if _, p, err := net.SplitHostPort(h.opGRPCAddr); err == nil && p != "" && p != "0" {
 		port = p
 	}
 	host := ""
-	for _, candidate := range []string{h.settings.PanelSecurity().PublicURL, publicURL} {
-		if candidate == "" {
-			continue
-		}
-		if u, err := url.Parse(candidate); err == nil && u.Hostname() != "" {
+	if base, _ := settings.RequestBaseURL(c, h.settings); base != "" {
+		if u, err := url.Parse(base); err == nil {
 			host = u.Hostname()
-			break
 		}
 	}
 	if host == "" {

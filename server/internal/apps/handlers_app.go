@@ -329,7 +329,9 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 
 	// If AutoDeploy is enabled for a GitHub repository and the Git Provider is connected,
 	// automatically register the push webhook on the repository via GitHub API.
-	if app.AutoDeploy && h.gitProvider != nil && strings.Contains(strings.ToLower(app.RepoURL), "github.com") {
+	// Repositories covered by a GitHub App installation are triggered by App-level
+	// events instead; registering a per-repo hook there would duplicate every push.
+	if app.AutoDeploy && h.gitProvider != nil && strings.Contains(strings.ToLower(app.RepoURL), "github.com") && !h.repoCoveredByGitHubApp(app.RepoURL) {
 		webhookURL := h.buildWebhookURL(c, app.WebhookToken)
 		hookID, err := h.gitProvider.EnsureRepoWebhook(c.Request.Context(), app.RepoURL, webhookURL)
 		if err == nil {
@@ -363,16 +365,27 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
+// buildWebhookURL returns the absolute event URL handed to a Git provider.
+// It uses the shared panel-URL resolver (bound panel domain → request Host,
+// see settings.BaseURL) so the address matches the one the GitHub App path
+// advertises.
 func (h *AppHandlers) buildWebhookURL(c *gin.Context, token string) string {
-	scheme := "http"
-	if c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https") {
-		scheme = "https"
+	base, _ := settings.RequestBaseURL(c, h.settings)
+	if base == "" {
+		base = "http://127.0.0.1:18080"
 	}
-	host := c.Request.Host
-	if host == "" {
-		host = "127.0.0.1:18080"
+	return fmt.Sprintf("%s/api/v1/apps/webhook/%s", base, token)
+}
+
+// repoCoveredByGitHubApp reports whether the repository is inside a
+// non-suspended GitHub App installation. Those pushes already reach the App
+// event endpoint, so auto-deploy must not also register a per-repo webhook.
+func (h *AppHandlers) repoCoveredByGitHubApp(repoURL string) bool {
+	if h.ghAppStore == nil || !h.ghAppStore.Configured() {
+		return false
 	}
-	return fmt.Sprintf("%s://%s/api/v1/apps/webhook/%s", scheme, host, token)
+	_, covered := h.ghAppStore.FindInstallationForRepo(githubapp.NormalizeRepoURL(repoURL))
+	return covered
 }
 
 // updateAppReq is the body of PUT /apps/:id. Every mutable field is a pointer
@@ -583,9 +596,12 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 			a.MeshForwardTarget = ""
 		}
 
-		// Sync webhook if auto_deploy state or repo changed
+		// Sync webhook if auto_deploy state or repo changed. Repositories covered
+		// by a GitHub App installation are driven by App-level events, so the two
+		// trigger mechanisms never stack; disabling still cleans up any legacy hook.
 		if h.gitProvider != nil && strings.Contains(strings.ToLower(a.RepoURL), "github.com") {
-			if a.AutoDeploy && (!oldApp.AutoDeploy || a.RepoURL != oldApp.RepoURL || a.GitHubHookID == 0) {
+			coveredByApp := h.repoCoveredByGitHubApp(a.RepoURL)
+			if a.AutoDeploy && !coveredByApp && (!oldApp.AutoDeploy || a.RepoURL != oldApp.RepoURL || a.GitHubHookID == 0) {
 				webhookURL := h.buildWebhookURL(c, a.WebhookToken)
 				hookID, err := h.gitProvider.EnsureRepoWebhook(c.Request.Context(), a.RepoURL, webhookURL)
 				if err == nil {

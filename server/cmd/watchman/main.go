@@ -68,7 +68,7 @@ func main() {
 	aiKey := flag.String("ai-key", "", "LLM API key (for vLLM/OpenAI-compatible; empty for Ollama)")
 	wsOrigins := flag.String("ws-origins", "", "comma-separated extra browser origins allowed to open WebSocket sessions (same-origin and loopback are always allowed; \"*\" disables the check)")
 	manifestPath := flag.String("manifest", "/opt/watchman/manifest.json", "release manifest (deployed by install.sh); source of truth for agent upgrades")
-	publicURL := flag.String("public-url", "", "agent-facing public base URL (e.g. https://watchman.example.com); overrides the request Host header when building agent download URLs")
+	publicURL := flag.String("public-url", "", "deprecated and ignored; the bound panel domain is the only configured address source (系统设置 → 面板域名与证书)")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate for gRPC (empty = insecure)")
 	tlsKey := flag.String("tls-key", "", "TLS private key for gRPC")
 	httpTLS := flag.Bool("http-tls", false, "serve HTTPS on -http using -tls-cert/-tls-key")
@@ -162,13 +162,6 @@ func main() {
 	} else {
 		api.SetAgentRelease(m)
 		log.Info("release manifest loaded", "agent_version", m.Version, "commit", m.Commit)
-	}
-
-	// Agent-facing public URL for download links handed to agents.
-	if *publicURL != "" {
-		api.SetPublicURL(*publicURL)
-		apps.SetPublicURL(*publicURL)
-		log.Info("public URL configured", "url", *publicURL)
 	}
 
 	// Upgrade signing: derive a persistent Ed25519 key from the vault
@@ -278,6 +271,13 @@ func main() {
 	settingsStore.ApplyTimezone()
 	if tz := settingsStore.Timezone(); tz != "" {
 		log.Info("panel timezone applied", "timezone", tz)
+	}
+	// -public-url is retired: the bound panel domain is the only configured
+	// address source (settings.BaseURL). Accept the flag so old service units
+	// still boot, but say why it no longer has any effect. A one-off migration
+	// of the retired server.public_url setting lives in settings.NewStore.
+	if *publicURL != "" {
+		log.Warn("-public-url is deprecated and ignored; bind a panel domain in 系统设置 → 面板域名与证书 instead", "value", *publicURL)
 	}
 
 	// Control-plane backup/restore, so the whole dataset can be archived and

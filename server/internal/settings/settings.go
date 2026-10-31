@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -167,39 +168,40 @@ var Definitions = []Definition{
 	{Key: "security.secure_entry_enabled", Scope: ScopeSystem, Kind: KindBool, Title: "安全入口", Default: false},
 	{Key: "security.secure_entry_path", Scope: ScopeSystem, Kind: KindString, Title: "安全入口路径", Default: "",
 		MaxLen: 64, Validate: validateSecureEntryPath},
-		// 测试计划：开启后，控制端升级（重跑 deploy/install.sh）会跟踪预发布版本
-		// （含 pre-release 的 GitHub Release）；关闭则只跟踪正式版。system 域，
-		// 管理员专属。install.sh 在升级时从 <data>/settings.json 的 system 域读取。
-		{Key: "system.join_beta_program", Scope: ScopeSystem, Kind: KindBool, Title: "加入测试计划", Default: false},
+	// 测试计划：开启后，控制端升级（重跑 deploy/install.sh）会跟踪预发布版本
+	// （含 pre-release 的 GitHub Release）；关闭则只跟踪正式版。system 域，
+	// 管理员专属。install.sh 在升级时从 <data>/settings.json 的 system 域读取。
+	{Key: "system.join_beta_program", Scope: ScopeSystem, Kind: KindBool, Title: "加入测试计划", Default: false},
 
-		// 面板域名与公网访问地址（system 域，管理员专属）：
-		// 绑定域名后面板只能通过该域名访问（自动启用严格域名限制，
-		// 直接 IP 访问将被拦截），解绑后恢复 IP 访问。
-		{Key: "server.public_url", Scope: ScopeSystem, Kind: KindString, Title: "面板公网访问地址", Default: "",
-			MaxLen: 256, Validate: validatePublicURL},
-		// 面板时区（IANA 名称，如 Asia/Shanghai）：控制端进程本地时间与面板
-		// 全部时间展示的基准；空 = 跟随服务器操作系统时区。Agent 的月流量
-		// 计费周期仍按 Agent 所在主机的本地时间，不受此项影响。
-		{Key: "server.timezone", Scope: ScopeSystem, Kind: KindString, Title: "面板时区", Default: "",
-			MaxLen: 64, Validate: validateTimezone},
-		{Key: "security.panel_domain", Scope: ScopeSystem, Kind: KindString, Title: "面板绑定域名", Default: "",
-			MaxLen: 253, Validate: validateDomainName},
+	// 面板时区（IANA 名称，如 Asia/Shanghai）：控制端进程本地时间与面板
+	// 全部时间展示的基准；空 = 跟随服务器操作系统时区。Agent 的月流量
+	// 计费周期仍按 Agent 所在主机的本地时间，不受此项影响。
+	{Key: "server.timezone", Scope: ScopeSystem, Kind: KindString, Title: "面板时区", Default: "",
+		MaxLen: 64, Validate: validateTimezone},
 
-		// 面板 SSL / HTTPS（system 域，管理员专属）：
-		{Key: "security.panel_ssl_enabled", Scope: ScopeSystem, Kind: KindBool, Title: "面板 SSL / HTTPS", Default: false},
-		{Key: "security.panel_ssl_mode", Scope: ScopeSystem, Kind: KindEnum, Title: "证书来源", Default: "cert_center",
-			Enum: []string{"cert_center", "custom"}},
-		{Key: "security.panel_ssl_cert_id", Scope: ScopeSystem, Kind: KindString, Title: "证书中心证书 ID", Default: "", MaxLen: 64},
-		{Key: "security.panel_ssl_cert_pem", Scope: ScopeSystem, Kind: KindString, Title: "自定义证书 (PEM)", Default: "", MaxLen: 65536},
-		{Key: "security.panel_ssl_key_pem", Scope: ScopeSystem, Kind: KindString, Title: "自定义私钥 (PEM)", Default: "", MaxLen: 65536},
-		{Key: "security.panel_force_https", Scope: ScopeSystem, Kind: KindBool, Title: "强制 HTTPS 访问", Default: false},
+	// 面板域名与 SSL（system 域，管理员专属）：
+	// 绑定域名后面板只能通过该域名访问（自动启用严格域名限制，
+	// 直接 IP 访问将被拦截），解绑后恢复 IP 访问。该域名同时是面板
+	// 对外地址的**唯一**配置来源（见 baseurl.go）；旧 server.public_url
+	// 加载时一次性迁移进该键。
+	{Key: "security.panel_domain", Scope: ScopeSystem, Kind: KindString, Title: "面板绑定域名", Default: "",
+		MaxLen: 253, Validate: validateDomainName},
 
-		// 证书中心（system 域，管理员专属）：
-		// 自动续期在「到期前 N 天」触发；手动签发/手动上传的证书不会自动续期，
-		// 到期前 N 天经告警中心提醒一次。短期证书两侧都按有效期 1/3 自适应收紧（取较小者）。
-		{Key: "certs.auto_renew_days", Scope: ScopeSystem, Kind: KindInt, Title: "证书自动续期提前天数", Default: DefaultCertRenewDays, Min: MinCertDays, Max: MaxCertDays, DefaultOnEmpty: true},
-		{Key: "certs.expiry_reminder_days", Scope: ScopeSystem, Kind: KindInt, Title: "手动证书到期提醒提前天数", Default: DefaultCertRenewDays, Min: MinCertDays, Max: MaxCertDays, DefaultOnEmpty: true},
-	}
+	// 面板 SSL / HTTPS（system 域，管理员专属）：
+	{Key: "security.panel_ssl_enabled", Scope: ScopeSystem, Kind: KindBool, Title: "面板 SSL / HTTPS", Default: false},
+	{Key: "security.panel_ssl_mode", Scope: ScopeSystem, Kind: KindEnum, Title: "证书来源", Default: "cert_center",
+		Enum: []string{"cert_center", "custom"}},
+	{Key: "security.panel_ssl_cert_id", Scope: ScopeSystem, Kind: KindString, Title: "证书中心证书 ID", Default: "", MaxLen: 64},
+	{Key: "security.panel_ssl_cert_pem", Scope: ScopeSystem, Kind: KindString, Title: "自定义证书 (PEM)", Default: "", MaxLen: 65536},
+	{Key: "security.panel_ssl_key_pem", Scope: ScopeSystem, Kind: KindString, Title: "自定义私钥 (PEM)", Default: "", MaxLen: 65536},
+	{Key: "security.panel_force_https", Scope: ScopeSystem, Kind: KindBool, Title: "强制 HTTPS 访问", Default: false},
+
+	// 证书中心（system 域，管理员专属）：
+	// 自动续期在「到期前 N 天」触发；手动签发/手动上传的证书不会自动续期，
+	// 到期前 N 天经告警中心提醒一次。短期证书两侧都按有效期 1/3 自适应收紧（取较小者）。
+	{Key: "certs.auto_renew_days", Scope: ScopeSystem, Kind: KindInt, Title: "证书自动续期提前天数", Default: DefaultCertRenewDays, Min: MinCertDays, Max: MaxCertDays, DefaultOnEmpty: true},
+	{Key: "certs.expiry_reminder_days", Scope: ScopeSystem, Kind: KindInt, Title: "手动证书到期提醒提前天数", Default: DefaultCertRenewDays, Min: MinCertDays, Max: MaxCertDays, DefaultOnEmpty: true},
+}
 
 // validateAbsPath accepts an empty value (OS default applies) or an absolute
 // path: Unix-style or a Windows drive path.
@@ -262,20 +264,6 @@ func validateDomainName(v any) error {
 				return errors.New("域名只允许包含字母、数字与连字符 '-'")
 			}
 		}
-	}
-	return nil
-}
-
-// validatePublicURL 校验面板公网访问基准地址。
-func validatePublicURL(v any) error {
-	s, _ := v.(string)
-	if s == "" {
-		return nil
-	}
-	s = strings.TrimSpace(s)
-	u, err := url.Parse(s)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return errors.New("公网访问地址必须是有效的 http:// 或 https:// URL，例如 https://panel.example.com:18789")
 	}
 	return nil
 }
@@ -396,9 +384,10 @@ type AppearancePrefs struct {
 
 // PanelSecurityConfig is the typed view of panel domain and SSL security settings.
 // Strict domain checking is derived: a non-empty PanelDomain means the panel
-// is only reachable through that domain.
+// is only reachable through that domain. PanelDomain is also the only
+// configured source for the panel's outbound base URL; without it the address
+// comes from the inbound request (see BaseURL in baseurl.go).
 type PanelSecurityConfig struct {
-	PublicURL   string `json:"public_url"`
 	PanelDomain string `json:"panel_domain"`
 	SSLEnabled  bool   `json:"ssl_enabled"`
 	SSLMode     string `json:"ssl_mode"`
@@ -471,7 +460,69 @@ func (s *Store) load() error {
 	if doc.Users != nil {
 		s.users = doc.Users
 	}
+	s.migrateRetiredPublicURL()
 	return nil
+}
+
+// migrateRetiredPublicURL folds the retired server.public_url setting into
+// security.panel_domain once, then drops it. The binding is the panel's only
+// configured address source, so without this an upgraded deployment that
+// never bound a domain would start advertising whatever IP a browser happens
+// to use (agent install commands, Git webhooks, version info). The write goes
+// straight to the in-memory map: SetMany's certificate reset is for
+// admin-initiated domain changes, not for preserving an address that is
+// already in use.
+func (s *Store) migrateRetiredPublicURL() {
+	raw, ok := s.system["server.public_url"]
+	if !ok {
+		return
+	}
+	delete(s.system, "server.public_url")
+
+	var legacy string
+	_ = json.Unmarshal(raw, &legacy)
+	domain, droppedPort := legacyPanelDomain(legacy)
+	if domain == "" {
+		if strings.TrimSpace(legacy) != "" {
+			s.log.Warn("retired server.public_url has no usable hostname; bind a panel domain in 系统设置 → 面板域名与证书", "value", legacy)
+		}
+	} else {
+		var current string
+		_ = json.Unmarshal(s.system["security.panel_domain"], &current)
+		if strings.TrimSpace(current) == "" {
+			if encoded, err := json.Marshal(domain); err == nil {
+				s.system["security.panel_domain"] = encoded
+				s.log.Info("migrated retired server.public_url setting to the bound panel domain", "domain", domain, "dropped_port", droppedPort)
+			}
+		} else {
+			s.log.Warn("retired server.public_url ignored: a panel domain is already bound", "domain", strings.TrimSpace(current))
+		}
+	}
+
+	if err := s.save(); err != nil {
+		s.log.Warn("drop retired server.public_url setting", "err", err)
+	}
+}
+
+// legacyPanelDomain extracts a bindable panel domain from a retired explicit
+// base URL, plus the port that cannot survive the migration. Only a hostname
+// works: an IP cannot be a panel domain, and the domain is served on the
+// standard ports, so a non-standard port has no equivalent in the
+// single-source model.
+func legacyPanelDomain(raw string) (domain, droppedPort string) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", ""
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if host == "" || net.ParseIP(host) != nil || validateDomainName(host) != nil {
+		return "", ""
+	}
+	port := u.Port()
+	if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	return host, port
 }
 
 // save persists the live document via temp-file + rename so a crash cannot
@@ -827,7 +878,6 @@ func (s *Store) Appearance(username string) AppearancePrefs {
 // PanelSecurity returns the typed panel domain and SSL security settings.
 func (s *Store) PanelSecurity() PanelSecurityConfig {
 	var p PanelSecurityConfig
-	s.decode(ScopeSystem, "", "server.public_url", &p.PublicURL)
 	s.decode(ScopeSystem, "", "security.panel_domain", &p.PanelDomain)
 	s.decode(ScopeSystem, "", "security.panel_ssl_enabled", &p.SSLEnabled)
 	s.decode(ScopeSystem, "", "security.panel_ssl_mode", &p.SSLMode)

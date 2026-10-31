@@ -63,40 +63,17 @@ func TestTunnelClientInfoEnabledDerivation(t *testing.T) {
 		t.Fatalf("endpoint must derive host from request Host: %v", body["endpoint"])
 	}
 
-	// Public URL wins over the request Host.
+	// The bound panel domain wins over the request Host.
 	if err := settingsStore.SetMany(settings.ScopeSystem, "", map[string]json.RawMessage{
-		"server.public_url": json.RawMessage(`"https://watchman.example.com:8443"`),
+		"security.panel_domain": json.RawMessage(`"watchman.example.com"`),
 	}); err != nil {
-		t.Fatalf("set public url: %v", err)
+		t.Fatalf("set panel domain: %v", err)
 	}
-	_, body = getJSON(t, r, tok, "/api/v1/tunnels/client-info", "panel.example.com:18789")
+	// The bound panel domain wins over the request Host. Access via loopback
+	// so the strict-domain guard does not reject the probe first.
+	_, body = getJSON(t, r, tok, "/api/v1/tunnels/client-info", "127.0.0.1:18789")
 	if body["endpoint"] != "watchman.example.com:19443" {
-		t.Fatalf("public URL hostname must win: %v", body["endpoint"])
-	}
-}
-
-// TestTunnelClientInfoPublicURLFlag: the -public-url flag backs up the
-// panel public URL setting; the setting still wins when both are set.
-func TestTunnelClientInfoPublicURLFlag(t *testing.T) {
-	SetPublicURL("https://flag.example.com:9090")
-	t.Cleanup(func() { SetPublicURL("") })
-
-	r, authStore, settingsStore := newTestRouterOp(t, ":19443")
-	tok := tokenFor(t, authStore, "ci_flag", auth.RoleOperator)
-
-	_, body := getJSON(t, r, tok, "/api/v1/tunnels/client-info", "panel.example.com:18789")
-	if body["endpoint"] != "flag.example.com:19443" {
-		t.Fatalf("flag public URL must back up the request Host: %v", body["endpoint"])
-	}
-
-	if err := settingsStore.SetMany(settings.ScopeSystem, "", map[string]json.RawMessage{
-		"server.public_url": json.RawMessage(`"https://watchman.example.com:8443"`),
-	}); err != nil {
-		t.Fatalf("set public url: %v", err)
-	}
-	_, body = getJSON(t, r, tok, "/api/v1/tunnels/client-info", "panel.example.com:18789")
-	if body["endpoint"] != "watchman.example.com:19443" {
-		t.Fatalf("setting must win over the flag: %v", body["endpoint"])
+		t.Fatalf("bound domain hostname must win: %v", body["endpoint"])
 	}
 }
 

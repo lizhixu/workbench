@@ -136,7 +136,7 @@ async function doCreateApp() {
       appOrgInput.value.trim() || undefined,
     )
     if (!res.public_url_configured) {
-      message.warning('面板公网地址未配置，事件地址将使用本次请求地址，GitHub 可能无法访问，请先到系统设置配置 server.public_url')
+      message.warning('面板未绑定域名，事件地址将使用本次请求地址（IP），GitHub 可能无法访问；请先在系统设置中绑定面板域名')
     }
     // 名称留空时服务端生成唯一值：回填输入框，万一 GitHub 创建页没打开
     // （弹窗拦截/网络异常），用户能看到实际用了什么名字再重试。

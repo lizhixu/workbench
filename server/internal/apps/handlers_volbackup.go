@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"watchman/server/internal/rpc"
+	"watchman/server/internal/settings"
 )
 
 // volumeNoteMaxRunes bounds the free-form note stored on each archive record.
@@ -363,16 +364,14 @@ func (h *AppHandlers) uploadVolumeBackupRestore(c *gin.Context) {
 
 	// Validate the public URL before reading any uploaded data: an operator
 	// uploading a 2GB archive should fail fast if the server cannot form the
-	// agent download URL. Do not derive this from Request.Host: behind a proxy
-	// that header is client-controlled and may point the agent at an attacker.
-	configuredURL := ""
-	if h.settings != nil {
-		configuredURL = h.settings.PanelSecurity().PublicURL
+	// agent download URL. The request Host is deliberately refused here:
+	// behind a proxy that header is client-controlled and may point the agent
+	// at an attacker, so only a bound panel domain is accepted.
+	base, configured := settings.RequestBaseURL(c, h.settings)
+	if !configured {
+		base = ""
 	}
-	if strings.TrimSpace(configuredURL) == "" {
-		configuredURL = agentPublicURL
-	}
-	baseURL, err := uploadRestoreBaseURL(configuredURL)
+	baseURL, err := uploadRestoreBaseURL(base)
 	if err != nil {
 		h.engine.releaseVolumeSlot(app.ID)
 		// Surface the concrete reason: "not configured" and "configured but

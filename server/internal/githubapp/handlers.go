@@ -60,24 +60,12 @@ func (h *Handlers) Register(readRG, writeRG, publicRG *gin.RouterGroup) {
 	publicRG.POST("/github-app/webhook", h.webhook)
 }
 
-// panelBaseURL resolves the panel's public base URL: the configured
-// server.public_url when set, otherwise the request's own scheme+host
-// (same derivation as the per-app webhook URL builder).
+// panelBaseURL resolves the panel's public base URL through the shared
+// resolver (bound panel domain → request Host). configured is true only when
+// the domain produced the address; a request-derived one is a guess, so the
+// create page warns that GitHub may not reach it.
 func (h *Handlers) panelBaseURL(c *gin.Context) (string, bool) {
-	if h.settings != nil {
-		if pub := strings.TrimRight(h.settings.PanelSecurity().PublicURL, "/"); pub != "" {
-			return pub, true
-		}
-	}
-	scheme := "http"
-	if c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https") {
-		scheme = "https"
-	}
-	host := c.Request.Host
-	if host == "" {
-		return "", false
-	}
-	return scheme + "://" + host, false
+	return settings.RequestBaseURL(c, h.settings)
 }
 
 func (h *Handlers) webhookURL(c *gin.Context) string {
@@ -193,7 +181,7 @@ func (h *Handlers) createManifest(c *gin.Context) {
 	}
 	base, configured := h.panelBaseURL(c)
 	if base == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无法确定面板公网地址，请先在系统设置中配置 server.public_url"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无法确定面板公网地址，请先在系统设置 → 面板域名与证书绑定面板域名"})
 		return
 	}
 	raw := make([]byte, 16)

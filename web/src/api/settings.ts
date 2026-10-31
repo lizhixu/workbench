@@ -38,11 +38,12 @@ export const SETTING_KEYS = {
   // Certificate center timing (system scope, admin only).
   certAutoRenewDays: 'certs.auto_renew_days',
   certExpiryReminderDays: 'certs.expiry_reminder_days',
-  // Panel domain and public access (system scope).
-  // 绑定域名即自动启用严格域名限制（只能通过该域名访问面板），无独立开关。
-  publicURL: 'server.public_url',
   // Panel timezone (system scope): IANA name; '' = server OS timezone.
   timezone: 'server.timezone',
+  // Panel domain (system scope). 绑定域名即自动启用严格域名限制（只能通过
+  // 该域名访问面板），同时是面板对外地址的**唯一**配置来源：绑定后所有
+  // 对外 URL（Agent 安装/升级、Git webhook、卷恢复、组网 endpoint）都按它
+  // 推导，未绑定则使用访问时的 IP。
   panelDomain: 'security.panel_domain',
   // Panel SSL / HTTPS (system scope)
   panelSSLEnabled: 'security.panel_ssl_enabled',

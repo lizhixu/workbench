@@ -25,15 +25,6 @@ import (
 // record is deleted, and are purged wholesale at panel startup — a restart
 // kills the restore goroutine, so no staged file can still be in flight.
 
-var agentPublicURL string
-
-// SetPublicURL configures the server's agent-facing public URL for upload
-// restore callbacks. It is the flag-level fallback when settings.server.public_url
-// is empty; request Host is deliberately never used for this path.
-func SetPublicURL(u string) {
-	agentPublicURL = strings.TrimRight(strings.TrimSpace(u), "/")
-}
-
 const (
 	volumeUploadsDir = "volume-uploads"
 
@@ -256,26 +247,27 @@ func (s *VolumeUploadStore) Serve(w http.ResponseWriter, archiveID string) error
 	return err
 }
 
-// uploadRestoreBaseURL accepts only the explicitly configured panel endpoint.
-// Request.Host is intentionally not a fallback: it is client-controlled behind
-// reverse proxies and may point the agent at an attacker or an unreachable LAN.
+// uploadRestoreBaseURL accepts only a bound panel domain (resolved by
+// settings.BaseURL). Request.Host is intentionally not a fallback: it is
+// client-controlled behind reverse proxies and may point the agent at an
+// attacker or an unreachable LAN.
 func uploadRestoreBaseURL(configured string) (string, error) {
 	configured = strings.TrimSpace(configured)
 	if configured == "" {
-		return "", errors.New("请先在系统设置中配置面板公网访问地址（server.public_url），再使用上传恢复")
+		return "", errors.New("请先在系统设置 → 面板域名与证书绑定面板域名，再使用上传恢复")
 	}
 	u, err := url.Parse(configured)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return "", errors.New("面板公网访问地址无效，请检查 server.public_url")
+		return "", errors.New("面板对外地址无效，请检查面板域名与 SSL 配置")
 	}
 	host := u.Hostname()
 	if host == "" {
-		return "", errors.New("面板公网访问地址无效，请检查 server.public_url")
+		return "", errors.New("面板对外地址无效，请检查面板域名与 SSL 配置")
 	}
 	if portStr := u.Port(); portStr != "" {
 		p, err := strconv.Atoi(portStr)
 		if err != nil || p <= 0 || p > 65535 {
-			return "", errors.New("面板公网访问地址端口无效")
+			return "", errors.New("面板对外地址端口无效")
 		}
 	}
 	return strings.TrimRight(u.String(), "/"), nil

@@ -297,13 +297,29 @@ func TestHTTPSMiddleware(t *testing.T) {
 		t.Fatalf("Location = %q, want https://panel.example.com:18789/dashboard?tab=files", loc)
 	}
 
-	// HTTPS request with X-Forwarded-Proto -> 200 OK
+	// Direct TLS request -> 200 OK (already https, no redirect).
 	req = httptest.NewRequest("GET", "/dashboard", nil)
-	req.Header.Set("X-Forwarded-Proto", "https")
+	req.TLS = &tls.ConnectionState{}
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
-		t.Fatalf("https header: got status %d, want 200", w.Code)
+		t.Fatalf("direct TLS: got status %d, want 200", w.Code)
+	}
+
+	// A forged X-Forwarded-Proto header must NOT bypass the forced-HTTPS
+	// redirect: the panel is the outermost service, so the header is
+	// never trusted. Plaintext + header -> 301 to the primary port's
+	// https endpoint, same as plaintext without the header.
+	req = httptest.NewRequest("GET", "/dashboard", nil)
+	req.Host = "panel.example.com:18789"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusMovedPermanently {
+		t.Fatalf("forged header: got status %d, want 301", w.Code)
+	}
+	if loc := w.Header().Get("Location"); loc != "https://panel.example.com:18789/dashboard" {
+		t.Fatalf("forged header Location = %q, want https://panel.example.com:18789/dashboard", loc)
 	}
 }
 

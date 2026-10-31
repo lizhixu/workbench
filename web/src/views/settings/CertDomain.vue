@@ -580,7 +580,7 @@ onUnmounted(stopJobPoll)
               面板仅可通过该域名访问：IP / 其他域名返回 403，「域名 + 主端口」在免端口入口可用时自动跳转。
               <template v-if="activeEntryURL">免端口入口：<code>{{ activeEntryURL }}</code>。</template>
               批量升级 Agent 的安装包地址使用该域名，内网环境请确保能解析。
-              反向代理终结 TLS 时请透传 <code>X-Forwarded-Proto: https</code>，否则对外地址会被推导为 http。
+              对外地址按面板实际服务状态生成：SSL 开启且 :443 在监听时为 https，否则为 http；面板默认最外层，不信任前置反代的请求头，如需对外 https 请开启面板 SSL。
             </p>
           </div>
           <NForm v-else label-placement="top" :show-feedback="false">

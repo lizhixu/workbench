@@ -652,14 +652,6 @@ func main() {
 	}
 	dynamicHTTPListener := panelsec.NewDynamicListener(httpLis, panelTLSConfig, settingsStore, log)
 
-	go func() {
-		log.Info("http/https server listening", "addr", *httpAddr)
-		if err := hs.Serve(dynamicHTTPListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("http serve", "err", err)
-			cancel()
-		}
-	}()
-
 	// Portless access: while a panel domain is bound, also serve the panel on
 	// :80 (and :443 when panel SSL is on), sharing the same handler. These
 	// listeners follow the domain/SSL settings live — started when the domain
@@ -681,6 +673,29 @@ func main() {
 	stdPorts.Reconcile()
 	go stdPorts.Run(ctx)
 	settingsStore.SetOnChange(stdPorts.Reconcile)
+	// The panel's externally advertised address must follow what it
+	// actually serves, not how one request arrived (see settings/baseurl.go):
+	// bound-domain URLs come from the live standard-port listeners, with
+	// the primary port as fallback when neither standard port serves.
+	settingsStore.SetServingStateProvider(func() settings.ServingState {
+		return settings.ServingState{
+			HTTPSListening: panelsec.StandardPortListening(443),
+			HTTPListening:  panelsec.StandardPortListening(80),
+			PrimaryPort:    panelsec.PanelHTTPPort(),
+		}
+	})
+
+	// The standard-port listeners and the serving-state provider are wired
+	// before the primary listener starts serving, so the first request
+	// already sees the live serving state instead of the setting-only
+	// fallback for the panel's advertised address.
+	go func() {
+		log.Info("http/https server listening", "addr", *httpAddr)
+		if err := hs.Serve(dynamicHTTPListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("http serve", "err", err)
+			cancel()
+		}
+	}()
 
 	// Wait for shutdown signal.
 	sig := make(chan os.Signal, 1)

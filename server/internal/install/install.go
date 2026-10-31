@@ -91,9 +91,12 @@ func (h *Handler) installScript(c *gin.Context) {
 	osType := c.DefaultQuery("os_type", "linux")
 	token := c.Query("token")
 
-	// Determine the server's external URL from the request.
+	// Determine the server's external URL from the request. Direct TLS
+	// only: the panel is the outermost service, so X-Forwarded-Proto is
+	// never trusted — a forged header must not put https into a script
+	// that agents will then try to download from.
 	scheme := "http"
-	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
+	if c.Request.TLS != nil {
 		scheme = "https"
 	}
 	// Allow override via query param (for NAT/proxy setups).

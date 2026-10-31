@@ -295,7 +295,11 @@ func (g *Guard) HTTPSMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		isTLS := c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https"
+		// Direct TLS only: the panel is the outermost service, so
+		// X-Forwarded-Proto is never trusted. Trusting it would let any
+		// direct client forge the header and bypass the forced-HTTPS
+		// redirect, receiving panel content over plaintext.
+		isTLS := c.Request.TLS != nil
 		if !isTLS {
 			// Redirecting is only safe when the target really serves TLS. When
 			// the portless :443 listener failed to bind (the port is held by

@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -721,16 +722,23 @@ func TestPanelSecurityBaseURL(t *testing.T) {
 			want: "https://panel.example.com", wantSet: true,
 		},
 		{
-			name:      "force https alone implies https",
+			// ForceHTTPS is a redirect policy, not a serving capability:
+			// it cannot make :443 serve, so it must not flip the scheme.
+			name:      "force https alone does not imply https",
 			sec:       PanelSecurityConfig{PanelDomain: "panel.example.com", ForceHTTPS: true},
 			reqScheme: "http", reqHost: "10.0.0.5:18789",
-			want: "https://panel.example.com", wantSet: true,
+			want: "http://panel.example.com", wantSet: true,
 		},
 		{
-			name:      "bound domain follows request https behind a TLS proxy",
+			// A bound-domain URL carries no port, so it always means the
+			// standard ports. How this request arrived (https on the
+			// primary port, or a forwarded header) proves nothing about
+			// :443 and must not flip the scheme. To advertise https,
+			// enable panel SSL so :443 actually serves.
+			name:      "bound domain ignores request https",
 			sec:       PanelSecurityConfig{PanelDomain: "  panel.example.com  "},
 			reqScheme: "https", reqHost: "127.0.0.1:18789",
-			want: "https://panel.example.com", wantSet: true,
+			want: "http://panel.example.com", wantSet: true,
 		},
 		{
 			name:      "plain bound domain over http stays http",
@@ -797,6 +805,94 @@ func TestStoreBaseURLFromSettings(t *testing.T) {
 	}
 	if got, set := s.BaseURL("http", "10.0.0.5:18789"); got != "http://10.0.0.5:18789" || set {
 		t.Fatalf("unbound BaseURL = (%q, %v)", got, set)
+	}
+}
+
+func TestStoreBaseURLUsesServingState(t *testing.T) {
+	s := newTestStore(t)
+	domain, _ := json.Marshal("panel.example.com")
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_domain": domain,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// SSL off + request https + :80 serving: the actual entry is http,
+	// even though this request arrived over https on the primary port.
+	s.SetServingStateProvider(func() ServingState {
+		return ServingState{HTTPListening: true, PrimaryPort: "18789"}
+	})
+	if got, _ := s.BaseURL("https", "10.0.0.5:18789"); got != "http://panel.example.com" {
+		t.Fatalf("serving http = %q, want http://panel.example.com", got)
+	}
+
+	// SSL on + :443 serving: https, even though the request was http.
+	sslOn, _ := json.Marshal(true)
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_ssl_enabled": sslOn,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.SetServingStateProvider(func() ServingState {
+		return ServingState{HTTPSListening: true, HTTPListening: true, PrimaryPort: "18789"}
+	})
+	if got, _ := s.BaseURL("http", "10.0.0.5:18789"); got != "https://panel.example.com" {
+		t.Fatalf("serving https = %q, want https://panel.example.com", got)
+	}
+
+	// SSL on but :443 NOT serving, :80 serving: do not advertise https.
+	s.SetServingStateProvider(func() ServingState {
+		return ServingState{HTTPListening: true, PrimaryPort: "18789"}
+	})
+	if got, _ := s.BaseURL("https", "10.0.0.5:18789"); got != "http://panel.example.com" {
+		t.Fatalf("443 not serving = %q, want http://panel.example.com", got)
+	}
+
+	// Neither standard port serving: fall back to the primary port, with
+	// the scheme following panel SSL (the dynamic listener on it sniffs
+	// TLS when SSL is on).
+	s.SetServingStateProvider(func() ServingState {
+		return ServingState{PrimaryPort: "18789"}
+	})
+	if got, _ := s.BaseURL("http", "10.0.0.5:18789"); got != "https://panel.example.com:18789" {
+		t.Fatalf("primary fallback (ssl on) = %q, want https://panel.example.com:18789", got)
+	}
+
+	sslOff, _ := json.Marshal(false)
+	if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{
+		"security.panel_ssl_enabled": sslOff,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.BaseURL("https", "10.0.0.5:18789"); got != "http://panel.example.com:18789" {
+		t.Fatalf("primary fallback (ssl off) = %q, want http://panel.example.com:18789", got)
+	}
+
+	// No provider at all: setting alone decides, still never the request.
+	s.SetServingStateProvider(nil)
+	if got, _ := s.BaseURL("https", "10.0.0.5:18789"); got != "http://panel.example.com" {
+		t.Fatalf("no provider = %q, want http://panel.example.com", got)
+	}
+}
+
+func TestRequestBaseURLIgnoresForwardedProto(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := newTestStore(t) // no domain bound: unbound fallback path
+
+	// A forwarded header claiming https must not flip the fallback to
+	// https when the request itself arrived over plain HTTP: the panel
+	// is the outermost service, so no proxy header is trusted.
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "http://10.0.0.5:18789/api/v1/version", nil)
+	c.Request.Header.Set("X-Forwarded-Proto", "https")
+	if got, set := RequestBaseURL(c, s); got != "http://10.0.0.5:18789" || set {
+		t.Fatalf("forwarded https = (%q, %v), want (http://10.0.0.5:18789, false)", got, set)
+	}
+
+	// Direct TLS still counts: the request really arrived over https.
+	c.Request.TLS = &tls.ConnectionState{}
+	if got, set := RequestBaseURL(c, s); got != "https://10.0.0.5:18789" || set {
+		t.Fatalf("direct TLS = (%q, %v), want (https://10.0.0.5:18789, false)", got, set)
 	}
 }
 

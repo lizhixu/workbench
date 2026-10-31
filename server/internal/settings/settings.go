@@ -411,6 +411,11 @@ type Store struct {
 	system   map[string]json.RawMessage
 	users    map[string]map[string]json.RawMessage
 	onChange func()
+	// servingProvider reports what the panel actually serves right now
+	// (standard-port listeners + primary port), supplied by the panel
+	// security layer. Nil when not wired (tests, reset tools); BaseURL
+	// then falls back to the setting-only rule.
+	servingProvider func() ServingState
 }
 
 // NewStore loads settings from disk, migrating the legacy term_prefs.json on
@@ -728,6 +733,22 @@ func (s *Store) SetOnChange(fn func()) {
 	s.mu.Lock()
 	s.onChange = fn
 	s.mu.Unlock()
+}
+
+// SetServingStateProvider registers the callback BaseURL uses to learn what
+// the panel actually serves (standard-port listeners + primary port). It is
+// a callback, not a direct call, because settings cannot import the panel
+// security layer that owns the listeners (import cycle).
+func (s *Store) SetServingStateProvider(fn func() ServingState) {
+	s.mu.Lock()
+	s.servingProvider = fn
+	s.mu.Unlock()
+}
+
+func (s *Store) servingStateProvider() func() ServingState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.servingProvider
 }
 
 // SetMany validates every item first and then applies them atomically: if any

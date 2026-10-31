@@ -55,11 +55,12 @@ func TestPanelBaseURLFromBoundDomain(t *testing.T) {
 	}
 }
 
-// A reverse proxy may terminate TLS while the panel itself runs plain HTTP.
-// The bound domain must follow the scheme the browser actually used
-// (X-Forwarded-Proto), otherwise the endpoint we hand to GitHub is
-// http://domain and delivery fails without a redirect being followed.
-func TestPanelBaseURLDomainFollowsProxyTLS(t *testing.T) {
+// A reverse proxy terminating TLS no longer flips the bound domain to
+// https on its own: the header is client-controlled, and a bound-domain URL
+// carries no port, so https would mean :443 — which the panel does not
+// serve while its own SSL is off. To hand GitHub an https endpoint, enable
+// panel SSL so :443 actually serves.
+func TestPanelBaseURLIgnoresProxyTLSWhenSSLDisabled(t *testing.T) {
 	st, err := settings.NewStore(t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +76,7 @@ func TestPanelBaseURLDomainFollowsProxyTLS(t *testing.T) {
 	c := newBaseURLContext()
 	c.Request.Header.Set("X-Forwarded-Proto", "https")
 	got, configured := h.panelBaseURL(c)
-	if want := "https://panel.example.com"; got != want {
+	if want := "http://panel.example.com"; got != want {
 		t.Fatalf("base url = %q, want %q", got, want)
 	}
 	if !configured {

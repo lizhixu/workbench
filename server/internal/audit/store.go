@@ -251,17 +251,13 @@ func matchAction(pattern, action string) bool {
 	return pattern == action
 }
 
-// RequestInfo extracts client IP and user agent from a request. The IP
-// prefers the proxy-forwarded address set by the fronting nginx.
+// RequestInfo extracts client IP and user agent from a request. The IP is
+// the connection's RemoteAddr only: the panel is the outermost service, so
+// X-Real-IP and X-Forwarded-For are client-controlled and must not be
+// written into the audit trail as if they were the real source address.
+// (User-Agent is logged as claimed; it is not an identity claim.)
 func RequestInfo(r *http.Request) (ip, ua string) {
-	ip = r.Header.Get("X-Real-IP")
-	if ip == "" {
-		ip = r.Header.Get("X-Forwarded-For")
-		if i := strings.Index(ip, ","); i > 0 {
-			ip = strings.TrimSpace(ip[:i])
-		}
-	}
-	if ip == "" && r != nil && r.RemoteAddr != "" {
+	if r != nil && r.RemoteAddr != "" {
 		if i := strings.LastIndex(r.RemoteAddr, ":"); i > 0 {
 			ip = r.RemoteAddr[:i]
 		} else {

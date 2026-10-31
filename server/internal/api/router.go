@@ -613,7 +613,8 @@ func (h *handlers) loginWithAudit(login gin.HandlerFunc) gin.HandlerFunc {
 func (h *handlers) enroll(c *gin.Context) {
 	token := h.reg.IssueEnrollToken()
 	// Single resolution path for the panel's public address (AGENTS.md
-	// §3.7 / settings.BaseURL): bound panel domain → request Host.
+	// §3.7 / settings.BaseURL): a bound panel domain follows the live
+	// serving state, an unbound panel falls back to the request Host.
 	serverURL, _ := settings.RequestBaseURL(c, h.settings)
 	c.JSON(http.StatusOK, gin.H{
 		"enroll_token": token,

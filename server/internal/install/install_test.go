@@ -1,10 +1,12 @@
 package install
 
 import (
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -86,3 +88,39 @@ func TestAgentBinary_RejectsCorruptFile(t *testing.T) {
 	}
 }
 
+func TestInstallScriptIgnoresForwardedProto(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := NewHandler(nil, "")
+	engine := gin.New()
+	h.RegisterRoutes(engine)
+
+	// Forged header + plaintext request: the script must still use http,
+	// because the panel is the outermost service and the header is never
+	// trusted. An https script here would make agents try to download
+	// from a TLS endpoint the panel does not serve.
+	req := httptest.NewRequest("GET", "http://10.0.0.5:18789/install?token=test-token-123", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("install script: got status %d, want 200", w.Code)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `WATCHMAN_SERVER="http://10.0.0.5:18789"`) {
+		t.Fatalf("forwarded https: script does not contain http server URL")
+	}
+	if body := w.Body.String(); strings.Contains(body, `WATCHMAN_SERVER="https://10.0.0.5:18789"`) {
+		t.Fatalf("forwarded https: script must not contain https server URL")
+	}
+
+	// Direct TLS still yields https.
+	req = httptest.NewRequest("GET", "http://10.0.0.5:18789/install?token=test-token-123", nil)
+	req.TLS = &tls.ConnectionState{}
+	w = httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("direct TLS install script: got status %d, want 200", w.Code)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `WATCHMAN_SERVER="https://10.0.0.5:18789"`) {
+		t.Fatalf("direct TLS: script does not contain https server URL")
+	}
+}

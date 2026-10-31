@@ -139,7 +139,7 @@
   - **多域名与证书自动匹配（宝塔式站点模型）**：
     - **契约（`ProxyDomains []DomainBinding`）**：`Application.Domain` 单值字段升级为 `ProxyDomains []DomainBinding`（`{domain, cert_id, auto}`），一个应用支持绑定多个独立域名；**证书不再要求用户逐个选择**——`PUT /apps/:id/proxy` 的 `cert_id` 可省略/留空，表示由服务端按域名自动匹配当前可用的覆盖证书，并在保存时把具体证书 ID 物化进 `cert_id`（同时置 `auto=true`）。运行期没有动态 SNI 匹配：Nginx vhost、续期回推、删除守卫都读已存储的 ID。
     - **自动匹配口径（`hub.FindUsableByDomain`）**：与 `FindByDomain` 同一套确定性排序（精确 SAN > 通配符；通配符标签深度多者优先；`NotAfter` 新者优先；证书 ID 字典序兜底），但只接受**当前可用**的证书——已生效（`NotBefore ≤ now`）、未过期、且私钥材料齐全；过期/未生效/缺私钥的证书不会被自动选中（`CertUnusableReason` 给出原因）。**跨整个请求先解析再写主机**：任一域名无可用证书时整体拒绝（400 + `missing_domains` 列表），此时尚未对任何主机做写入，前端可一次性批量签发后重试。
-    - **显式证书仍严格校验**：传了具体 `cert_id` 时按显式绑定处理（`auto=false`），校验存在性（400）、**SAN 覆盖域名（`cert.DomainCovers`，未覆盖 400）**与私钥材料完整性（409）；显式指定的过期证书仍允许保存（便于接管遗留材料，UI 标注），下次续期按身份回推。
+    - **显式证书仍严格校验**：传了具体 `cert_id` 时按显式绑定处理（`auto=false`），校验存在性（400）、**SAN 覆盖域名（`cert.DomainCovers`，未覆盖 400）**与私钥材料完整性（409）；显式指定的过期证书仍允许保存（便于接管遗留材料，UI 标注），下次续期按身份回推。UI 标注的口径：手动指定行的提示按证书有效期给语气——已过期或尚未生效时为警告（仍允许保存，仅说明后果），有效时才为正常；手动下拉里过期证书的剩余天数不写「剩余 0 天」，直接标「已过期」。缺私钥无法从列表数据判断（私钥永不出网），只按有效期标注，不可用的最终判定仍以服务端绑定校验为准。
     - **`auto` 标志持久化**：服务端自动选中的绑定记 `auto=true`，前端展示为「自动匹配：<证书 SAN>」；重新载入后该行仍按「未指定证书」提交，下一次保存会按当时可用证书重新解析——避免把已物化的旧 ID 钉成显式选择，导致证书过期后绑回旧证。存量迁移与遗留单域名解析同样写 `auto=true`。
     - **多域名 Nginx Virtual Host 渲染**：统一生成至单文件 `watchman-<appID>.conf`，为每个域名独立渲染 HTTP 80 重定向块与 HTTPS 443 反代 server 块，各自引用专用证书与密钥文件（`/opt/apps/nginx/certs/<domain>.crt` 与 `<domain>.key`）。解绑应用反代或彻底删除应用时，联动清理全部绑定域名的证书与配置文件。
     - **身份优先证书回推（Identity-First Re-push）**：证书自动化续期成功后，`ProxyHandler.RepushAppCerts` 遍历各应用，优先匹配 `binding.CertID == crt.ID`（或存量未物化空 CertID 条目且域名覆盖）；更新并热重载 Nginx，杜绝多厂商/新签证书跨应用漂移劫持。
@@ -1779,7 +1779,7 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 凡是展示**外部输入的 Markdown**（GitHub Release 正文 `release_notes`、AI 助手回答等），一律走 `web/src/utils/markdown.ts` 的 `renderMarkdown()`，**不得直接用 `<pre>{{ text }}</pre>` 原样输出**——GitHub Release 正文是标准 Markdown，原样输出会把 `### Added`、`- **apps** ...` 连标记一起显示给用户。
 
 - **零依赖**：渲染器是项目内实现，不引入 marked / markdown-it 等库，避免为几个标题和列表增加打包体积。
-- **支持范围**：`#`~`######` 标题（映射 h4~h6，避免卡片内过大）、有序/无序列表及缩进续行、`**加粗**`、`*斜体*`、`~~删除线~~`、行内 `code`、``` 代码块（支持提取语言为 `data-lang` 属性）、`[文本](链接)`、`>` 引用、`---` 分隔线、GFM 表格（`| Header |` 与对齐分隔行，自动包裹在 `<div class="md-table-wrap">` 内实现响应式横向滚动）。不支持行内 HTML。
+- **支持范围**：`#`~`######` 标题（映射 h4~h6，避免卡片内过大）、有序/无序列表及缩进续行、`**加粗**`、`*斜体*`、`~~删除线~~`、行内 `code`、``` 代码块（支持提取语言为 `data-lang` 属性）、`[文本](链接)`、`>` 引用、`---` 分隔线、GFM 表格（`| Header |` 与对齐分隔行，自动包裹在 `<div class="md-table-wrap">` 内实现响应式横向滚动；分隔行必须含 `|`，裸 `---` 是分隔线而非表格分隔行，否则含 `|` 的段落行后跟 `---` 会被误吞成单列表格）。不支持行内 HTML。
 - **安全**：整体先转义 HTML 再做标记替换，输出标签全部由渲染器生成；链接只放行 `http(s)://`、`mailto:`、锚点与站内绝对路径，`javascript:` 等一律降级为 `#`。因此可以安全地配合 `v-html` 使用，禁止改成「先渲染再过滤」的写法。
 - **样式**：`v-html` 注入的节点没有 scoped 属性，容器样式必须用 `:deep()` 下发给 h4~h6 / ul / li / p / code / pre / a / blockquote / hr / table，参考 `SystemUpgrade.vue` 的 `.changelog-body` 与 `AppAiAssistant.vue` 的 `.markdown-body`。
 - **AI 助手与应用创建页部署助手**：创建页 AI 部署助手（`AppAiAssistant.vue`）中的选型说明卡片（`draftResult.explanation`）与对话助手气泡统一接入 `renderMarkdown()`，容器配置 `.markdown-body` 并在 scoped CSS 中通过 `:deep()` 下发段落、标题、列表、引用、行内代码、语言标注代码块与自适应表格样式，并重设 `white-space: normal` 保证 HTML 块级节点正常流式排版；后端 `app_assist.go` 的 `extractJSONPayload` 自动剥除推理模型 `<think>`/`<thought>` 思考标签，并经 `repairJSON` 修复字符串字面量中未转义的换行与末尾逗号，防止反序列化失败将原始 JSON 串或思考过程泄露到对话气泡。

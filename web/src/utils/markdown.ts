@@ -77,6 +77,10 @@ function splitCells(row: string): string[] {
 }
 
 function isDelimiterRow(row: string): boolean {
+  // A bare `---` is a horizontal rule, not a table delimiter: a delimiter
+  // row must contain at least one pipe, otherwise a paragraph line holding
+  // `|` followed by a `---` separator would be swallowed into a table.
+  if (!row.includes('|')) return false
   const cells = splitCells(row)
   if (cells.length === 0) return false
   return cells.every((c) => /^:?-+:?$/.test(c))

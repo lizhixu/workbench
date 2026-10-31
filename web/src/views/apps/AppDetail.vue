@@ -288,9 +288,12 @@ const certOptions = computed(() => {
   return certs.value.map((c) => {
     const sans = c.domains.join(', ') || c.id
     const issuer = c.issuer || (c.source === 'manual_upload' ? '手动上传' : c.account_name || 'ACME')
+    // certDaysRemaining 把过期钳制为 0，会把“已过期”伪装成“今天到期”；
+    // 下拉里过期证书必须明示，否则手动指定时无从分辨。
+    const expired = new Date(c.not_after).getTime() <= Date.now()
     const days = certDaysRemaining(c.not_after)
     return {
-      label: `${sans} · ${issuer} · 剩余 ${days} 天`,
+      label: `${sans} · ${issuer} · ${expired ? '已过期' : `剩余 ${days} 天`}`,
       value: c.id,
     }
   })
@@ -317,6 +320,19 @@ const proxyAutoDomains = computed(() =>
 function proxyDomainHint(row: ProxyDomainRow): { tone: 'ok' | 'warn'; text: string } {
   if (row.cert_id) {
     const c = certs.value.find((x) => x.id === row.cert_id)
+    // 显式指定仍允许保存过期/未生效证书（接管遗留材料），但提示不能再是 ok：
+    // 否则用户会以为手动指定即无问题。缺私钥无法从列表数据判断（私钥永不出网），
+    // 只按有效期标注；真正不可用的判断仍以服务端绑定校验为准。
+    if (c) {
+      const now = Date.now()
+      const sans = c.domains.join(', ') || c.id
+      if (new Date(c.not_after).getTime() <= now) {
+        return { tone: 'warn', text: `已手动指定证书：${sans}（证书已过期，保存时仍按显式绑定，浏览器将告警）` }
+      }
+      if (new Date(c.not_before).getTime() > now) {
+        return { tone: 'warn', text: `已手动指定证书：${sans}（证书尚未生效，保存时仍按显式绑定）` }
+      }
+    }
     return { tone: 'ok', text: `已手动指定证书：${c ? c.domains.join(', ') : row.cert_id}` }
   }
   if (row.cover?.covered) {

@@ -3,7 +3,7 @@ import { computed, onActivated, onMounted, onUnmounted, reactive, ref, watch } f
 import { useRoute, useRouter } from 'vue-router'
 import {
   NAlert, NAvatar, NButton, NCard, NForm, NFormItem, NGi, NGrid, NIcon, NInput, NInputNumber,
-  NRadio, NRadioGroup, NSelect, NSpace, NSwitch, NTag, useMessage,
+  NRadio, NRadioButton, NRadioGroup, NSelect, NSpace, NSwitch, NTag, useMessage,
 } from 'naive-ui'
 import {
   ArrowBackOutline, LogoGithub, RefreshOutline,
@@ -128,6 +128,17 @@ const appInstalledRepos = ref<GitHubAppInstalledRepo[]>([])
 const appConfigured = ref(false)
 const githubSourceReady = computed(() => githubAccount.value !== null || appConfigured.value)
 
+// 先选接入方式、再选仓库：两种方式各自独立的仓库清单，不做跨来源合并去重。
+type GitHubMethod = 'pat' | 'app'
+const githubMethod = ref<GitHubMethod | null>(null)
+// 只列出实际已配置的接入方式；都未配置时由上方连接引导接管。
+const githubMethodOptions = computed(() => {
+  const opts: Array<{ label: string; value: GitHubMethod }> = []
+  if (githubAccount.value) opts.push({ label: 'GitHub 账号（PAT）', value: 'pat' })
+  if (appConfigured.value) opts.push({ label: 'GitHub App', value: 'app' })
+  return opts
+})
+
 async function fetchAppInstalledRepos() {
   try {
     const st = await getGitHubAppStatus()
@@ -137,6 +148,13 @@ async function fetchAppInstalledRepos() {
   } catch {
     // GitHub App 未配置时静默，PAT 流程不受影响
   }
+}
+
+// 只有一种方式可用时自动选中；两种都可用时留空，强制先做出选择。
+function syncGithubMethod() {
+  const available = githubMethodOptions.value.map((o) => o.value)
+  if (githubMethod.value && available.includes(githubMethod.value)) return
+  githubMethod.value = available.length === 1 ? available[0] : null
 }
 
 const branches = ref<GitHubBranch[]>([])
@@ -716,29 +734,24 @@ const vaultOptions = computed(() => [
   ...vaults.value.map((v) => ({ label: `${v.name} (${v.type})`, value: v.id })),
 ])
 
-const repoOptions = computed(() => {
-  const patNames = new Set(githubRepos.value.map((r) => r.full_name))
-  const appNames = new Set(appInstalledRepos.value.map((r) => r.full_name))
-  const patOptions = githubRepos.value.map((r) => ({
-    // 同一仓库只保留账号授权一条；被 App 覆盖的在此点明——推送触发与
-    // 拉码凭据实际都由 App 优先，不能让人误以为是 PAT 在生效。
+const patRepoOptions = computed(() =>
+  githubRepos.value.map((r) => ({
+    // 账号清单里同时被 App 覆盖的仓库仍如实列出，但要点明实际触发与拉码
+    // 由 App 优先，不能让人误以为是 PAT 在生效。
     label:
       `${r.full_name}${r.private ? ' [私有]' : ''}${r.description ? ' - ' + r.description : ''}` +
-      (appNames.has(r.full_name) ? ' · App 已覆盖' : ''),
+      (appInstalledRepos.value.some((a) => a.full_name === r.full_name) ? ' · App 已覆盖' : ''),
     value: r.full_name,
-  }))
-  // App 安装范围内、PAT 列表里没有的仓库才追加，避免同一仓库出现两次。
-  const appOptions = appInstalledRepos.value
-    .filter((r) => !patNames.has(r.full_name))
-    .map((r) => ({ label: r.full_name, value: r.full_name }))
-  return [
-    ...(patOptions.length
-      ? [{ type: 'group' as const, key: 'pat', label: 'GitHub 账号（PAT）', children: patOptions }]
-      : []),
-    ...(appOptions.length
-      ? [{ type: 'group' as const, key: 'app', label: 'GitHub App 安装范围', children: appOptions }]
-      : []),
-  ]
+  })),
+)
+const appRepoOptions = computed(() =>
+  appInstalledRepos.value.map((r) => ({ label: r.full_name, value: r.full_name })),
+)
+// 当前接入方式下的仓库；未选择方式时不展示任何来源的清单。
+const repoOptions = computed(() => {
+  if (githubMethod.value === 'pat') return patRepoOptions.value
+  if (githubMethod.value === 'app') return appRepoOptions.value
+  return []
 })
 
 const branchOptions = computed(() =>
@@ -973,6 +986,7 @@ async function checkGitHubStatus() {
     checkingGitHub.value = false
   }
   await fetchAppInstalledRepos()
+  syncGithubMethod()
 }
 
 async function fetchGitHubRepos() {
@@ -989,14 +1003,21 @@ async function fetchGitHubRepos() {
 async function refreshRepoLists() {
   if (githubAccount.value) await fetchGitHubRepos()
   await fetchAppInstalledRepos()
+  syncGithubMethod()
 }
 
-// 当用户在下拉框选中某个 GitHub 仓库时：自动填充应用名、克隆地址，并拉取所有分支
+// 当用户在下拉框选中某个 GitHub 仓库时：自动填充应用名、克隆地址，并拉取所有分支。
+// 取数通道由接入方式决定：App 方式即使该仓库也在 PAT 清单里，分支仍走安装令牌。
+let repoPickSeq = 0
 watch(selectedRepoFullName, async (fullName) => {
   if (!fullName) return
-  const repo = githubRepos.value.find((r) => r.full_name === fullName)
+  const seq = ++repoPickSeq
+  const repo =
+    githubMethod.value === 'pat'
+      ? githubRepos.value.find((r) => r.full_name === fullName)
+      : undefined
   if (!repo) {
-    // GitHub App 安装仓库（无 PAT 元数据）：只填克隆地址与应用名，分支走 App 令牌拉取。
+    // GitHub App 安装仓库：只填克隆地址与应用名，分支走 App 令牌拉取。
     const [owner, name] = fullName.split('/')
     if (!owner || !name) return
     form.repo_url = `https://github.com/${fullName}.git`
@@ -1007,13 +1028,14 @@ watch(selectedRepoFullName, async (fullName) => {
     loadingBranches.value = true
     try {
       const names = await listGitHubAppBranches(owner, name)
+      if (seq !== repoPickSeq) return
       branches.value = names.map((n) => ({ name: n, protected: false, sha: '' }))
       if (names.includes('main')) form.branch = 'main'
       else if (names.length > 0) form.branch = names[0]
     } catch (e: any) {
-      message.error(e.message || '获取仓库分支失败')
+      if (seq === repoPickSeq) message.error(e.message || '获取仓库分支失败')
     } finally {
-      loadingBranches.value = false
+      if (seq === repoPickSeq) loadingBranches.value = false
     }
     return
   }
@@ -1029,6 +1051,7 @@ watch(selectedRepoFullName, async (fullName) => {
   try {
     const [owner, name] = repo.full_name.split('/')
     const bList = await listGitHubBranches(owner, name)
+    if (seq !== repoPickSeq) return
     branches.value = bList
     if (bList.some((b) => b.name === repo.default_branch)) {
       form.branch = repo.default_branch
@@ -1036,10 +1059,22 @@ watch(selectedRepoFullName, async (fullName) => {
       form.branch = bList[0].name
     }
   } catch (e: any) {
-    message.error(e.message || '获取仓库分支失败')
+    if (seq === repoPickSeq) message.error(e.message || '获取仓库分支失败')
   } finally {
-    loadingBranches.value = false
+    if (seq === repoPickSeq) loadingBranches.value = false
   }
+})
+
+// 切换接入方式后旧仓库与分支不再属于当前来源，必须清空，避免带着另一来源
+// 的元数据提交；在途的分支请求一并作废。
+watch(githubMethod, (method, prev) => {
+  if (!prev || prev === method) return
+  repoPickSeq++
+  selectedRepoFullName.value = null
+  branches.value = []
+  loadingBranches.value = false
+  form.branch = ''
+  form.repo_url = ''
 })
 
 // 账号接入属于系统级凭据管理：创建页不再内嵌 Token 表单，统一跳到
@@ -1077,6 +1112,11 @@ function validate(): string | null {
       if (!form.compose_content.trim()) return '请填写 Docker Compose 内容'
       break
     case 'github':
+      if (!githubMethod.value) return '请先选择代码接入方式'
+      if (!selectedRepoFullName.value) return '请选择 GitHub 仓库'
+      if (!form.repo_url.trim()) return '请选择或填写 Git 仓库地址'
+      if (!/^https?:\/\//.test(form.repo_url.trim())) return '仓库地址必须是 http(s):// 开头的 URL'
+      break
     case 'custom':
       if (!form.repo_url.trim()) return '请选择或填写 Git 仓库地址'
       if (!/^https?:\/\//.test(form.repo_url.trim())) return '仓库地址必须是 http(s):// 开头的 URL'
@@ -1411,15 +1451,15 @@ onMounted(loadData)
                 <NSpace align="center">
                   <NIcon size="28"><LogoGithub /></NIcon>
                   <div>
-                    <div style="font-weight: 600">未连接 GitHub 账号</div>
-                    <div class="hint">连接后可直接读取您公开与私有的所有仓库列表，点击即可创建，自动拉取分支。账号连接与 GitHub App 统一在「系统设置 → 代码源集成」中管理。</div>
+                    <div style="font-weight: 600">未配置 GitHub 接入</div>
+                    <div class="hint">可接入 GitHub 账号（PAT）或 GitHub App，配置后即可直接选仓并自动拉取分支。两种接入统一在「系统设置 → 代码源集成」中管理。</div>
                   </div>
                 </NSpace>
                 <NButton type="primary" secondary @click="openGitHubSettings">
                   <template #icon>
                     <NIcon><LogoGithub /></NIcon>
                   </template>
-                  连接 GitHub 账号
+                  前往代码源设置
                 </NButton>
               </NSpace>
             </div>
@@ -1435,13 +1475,6 @@ onMounted(loadData)
                   <NTag v-if="appConfigured" size="tiny" type="info" :bordered="false">
                     GitHub App 已配置
                   </NTag>
-                  <span v-if="appConfigured && !githubAccount" class="hint">
-                    {{
-                      appInstalledRepos.length
-                        ? '可直接从 App 安装仓库中选仓，部署拉取走安装令牌'
-                        : 'App 尚未同步到任何已安装仓库：请到「代码源设置」安装到账号/组织后刷新仓库'
-                    }}
-                  </span>
                 </NSpace>
                 <NSpace align="center" :size="4">
                   <NButton size="tiny" secondary @click="refreshRepoLists" :loading="loadingRepos">
@@ -1455,30 +1488,58 @@ onMounted(loadData)
               </NSpace>
             </div>
 
-            <NFormItem label="选择 GitHub 仓库" required>
-              <NSelect
-                v-model:value="selectedRepoFullName"
-                :options="repoOptions"
-                :loading="loadingRepos"
-                placeholder="搜索并选择您的代码仓库 (支持私有库与组织仓库)"
-                filterable
-              />
-            </NFormItem>
-
-            <NSpace v-if="selectedRepoFullName">
-              <NFormItem label="应用名称" required style="flex: 1">
-                <NInput v-model:value="form.name" placeholder="如 my-web-api" />
+            <template v-if="githubSourceReady">
+              <NFormItem label="接入方式" required>
+                <NRadioGroup v-model:value="githubMethod">
+                  <NSpace>
+                    <NRadioButton v-for="m in githubMethodOptions" :key="m.value" :value="m.value">
+                      {{ m.label }}
+                    </NRadioButton>
+                  </NSpace>
+                </NRadioGroup>
               </NFormItem>
-              <NFormItem label="部署分支" required style="flex: 1">
+              <div v-if="githubMethod" class="hint tip-hint github-method-hint">
+                {{
+                  githubMethod === 'pat'
+                    ? '读取已授权 GitHub 账号的仓库；未被 App 安装覆盖的仓库推送时走逐仓 Webhook。'
+                    : '读取 GitHub App 安装范围内的仓库；拉码使用短期安装令牌，推送由 App 级事件触发。'
+                }}
+              </div>
+              <div v-else class="hint github-method-hint">先选择本次使用的接入方式，再从中挑选仓库。</div>
+
+              <NFormItem label="选择 GitHub 仓库" required>
                 <NSelect
-                  v-model:value="form.branch"
-                  :options="branchOptions"
-                  :loading="loadingBranches"
-                  placeholder="选择分支"
+                  v-model:value="selectedRepoFullName"
+                  :options="repoOptions"
+                  :loading="loadingRepos"
+                  :disabled="!githubMethod"
+                  :placeholder="githubMethod ? '搜索并选择您的代码仓库 (支持私有库与组织仓库)' : '请先选择接入方式'"
                   filterable
                 />
               </NFormItem>
-            </NSpace>
+              <div v-if="githubMethod && !loadingRepos && repoOptions.length === 0" class="hint github-method-hint">
+                {{
+                  githubMethod === 'pat'
+                    ? '该账号下没有读取到仓库：请到「代码源设置」检查授权后刷新。'
+                    : 'App 尚未同步到任何已安装仓库：请到「代码源设置」安装到账号/组织并同步。'
+                }}
+              </div>
+
+              <NSpace v-if="selectedRepoFullName">
+                <NFormItem label="应用名称" required style="flex: 1">
+                  <NInput v-model:value="form.name" placeholder="如 my-web-api" />
+                </NFormItem>
+                <NFormItem label="部署分支" required style="flex: 1">
+                  <NSelect
+                    v-model:value="form.branch"
+                    :options="branchOptions"
+                    :loading="loadingBranches"
+                    placeholder="选择分支"
+                    filterable
+                  />
+                </NFormItem>
+              </NSpace>
+            </template>
           </template>
 
           <!-- 通用 Git -->
@@ -2051,6 +2112,10 @@ onMounted(loadData)
 .hint {
   font-size: 12px;
   color: var(--n-text-color-disabled, #999);
+}
+
+.github-method-hint {
+  margin: -6px 0 14px;
 }
 
 /* 代码推送自动部署：独立小节边界，避免与「代码来源」字段混读 */

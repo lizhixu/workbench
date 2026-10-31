@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onActivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NAlert, NAvatar, NButton, NCard, NForm, NFormItem, NGi, NGrid, NIcon, NInput, NInputNumber,
-  NModal, NRadio, NRadioGroup, NSelect, NSpace, NSwitch, NTag, useMessage,
+  NRadio, NRadioGroup, NSelect, NSpace, NSwitch, NTag, useMessage,
 } from 'naive-ui'
 import {
   ArrowBackOutline, LogoGithub, RefreshOutline,
@@ -21,7 +21,7 @@ import { getNetworkConfig, listNetworkNodes, probeMeshIP, type NetworkConfig } f
 import { bothMeshed } from '../../utils/mesh'
 import { listCredentials } from '../../api/vault'
 import {
-  connectGitHubToken, disconnectGitHub, getGitProviders,
+  getGitProviders,
   listGitHubBranches, listGitHubRepos, type GitHubAccount,
   type GitHubBranch, type GitHubRepo,
   getGitHubAppStatus, listGitHubAppRepos, listGitHubAppBranches,
@@ -118,9 +118,6 @@ const wordpressTemplate = `services:
 // GitHub 授权与仓库列表状态
 const githubAccount = ref<GitHubAccount | null>(null)
 const checkingGitHub = ref(false)
-const showAuthModal = ref(false)
-const githubTokenInput = ref('')
-const connectingGitHub = ref(false)
 
 const githubRepos = ref<GitHubRepo[]>([])
 const loadingRepos = ref(false)
@@ -740,6 +737,55 @@ const branchOptions = computed(() =>
   })),
 )
 
+// ---- 代码推送自动部署：独立于代码来源的触发方式 ----
+// 所选仓库是否在 GitHub App（未暂停安装）的仓库清单内。命中时推送由
+// App 级事件触发，后端不会再给该仓库注册逐仓 Webhook。
+const selectedRepoAppCovered = computed(
+  () =>
+    !!selectedRepoFullName.value &&
+    appInstalledRepos.value.some((r) => r.full_name === selectedRepoFullName.value),
+)
+
+// 仓库地址是否已确定：GitHub 来源要先选仓，通用 Git 来源看手填地址。
+const autoDeployRepoReady = computed(() =>
+  sourceMode.value === 'github' ? !!selectedRepoFullName.value : form.repo_url.trim() !== '',
+)
+
+// 实际触发机制（与后端注册逻辑一致）：App 级事件 / 创建时自动注册逐仓
+// Webhook（仅 github.com 且已连接 GitHub 账号）/ 手动配置 Webhook 地址。
+const autoDeployMechanism = computed<'app' | 'webhook' | 'manual'>(() => {
+  if (sourceMode.value === 'github' && selectedRepoAppCovered.value) return 'app'
+  if (githubAccount.value && form.repo_url.toLowerCase().includes('github.com')) return 'webhook'
+  return 'manual'
+})
+
+const autoDeployMechanismLabel = computed(
+  () =>
+    ({ app: 'GitHub App 托管', webhook: '自动注册 Webhook', manual: '手动 Webhook' })[
+      autoDeployMechanism.value
+    ],
+)
+
+const autoDeployHint = computed(() => {
+  if (!form.auto_deploy) {
+    return '已关闭：推送代码不会触发部署；创建后仍可在应用详情页开启。'
+  }
+  if (!autoDeployRepoReady.value) {
+    return '选定仓库后按实际接入情况自动识别触发方式。'
+  }
+  const branch = form.branch.trim() || 'main'
+  switch (autoDeployMechanism.value) {
+    case 'app':
+      return `该仓库在 GitHub App 安装范围内：推送 ${branch} 分支时由 App 级事件触发部署，无需逐仓配置 Webhook。`
+    case 'webhook':
+      return `创建时将自动通过已连接的 GitHub 账号为该仓库注册 Push Webhook，推送 ${branch} 分支后自动部署。`
+    default:
+      return sourceMode.value === 'github'
+        ? '该仓库不在 GitHub App 安装范围内且未连接 GitHub 账号：创建后到应用详情页复制 Webhook 地址配置到仓库，或先在系统设置接入 GitHub App。'
+        : '创建后到应用详情页复制 Webhook 地址，配置到代码仓库的 push 事件。'
+  }
+})
+
 const parsedEnvVars = computed<Record<string, string> | undefined>(() => {
   // 模板来源的 env 由 TemplateParams 渲染，不读文本框
   if (sourceMode.value === 'template') return undefined
@@ -906,6 +952,9 @@ async function checkGitHubStatus() {
       await fetchGitHubRepos()
     } else {
       githubAccount.value = null
+      // 在系统设置里断开账号后返回：PAT 仓库清单已失效，清掉避免下拉框
+      // 继续展示当前凭证拉取不到的旧仓库。
+      githubRepos.value = []
     }
   } catch {
     githubAccount.value = null
@@ -982,37 +1031,22 @@ watch(selectedRepoFullName, async (fullName) => {
   }
 })
 
-async function submitGitHubToken() {
-  if (!githubTokenInput.value.trim()) {
-    message.warning('请输入 GitHub Personal Access Token')
-    return
-  }
-  connectingGitHub.value = true
-  try {
-    const acc = await connectGitHubToken(githubTokenInput.value.trim())
-    githubAccount.value = acc
-    message.success(`成功连接 GitHub 账号: ${acc.login}`)
-    showAuthModal.value = false
-    githubTokenInput.value = ''
-    await fetchGitHubRepos()
-  } catch (e: any) {
-    message.error(e.message || '连接失败，请检查 Token 权限')
-  } finally {
-    connectingGitHub.value = false
-  }
+// 账号接入属于系统级凭据管理：创建页不再内嵌 Token 表单，统一跳到
+// 「系统设置 → 代码源集成」，避免同一份授权在两处各维护一套 UI。
+function openGitHubSettings() {
+  router.push('/settings?s=git')
 }
 
-async function doDisconnectGitHub() {
-  try {
-    await disconnectGitHub()
-    githubAccount.value = null
-    githubRepos.value = []
-    selectedRepoFullName.value = null
-    message.success('已断开 GitHub 连接')
-  } catch (e: any) {
-    message.error(e.message || '断开失败')
+// 从系统设置连好/断开账号后切回本页时，授权与仓库清单可能已经变化。
+// 首次激活由 onMounted 的 loadData 负责，这里跳过以免重复请求。
+let githubActivatedOnce = false
+onActivated(() => {
+  if (!githubActivatedOnce) {
+    githubActivatedOnce = true
+    return
   }
-}
+  void checkGitHubStatus()
+})
 
 function validate(): string | null {
   if (!form.name.trim()) return '请填写应用名称'
@@ -1367,10 +1401,10 @@ onMounted(loadData)
                   <NIcon size="28"><LogoGithub /></NIcon>
                   <div>
                     <div style="font-weight: 600">未连接 GitHub 账号</div>
-                    <div class="hint">连接后可直接读取您公开与私有的所有仓库列表，点击即可创建，自动拉取分支。已在设置里配置 GitHub App 时也可直接选仓，无需再连账号。</div>
+                    <div class="hint">连接后可直接读取您公开与私有的所有仓库列表，点击即可创建，自动拉取分支。账号连接与 GitHub App 统一在「系统设置 → 代码源集成」中管理。</div>
                   </div>
                 </NSpace>
-                <NButton type="primary" secondary @click="showAuthModal = true">
+                <NButton type="primary" secondary @click="openGitHubSettings">
                   <template #icon>
                     <NIcon><LogoGithub /></NIcon>
                   </template>
@@ -1399,7 +1433,7 @@ onMounted(loadData)
                     </template>
                     刷新仓库
                   </NButton>
-                  <NButton v-if="githubAccount" size="tiny" quaternary type="error" @click="doDisconnectGitHub">断开</NButton>
+                  <NButton size="tiny" quaternary @click="openGitHubSettings">代码源设置</NButton>
                 </NSpace>
               </NSpace>
             </div>
@@ -1473,6 +1507,21 @@ onMounted(loadData)
               {{ repoProbe.error }}（不影响手动填写）
             </div>
           </template>
+
+          <!-- 代码推送自动部署：与「代码来源」概念分离——来源决定构建什么，
+               这里只决定何时构建；触发机制按实际接入情况显式标注。 -->
+          <div v-if="sourceMode === 'github' || sourceMode === 'custom'" class="auto-deploy-box">
+            <div class="auto-deploy-head">
+              <div class="auto-deploy-title">代码推送自动部署</div>
+              <NSpace align="center" :size="8">
+                <NTag v-if="form.auto_deploy && autoDeployRepoReady" size="tiny" type="info" :bordered="false">
+                  {{ autoDeployMechanismLabel }}
+                </NTag>
+                <NSwitch v-model:value="form.auto_deploy" size="small" />
+              </NSpace>
+            </div>
+            <div class="hint">{{ autoDeployHint }}</div>
+          </div>
 
           <NFormItem label="目标主机" required>
             <NSelect
@@ -1810,17 +1859,6 @@ onMounted(loadData)
               </template>
             </NSpace>
           </NFormItem>
-
-          <NFormItem v-if="sourceMode === 'github' || sourceMode === 'custom'" label="推送代码自动部署（Webhook）">
-            <NSpace align="center">
-              <NSwitch v-model:value="form.auto_deploy" />
-              <span v-if="form.auto_deploy" class="hint">
-                {{ sourceMode === 'github'
-                    ? '系统将自动通过已连接的 GitHub 账号在仓库配置 Webhook，推送代码后自动部署（无需手动配置）'
-                    : '创建后可在应用详情页复制 Webhook 地址配置到仓库' }}
-              </span>
-            </NSpace>
-          </NFormItem>
         </NForm>
 
         <NSpace justify="end">
@@ -1838,53 +1876,6 @@ onMounted(loadData)
       @apply-draft="applyDraft"
     />
     </div>
-
-    <!-- 连接 GitHub 弹窗 -->
-    <NModal
-      v-model:show="showAuthModal"
-      preset="card"
-      title="连接 GitHub 账号"
-      style="width: 620px; max-width: 94vw"
-    >
-      <NSpace vertical size="medium">
-        <NAlert type="info" :show-icon="true">
-          <div style="font-weight: 600; margin-bottom: 6px">Token 权限配置说明（满足以下任一方式即可）：</div>
-          <div style="font-size: 13px; line-height: 1.6">
-            <div>
-              <b>1. 细粒度 Token（Fine-grained，官方推荐）</b>：
-              <ul style="margin: 2px 0 6px 18px; padding: 0">
-                <li><b>Repository access</b>：选择目标仓库或 <i>All repositories</i></li>
-                <li><b>Permissions -&gt; Contents</b>：设置为 <b>Read-only</b>（用于读取代码与 Compose 编排）</li>
-                <li><i>(可选)</i> <b>Permissions -&gt; Webhooks</b>：设置为 <b>Read and write</b>（用于提交自动触发重部署）</li>
-              </ul>
-            </div>
-            <div>
-              <b>2. 传统 Token（Tokens classic）</b>：
-              <ul style="margin: 2px 0 0 18px; padding: 0">
-                <li>私有仓库勾选 <b>repo</b>（公开仓库仅需 <b>public_repo</b>）</li>
-                <li><i>(可选)</i> 勾选 <b>admin:repo_hook</b>（用于自动注册 Push Webhook）</li>
-              </ul>
-            </div>
-          </div>
-        </NAlert>
-
-        <NFormItem label="GitHub Personal Access Token" required>
-          <NInput
-            v-model:value="githubTokenInput"
-            type="password"
-            show-password-on="click"
-            placeholder="github_pat_xxx 或 ghp_xxx"
-          />
-        </NFormItem>
-
-        <NSpace justify="end">
-          <NButton @click="showAuthModal = false">取消</NButton>
-          <NButton type="primary" :loading="connectingGitHub" @click="submitGitHubToken">
-            验证并连接
-          </NButton>
-        </NSpace>
-      </NSpace>
-      </NModal>
   </div>
 </template>
 
@@ -2043,6 +2034,33 @@ onMounted(loadData)
 .hint {
   font-size: 12px;
   color: var(--n-text-color-disabled, #999);
+}
+
+/* 代码推送自动部署：独立小节边界，避免与「代码来源」字段混读 */
+.auto-deploy-box {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 20px;
+  background: rgba(128, 128, 128, 0.04);
+
+  .auto-deploy-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 6px;
+  }
+
+  .auto-deploy-title {
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .hint {
+    display: block;
+    line-height: 1.6;
+  }
 }
 
 /* 镜像/仓库真实配置的探测提示条 */

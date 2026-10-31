@@ -51,6 +51,14 @@ watch(
   (raw) => {
     if (route.name !== 'settings') return
     activeKey.value = resolveSectionKey(raw, visibleSections.value)
+    // 跨页深链（如创建页「连接 GitHub 账号」跳 ?s=git）也要回写页签路径；
+    // 仅靠 onMounted 只覆盖首次进入，已打开过的设置页签会停留在旧分区。
+    workspace.openTab({
+      key: '/settings',
+      title: '系统设置',
+      path: `/settings?s=${activeKey.value}`,
+      closable: true,
+    })
   },
 )
 

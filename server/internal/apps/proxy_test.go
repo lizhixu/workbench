@@ -437,8 +437,11 @@ func TestBindProxyRejectsWindowsHost(t *testing.T) {
 	}
 }
 
-// TestBindProxyValidation: bind requires explicit cert selection and rejects
-// missing certs, non-covering certs, or duplicate domains in the request.
+// TestBindProxyValidation: bind auto-resolves an omitted cert_id to the best
+// usable covering certificate, and rejects uncovered domains (with the whole
+// missing list), non-existent certs, non-covering certs, certs without key
+// material, and duplicate domains in the request — always before touching any
+// host, so a rejected request must leave the stored binding untouched.
 func TestBindProxyValidation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := newTestStore(t)
@@ -477,10 +480,16 @@ func TestBindProxyValidation(t *testing.T) {
 			wantSubstr: "至少绑定一个域名",
 		},
 		{
-			name:       "missing cert_id",
-			body:       `{"domains":[{"domain":"sub.example.com","cert_id":""}]}`,
+			name:       "auto with no covering cert lists missing domains",
+			body:       `{"domains":[{"domain":"uncovered.org","cert_id":""}]}`,
 			wantCode:   http.StatusBadRequest,
-			wantSubstr: "未选择证书",
+			wantSubstr: `"missing_domains":["uncovered.org"]`,
+		},
+		{
+			name:       "auto skips a keyless covering cert",
+			body:       `{"domains":[{"domain":"nokey.com","cert_id":""}]}`,
+			wantCode:   http.StatusBadRequest,
+			wantSubstr: `"missing_domains":["nokey.com"]`,
 		},
 		{
 			name:       "duplicate domain in request",
@@ -520,6 +529,15 @@ func TestBindProxyValidation(t *testing.T) {
 				t.Fatalf("body %s does not contain %q", w.Body.String(), tc.wantSubstr)
 			}
 		})
+	}
+	// Every case is rejected before any host write, so nothing may land on the
+	// stored app — a partially persisted binding would point nginx at a vhost
+	// whose certificate files were never pushed.
+	if got, ok := store.GetApp("app1"); !ok {
+		t.Fatalf("GetApp: app not found")
+	} else if len(got.ProxyDomains) != 0 || got.ProxyMode != "" || got.ProxyUpstream != "" {
+		t.Errorf("rejected bind must persist nothing, got domains=%+v mode=%q upstream=%q",
+			got.ProxyDomains, got.ProxyMode, got.ProxyUpstream)
 	}
 }
 
@@ -771,5 +789,72 @@ func TestProxyUnbindScriptQuotesPaths(t *testing.T) {
 	}
 	if strings.Contains(script, "|| true") {
 		t.Errorf("unbind script must not mask the reload result with || true:\n%s", script)
+	}
+}
+
+// TestResolveProxyCerts: an empty cert_id means auto — the binding is
+// materialized with the concrete ID of the best usable covering certificate,
+// while every uncovered/unusable domain is collected into one missing list so
+// the caller can batch-issue them. Explicit IDs keep the strict
+// existence/coverage/key checks.
+func TestResolveProxyCerts(t *testing.T) {
+	hub, err := cert.NewHub(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewHub: %v", err)
+	}
+	_ = hub.StoreCertForTest("crt_a", []string{"a.example.com"}, "cert", "key")
+	_ = hub.StoreCertForTest("crt_wild", []string{"*.example.com"}, "cert", "key")
+	_ = hub.StoreCertForTest("crt_nokey", []string{"nokey.test"}, "cert", "")
+
+	pairs, missing, rerr := resolveProxyCerts(hub, []DomainBinding{
+		{Domain: "a.example.com"},
+		{Domain: "sub.example.com"},
+		{Domain: "nokey.test"},
+		{Domain: "nothing.org"},
+	})
+	if rerr != nil {
+		t.Fatalf("auto resolve: unexpected error %v", rerr)
+	}
+	if len(missing) != 2 || missing[0] != "nokey.test" || missing[1] != "nothing.org" {
+		t.Errorf("missing = %v, want [nokey.test nothing.org]", missing)
+	}
+	if len(pairs) != 2 {
+		t.Fatalf("pairs = %d, want 2", len(pairs))
+	}
+	if pairs[0].binding.CertID != "crt_a" || !pairs[0].binding.Auto {
+		t.Errorf("exact SAN should materialize crt_a as auto, got %+v", pairs[0].binding)
+	}
+	if pairs[1].binding.CertID != "crt_wild" || pairs[1].crt.ID != "crt_wild" || !pairs[1].binding.Auto {
+		t.Errorf("wildcard should materialize crt_wild as auto, got binding=%+v crt=%q", pairs[1].binding, pairs[1].crt.ID)
+	}
+
+	// Explicit override is honored even when auto would pick a different cert,
+	// and it is recorded as a deliberate choice (auto=false).
+	pairs, missing, rerr = resolveProxyCerts(hub, []DomainBinding{{Domain: "a.example.com", CertID: "crt_wild"}})
+	if rerr != nil || len(missing) != 0 || len(pairs) != 1 || pairs[0].binding.CertID != "crt_wild" || pairs[0].binding.Auto {
+		t.Fatalf("explicit override: pairs=%v missing=%v err=%v", pairs, missing, rerr)
+	}
+
+	// Explicit failures keep their old classification.
+	cases := []struct {
+		name       string
+		binding    DomainBinding
+		wantStatus int
+		wantSubstr string
+	}{
+		{name: "missing cert", binding: DomainBinding{Domain: "a.example.com", CertID: "nope"}, wantStatus: http.StatusBadRequest, wantSubstr: "指定的证书不存在"},
+		{name: "cert does not cover", binding: DomainBinding{Domain: "b.org", CertID: "crt_a"}, wantStatus: http.StatusBadRequest, wantSubstr: "不覆盖域名"},
+		{name: "cert missing key", binding: DomainBinding{Domain: "nokey.test", CertID: "crt_nokey"}, wantStatus: http.StatusConflict, wantSubstr: "证书材料缺失"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, rerr := resolveProxyCerts(hub, []DomainBinding{tc.binding})
+			if rerr == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if rerr.status != tc.wantStatus || !strings.Contains(rerr.msg, tc.wantSubstr) {
+				t.Errorf("got status=%d msg=%q, want status=%d containing %q", rerr.status, rerr.msg, tc.wantStatus, tc.wantSubstr)
+			}
+		})
 	}
 }

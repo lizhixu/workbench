@@ -88,7 +88,7 @@ func TestGetCertCoverEndpoint(t *testing.T) {
 		t.Fatalf("exact: code = %d, body %s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	for _, want := range []string{`"covered":true`, `"id":"crt_exact"`, `"source":"manual_upload"`} {
+	for _, want := range []string{`"covered":true`, `"usable":true`, `"id":"crt_exact"`, `"source":"manual_upload"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("exact: body missing %s: %s", want, body)
 		}
@@ -291,5 +291,89 @@ func TestDeleteCertGuardedByApps(t *testing.T) {
 	}
 	if _, ok := h.Get("crt_bound"); ok {
 		t.Fatal("certificate should be deleted after force delete")
+	}
+}
+
+// TestFindUsableByDomain: automatic reverse-proxy binding may only
+// materialize a certificate that can serve right now — expired,
+// not-yet-valid and keyless records are skipped while a healthy sibling still
+// wins; FindByDomain keeps returning the best record regardless of usability
+// (the cover endpoint reports why it is unusable).
+func TestFindUsableByDomain(t *testing.T) {
+	h, err := NewHub(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM := makeTestCertPEM(t)
+	now := time.Now()
+
+	_ = h.storeResult("c_bad_expired", "", []string{"svc.example.com"}, certPEM, keyPEM, now.Add(-30*24*time.Hour), now.Add(-time.Hour), "test", false)
+	_ = h.storeResult("c_bad_future", "", []string{"svc.example.com"}, certPEM, keyPEM, now.Add(time.Hour), now.Add(90*24*time.Hour), "test", false)
+	_ = h.storeResult("c_bad_nokey", "", []string{"svc.example.com"}, certPEM, []byte(""), now.Add(-time.Hour), now.Add(90*24*time.Hour), "test", false)
+
+	if _, ok := h.FindUsableByDomain("svc.example.com"); ok {
+		t.Fatal("expired/future/keyless certs must not be usable")
+	}
+	best, ok := h.FindByDomain("svc.example.com")
+	if !ok || CertUnusableReason(best, now) == "" {
+		t.Fatalf("FindByDomain must still return a covering (unusable) record, got %v", best)
+	}
+
+	// A usable covering cert wins even when an exact-but-expired record
+	// outranks it on SAN specificity — usability is a hard filter.
+	_ = h.storeResult("c_good_wild", "", []string{"*.example.com"}, certPEM, keyPEM, now.Add(-time.Hour), now.Add(90*24*time.Hour), "test", false)
+	got, ok := h.FindUsableByDomain("svc.example.com")
+	if !ok || got.ID != "c_good_wild" {
+		t.Fatalf("usable wildcard should be selected, got %v", got)
+	}
+
+	// Once the exact record becomes usable it outranks the wildcard again.
+	_ = h.storeResult("c_good_exact", "", []string{"svc.example.com"}, certPEM, keyPEM, now.Add(-time.Hour), now.Add(30*24*time.Hour), "test", false)
+	got, ok = h.FindUsableByDomain("svc.example.com")
+	if !ok || got.ID != "c_good_exact" {
+		t.Fatalf("usable exact SAN should outrank wildcard, got %v", got)
+	}
+}
+
+// TestGetCertCoverUsableReason: the create/detail page pre-check must tell
+// the operator why a covering certificate cannot be used, and must never
+// report usable=true for material the bind would reject.
+func TestGetCertCoverUsableReason(t *testing.T) {
+	h, err := NewHub(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM := makeTestCertPEM(t)
+	now := time.Now()
+	_ = h.storeResult("c_expired", "", []string{"expired.example.com"}, certPEM, keyPEM, now.Add(-30*24*time.Hour), now.Add(-time.Hour), "test", false)
+	_ = h.storeResult("c_future", "", []string{"future.example.com"}, certPEM, keyPEM, now.Add(time.Hour), now.Add(90*24*time.Hour), "test", false)
+	_ = h.storeResult("c_nokey", "", []string{"nokey.example.com"}, certPEM, []byte(""), now.Add(-time.Hour), now.Add(90*24*time.Hour), "test", false)
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	NewHandlers(h, nil, nil).Register(r.Group(""), r.Group(""))
+
+	cases := []struct {
+		domain     string
+		wantReason string
+	}{
+		{"expired.example.com", "证书已过期"},
+		{"future.example.com", "证书尚未生效"},
+		{"nokey.example.com", "证书缺少私钥材料"},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodGet, "/certs/cover?domain="+tc.domain, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: code = %d, body %s", tc.domain, w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, `"covered":true`) || !strings.Contains(body, `"usable":false`) {
+			t.Errorf("%s: expected covered but unusable, body %s", tc.domain, body)
+		}
+		if !strings.Contains(body, tc.wantReason) {
+			t.Errorf("%s: reason %q missing, body %s", tc.domain, tc.wantReason, body)
+		}
 	}
 }

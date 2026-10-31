@@ -460,12 +460,45 @@ func (h *Hub) Get(id string) (*Certificate, bool) {
 // among wildcards more labels win; then the longest remaining validity;
 // finally the certificate ID keeps the order stable across restarts.
 func (h *Hub) FindByDomain(domain string) (*Certificate, bool) {
+	return h.findByDomain(domain, false)
+}
+
+// FindUsableByDomain is FindByDomain restricted to certificates that can
+// actually serve traffic right now: private key present and validity window
+// covering now. The reverse-proxy bind resolves its automatic certificate
+// through this function, so a renewal-in-progress or expired record can never
+// be materialized into an app binding while a sibling covering certificate is
+// still good.
+func (h *Hub) FindUsableByDomain(domain string) (*Certificate, bool) {
+	return h.findByDomain(domain, true)
+}
+
+// CertUnusableReason explains why a covering certificate cannot serve now;
+// empty means usable.
+func CertUnusableReason(c *Certificate, now time.Time) string {
+	if !now.Before(c.NotAfter) {
+		return "证书已过期"
+	}
+	if now.Before(c.NotBefore) {
+		return "证书尚未生效"
+	}
+	if c.KeyPEM == "" {
+		return "证书缺少私钥材料"
+	}
+	return ""
+}
+
+func (h *Hub) findByDomain(domain string, usableOnly bool) (*Certificate, bool) {
 	domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	now := time.Now()
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	var best *Certificate
 	bestRank := certMatchRank{}
 	for _, c := range h.certs {
+		if usableOnly && CertUnusableReason(c, now) != "" {
+			continue
+		}
 		// A certificate's rank is governed by its best covering SAN, not the
 		// first one found (a cert may carry both `*.example.com` and an exact
 		// entry for the very domain being resolved).

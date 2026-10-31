@@ -108,14 +108,17 @@ type PortMapping struct {
 	BindScope string `json:"bind_scope,omitempty"`
 }
 
-// DomainBinding is one explicitly bound hostname plus the certificate that
-// serves it. CertID is mandatory on every new bind (the API validates the
-// certificate exists AND covers the domain); the empty CertID only occurs on
-// entries migrated from the legacy single Domain field, which are resolved
-// via deterministic best-match and frozen back on first use.
+// DomainBinding is one bound hostname plus the certificate that serves it.
+// CertID always holds the concrete certificate in use: when the caller leaves
+// cert_id empty (auto), the server resolves the best usable covering cert and
+// materializes its ID here at save time — there is no dynamic SNI at request
+// time, so renewal re-push / delete guard keep working off the stored ID.
+// Auto records that the ID was picked by the server; the UI shows such rows as
+// "自动匹配" and re-resolves on the next save instead of pinning the old cert.
 type DomainBinding struct {
 	Domain string `json:"domain"`
 	CertID string `json:"cert_id"`
+	Auto   bool   `json:"auto,omitempty"`
 }
 
 // Deployment statuses.

@@ -199,10 +199,12 @@ func (h *Handlers) listCerts(c *gin.Context) {
 // domain, so the app create page can pre-check coverage while the domain is
 // being typed and the issuance flow can poll for completion. Matching goes
 // through hub.FindByDomain — the exact rule the reverse-proxy binding
-// applies — so the pre-check and the eventual bind can never disagree.
-// Read-only and login-accessible like the detail endpoint (exempt from
-// operation audit per §7, same example as detail/download); PEM material
-// never crosses this boundary (json:"-" on Certificate).
+// applies — while `usable`/`reason` come from the same predicate the bind's
+// automatic certificate resolution uses, so the pre-check and the eventual
+// bind can never disagree. Read-only and login-accessible like the detail
+// endpoint (exempt from operation audit per §7, same example as
+// detail/download); PEM material never crosses this boundary (json:"-" on
+// Certificate).
 func (h *Handlers) getCertCover(c *gin.Context) {
 	domain := strings.TrimSpace(strings.ToLower(c.Query("domain")))
 	if !validCoverDomain(domain) {
@@ -214,9 +216,17 @@ func (h *Handlers) getCertCover(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"data": gin.H{"covered": false}})
 		return
 	}
+	view := &CertView{Certificate: crt, Source: h.hub.sourceOf(crt), AccountName: h.hub.accountNameOf(crt)}
+	if usable, ok := h.hub.FindUsableByDomain(domain); ok {
+		view = &CertView{Certificate: usable, Source: h.hub.sourceOf(usable), AccountName: h.hub.accountNameOf(usable)}
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{"covered": true, "usable": true, "cert": view}})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{
 		"covered": true,
-		"cert":    &CertView{Certificate: crt, Source: h.hub.sourceOf(crt), AccountName: h.hub.accountNameOf(crt)},
+		"usable":  false,
+		"reason":  CertUnusableReason(crt, time.Now()),
+		"cert":    view,
 	}})
 }
 

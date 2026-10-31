@@ -20,7 +20,15 @@ http.interceptors.request.use((config) => {
 // Response interceptor: unwrap errors, handle 401.
 http.interceptors.response.use(
   (resp) => resp,
-  (error: AxiosError<{ error?: string; needs_confirm?: boolean; risk_level?: string; matched_pattern?: string }>) => {
+  (
+    error: AxiosError<{
+      error?: string
+      needs_confirm?: boolean
+      risk_level?: string
+      matched_pattern?: string
+      missing_domains?: string[]
+    }>,
+  ) => {
     const status = error.response?.status
     const data = error.response?.data
     const msg = data?.error || error.message
@@ -31,11 +39,19 @@ http.interceptors.response.use(
         window.location.href = '/login'
       }
     }
-    const err = new Error(msg) as Error & { status?: number; needsConfirm?: boolean; riskLevel?: string; matchedPattern?: string }
+    const err = new Error(msg) as Error & {
+      status?: number
+      needsConfirm?: boolean
+      riskLevel?: string
+      matchedPattern?: string
+      // 反代绑定在域名缺少可用证书时返回 400 + 该清单，创建页/详情页据此批量签发后重试绑定。
+      missingDomains?: string[]
+    }
     err.status = status
     err.needsConfirm = data?.needs_confirm
     err.riskLevel = data?.risk_level
     err.matchedPattern = data?.matched_pattern
+    err.missingDomains = data?.missing_domains
     return Promise.reject(err)
   },
 )

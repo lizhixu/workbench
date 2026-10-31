@@ -110,6 +110,10 @@ export function listCerts() {
 // 它，预检与最终绑定永不出现规则分叉。非法/空域名返回 400。
 export interface CertCover {
   covered: boolean
+  // usable=false 表示存在覆盖该域名的证书但当前不可用（过期/未生效/缺私钥），
+  // reason 给出不可用原因；covered=false 表示完全没有覆盖证书。
+  usable?: boolean
+  reason?: string
   cert?: Certificate
 }
 
@@ -251,8 +255,15 @@ export function deleteCert(id: string, force = false) {
   return unwrap<{ ok: boolean }>(http.delete(`/certs/${id}${force ? '?force=true' : ''}`))
 }
 
+// 绑定时 cert_id 可省略（或空串），表示由服务端按域名自动匹配当前可用证书；
+// 整批都匹配不到时服务端 400 返回 missing_domains 列表（此时未做任何主机写入）。
+export interface ProxyBindDomain {
+  domain: string
+  cert_id?: string
+}
+
 export interface ProxyBindRequest {
-  domains?: DomainBinding[]
+  domains?: ProxyBindDomain[]
   domain?: string
   cert_id?: string
   mode: 'local' | 'gateway'

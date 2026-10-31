@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, h, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
-  NAlert, NButton, NCard, NCode, NDataTable, NDescriptions, NDescriptionsItem,
+  NAlert, NButton, NCard, NCode, NCollapse, NCollapseItem, NDataTable, NDescriptions, NDescriptionsItem,
   NEmpty, NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPagination, NPopconfirm, NRadio, NRadioGroup,
   NSelect, NSpace, NSpin, NSwitch, NTabPane, NTabs, NUpload,
   NTag, useMessage,
@@ -26,7 +26,10 @@ import {
   listBackupJobs, createBackupJob, updateBackupJob, deleteBackupJob, runBackupJob,
   listS3Targets, type BackupJob, type CreateJobReq, type S3Target,
 } from '../../api/snapshots'
-import { bindProxy, unbindProxy, listCerts, type Certificate } from '../../api/certs'
+import {
+  bindProxy, getCertCover, listCerts, unbindProxy,
+  type CertCover, type Certificate, type ProxyBindDomain,
+} from '../../api/certs'
 import { installDocker, listHosts } from '../../api/hosts'
 import { listNetworkNodes } from '../../api/network'
 import {
@@ -38,10 +41,13 @@ import { copyToClipboard } from '../../utils/clipboard'
 import { useAuthStore } from '../../stores/auth'
 import OpsTunnelModal from '../../components/tunnels/OpsTunnelModal.vue'
 import AppMigrateModal from '../../components/apps/AppMigrateModal.vue'
+import CertLogModal from '../../components/cert/CertLogModal.vue'
+import { useCertIssuance } from '../../composables/useCertIssuance'
 
 defineOptions({ name: 'AppDetail' })
 
 const route = useRoute()
+const router = useRouter()
 const message = useMessage()
 const auth = useAuthStore()
 
@@ -135,8 +141,28 @@ const hostOptions = computed(() => {
 // 网关主机必须自身已加入组网（网关需经组网访问应用主机），据此标注/禁用选项
 const meshIPById = ref<Map<string, string>>(new Map())
 interface ProxyDomainRow {
+  id: number
   domain: string
   cert_id: string
+  cover: CertCover | null
+  loading: boolean
+  error: string
+  seq: number
+  timer: ReturnType<typeof setTimeout> | null
+}
+
+let nextProxyRowId = 1
+function newProxyRow(domain = '', certId = ''): ProxyDomainRow {
+  return {
+    id: nextProxyRowId++,
+    domain,
+    cert_id: certId,
+    cover: null,
+    loading: false,
+    error: '',
+    seq: 0,
+    timer: null,
+  }
 }
 
 const proxyForm = ref({
@@ -149,23 +175,80 @@ const proxyForm = ref({
   websocket: true,
 })
 const savingProxy = ref(false)
+const proxyActionLabel = ref('')
+// 服务端报告「没有可用证书」的域名：展示为可重试的提示区（管理员可就地签发）
+const proxyMissingDomains = ref<string[]>([])
+
+// 证书自动签发编排（与创建页共用）：ACME 账户、验证方式、任务日志弹窗
+const {
+  canIssue,
+  accounts: issueAccounts,
+  accountId: issueAccountId,
+  challenge: issueChallenge,
+  dnsReady: dnsConfigReady,
+  accountOptions,
+  loadSupport: loadIssueSupport,
+  logShow: certLogShow,
+  logTaskId: certLogTaskId,
+  logDomains: certLogDomains,
+  issueDomains,
+} = useCertIssuance()
 
 function syncProxyForm() {
   if (app.value) {
+    let rows: ProxyDomainRow[] = []
     if (app.value.proxy_domains && app.value.proxy_domains.length > 0) {
-      proxyForm.value.domains = app.value.proxy_domains.map((d) => ({ domain: d.domain, cert_id: d.cert_id }))
+      // auto=true 的绑定在下次保存时由服务端重新匹配（不把已物化的旧 ID
+      // 当成用户显式选择，否则证书过期后会绑回一张旧证）。
+      rows = app.value.proxy_domains.map((d) => newProxyRow(d.domain, d.auto ? '' : d.cert_id))
     } else if (app.value.domain) {
-      proxyForm.value.domains = [{ domain: app.value.domain, cert_id: '' }]
-    } else {
-      proxyForm.value.domains = []
+      rows = [newProxyRow(app.value.domain)]
     }
+    for (const r of proxyForm.value.domains) {
+      if (r.timer) clearTimeout(r.timer)
+    }
+    proxyForm.value.domains = rows
+    rows.forEach(probeProxyDomain)
     proxyForm.value.mode = (app.value.proxy_mode as 'local' | 'gateway') ?? 'local'
     proxyForm.value.gateway_host_id = app.value.proxy_gateway_host_id ?? null
     proxyForm.value.upstream = app.value.proxy_upstream ?? ''
     // WebSocket 开关同样来自服务端存量：存量记录没有该字段时默认 true，
     // 与此前同步恒渲染 Upgrade 头的行为一致，避免老应用被静默关掉。
     proxyForm.value.websocket = app.value.proxy_websocket ?? true
+    proxyMissingDomains.value = []
   }
+}
+
+function probeProxyDomain(row: ProxyDomainRow) {
+  if (row.timer) clearTimeout(row.timer)
+  const d = row.domain.trim().toLowerCase()
+  if (!d) {
+    row.seq++ // 作废在途探测，否则它会把结果写回已被清空的行
+    row.cover = null
+    row.loading = false
+    row.error = ''
+    return
+  }
+  row.loading = true
+  row.timer = setTimeout(async () => {
+    const seq = ++row.seq
+    try {
+      const cover = await getCertCover(d)
+      if (seq !== row.seq) return
+      row.cover = cover
+      row.error = ''
+    } catch {
+      if (seq !== row.seq) return
+      row.cover = null
+      row.error = '证书覆盖探测失败（不影响手动绑定）'
+    } finally {
+      if (seq === row.seq) row.loading = false
+    }
+  }, 400)
+}
+
+function onProxyDomainInput(row: ProxyDomainRow) {
+  probeProxyDomain(row)
 }
 
 // syncForm=false 时只刷新证书/主机/组网等只读数据，不覆盖反代表单：
@@ -176,6 +259,7 @@ async function loadProxyData(syncForm = true) {
   } catch {
     certs.value = []
   }
+  void loadIssueSupport()
   try {
     const nodes = (await listNetworkNodes()) ?? []
     meshIPById.value = new Map(nodes.filter((n) => n.ip).map((n) => [n.host_id, n.ip]))
@@ -212,6 +296,41 @@ const certOptions = computed(() => {
   })
 })
 
+// 高级手动指定：'' 是真实选项（自动匹配），不走 §8.3.1 的 null 空值约定
+const certOverrideOptions = computed(() => [
+  { label: '自动匹配（推荐）', value: '' },
+  ...certOptions.value,
+])
+
+function proxyDomainHasUsableCert(row: ProxyDomainRow): boolean {
+  return row.cover?.covered === true && row.cover.usable !== false
+}
+
+const proxyActiveDomains = computed(() =>
+  proxyForm.value.domains.filter((r) => r.domain.trim().length > 0),
+)
+
+const proxyAutoDomains = computed(() =>
+  proxyActiveDomains.value.filter((r) => !r.cert_id && !proxyDomainHasUsableCert(r)),
+)
+
+function proxyDomainHint(row: ProxyDomainRow): { tone: 'ok' | 'warn'; text: string } {
+  if (row.cert_id) {
+    const c = certs.value.find((x) => x.id === row.cert_id)
+    return { tone: 'ok', text: `已手动指定证书：${c ? c.domains.join(', ') : row.cert_id}` }
+  }
+  if (row.cover?.covered) {
+    if (row.cover.usable !== false && row.cover.cert) {
+      return { tone: 'ok', text: `已匹配可用证书：${row.cover.cert.domains.join(', ')}（保存时自动绑定）` }
+    }
+    return {
+      tone: 'warn',
+      text: `已有覆盖证书但当前不可用（${row.cover.reason || '不可用'}），保存时将尝试自动签发`,
+    }
+  }
+  return { tone: 'warn', text: '暂无覆盖证书，保存时将尝试自动签发' }
+}
+
 const boundDomains = computed<string[]>(() => {
   if (app.value?.proxy_domains && app.value.proxy_domains.length > 0) {
     return app.value.proxy_domains.map((b) => b.domain)
@@ -220,10 +339,12 @@ const boundDomains = computed<string[]>(() => {
 })
 
 function addProxyDomain() {
-  proxyForm.value.domains.push({ domain: '', cert_id: certs.value[0]?.id || '' })
+  proxyForm.value.domains.push(newProxyRow())
 }
 
 function removeProxyDomain(index: number) {
+  const row = proxyForm.value.domains[index]
+  if (row?.timer) clearTimeout(row.timer)
   proxyForm.value.domains.splice(index, 1)
 }
 
@@ -356,6 +477,57 @@ async function doSaveForward() {
   }
 }
 
+// 绑定载荷：cert_id 省略 = 由服务端按域名自动匹配当前可用证书并在保存时
+// 物化具体 ID，前端不猜测证书覆盖关系（与创建页同一套契约）。
+function proxyBindList(): ProxyBindDomain[] {
+  return proxyForm.value.domains
+    .filter((r) => r.domain.trim())
+    .map((r) => ({
+      domain: r.domain.trim().toLowerCase(),
+      cert_id: r.cert_id || undefined,
+    }))
+}
+
+function sendProxyBind(list: ProxyBindDomain[]) {
+  return bindProxy(appId.value, {
+    domains: list,
+    mode: proxyForm.value.mode,
+    gateway_host_id: proxyForm.value.gateway_host_id || undefined,
+    upstream: proxyForm.value.upstream.trim() || undefined,
+    websocket: proxyForm.value.websocket,
+  })
+}
+
+// 缺证书域名就地签发后重试整批绑定：只由管理员触发，失败保留提示区可重试。
+async function issueMissingAndBind(missing: string[]) {
+  if (missing.length === 0) return
+  savingProxy.value = true
+  proxyActionLabel.value = '签发证书中…'
+  try {
+    const issued = await issueDomains(missing)
+    if (!issued.ok) {
+      message.error(`证书签发失败：${issued.error || '未知原因'}；可稍后重试或在证书中心手动签发`)
+      return
+    }
+    proxyActionLabel.value = '绑定反代中…'
+    try {
+      const res = await sendProxyBind(proxyBindList())
+      proxyMissingDomains.value = []
+      message.success(`已为 ${missing.join('、')} 签发证书并完成反代绑定`)
+      if (res.warnings && res.warnings.length > 0) {
+        message.warning(`反代已生效，但有残留未清理：${res.warnings.join('；')}`)
+      }
+      await loadApp()
+    } catch (e: any) {
+      proxyMissingDomains.value = Array.isArray(e?.missingDomains) ? e.missingDomains : missing
+      message.error(`证书已签发但重新绑定失败：${e?.message || e}`)
+    }
+  } finally {
+    proxyActionLabel.value = ''
+    savingProxy.value = false
+  }
+}
+
 async function doBindProxy() {
   if (proxyForm.value.domains.length === 0) {
     message.warning('请至少添加一个域名绑定')
@@ -370,10 +542,6 @@ async function doBindProxy() {
     }
     if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(d)) {
       message.warning(`第 ${i + 1} 行域名格式不正确: ${d}`)
-      return
-    }
-    if (!r.cert_id) {
-      message.warning(`请为域名 ${d} 选择覆盖证书`)
       return
     }
   }
@@ -397,30 +565,41 @@ async function doBindProxy() {
       return
     }
   }
+
+  const domains = proxyBindList()
   savingProxy.value = true
+  proxyMissingDomains.value = []
+  proxyActionLabel.value = '绑定反代中…'
+  let missing: string[] = []
   try {
     // 绑定响应可能带 warnings（旧目标主机离线、旧配置残留等）：绑定本身
     // 已生效，但残留必须让用户看见，不能只报“已下发”。
-    const res = await bindProxy(appId.value, {
-      domains: proxyForm.value.domains.map((r) => ({
-        domain: r.domain.trim().toLowerCase(),
-        cert_id: r.cert_id,
-      })),
-      mode: proxyForm.value.mode,
-      gateway_host_id: proxyForm.value.gateway_host_id || undefined,
-      upstream: proxyForm.value.upstream.trim() || undefined,
-      websocket: proxyForm.value.websocket,
-    })
+    const res = await sendProxyBind(domains)
     message.success('反代配置已下发')
     if (res.warnings && res.warnings.length > 0) {
       message.warning(`反代已生效，但有残留未清理：${res.warnings.join('；')}`)
     }
     await loadApp()
+    return
   } catch (e: any) {
-    message.error(e.message || '下发失败')
+    missing = Array.isArray(e?.missingDomains) ? e.missingDomains : []
+    if (missing.length === 0) {
+      message.error(e.message || '下发失败')
+      return
+    }
+    // 服务端在写任何主机之前整体拒绝：列出缺证书域名，管理员可一次性签发。
+    proxyMissingDomains.value = missing
+    if (!canIssue.value) {
+      message.warning(`以下域名没有可用证书：${missing.join('、')}；当前账号无签发权限，请联系管理员到证书中心签发覆盖证书后重试`)
+      return
+    }
   } finally {
+    proxyActionLabel.value = ''
     savingProxy.value = false
   }
+
+  if (missing.length === 0) return
+  await issueMissingAndBind(missing)
 }
 
 async function doUnbindProxy() {
@@ -431,7 +610,11 @@ async function doUnbindProxy() {
     if (res.warnings && res.warnings.length > 0) {
       message.warning(`绑定记录已清除，但以下主机上的旧配置未能清理：${res.warnings.join('；')}`)
     }
+    for (const r of proxyForm.value.domains) {
+      if (r.timer) clearTimeout(r.timer)
+    }
     proxyForm.value.domains = []
+    proxyMissingDomains.value = []
     await loadApp()
   } catch (e: any) {
     message.error(e.message || '解绑失败')
@@ -2106,6 +2289,9 @@ onUnmounted(() => {
     pollTimer = null
   }
   stopDeployPolling()
+  for (const r of proxyForm.value.domains) {
+    if (r.timer) clearTimeout(r.timer)
+  }
 })
 </script>
 
@@ -2714,7 +2900,7 @@ onUnmounted(() => {
               <div style="margin-bottom: 6px">
                 <NSpace :size="6" :wrap="true">
                   <NTag
-                    v-for="b in (app.proxy_domains || [{ domain: app.domain || '', cert_id: '' }])"
+                    v-for="b in (app.proxy_domains || [{ domain: app.domain || '', cert_id: '', auto: false }])"
                     :key="b.domain"
                     size="small"
                     type="success"
@@ -2722,7 +2908,7 @@ onUnmounted(() => {
                   >
                     {{ b.domain }}
                     <span v-if="b.cert_id && certMap.get(b.cert_id)" style="opacity: 0.8; margin-left: 4px">
-                      ({{ certMap.get(b.cert_id)?.domains.join(', ') || b.cert_id }})
+                      ({{ b.auto ? '自动匹配：' : '' }}{{ certMap.get(b.cert_id)?.domains.join(', ') || b.cert_id }})
                     </span>
                   </NTag>
                 </NSpace>
@@ -2773,37 +2959,151 @@ onUnmounted(() => {
             </div>
 
             <NForm label-placement="top" style="max-width: 680px">
-              <NFormItem label="域名与证书绑定（多域名独立选择证书）" required>
+              <NFormItem label="域名（证书默认自动匹配）" required>
                 <div style="width: 100%">
                   <NSpace vertical style="width: 100%">
                     <div
                       v-for="(row, idx) in proxyForm.domains"
-                      :key="idx"
-                      style="display: flex; gap: 8px; align-items: center; margin-bottom: 8px"
+                      :key="row.id"
+                      style="display: flex; gap: 8px; align-items: flex-start; margin-bottom: 6px"
                     >
-                      <NInput
-                        v-model:value="row.domain"
-                        placeholder="api.example.com"
-                        style="flex: 1"
-                      />
-                      <NSelect
-                        v-model:value="row.cert_id"
-                        :options="certOptions"
-                        placeholder="选择覆盖证书"
-                        filterable
-                        style="flex: 1.5"
-                      />
-                      <NButton
-                        type="error"
-                        quaternary
-                        @click="removeProxyDomain(idx)"
-                      >
+                      <div style="flex: 1; min-width: 0">
+                        <NInput
+                          v-model:value="row.domain"
+                          placeholder="api.example.com"
+                          @input="onProxyDomainInput(row)"
+                        />
+                        <div v-if="row.loading" class="proxy-domain-status">探测证书覆盖中…</div>
+                        <div v-else-if="row.error" class="proxy-domain-status is-error">{{ row.error }}</div>
+                        <div
+                          v-else-if="row.domain.trim()"
+                          class="proxy-domain-status"
+                          :class="`is-${proxyDomainHint(row).tone}`"
+                        >
+                          {{ proxyDomainHint(row).text }}
+                        </div>
+                      </div>
+                      <NButton quaternary type="error" @click="removeProxyDomain(idx)">
                         删除
                       </NButton>
                     </div>
-                    <NButton dashed @click="addProxyDomain" style="width: 100%">
-                      + 添加域名
-                    </NButton>
+                    <div style="display: flex; align-items: center; gap: 8px">
+                      <NButton dashed size="small" @click="addProxyDomain">添加域名</NButton>
+                      <span class="hint">证书默认自动匹配覆盖该域名的可用证书，无需逐个选择</span>
+                    </div>
+
+                    <!-- 高级：手动指定证书（默认自动匹配，仅特殊场景需要逐个覆盖） -->
+                    <NCollapse v-if="proxyActiveDomains.length > 0">
+                      <NCollapseItem title="高级：手动指定证书" name="cert-override">
+                        <NSpace vertical style="width: 100%">
+                          <span class="hint">默认按域名自动匹配当前可用的覆盖证书；这里可逐域名改用其他证书（如专用多 SAN 证书）。</span>
+                          <div
+                            v-for="row in proxyActiveDomains"
+                            :key="row.id"
+                            style="display: flex; gap: 8px; align-items: center"
+                          >
+                            <span style="min-width: 180px; font-size: 13px">{{ row.domain.trim() }}</span>
+                            <NSelect
+                              v-model:value="row.cert_id"
+                              :options="certOverrideOptions"
+                              filterable
+                              style="flex: 1"
+                            />
+                          </div>
+                        </NSpace>
+                      </NCollapseItem>
+                    </NCollapse>
+
+                    <!-- 上次绑定被服务端整体拒绝（未做任何主机写入）：可直接就地签发后重试 -->
+                    <NAlert v-if="proxyMissingDomains.length > 0" type="warning" size="small" :show-icon="true">
+                      <template #header>以下域名没有可用证书</template>
+                      {{ proxyMissingDomains.join('、') }}：服务端未找到覆盖且当前可用的证书，本次未做任何主机变更。
+                      <template v-if="canIssue">可直接就地签发一张多 SAN 证书后自动重试绑定。</template>
+                      <template v-else>当前账号无证书签发权限，请联系管理员到证书中心签发覆盖证书后重试。</template>
+                      <div style="margin-top: 8px">
+                        <NSpace>
+                          <NButton
+                            v-if="canIssue"
+                            size="small"
+                            type="primary"
+                            secondary
+                            :loading="savingProxy"
+                            @click="issueMissingAndBind(proxyMissingDomains)"
+                          >
+                            签发并重试绑定
+                          </NButton>
+                          <NButton v-else size="small" secondary @click="router.push('/certs')">
+                            前往证书中心
+                          </NButton>
+                        </NSpace>
+                      </div>
+                    </NAlert>
+
+                    <!-- 保存时自动签发配置（与创建页同一套编排） -->
+                    <template v-if="proxyAutoDomains.length > 0">
+                      <NAlert type="info" size="small" :show-icon="true">
+                        <template #header>部分域名暂无可用证书</template>
+                        保存时会先尝试自动绑定；服务端报告缺失证书后，将为这些域名（{{ proxyAutoDomains.map((r) => r.domain.trim()).join('、') }}）自动签发一张多 SAN 证书，成功后再重试绑定。
+                      </NAlert>
+                      <NAlert v-if="!canIssue" type="warning" size="small" :show-icon="true">
+                        <template #header>当前账号无证书签发权限</template>
+                        证书签发仅管理员可用。保存时会绑定已有可用证书的域名；缺失域名请联系管理员签发，或在高级中手动指定已有证书。
+                      </NAlert>
+                      <NAlert v-else-if="issueAccounts.length === 0" type="warning" size="small" :show-icon="true">
+                        <template #header>尚未配置 ACME 账户</template>
+                        请先到证书中心创建 ACME 账户，再回到本页保存（或在高级中为域名手动指定已有证书）。
+                        <NButton
+                          size="tiny"
+                          secondary
+                          type="primary"
+                          style="margin-left: 8px"
+                          @click="router.push('/certs')"
+                        >
+                          前往证书中心
+                        </NButton>
+                      </NAlert>
+                      <template v-else>
+                        <NSelect
+                          v-model:value="issueAccountId"
+                          :options="accountOptions"
+                          size="small"
+                          placeholder="选择 ACME 账户"
+                        />
+                        <NRadioGroup v-model:value="issueChallenge" size="small">
+                          <NSpace>
+                            <NRadio value="">自动推荐</NRadio>
+                            <NRadio value="http-01">HTTP-01</NRadio>
+                            <NRadio value="dns-01">DNS-01</NRadio>
+                          </NSpace>
+                        </NRadioGroup>
+                        <NAlert
+                          v-if="issueChallenge === 'dns-01' && !dnsConfigReady"
+                          type="warning"
+                          size="small"
+                          :show-icon="true"
+                        >
+                          <template #header>DNS-01 需要 dns-mng 集成</template>
+                          自动 DNS 验证依赖证书中心的 dns-mng 集成（自动添加/清理 TXT 解析），尚未配置。
+                          <NButton
+                            size="tiny"
+                            secondary
+                            type="primary"
+                            style="margin-left: 8px"
+                            @click="router.push('/certs')"
+                          >
+                            前往配置
+                          </NButton>
+                        </NAlert>
+                        <span class="hint">
+                          HTTP-01 验证在控制端主机临时监听 80 端口，仅当域名解析到控制端时可用；应用域名通常应选 DNS-01（需 dns-mng 自动解析）。
+                        </span>
+                      </template>
+                      <span class="hint">
+                        通配符域名（如 *.example.com）不支持在线自动签发：请先到
+                        <a @click.prevent="router.push('/certs')">证书中心</a>
+                        手动 DNS-01 签发后，回到本页保存（或在上方高级中直接指定）。
+                      </span>
+                    </template>
                   </NSpace>
                 </div>
               </NFormItem>
@@ -2833,7 +3133,7 @@ onUnmounted(() => {
               </NFormItem>
               <NSpace>
                 <NButton type="primary" :loading="savingProxy" @click="doBindProxy">
-                  下发并绑定
+                  {{ proxyActionLabel || '下发并绑定' }}
                 </NButton>
                 <NPopconfirm v-if="boundDomains.length" @positive-click="doUnbindProxy">
                   <template #trigger>
@@ -3130,6 +3430,13 @@ onUnmounted(() => {
     <!-- 服务迁移：跨主机搬迁（可选经 S3 携带挂载卷数据） -->
     <AppMigrateModal v-model:show="showMigrate" :app="app" @migrated="onMigrated" />
 
+    <CertLogModal
+      v-model:show="certLogShow"
+      :task-id="certLogTaskId"
+      :domains="certLogDomains"
+      title="证书签发日志"
+    />
+
     <!-- 应用配置编辑（部分更新：只提交改动字段） -->
     <NModal
       v-model:show="showEdit"
@@ -3280,6 +3587,25 @@ onUnmounted(() => {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 10px 2px 0 0;
+}
+
+.proxy-domain-status {
+  font-size: 11px;
+  line-height: 1.5;
+  margin-top: 2px;
+  color: var(--text-tertiary, #999);
+
+  &.is-ok {
+    color: #10b981;
+  }
+
+  &.is-warn {
+    color: #f59e0b;
+  }
+
+  &.is-error {
+    color: #e06c75;
+  }
 }
 
 .deployments-pane {

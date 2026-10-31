@@ -82,9 +82,10 @@ func (h *ProxyHandler) Register(writeRG *gin.RouterGroup) {
 	writeRG.DELETE("/apps/:id/proxy", h.unbindProxy)
 }
 
-// proxyDomainReq is one domain of a bind request: the hostname plus the
-// certificate that serves it. CertID is mandatory — there is no auto-match
-// and no auto-issue on the bind path.
+// proxyDomainReq is one domain of a bind request: the hostname plus an
+// optional certificate override. Empty CertID means auto: the bind resolves
+// the best usable covering certificate at save time (宝塔-style) and
+// materializes its concrete ID into the stored binding.
 type proxyDomainReq struct {
 	Domain string `json:"domain"`
 	CertID string `json:"cert_id"`
@@ -121,6 +122,51 @@ func websocketEnabled(p *bool) bool { return p == nil || *p }
 type domainCertPair struct {
 	binding DomainBinding
 	crt     *cert.Certificate
+}
+
+// proxyCertError carries the HTTP status an explicit-certificate validation
+// failure maps to (404-ish bad request vs. a cert-material conflict).
+type proxyCertError struct {
+	status int
+	msg    string
+}
+
+func (e *proxyCertError) Error() string { return e.msg }
+
+// resolveProxyCerts resolves one certificate per domain. Empty CertID means
+// auto: the best usable covering certificate is picked and its concrete ID is
+// written back into the binding. Explicit IDs keep the old strict checks
+// (existence, SAN coverage, key material) — an expired explicit certificate
+// is still allowed so operators can bind legacy material deliberately; the
+// UI labels it, and the next renewal re-pushes by identity.
+func resolveProxyCerts(hub *cert.Hub, domains []DomainBinding) (pairs []domainCertPair, missing []string, rerr *proxyCertError) {
+	pairs = make([]domainCertPair, 0, len(domains))
+	for _, d := range domains {
+		if d.CertID == "" {
+			crt, ok := hub.FindUsableByDomain(d.Domain)
+			if !ok {
+				missing = append(missing, d.Domain)
+				continue
+			}
+			d.CertID = crt.ID
+			d.Auto = true
+			pairs = append(pairs, domainCertPair{binding: d, crt: crt})
+			continue
+		}
+		d.Auto = false
+		crt, ok := hub.Get(d.CertID)
+		if !ok {
+			return nil, nil, &proxyCertError{status: http.StatusBadRequest, msg: fmt.Sprintf("域名 %s 指定的证书不存在", d.Domain)}
+		}
+		if !certCoversDomain(crt, d.Domain) {
+			return nil, nil, &proxyCertError{status: http.StatusBadRequest, msg: fmt.Sprintf("所选证书不覆盖域名 %s（证书 SAN：%s），请选择其他证书或先签发覆盖该域名的证书", d.Domain, strings.Join(crt.Domains, ", "))}
+		}
+		if crt.KeyPEM == "" {
+			return nil, nil, &proxyCertError{status: http.StatusConflict, msg: fmt.Sprintf("域名 %s 所选证书材料缺失，请先重新签发该证书", d.Domain)}
+		}
+		pairs = append(pairs, domainCertPair{binding: d, crt: crt})
+	}
+	return pairs, missing, nil
 }
 
 func (h *ProxyHandler) bindProxy(c *gin.Context) {
@@ -166,36 +212,7 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		}
 		seen[domain] = true
 		certID := strings.TrimSpace(req.Domains[i].CertID)
-		if certID == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("域名 %s 未选择证书：请先在证书中心签发或选择覆盖该域名的证书，再进行绑定", domain)})
-			return
-		}
 		domains = append(domains, DomainBinding{Domain: domain, CertID: certID})
-	}
-
-	// Resolve every binding's certificate up front — explicit CertID only,
-	// no auto-match and no auto-issue. Nothing is pushed to any host before
-	// the whole request is known good.
-	pairs := make([]domainCertPair, 0, len(domains))
-	for _, d := range domains {
-		if h.hub == nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "证书中心未初始化"})
-			return
-		}
-		crt, ok := h.hub.Get(d.CertID)
-		if !ok {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("域名 %s 指定的证书不存在", d.Domain)})
-			return
-		}
-		if !certCoversDomain(crt, d.Domain) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("所选证书不覆盖域名 %s（证书 SAN：%s），请选择其他证书或先签发覆盖该域名的证书", d.Domain, strings.Join(crt.Domains, ", "))})
-			return
-		}
-		if crt.KeyPEM == "" {
-			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("域名 %s 所选证书材料缺失，请先重新签发该证书", d.Domain)})
-			return
-		}
-		pairs = append(pairs, domainCertPair{binding: d, crt: crt})
 	}
 
 	// One domain maps to exactly one app: two vhosts with the same
@@ -213,6 +230,31 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 			}
 		}
 	}
+
+	// Resolve every binding's certificate before touching any host: explicit
+	// CertID is validated as-is, empty CertID auto-selects the best usable
+	// covering certificate and materializes its concrete ID into the stored
+	// binding (marked auto so the UI re-resolves on the next save instead of
+	// pinning a certificate that later expires). Unresolved domains are
+	// collected across the whole request so the caller gets one list to
+	// batch-issue instead of discovering them one by one.
+	if h.hub == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "证书中心未初始化"})
+		return
+	}
+	pairs, missing, rerr := resolveProxyCerts(h.hub, domains)
+	if rerr != nil {
+		c.JSON(rerr.status, gin.H{"error": rerr.msg})
+		return
+	}
+	if len(missing) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":           fmt.Sprintf("以下域名没有可用证书：%s。请先签发覆盖这些域名的证书后再绑定", strings.Join(missing, "、")),
+			"missing_domains": missing,
+		})
+		return
+	}
+
 	mode := req.Mode
 	if mode == "" {
 		mode = "local"
@@ -954,13 +996,14 @@ func (h *ProxyHandler) resolveBindingCerts(app *Application) ([]domainCertPair, 
 			return nil, fmt.Errorf("域名 %s 的存量绑定未记录证书，且证书中心没有覆盖它的证书，请先在应用详情绑定证书", domain)
 		}
 		freeze[domain] = crt.ID
-		pairs = append(pairs, domainCertPair{binding: DomainBinding{Domain: domain, CertID: crt.ID}, crt: crt})
+		pairs = append(pairs, domainCertPair{binding: DomainBinding{Domain: domain, CertID: crt.ID, Auto: true}, crt: crt})
 	}
 	if len(freeze) > 0 {
 		if err := h.store.UpdateApp(app.ID, func(a *Application) error {
 			for i := range a.ProxyDomains {
 				if id, ok := freeze[strings.ToLower(strings.TrimSpace(a.ProxyDomains[i].Domain))]; ok {
 					a.ProxyDomains[i].CertID = id
+					a.ProxyDomains[i].Auto = true
 				}
 			}
 			return nil

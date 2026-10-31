@@ -5,10 +5,13 @@
 > 背景：原 SaaS 服务说停就停、不提供服务，数据与可用性不可控，故自研一套可自部署的等价系统，核心目标是「自己掌控、永久可用、不依赖第三方 SaaS」。
 >
 > **必读 + 维护约定**：
-> 1. 本文档**每次会话/每次任务开工前必须完整阅读**，并且**必须严格遵循其中的全部约束**（§7 代码质量校验、§8 前端布局规范、§8.5 终端断线重连、§8.6 维护握手与告警防抖等）。开工前先读、改代码时对照，不得凭印象或惯例行事；与文档冲突时以文档为准，若文档确实过时则先更新文档再改代码。
-> 2. 本文档是需求与设计的唯一事实来源。**所有需求的改动和新增，实现代码的同时必须同步维护本文档**——涉及协议字段、数据模型、REST/WS 接口、配置项、前端布局与交互规范、构建与部署方式的，都要在对应章节补齐或更正，不允许只改代码不更新文档。
+> 1. 本文档**每次会话/每次任务开工前必须完整阅读**，并且**必须严格遵循其中的全部约束**（§7 代码质量校验、§8 前端工程与会话可靠性规范、§8.5 终端断线重连、§8.6 维护握手与告警防抖、DESIGN.md §9 前端页面布局与组件规范等）。开工前先读、改代码时对照，不得凭印象或惯例行事；与文档冲突时以文档为准，若文档确实过时则先更新文档再改代码。
+> 2. **文档分工与唯一事实源边界**：
+>    - 本文档是系统功能需求、业务架构、通信协议（gRPC/WebSocket/REST）、数据模型、安全与审计边界、以及底层系统可靠性（长连接维护握手、终端会话持久化、RPC 锁纪律等）的**唯一权威事实源**。
+>    - `DESIGN.md` 是前端 Web 控制台页面布局、视觉设计令牌（Design Tokens）、UI/UX 交互规范、组件选用与封装、CSS/SCSS 样式类名以及前端架构的**唯一权威事实源**（特别是 `DESIGN.md` 第 9 节「前端页面布局与组件开发规范」）。
+>    - **严禁在本文档中堆砌纯前端 CSS 类名、内边距度量、表单像素间距、按钮圆角等纯 UI 视觉实现细节**；凡涉及前端页面设计、布局结构、组件规范或交互美学的改动，必须完整维护并同步更新 `DESIGN.md`。涉及协议字段、数据模型、接口契约与后端工程规则的，必须在本文档对应章节补齐。
 > 3. **版本唯一真相源**：**版本完全由官方 Release 提供，严禁任何自行决定或拼凑版本的行为**。系统版本、安装包与升级清单必须 100% 来源于 Git tag 触发 GitHub Actions 产出的官方 Release（形如 `v1.2.3` / `v1.2.3-beta.1`）及 CI 生成的 `manifest.json`；严禁在任何环境部署或升级流程中私自捏造/拼接版本号（如 `0.1.0-<hash>`）。
-> 4. **正文与章节标题不得出现「更新时间」式日期标注**：不要写 `（YYYY-MM-DD）`、`（YYYY-MM-DD 修复）`、`（YYYY-MM-DD 起）`、`（YYYY-MM-DD 加固）`、`落地日期：YYYY-MM-DD`、`调研日期：YYYY-MM-DD`、`已于 YYYY-MM-DD …` 这类变更时间戳（此处用 `YYYY-MM-DD` 占位，正文也不写具体日期）。本文档描述的是**当前事实**，不是变更流水：需要交代来历时用「此前 / 早前 / 旧实现」等相对表述，新增章节不带日期后缀（写 `§8.13 xxx`，不写 `§8.13 xxx（YYYY-MM-DD）`）。时间字段本身的格式、时区与接口时间参数按 §8.14 记录，不受此条限制。
+> 4. **正文与章节标题不得出现「更新时间」式日期标注**：不要写 `（YYYY-MM-DD）`、`（YYYY-MM-DD 修复）`、`（YYYY-MM-DD 起）`、`（YYYY-MM-DD 加固）`、`落地日期：YYYY-MM-DD`、`调研日期：YYYY-MM-DD`、`已于 YYYY-MM-DD …` 这类变更时间戳（此处用 `YYYY-MM-DD` 占位，正文也不写具体日期）。本文档描述的是**当前事实**，不是变更流水：需要交代来历时用「此前 / 早前 / 旧实现」等相对表述，新增章节不带日期后缀（写 `§8.13 xxx`，不写 `§8.13 xxx（YYYY-MM-DD）`）。时间字段本身的格式、时区与接口时间参数按 §8.14（及 DESIGN.md §9.15）记录，不受此条限制。
 
 ---
 
@@ -124,7 +127,7 @@
     - **（入口主机， 入口端口）全应用唯一**（`meshForwardConflict`）：创建与更新均校验（更新排除自身），冲突返回 409 并提示占用方应用名。
     - **入口主机变更/关闭转发即拆除旧中继**：入口主机变更时先按旧坐标 `CleanMeshForwarder`（新表单已清空旧字段，不清理会遗留孤儿容器）；purge 以**记录过入口主机**为准（而非仅看 Enabled 开关），历史遗留配置仍可被回收。
     - **更新响应同步化**：`PUT /apps/:id` 在转发配置变化时同步执行 `SyncMeshForwarder`，结果经响应字段 `mesh_forward_target`（生效的中继目标）/ `mesh_forward_warning`（同步失败原因）返回，不再只依赖异步协程。
-    - **中继清理失败不再静默**：`CleanMeshForwarder`/`SyncMeshForwarder` 改为返回 error；更新时入口主机变更或禁用转发，先预清理旧中继，失败则 409 且不落库（旧坐标得以保留，杜绝孤儿中继）；部署成功路径的中继失败仍只记 WARN（P2，不在本轮）。
+    - **中继清理失败不再静默**：`CleanMeshForwarder`/`SyncMeshForwarder` 改为返回 error；更新时入口主机变更或禁用转发，先预清理旧中继，失败则 409 且不落库（旧坐标得以保留，杜绝孤儿中继）；部署成功路径的中继失败仍只记 WARN（记录告警并允许主服务上线，避免辅助中继故障阻断主部署）。
     - **部署完成重读存储**：`finishDeploySuccess` 创建中继前重新 `GetApp`，应用在部署期间被删除则跳过并在部署日志说明（消除用过期指针建中继的竞态）。
     - **启停联动结果可观测**：`containerAction`（stop/start/restart）对中继容器的联动失败（入口主机离线/执行失败/非零退出）以响应字段 `relay_warning` 上抛，主操作仍按自身结果返回。
   - **拓扑预览协同**：创建页与详情页的流量拓扑实时呈现 TCP 4 层中继链路与 7 层 HTTP/HTTPS 反代链路。
@@ -262,26 +265,10 @@
 
 ### 3.12 系统设置
 
-> 实现备注（设置中心 Phase 2）：所有设置项走统一存储 `server/internal/settings`
->（`settings.json`，system/user 双作用域、点分键、注册表校验），前端经 `stores/settings`
-> 统一读写；`appearance.theme_mode` 已从浏览器 localStorage 迁到服务端（localStorage 仅作首屏缓存）。
-> 秘密类配置（AI Key / Git Token）不进统一设置，保留专用存储。
-> 实现备注（设置中心 Phase 1）：`/settings` 改为左右布局——`SettingsLayout.vue`
->（左侧分组导航 + 搜索框，右侧内容区；`views/settings/sections.ts` 为分区注册表：
-> key/label/icon/component/keywords/group）。813 行旧 `Settings.vue` 已删除，内联区块抽取为
-> `SystemStatus.vue`、`AiConfig.vue`、`GitProviders.vue`、`InstallDeploy.vue`（样式随组件走）。
-> 分区切换走 `?s=` 查询参数（与主机详情 `?tab=` 同模式：深链优先、非法值回退 general、
-> 选中后把完整路径回写工作区页签），路由保持单条 `settings`（组件名仍为 `Settings`，
-> `meta.viewName` 不变），避免嵌套路由导致 AppShell 的 KeepAlive 按 key 反复重建布局。
-> 分区组件用内层 `<KeepAlive>` 缓存，切分区不丢已填表单；搜索按 label+keywords 过滤，
-> 回车跳首个匹配。AGENTS.md 3.12 中「设置搜索/拆分/导航」条目至此落地。
-> 实现备注（设置中心 Phase 3）：补齐 3.12 剩余可配置项——
-> `navigation.default_host_tab`（主机默认页签，URL `?tab=` 深链优先于首选项；选项与
-> HostDetail 的 subNavItems 同源）、`appearance.show_tips`（功能提示语开关：前端给说明性
-> `<p class="muted">` 加 `tip-hint` 类，`hide-tips` 根类由 App.vue 按设置切换隐藏；警告类
-> NAlert 不受影响）、`files.default_path`（文件管理默认路径，空=按 OS 默认；Linux `/root`、
-> Windows `C:\`，后端校验必须为绝对路径）。新组件 `views/settings/GeneralPrefs.vue`
-> 挂在 Settings.vue 的 CommandLibrary 之后。
+> **设置中心架构与工程实现**：
+> 1. **统一存储与作用域**：所有设置项统一持久化于 `server/internal/settings`（`settings.json`，支持 system/user 双作用域、点分命名空间、类型与注册表校验），前端经 `stores/settings` 统一读写。`appearance.theme_mode` 统一由服务端落盘持久化（浏览器 localStorage 仅作首屏首态加载缓存兜底）。秘密类凭证（AI Key / Git Token 等）不进统一设置，独立由专用安全存储持有。
+> 2. **前端页面架构与导航**：设置中心采用左右两栏工程布局（`SettingsLayout.vue`：左侧为分组导航与快捷搜索框，右侧为主内容展示区；`views/settings/sections.ts` 集中注册各分区：key、label、icon、component、keywords 与 group）。分区切换统一走 `?s=` 查询参数（与主机详情 `?tab=` 模式对齐：URL 深链优先、非法值自动回退 general 分区，并在选中后把包含深链的完整路径回写至工作区页签）。路由保持单条 `/settings`（组件名为 `Settings`，`meta.viewName` 保持稳定），配合内层 `<KeepAlive>` 缓存，既避免了嵌套路由导致 AppShell 页面重复重建，又保证了用户在切换不同设置分区时不会丢失正在编辑的未保存表单内容；搜索支持按 label 与 keywords 联合模糊匹配，回车即可聚焦首个命中项。
+> 3. **全局首选项与偏好配置**：支持配置 `navigation.default_host_tab`（进入主机详情时的默认页签，URL `?tab=` 深链优先级高于首选项；选项与 HostDetail 保持同源）、`appearance.show_tips`（功能说明提示语全局展示开关：前端说明性 `<p class="muted">` 标记 `tip-hint` 类，由 App.vue 依据偏好动态切换根类 `hide-tips` 实现全局隐藏；业务警告类 NAlert 保持显示不受影响）、`files.default_path`（文件管理初始路径，空值依系统类型默认回退至 Linux `/root` 或 Windows `C:\`，服务端严格校验必须为绝对路径）。各分区对应组件（如 `GeneralPrefs.vue`、`SystemStatus.vue`、`AiConfig.vue`、`GitProviders.vue`、`InstallDeploy.vue` 等）按模块化独立解耦维护。
 
 - **通用设置**：
   - 首选页面（进入主机管理时默认展示的模块：资源负载/系统状态/Docker/在线终端/文件管理/应用市场）。
@@ -302,7 +289,7 @@
 - **分组视角**：从分组出发管理主机与用户关系。
 - **用户视角**：从用户出发进行分组授权。
 
-### 3.14 多云联动（可选 / 二期）
+### 3.14 多云联动（规划中 / 扩展能力）
 
 - **联动云计算 API**：录入阿里云/腾讯云/微软云/亚马逊云等的 token，对云上服务器进行自动发现与联动管理。
 
@@ -403,39 +390,29 @@
 
 ---
 
-## 6. 交付范围（建议分期）
+## 6. 系统能力边界与交付范围
 
-### Phase 1（MVP，可替代日常使用）
-- 控制端 + Agent 基础架构（回连、鉴权、心跳）
-- 一键绑定（Linux/Windows）
-- 主机列表 / 状态 / 分组
-- 资源监控 + 7 天历史
-- 系统状态（进程/端口/账号/登录历史）
-- 在线终端（含登录行为配置、多标签、主题）
-- 文件管理
-- 推送命令（含常用命令库）
-- 基础用户与分组权限
-- 操作审计
-- AI 适配层 + 智能终端助手（自然语言转命令 / 命令解释 / 高危提示）
+系统分为核心基础交付能力（开箱即用的一体化自托管能力）与未来扩展能力（按需对接与生态联动）。
 
-### Phase 2
-- 终端分享（观看/控制）
-- Docker 管理（容器/镜像/终端/批量/一键装 Docker）
-- 应用市场（一键安装常用应用）
-- 监控告警（自定义监控项 + 通知方式）
-- 动态组网 / 内网穿透
-- 会话回放
-- AI 智能诊断（异常根因 / 日志解读 / 故障排查向导）
-- AI 主机概览与自然语言问答（Tool calling 查平台数据）
+### 6.1 核心交付能力（自托管完整闭环）
+- **主机接入与生命周期**：控制端 + 跨平台 Agent 基础架构（主动出站回连、鉴权、心跳）；Linux/Windows 一键绑定；主机列表、实时状态探活、分组管理。
+- **监控与网络质量**：资源监控（CPU/内存/网络/磁盘实时吞吐与历史时序曲线）；电信/联通/移动三网 TCP 质量探测；存储挂载点监控；多渠道自定义阈值告警（Webhook/邮件）与静默防抖。
+- **系统状态与审计**：进程清单（支持结束进程）、网络监听端口、系统用户账号与登录历史；全生命周期操作审计日志与终端 asciicast v2 录像审计。
+- **在线终端（Web Terminal）**：免密/口令/缺省登录行为；多标签管理、终端主题切换；多角色终端分享（观看/控制模式）；Windows PowerShell/CMD 深度兼容；会话恢复与 60s 断线优雅宽限期。
+- **文件管理**：文件与目录的浏览、创建、移动、复制、删除、文本预览与编辑；大文件分片流式上传下载与进度展示。
+- **批量与常用命令**：自定义常用命令库管理；多主机命令/脚本批量推送与实时结果聚合。
+- **Docker 运行时管理**：容器状态观测、生命周期启停、实时日志、容器终端、纳管状态识别；镜像列表与未使用清理、镜像加速源配置；一键安装 Docker。
+- **应用中心（统一部署入口）**：应用模板、单镜像、Docker Compose、Git 四来源部署；GitHub App 自动化集成与 Webhook 联动；系统托管伴生反代 Nginx、多域名自动证书匹配与就地签发；集成 4 层 TCP 端口转发（socat companion）；数据卷全生命周期直传 S3 备份、恢复与应用跨主机安全迁移。
+- **动态组网与按需运维隧道**：Tailscale / Headscale 异地组网打通；无需外网端口的按需 gRPC 运维代理隧道（CLI 直连目标端口）。
+- **统一设置与多角色权限**：系统设置中心统一存储与点分命名空间；多用户隔离与分组授权；宝塔式安全入口保护与面板域名/证书防失联。
+- **AI 智能运维引擎（可选插拔）**：兼容 OpenAI 协议的统一适配层；智能终端助手（自然语言转命令、命令解释与三层高危拦截）；应用创建智能草稿生成与事实探测校验；AI 会话诊断与故障排查。
+- **快照备份与系统安全**：主机快照备份调度、S3 远程存储归档；Mimosa 密封安全基线与漏洞扫描。
 
-### Phase 3
-- 安全扫描（基线 / 入侵痕迹 / 漏洞）
-- AI 安全扫描报告解读 + 修复建议可执行化
-- AI 监控异常检测 / 告警降噪与解读
-- 多云联动
-- 高危命令管控
-- 多用户 SSO / 更细粒度权限
-- AI 运维报告（定时巡检 / 健康度报告）
+### 6.2 规划中扩展能力（生态联动与演进）
+- **多云联动**：主流公有云（阿里云/腾讯云/AWS/Azure）API 凭证对接，云资产自动化发现与实例纳管联动。
+- **多用户企业级 SSO**：支持 OAuth2 / OIDC / LDAP / SAML 等企业统一身份源认证。
+- **AI 巡检与周期性运维报告**：基于定时任务的集群健康度体检、配置漂移检测与自动化运维巡检报告生成。
+- **分布式跨主机编排**：跨多个网络节点的应用联合调度与高级流量调度。
 
 ---
 
@@ -538,9 +515,9 @@
 
 ---
 
-# 附录 B：详细设计（MVP 范围）
+# 附录 B：系统详细工程设计
 
-> 目标：把附录 A 的技术选型落到可开工的工程设计。覆盖目录结构、Agent 协议（gRPC）、数据模型、控制端 REST API、部署与配置。范围对齐 Phase 1 + Phase 2 前段，标注「(P2/P3)」的为后续阶段。
+> 目标：把技术选型落到规范的工程实现。覆盖目录结构、Agent 通信协议（gRPC）、数据模型、控制端 REST API、会话流转与部署配置。
 
 ## B.1 目录结构与模块划分
 
@@ -576,7 +553,7 @@ watchman/                       # 仓库名（暂定，可改）
 │   │   ├── exec/               # 命令/脚本执行
 │   │   ├── sysinfo/            # 系统状态采集（进程/端口/账号/登录）
 │   │   ├── monitor/           # 资源监控采集（CPU/内存/磁盘/网络）
-│   │   ├── docker/            # Docker 容器/镜像操作（P2）
+│   │   ├── docker/            # Docker 容器与镜像操作
 │   │   ├── enroll/            # 首次注册（token → 长期凭证）
 │   │   └── config/            # 本地配置 + 凭证存储
 │   └── Dockerfile
@@ -619,7 +596,7 @@ message AgentMessage {            // Agent → 控制端
     ExecResult        exec_result=5;   // 推送命令/脚本执行结果
     MetricsSample     metrics   = 6;  // 资源监控上报
     SysInfoSnapshot   sysinfo   = 7;  // 进程/端口/账号/登录快照
-    DockerEvent       docker    = 8;  // (P2)
+    DockerEvent       docker    = 8;  // Docker 事件上报
     Ack ack = 99;
   }
 }
@@ -636,7 +613,7 @@ message ServerMessage {           // 控制端 → Agent
     ExecRequest       exec      = 8;   // 下发命令/脚本（shell 类型 bash/sh/cmd/pwsh）
     SysInfoQuery      sysinfo_q = 9;
     MetricsQuery      metrics_q = 10;  // 拉取当前/历史
-    DockerOp          docker_op = 11;  // (P2)
+    DockerOp          docker_op = 11;  // Docker 操作下发
     ConfigUpdate      config_update=20; // 面板改配置后对在线 Agent 即时下发（重连兜底见 RegisterResponse）
   }
 }
@@ -677,7 +654,7 @@ message TerminalOpen {
   string account = 3;             // 登录账号（可选，空则用默认）
   string cwd = 4;
   uint32 cols = 5; uint32 rows = 6;
-  string share_mode = 7;          // none/view/control (P2)
+  string share_mode = 7;          // none/view/control 终端共享模式
 }
 message TerminalOutput { string session_id=1; bytes data=2; }
 message TerminalInput  { string session_id=1; bytes data=2; }
@@ -828,7 +805,7 @@ settings(key, value json)                                     # 通用设置（�
 
 ## B.4 控制端 REST API（节选）
 
-风格：RESTful + JWT（`/api/v1`）。WS 端点单独列出。仅列 MVP 必要项。
+风格：RESTful + JWT（`/api/v1`）。WS 端点单独列出。
 
 ```
 # 认证
@@ -864,7 +841,7 @@ POST   /api/v1/alerts/:id/ack
 # 终端（控制面；数据走 WS）
 POST   /api/v1/hosts/:id/terminals          → {session_id, ws_url}
 POST   /api/v1/terminals/:sid/resize
-POST   /api/v1/terminals/:sid/share         (P2)
+POST   /api/v1/terminals/:sid/share         # 终端会话分享
 DELETE /api/v1/terminals/:sid
 GET    /api/v1/sessions?host_id=&from=&to=   # 会话历史 + 录像
 
@@ -966,7 +943,7 @@ WS /api/v1/ws/agent/:agent_id        # (可选) 调试用 Agent stream 透视
 控制端 ws.TerminalHandler
   │ 校验 session_id/JWT/权限；按 sid 路由到 Agent stream
   │ 旁路：录制 goroutine → asciicast v2 落盘（"o"=输出,"i"=输入,"r"=resize,"m"=marker）
-  │ (P2) 旁路：广播给分享订阅者；viewer 输入丢弃
+  │ 终端分享旁路：广播给会话订阅者；viewer 输入丢弃
   ↓ ServerMessage{term_in/term_resize}
 Agent internal/shell
   │ 按 sid 找到本地 PTY，写入 ptmx；pty.Setsize 调整
@@ -975,7 +952,7 @@ Agent internal/shell
 ```
 
 - **录像**：控制端对每个 session 开一个 writer，实时追加行：`[t,"o",out]` / `[t,"i",in]` / `[t,"r","COLSxROWS"]`；首行 header 含 `width/height/timestamp/title`。回放：前端用 asciinema-player 或 xterm.js + 时间轴驱动。
-- **分享(P2)**：控制端维护 `session_id → [subscribers]`；Agent 输出 fan-out 给所有订阅者；`controller` 可发输入，`viewer` 输入被丢弃；控制权切换写 `"m"` marker + 审计。
+- **终端分享**：控制端维护 `session_id → [subscribers]`；Agent 输出 fan-out 给所有订阅者；`controller` 可发输入，`viewer` 输入被丢弃；控制权切换写 `"m"` marker + 审计。
 - **Windows**：Agent 用 `UserExistsError/conpty` 实现 `PTY` 接口，注意 ConPTY 死锁坑（通信分线程、关闭前先排空）。
 
 ## B.6 部署与配置
@@ -1228,22 +1205,24 @@ git push origin "$TAG"
 
 **红线**：已发布 Release 的 tag 不可删除、不可移动、不可重打；CI 失败时修复后打**下一个编号**，不复用同号 tag。历史遗留的轻量 tag 与本规范上线前的单句附注 tag 保留原样，仅记录为已知异常，不做追溯修改。
 
-## B.7 MVP 推进顺序（落地路线）
+## B.7 核心子系统架构与执行流转链路
 
-1. **打通回连骨架**：`proto` 定义 → 控制端 gRPC server + Agent 反向 Connect + 注册/心跳；前端主机列表显示在线状态。
-2. **终端 MVP**：Agent `creack/pty` 开 bash → bidi stream → 控制端 WS → xterm.js；Linux 单机跑通。
-3. **审计/录像**：asciicast v2 实时落盘 + 会话历史接口 + 回放。
-4. **文件管理**：list/stat/read/write + 上传下载分片。
-5. **推送命令**：exec_task 批量下发 + 结果聚合。
-6. **资源监控 + 系统状态**：MetricsSample 上报 + 历史查询 + 进程/端口/账号/登录。
-7. **用户/分组/权限 + 登录账号配置 + 登录行为**。
-8. **Windows Agent**：conpty 实现 `PTY` 接口，跑通 PowerShell/CMD。
-9. **AI 适配层**：LiteLLM 封装 + `nl2command` + 命令解释（带高危拦截）。
-10. **部署打包**：go:embed 前端 + 单二进制自托管（install.sh / quick_start.sh）+ 跨平台动态一键安装端点。
+系统各核心功能模块的设计与执行流转链路如下：
+
+1. **反向回连与生命周期**：控制端启动 gRPC/WebSocket 接入网关，Agent 经主动出向长连接完成 Token 登记、心跳维持与双向 RPC 派发；控制端实时维护节点在线状态池与探活。
+2. **Web 终端全双工通路**：前端 xterm.js 建立 WebSocket 连接 → 控制端 ws.TerminalHandler 鉴权并路由至目标 Agent → Agent 本地 PTY（Linux creack/pty，Windows ConPTY）执行交互 → 旁路实时录制 asciicast v2 并落盘。
+3. **审计录像与可追溯性**：控制端独立协程记录终端 I/O 帧并写入有界存储，支持事后在控制台完整时间轴回放；高危指令与敏感操作全量记入操作审计日志。
+4. **流式文件传输通路**：基于长连接多路复用，通过 `read/write/stat/list` 协议进行分片与断点续传，不暴露任何被管机端口，支持 Monaco 文本编辑与大文件流式上传下载。
+5. **批量命令并发下发**：控制端统一生成 `exec_task`，并发下发至多台目标 Agent，实时聚合各主机标准输出与退出码。
+6. **时序监控与系统画像**：Agent 定期上报 CPU/内存/磁盘/网络与三网 TCP 质量探测指标，控制端完成时序存储与降采样；支持按需拉取进程、网络端口、系统账号与登录历史快照。
+7. **用户权限与多作用域配置**：基于 RBAC 与分组授权实现资源隔离；系统设置中心统一管理 system/user 双作用域配置。
+8. **跨平台兼容与会话恢复**：Linux 与 Windows 双端原生适配，终端会话支持 60s 宽限期优雅重连，节点服务支持崩溃自启与在线升级验签。
+9. **AI 适配与智能辅助**：统一对接 OpenAI 兼容协议，支持智能命令生成（带三层高危拦截）、应用配置真实探测与草稿生成、日志诊断辅助。
+10. **自托管单二进制交付**：控制端将前端静态产物经 `go:embed` 嵌入单二进制文件，内置静态路由与 REST/WS 网关，支持零依赖快速部署。
 
 ## B.8 后端架构补充（查漏补缺）
 
-> 对照第 3 节需求清单逐项核对后补充的设计点，覆盖 MVP 与 P2/P3 预留。
+> 对照第 3 节需求清单逐项核对后补充的设计点，覆盖数据模型与存储实现。
 
 ### B.8.1 补充数据模型
 
@@ -1270,7 +1249,7 @@ settings(scope, key, value_json)          # 如 user/alice.terminal.theme, user/
 # 文件编辑版本/锁（防并发覆盖）
 file_locks(path, host_id, user_id, locked_at, expires_at)
 file_versions(path, host_id, version, etag, size, modified_by, modified_at)
-  # MVP 可只做 etag 乐观锁，P2 起保留版本
+  # etag 乐观锁与并发版本控制，支持历史版本追溯
 
 # 通知渠道（3.11 告警通知方式可扩展）
 notify_channels(id, type, name, config json, enabled)
@@ -1300,7 +1279,7 @@ applications(id, name, host_id, source_type,        # git | image | template | r
 deployments(id, app_id, commit_hash, commit_message, trigger, status,
             started_by, started_at, finished_at, duration_ms, exit_code, error, build_log)
 
-# 动态组网（P2，预留）
+# 动态组网
 network_nodes(host_id, virtual_ip, status, joined_at)
 network_routes(host_id, dest_host_id, type)          # direct/relay
 ```
@@ -1330,7 +1309,7 @@ PUT    /api/v1/settings                    # {data: {key: value}} 部分更新�
 # terminal.cursor_blink, terminal.scrollback, navigation.default_host_tab, files.default_path
 # 秘密（AI key / Git token 等）不进统一设置，留在各自专用存储
 
-# 文件锁/版本（MVP 仅 etag；P2 起开放）
+# 文件锁/版本
 POST   /api/v1/hosts/:id/files/lock
 GET    /api/v1/hosts/:id/files/versions?path=
 
@@ -1372,7 +1351,7 @@ GET    /api/v1/tunnels/client-info          # CLI 引导信息 {enabled, endpoin
 GET    /api/v1/tunnels/mine                 # 当前用户活动隧道腿（conn_id/目标/建立时间/空闲秒）；authed 读、免审计
 DELETE /api/v1/tunnels/mine/:id             # 强制关闭本人的隧道腿（服务层按用户名过滤，只能关自己的）；写组 + 审计 op_tunnel_close
 
-# 组网（P2）
+# 动态组网与网络拓扑
 POST   /api/v1/networks/:id/join          # 选中主机加入
 GET    /api/v1/networks/topology
 DELETE /api/v1/networks/:id/hosts/:hid
@@ -1426,8 +1405,8 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 
 ### B.8.3 协议补充
 
-- **DockerOp/DockerEvent（P2）**：`op` 含 `ps/images/start/stop/restart/rm/logs/inspect/remove_image/prune_images/pull/run`；Agent 侧 shelling out to the docker CLI 执行（`agent/internal/docker/docker.go`）。`run` 的参数走 `DockerOp.args_json`：`{"name":"...","ports":["hostPort:containerPort"],"volumes":["/host:/container"],"env":["KEY=VALUE"],"restart_policy":"no|on-failure|always|unless-stopped","command":["arg1","arg2"]}`，空值条目跳过；**每个字段先过字符白名单正则（容器名/端口/卷/环境变量键/重启策略/镜像引用，拒绝以 `-` 开头等伪装 docker flag 的载荷）再进 argv，exec 不走 shell**；镜像缺失由 docker CLI 自动拉取，故 `pull/run` 的服务端下发与 agent 执行均取 5 分钟超时。
-- **安全扫描（P3）**：新增 `ScanRequest(type, rule_set)` / `ScanResult(progress, findings json, report_ref)`，走 exec + 结果回传，不引入新通道。
+- **DockerOp/DockerEvent**：`op` 含 `ps/images/start/stop/restart/rm/logs/inspect/remove_image/prune_images/pull/run`；Agent 侧 shelling out to the docker CLI 执行（`agent/internal/docker/docker.go`）。`run` 的参数走 `DockerOp.args_json`：`{"name":"...","ports":["hostPort:containerPort"],"volumes":["/host:/container"],"env":["KEY=VALUE"],"restart_policy":"no|on-failure|always|unless-stopped","command":["arg1","arg2"]}`，空值条目跳过；**每个字段先过字符白名单正则（容器名/端口/卷/环境变量键/重启策略/镜像引用，拒绝以 `-` 开头等伪装 docker flag 的载荷）再进 argv，exec 不走 shell**；镜像缺失由 docker CLI 自动拉取，故 `pull/run` 的服务端下发与 agent 执行均取 5 分钟超时。
+- **安全扫描（Mimosa / 基线与漏洞检查）**：新增 `ScanRequest(type, rule_set)` / `ScanResult(progress, findings json, report_ref)`，走 exec + 结果回传，不引入新通道。
 - **Agent 自更新**：新增 `UpgradeRequest(version, url, sha256)` / `UpgradeProgress`，控制端可下发升级，Agent 校验签名后热更新（解耦发布）。升级签名密钥由控制端启动时从 `vault-pass` 经域分隔 SHA-256 派生 Ed25519（重启稳定、无需新密钥文件，`api.InitSigner`），公钥 hex 经 `GET /api/v1/version` 的 `upgrade_pubkey` 公开；agent 安装脚本自动带上 `-upgrade-pubkey`，agent 验签（未配置则跳过，只校验 sha256）。下载 URL 走面板对外地址统一解析（绑定域名 → 请求 Host，解决反代/NAT 下 Host 不可信）。
 - **Agent 卸载**：`UninstallRequest(remove_data)`（proto field 15）。三条路径：① 控制端解绑：`DELETE /api/v1/hosts/:id?uninstall_agent=true`（adminOnly），在线则下发卸载指令并等 agent 下线（15s 超时），离线直接 409（记录不删，提示先上线或去掉勾选）；超时未下线仍删记录但返回 `warning`。② agent 自卸载：`agent/internal/uninstall`，Linux 先 `signal.Ignore(SIGINT/SIGTERM)` 保命（**绝不能 `systemctl stop` 自己**：stop 的 SIGTERM 会杀死当前进程使清理中断；忽略信号后 stop 又会卡到 TimeoutStopSec 才被 SIGKILL），只做 disable + 删 unit + daemon-reload（unit 删掉后 systemd 即便 Restart=always 也无法重启已不存在的 unit）→ 删自身二进制 → remove_data=true 才删 data dir（路径须含 watchman 且非系统根目录）；sysvinit 同理只删脚本不 stop。Windows 删 Scheduled Task `WatchmanAgent`（安装脚本注册的是计划任务**不是** Windows service，`sc.exe` 找不到对象；`schtasks /Delete` 只删任务定义不杀当前运行实例）+ 延迟 cmd 自删（运行中 exe 删不掉，remove_data=false 时不拼 rmdir）。③ 安装脚本：`bash -s -- uninstall` / 落盘后 `& $f -Uninstall`（管道给 iex 传不了 switch 参数），停服务、删二进制与数据目录。
 - **证书轮换**：`RegisterResponse` 增加可选 `client_cert`/`cert_expires_at`；Agent 持有证书，控制端在到期前通过现有 mTLS 通道下发新证书（带签名），Agent 热加载。
@@ -1448,9 +1427,7 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 - 结构化日志（zerolog/zap）+ Prometheus `/metrics`（可选）便于接入监控。
 - Agent 侧：本地日志 + 回连后将关键日志摘要上报控制端（便于远程排障）。
 
-至此后端架构覆盖：目录、协议、数据模型、REST API、终端通路、部署配置、安全运维、可观测、备份迁移，以及 P2/P3（Docker/应用市场/组网/扫描/证书轮换/Agent 自更新）的协议与模型预留。
-
-(P2 起：终端分享、Docker 管理、应用市场、告警规则、动态组网、会话回放完善、AI 诊断/问答。)
+至此后端架构覆盖：目录结构、通信协议、数据模型、REST API、终端通路、部署配置、安全运维、可观测性、数据卷备份恢复与应用跨机迁移，以及 Docker 容器管理、应用中心全生命周期、动态组网、Mimosa 安全扫描、证书自动化轮换与 Agent 在线更新的完整工程实现。
 
 ---
 
@@ -1488,101 +1465,36 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 
 ---
 
-## 8. 前端布局规范
+## 8. 前端工程与会话可靠性规范
 
-### 8.1 页面留白统一
+> **文档分工与唯一定位说明**：
+> 本节聚焦前端 Web 控制台与中心服务端的**工程可靠性架构、会话生命周期、并发锁纪律与长连接协议保障**（KeepAlive 状态保持、终端会话防抖与断线重连、双向维护握手信令、RPC Hub 锁纪律与并发安全等）。
+> 涉及页面内边距留白、大数据表格 flex 布局、NSelect 空值处理、紧凑表单间距补偿、Markdown 外部渲染、输入卡交互机制、登录门户工程美学以及 UI 设计令牌（Design Tokens）等纯前端 UI/UX 与样式开发规范，**统一以 [DESIGN.md §9 前端页面布局与组件开发规范](./DESIGN.md) 为唯一权威事实源**，本文档不再冗余堆砌纯 CSS 样式类名与视觉细节。
 
-- 路由页面的外层内边距由 `AppShell` 的 `.app-body` 统一施加，取值来自 `--page-padding`（桌面 16px / 窄屏 10px）。
-- **页面组件自身不得再设置外层 `padding`**，否则各页面留白会重新出现不一致。
-- 页面内主卡片/面板的内边距统一取 `--card-padding`，与页面留白同一档位。
+### 8.1 页面留白与布局间距体系
+
+路由页面的外层内边距由 `AppShell` 的 `.app-body` 统一施加，取值来自 `--page-padding`（桌面 16px / 窄屏 10px）。**页面组件自身严禁再设置外层 padding**，避免出现各页面留白不一致；页面内主卡片/面板内边距统一取 `--card-padding`。详细布局度量与间距体系详见 `DESIGN.md §9.2`。
 
 ### 8.2 大数据表格：整页高度自适应 + 表头分页固定
-凡是承载**不定长数据列表**的表格（审计日志、进程清单、端口清单、系统账号、登录历史、会话记录、文件列表、容器/镜像列表、扫描结果、告警消息、用户、凭据、分组、命令拦截审计等），一律采用「整页填满视口 + 表头与分页固定 + 仅数据区滚动 + **必须分页**」的布局。不允许让整页跟着表格一起长高，把分页条推到首屏之外；也不允许不分页地一次渲染全量数据。
 
-实现要求：
+凡是承载**不定长数据列表**的表格（审计日志、进程清单、端口清单、系统账号、登录历史、会话记录、文件列表、容器/镜像列表、扫描结果、告警消息、用户、凭据、分组、命令拦截审计等），一律采用「整页填满视口 + 表头与分页固定 + 仅数据区滚动 + **必须分页**」的布局原则，严禁一次性渲染全量数据或让整页被无限撑高。
 
-1. **页面根容器**撑满可用高度并作为纵向 flex 容器：
-
-   ```scss
-   .xxx-view {
-     display: flex;
-     flex-direction: column;
-     height: 100%;
-     min-height: 0; // 必须，否则子项无法收缩
-   }
-   ```
-
-2. **表格容器**吃掉剩余空间，且**必须**同时写 `min-height: 0`。flex 子项默认 `min-height: auto`，不写则永远不会收缩，滚动条会跑到页面外层：
-
-   ```scss
-   .table-card {
-     flex: 1;
-     min-height: 0;
-     display: flex;
-     flex-direction: column;
-   }
-   ```
-
-   包一层 naive `NCard` 时，还需让其内容区同样具备 flex 能力：
-
-   ```scss
-   .table-card :deep(.n-card-content) {
-     flex: 1;
-     min-height: 0;
-     display: flex;
-     flex-direction: column;
-     overflow: hidden;
-   }
-   ```
-
-3. **`NDataTable` 一律加 `flex-height`**，让表格按父容器高度计算滚动区，表头随之固定：
-
-   ```vue
-   <NDataTable flex-height :columns="columns" :data="rows" />
-   ```
-
-   - `flex-height` 与写死的 `:max-height` 是互斥语义，用了前者就不要再写后者。
-   - 横向可滚动的宽表继续保留 `:scroll-x`，两者可共存。
-
-4. **分页条固定在表格下方**，用 `flex-shrink: 0` 钉住，不参与滚动。分页条需要固定条高与上下对称内边距，让分页组件在条内垂直居中；只加 `padding-top` 会使分页紧贴卡片底边，视觉上像被裁切，「每页条数」下拉也会顶到边缘。
-
-5. **必须有分页，不允许一次渲染全量数据**。上面第 4 条只规定了分页条的位置，不是「有分页时才管位置」——凡是不定长列表都必须分页。没有分页时，进程清单、目录列表、扫描发现这类数据会一次性渲染成千上万行，滚动卡顿且用户永远找不到末尾；配合写死的 `:max-height` 更会把超出高度的记录彻底藏起来（既没有分页也没有提示，用户以为数据只有这么多）。
-
-   两种实现，按数据来源二选一：
-
-   - **服务端分页**（数据会持续累积，且后端支持分页参数）：请求带 `offset` / `page_size`，响应的 `total` 必须是**未分页的总数**，前端用独立 `NPagination` 放进 `.table-pagination-bar`。换页、改每页条数都重新请求。已有实现：审计日志 `AuditList.vue`、会话审计 `SessionList.vue`（后端 `GET /sessions` 的 `offset`/`page_size` 为可选参数，不传返回全量，老调用方不受影响）。
-   - **前端分页**（数据已整份在内存里，或后端本身有条数上限）：把全量数组交给 `NDataTable` 的 `:pagination`，由 naive-ui 负责切片并把分页条渲染在表格滚动区下方。统一用 `web/src/composables/useTablePagination.ts`：
-
-     ```ts
-     const rowCount = computed(() => rows.value.length)
-     const { pagination, resetPage } = useTablePagination({ pageSize: 20, rowCount })
-     ```
-
-     ```vue
-     <NDataTable flex-height :columns="columns" :data="rows" :pagination="pagination" />
-     ```
-
-     `rowCount` 用于**页码收敛**：删除某页最后一行、或筛选条件收紧后行数变少时，页码会被夹回最大有效页，否则表格会在「还有数据」的情况下渲染成空白。数据源重新加载（换目录、切页签、刷新）后调用 `resetPage()` 回到第一页。筛选条件变化也要 `watch` 到 `resetPage()`。
-
-6. 全局提供可复用类（见 `web/src/styles/global.scss`）：`.page-flex-column`、`.table-flex-fill`、`.table-pagination-bar`。新页面直接套用，避免每处重复写 flex 三件套。
-
-7. **不要用原生 `<NTable>` 承载不定长列表**。`NTable` 只是带样式的 `<table>`，没有 `flex-height`、没有分页、没有固定表头，写出来的页面一定违反本节。需要表格就用 `NDataTable` + `columns` render 函数；单元格样式因此由 render 生成，scoped 样式要用 `:deep()` 穿透。
-
-8. **`flex-height` 只对「自身拿到高度」的表格生效**：`.table-flex-fill` 已经给内部 `.n-data-table` 设了 `flex: 1; min-height: 0`。若自己另写一个 `display: flex; flex-direction: column` 的容器，却只给 `NDataTable` 加 `flex-height` 而没给它 `flex: 1`，表格高度会按内容算成「表头 + 分页条」，数据区 `clientHeight` 为 0——整张表看起来是空的（部署历史页签此前即此因，页签里只剩表头和分页条，所有记录不可见）。验收口径：表格数据区 `clientHeight` 必须明显大于表头高度。
-
-**例外**：卡片内的辅助性小表格（常用命令库、备份列表、批量执行的主机勾选框、告警规则清单、单个分组的授权名单等），数据量天然有限且不是页面主体，可继续用固定 `:max-height` 限高、不分页，但**必须在代码注释里写明它属于本例外**，便于后续 review 区分「有意为之」和「漏了」。
+- **分页选型架构**：按数据特征严格二选一。数据量持续累加且后端支持分页的采用**服务端分页**（请求传 `offset` / `page_size`，响应 `total` 为未分页总数）；全量数据已在内存或带上限的采用**前端分页**（统一接入 `useTablePagination.ts`，基于 `rowCount` 自动执行页码收敛防空白）。
+- **组件与类名规范**：统一使用 `NDataTable`（开启 `flex-height`，禁止用原生 `<NTable>` 承载不定长数据）；布局容器结构（`.page-flex-column`、`.table-flex-fill`、`.table-pagination-bar`）与详细样式实现严格遵循 `DESIGN.md §9.4`。
+- **例外约束**：仅卡片内部天然有限的辅助性小表（如常用命令库、备份列表、批量执行的主机勾选框、告警规则清单等）允许使用固定 `:max-height` 限高且不分页，且**必须在代码注释中显式声明本例外**。
 
 ### 8.3 滚动容器约定
 
-- 一个可滚动区域只允许有一个滚动源。页面外层把滚动交给表格时，外层容器必须 `overflow: hidden`，防止出现双层滚动条。
-- 长列表滚动容器统一带 `-webkit-overflow-scrolling: touch` 与 `overscroll-behavior: contain`（`global.scss` 已按类名集中声明）。
-- **页签内的滚动容器必须显式 `height: 100%`（并配 `min-height: 0`）**：`overflow-y: auto` 单独不成立。NTabPane 经 `:deep(.n-tab-pane) { height: 100% }` 拿到确定高度，但子容器高度默认 `auto` 会按内容长高、越过页签底边，而外层（如 `AppDetail` 的 `.detail-body`）是 `overflow: hidden` —— 结果既没有滚动条，超出部分又被裁掉，用户看不到也滚不到（「数据卷备份」页归档表被裁掉底部即此因，`.overview-scroll` 已补 `height: 100%`）。验收口径：容器 `scrollHeight > clientHeight` 时必须能取到大于 0 的 `scrollTop` 最大值。
+- **单一滚动源原则**：一个可滚动区域只允许存在一个激活的滚动条。页面外层把滚动职责交付给表格时，外层容器必须显式配置 `overflow: hidden`，杜绝内外双层滚动条嵌套出现。
+- **长列表滚动优化**：所有滚动容器统一带有 `-webkit-overflow-scrolling: touch` 与 `overscroll-behavior: contain`。
+- **页签内滚动容器高度约束**：页签内的自定义滚动容器**必须显式声明 `height: 100%` 并搭配 `min-height: 0`**（单独 `overflow-y: auto` 会导致高度无界塌陷或超出部分被静默截断）。
+- 详细规范与样式实现详见 `DESIGN.md §9.7`。
 
 ### 8.3.1 NSelect 空值约定
 
-- **绑定 NSelect `v-model:value` 的字段一律用 `null` 做空值**（声明 `null as string | null`），**严禁 `''`**：naive-ui 对未命中选项的值会走默认 `fallbackOption` 合成一个 `label` 为空串的真实选项，select 自认为「已选中」，占位符永不渲染（幽灵选中态）。`null` 才被识别为空，占位符正常显示。
-- 例外：选项列表里**真实存在 `value: ''` 条目**时才允许用 `''`（如 AppCreate/AppDetail「高级：手动指定证书」里的「自动匹配（推荐）」选项）。
-- 连带约束：清空该值的代码（watcher、重置）必须写 `null`；提交载荷用 `|| undefined` 归一化；`Map.get(id)` 等强 string 入参处先判 truthy。AppCreate/AppDetail 已全部按此改造。
+- **绑定 NSelect `v-model:value` 的字段一律用 `null` 作为空值**（声明 `null as string | null`），**严禁使用 `''`（空字符串）**，避免触发 Naive UI 的 `fallbackOption` 导致占位符无法渲染的幽灵选中态。
+- **唯一例外**：选项列表中真实存在 `value: ''` 条目时允许使用空字符串（如应用中心「高级：手动指定证书」中的「自动匹配（推荐）」）。
+- 表单重置、清空及提交载荷过滤等规范详见 `DESIGN.md §9.8`。
 
 ### 8.4 页签工作区与 KeepAlive
 
@@ -1724,40 +1636,17 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 
 ### 8.8 组件选用与页面布局进阶规范
 
-1. **优先使用 Naive UI 原生组件，非必要不封装**：
-   - 凡能由 Naive UI 官方组件（`NCard`, `NDataTable`, `NTabs`, `NTabPane`, `NSpace`, `NButton`, `NModal`, `NAlert`, `NInput` 等）满足的交互与视觉结构，**一律优先直接使用官方组件**，严禁在外部包裹多层无意义的自定义 `div` 模拟组件结构；
-   - 杜绝低效套壳封装，非跨多页面特化的高复用业务逻辑（如终端 `TerminalPane` 等）严禁私自封装，统一由 Naive UI 原生组件绑定全局主题变量（如 `var(--bg-card)`）。
-
-2. **页面主标题统一为外层单文字**：
-   - 独立页面的主标题统一在视口顶部 `.page-header` 中使用单文字 `<h2 class="page-title">标题</h2>`，右侧配合 `NSpace` 放页面级全局操作；
-   - 严禁图标与文字混排、严禁中英文杂糅（如消除括号英文）、严禁在标题下放置冗余副标题说明、严禁将页面主标题塞在卡片内置标题中。
-
-3. **Tab 栏与表格卡片必须彻底分层**：
-   - 以消息与告警中心（`AlertList.vue`）为基准拓扑，全局 Tab 栏（`<NTabs>`）必须外置在 `.tabs-container` 中，**严禁将 Tab 与表格混放在同一个卡片容器内**；
-   - 各个 `NTabPane` 内部由 `.tab-pane-content` 垂直弹性承载，提示用 `NAlert`，表格独立包裹在 `<NCard :bordered="false" class="table-flex-fill">` 中，实现表头与分页条固钉、仅数据区滚动。
-
-4. **表格卡片背景色与无边框规范**：
-   - 所有承载表格的卡片容器背景统一绑定为 `var(--bg-card)`，杜绝因未定义 `--n-color` 导致回退到发灰的伪透明背景；
-   - 消除表格外层硬编码的 `border: 1px solid var(--border-color)` 与内缩 `padding`，保持平整、沉浸的控制台无边框视觉。
-
-5. **暗色模式表单控件必须有可见边框**：
-   - naive-ui 暗色主题把 `Input` 与 `InternalSelection` 的**常态**边框默认写成 `1px solid #0000`（全透明），仅 hover/focus 时才显形，导致暗色下输入框、下拉框、日期/时间选择器看起来没有边界（表格卡片本身仍按上一条保持无边框视觉，两者不冲突）。
-   - 统一在 `web/src/App.vue` 的 `themeOverrides` 中补回：`Input.border` / `Input.borderDisabled` / `Input.groupLabelBorder` 与 `InternalSelection.border`（取值 `1px solid rgba(255, 255, 255, 0.16)`，暗色专属，浅色不动）。
-   - 该覆盖经 `NConfigProvider` 对全站生效（含 InputNumber、DatePicker/TimePicker 内嵌输入与弹窗内控件）；**不要**在页面/组件内单独写输入框边框样式。
-   - `Input.borderColor` 不是 Input 的合法主题变量（写了是 no-op），新增覆盖前先查 `naive-ui/es/*/styles/light|dark.mjs` 的实际变量名。
+前端组件选型、页面排版、卡片分层与设计令牌规范已完整收录于 `DESIGN.md §9`，遵循以下核心原则：
+1. **优先使用 Naive UI 原生组件，非必要不封装**（`DESIGN.md §9.1`）。
+2. **页面主标题统一为外层单文字**，严禁图文混排与副标题堆砌（`DESIGN.md §9.3`）。
+3. **Tab 栏与表格卡片必须彻底分层**，以 `AlertList.vue` 为标准拓扑，严禁混放在同一个卡片内（`DESIGN.md §9.5`）。
+4. **表格卡片背景色统一为 `var(--bg-card)`**，消除多余外边框与内缩边距（`DESIGN.md §9.6`）。
+5. **暗色模式表单控件必须有可见边框**，由 `web/src/App.vue` 全局 `themeOverrides` 统一注水生效，页面内不散落重复样式（`DESIGN.md §9.8`）。
+6. **功能提示语的可开关约定**：各页面说明性段落标注 `.tip-hint`，受 `appearance.show_tips` 开关控制；业务警告与核心数据严禁隐藏（`DESIGN.md §9.11`）。
 
 ### 8.9 顶部 Workspace 多页签拖拽排序
 
-顶部多工作区页签（`AppShell.vue` 中的 `workspace-tab-item`）承载多任务多视图上下文，支持鼠标拖拽水平调整页签顺序：
-
-1. **零第三方库原生拖拽**：使用 HTML5 Drag and Drop API（`draggable="true"`, `@dragstart`, `@dragover`, `@drop`, `@dragend`），不引入任何臃肿的外置拖拽包。
-2. **位置动态感知与视觉指示线**：
-   - 拖拽经过目标页签时，计算鼠标在元素内的水平相对偏移量（左半区 / 右半区），确定插入方位为 `left` 或 `right`；
-   - 使用 CSS 伪类 `.drop-left::before` 与 `.drop-right::after` 渲染 3px 品牌色插入垂直指示线，定位在页签间隙中（带 `pointer-events: none`）；
-   - 正在拖拽的源页签赋予 `.is-dragging` 状态（半透明 `opacity: 0.45` 与 `cursor: grabbing`）。
-3. **状态同步与偏移校准**：
-   - Pinia `workspace` store 提供 `moveTab(fromIndex, targetIndex, position)`，在数组切片 `splice` 移动时自动校准由于元素抽取导致的索引位移，实现无缝平滑重排；
-   - 页签关闭按钮附加 `@mousedown.stop`，避免点击关闭图标时误触发父级拖拽。
+顶部工作区页签（`AppShell.vue`）支持原生 HTML5 拖拽重排，Pinia `workspace` store 提供 `moveTab` 状态平滑同步，无第三方依赖。视觉交互、插入指示线与状态校准细则详见 `DESIGN.md §9.10`。
 
 ### 8.10 RPC Hub 生命周期与锁纪律（告警引擎冻结事故复盘）
 
@@ -1769,63 +1658,41 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 4. **回归测试钉住死锁**：`registry_test.go` 的 `TestUnbindWithReentrantHandlerNoDeadlock`（处理器先注销自身再返回，`unbind` 5 秒内必须完成）与 `TestUnbindThenRebindChannelFreshness`（旧 hub 关闭后新 hub 可正常收发）任一失败即并发语义回归，禁止删除或放宽。
 5. **诊断手段**：`kill -QUIT <pid>` 可让 Go runtime 把全量 goroutine 栈Dump 到 stderr（journald 可查），`[sync.Mutex.Lock, N minutes]` 即锁等待时长，是定位「接口活着但后台协程全冻结」类问题的首选；systemd 会自动拉起被 QUIT 杀掉的进程，生产可用。
 
-### 8.3 功能提示语的可开关约定
-
-- 各页面**说明性**的帮助段落（`<p class="muted">` 这类功能说明文字）在 `class` 上追加 `tip-hint`，受用户设置 `appearance.show_tips` 控制：App.vue 按设置给 `documentElement` 切换 `hide-tips` 类，全局样式隐藏 `.tip-hint`。
-- **警告/报错类 NAlert、数据展示用的 muted 文本不加** `tip-hint`，开关只隐藏说明文字，不隐藏业务信息。
-
 ### 8.11 外部 Markdown 内容的渲染约定
 
-凡是展示**外部输入的 Markdown**（GitHub Release 正文 `release_notes`、AI 助手回答等），一律走 `web/src/utils/markdown.ts` 的 `renderMarkdown()`，**不得直接用 `<pre>{{ text }}</pre>` 原样输出**——GitHub Release 正文是标准 Markdown，原样输出会把 `### Added`、`- **apps** ...` 连标记一起显示给用户。
-
-- **零依赖**：渲染器是项目内实现，不引入 marked / markdown-it 等库，避免为几个标题和列表增加打包体积。
-- **支持范围**：`#`~`######` 标题（映射 h4~h6，避免卡片内过大）、有序/无序列表及缩进续行、`**加粗**`、`*斜体*`、`~~删除线~~`、行内 `code`、``` 代码块（支持提取语言为 `data-lang` 属性）、`[文本](链接)`、`>` 引用、`---` 分隔线、GFM 表格（`| Header |` 与对齐分隔行，自动包裹在 `<div class="md-table-wrap">` 内实现响应式横向滚动；分隔行必须含 `|`，裸 `---` 是分隔线而非表格分隔行，否则含 `|` 的段落行后跟 `---` 会被误吞成单列表格）。不支持行内 HTML。
-- **安全**：整体先转义 HTML 再做标记替换，输出标签全部由渲染器生成；链接只放行 `http(s)://`、`mailto:`、锚点与站内绝对路径，`javascript:` 等一律降级为 `#`。因此可以安全地配合 `v-html` 使用，禁止改成「先渲染再过滤」的写法。
-- **样式**：`v-html` 注入的节点没有 scoped 属性，容器样式必须用 `:deep()` 下发给 h4~h6 / ul / li / p / code / pre / a / blockquote / hr / table，参考 `SystemUpgrade.vue` 的 `.changelog-body` 与 `AppAiAssistant.vue` 的 `.markdown-body`。
-- **AI 助手与应用创建页部署助手**：创建页 AI 部署助手（`AppAiAssistant.vue`）中的选型说明卡片（`draftResult.explanation`）与对话助手气泡统一接入 `renderMarkdown()`，容器配置 `.markdown-body` 并在 scoped CSS 中通过 `:deep()` 下发段落、标题、列表、引用、行内代码、语言标注代码块与自适应表格样式，并重设 `white-space: normal` 保证 HTML 块级节点正常流式排版；后端 `app_assist.go` 的 `extractJSONPayload` 自动剥除推理模型 `<think>`/`<thought>` 思考标签，并经 `repairJSON` 修复字符串字面量中未转义的换行与末尾逗号，防止反序列化失败将原始 JSON 串或思考过程泄露到对话气泡。
-- **AI 对话**（`AiChat.vue`）目前仍是组件内的简易实现（仅加粗、代码块、换行），行为未变；后续如需标题与列表，改为调用同一函数并传 `codeBlockClass` / `inlineCodeClass` 保持现有类名即可。
+凡是展示外部输入的 Markdown（GitHub Release 正文 `release_notes`、AI 助手回答、部署选型说明等），一律走 `web/src/utils/markdown.ts` 的 `renderMarkdown()`，**严禁直接用 `<pre>{{ text }}</pre>` 裸输出**。自研轻量解析、防 XSS 注入、思考标签清洗与代码块/GFM 表格渲染规范详见 `DESIGN.md §9.12`。
 
 ### 8.12 AI 助手页输入框（CherryStudio 风格输入卡）与拖拽调整高度
 
-AI 助手页（`web/src/views/ai/AiChat.vue`，页面标题「AI 运维助手」）的对话输入区为**一体化圆角输入卡**（`.chat-composer`，CherryStudio 式 composer）：卡片内承载无边框透明 textarea 与底部工具行，聚焦时容器整体点亮而非输入框自身描边；默认 textarea 高 64px，输入卡上方提供拖拽把手（`.chat-resize-handle`）：
-
-1. **输入卡外观**：容器 14px 圆角、`var(--bg-card)` 底色 + `var(--border-color)` 描边 + `var(--shadow-sm)`；`:focus-within` 时描边转品牌色（`rgba(99,102,241,.55)`）并叠 3px 光晕。NInput 加 `:bordered="false"`、背景透明，占位文本只保留示例问题；快捷键说明不放占位符，固定在底栏左侧的键帽提示（`.hint-key`：等宽字体、圆角小框，`Enter 发送 · Shift+Enter 换行`）。
-2. **底栏与发送按钮**：`.composer-footer` 左侧键帽提示（窄屏隐藏）、右侧**圆形强调色图标发送按钮**（36px，仅纸飞机图标，`title/aria-label="发送"`；空输入禁用态转灰 `var(--bg-hover)`+弱化图标色，发送中由 NButton loading 转圈）。不得回退为「输入框旁贴一块矩形『发送』大按钮」的旧布局。
-3. **方向与复位**：向上拖增高、向下拖回落；双击把手复位到 64px。把手带 `role="separator"`、`aria-orientation="horizontal"` 与 `aria-valuemin/valuemax/valuenow`，分隔线由把手自身绘制，输入区不再单独写 `border-top`。
-4. **必须有上下限**：下限 `MIN_INPUT_H = 64`；上限 = `.chat-body` 高度 − `INPUT_MIN_LIST_H(180)` − `COMPOSER_EXTRA_H(46)`（底栏固定高度），保证消息列表至少留 180px，不允许把对话区挤没。容器高度变化（窗口缩放、侧栏展开）由 `ResizeObserver` 监听，已拖高的输入框要自动收敛回上限内。
-5. **必须用指针捕获（`setPointerCapture`）收尾**：`pointermove/pointerup/pointercancel` 绑在把手自身而不是 `window`。否则鼠标拖出浏览器窗口后松开收不到 `pointerup`，监听残留会让后续鼠标移动继续改高度（表现为「输入框自己越拖越大」）。拖拽期间 `body` 临时 `cursor: row-resize` / `user-select: none`，结束与组件卸载时必须还原。
-6. **窄屏（≤768px）禁用拖拽**：把手 `display: none`，输入框回到固定 64px，并恢复输入区的 `padding-top` 与 `border-top` 分隔线；底栏键帽提示同步隐藏（空间紧张），发送按钮加大到 40px 保证触控目标。
-7. **只改外壳高度**：高度写在 NInput 根元素（`.composer-input`）上，`textarea` 用 `height: 100%` 撑满并保持 `resize: none`；不要再启用 naive 原生 resize 把手。输入卡高度随 textarea 自动增长（textarea + 底栏），不单独参与拖拽。
+AI 运维助手页（`web/src/views/ai/AiChat.vue`）对话输入区采用一体化圆角输入卡（`.chat-composer`，CherryStudio 式风格），支持高度调节把手（`.chat-resize-handle`）、指针捕获（`setPointerCapture`）与窄屏自适应。交互细节与上下限约束详见 `DESIGN.md §9.13`。
 
 ### 8.13 关闭 feedback 的表单必须显式补间距
 
-`NForm` 加 `:show-feedback="false"` 后，naive-ui 不再给 `.n-form-item` 任何 `margin-bottom`（实测为 `0px`），多个字段会紧贴在一起，只剩 `label` 自身高度做分隔。凡是使用紧凑表单的地方（如 CertDomain 的「上传已有证书」、开关区），必须在表单容器上加类名并显式补齐：
-
-```scss
-.upload-cert-form {
-  :deep(.n-form-item) { margin-bottom: 14px; }
-  :deep(.n-form-item:last-child) { margin-top: 2px; margin-bottom: 0; } // 末项是提交按钮
-  :deep(.n-form-item-label) { padding-bottom: 8px; }                    // label 与控件
-}
-```
-
-- 折叠面板内还需给 `.n-collapse-item__content-inner` 补 `padding: 16px 0 8px`，否则内容顶到标题、按钮贴折叠底边。
-- 参照口径：`label`→控件 8px、控件间 14px（加上 label 行高后视觉约 40px）、按钮上方 14px、面板底部 8px；不要在页面里逐个写 inline `style="margin-top"`。
+`NForm` 加 `:show-feedback="false"` 后，Naive UI 会彻底移除 `.n-form-item` 底部的间距。使用紧凑表单时必须在表单容器上显式补充标准间距（Label-控件 8px、字段间 14px、按钮上 14px、折叠面板内部 16px）。具体类名与样式口径详见 `DESIGN.md §9.9`。
 
 ### 8.14 时间字段、时区与时间范围过滤（现状）
 
-本节只记录当前实现，不作为新接口的强制口径。
+本节记录系统时间处理与时区接口口径：
 
 **时间字段与展示**
 - 后端时间点使用 `time.Time`：结构体经 `encoding/json` 输出 RFC3339Nano（带时区偏移，秒后可能带小数）；部分手工组装的响应与 CSV 导出用 `Format(time.RFC3339)`（秒级），如审计 CSV、证书 `not_after`、分享链接 `expires_at`、发版检查 `checked_at`。
-- 前端展示时间统一走 `web/src/utils/time.ts`：`fmtDateTime`（含秒）、`fmtDateTimeMinute`（不含秒）、`fmtDate`、`fmtTime`（仅时刻）。表格时间列不再手写 `slice(0, 19).replace('T', ' ')`（会话、分组、用户、凭据、文件列表、消息面板均已改为 `fmtDateTime`）。时区取面板配置 `server.timezone`（见 §3.12 与配置清单），未配置时回落浏览器本地时区。
+- 前端展示时间统一走 `web/src/utils/time.ts`（`fmtDateTime`、`fmtDate`、`fmtTime` 等），严格基于控制端下发的 `server.timezone` 呈现。前端组件严禁手写字符串切割（详见 `DESIGN.md §9.15`）。
 
 **时间范围过滤（统一 RFC3339）**
 - 审计 `GET /api/v1/audit`、`/api/v1/audit/export`：`from` / `to` 为 RFC3339 字符串，`server/internal/audit/handlers.go` 的 `queryFromContext` 用 `time.Parse(time.RFC3339, v)` 解析，格式非法直接 400（`invalid from time: ...`）；`audit.Query.match` 为闭区间，两端都包含，`from > to` 时两个条件互斥、结果为空。
 - 指标历史 `GET /api/v1/hosts/:id/metrics/history`：`from` / `to` 同样按 RFC3339 解析（`router.go:getMetricsHistory` 先试 RFC3339，失败再按 Unix 秒解析以兼容旧调用），`step` 为秒；缺省或非法时回退 `to=now`、`from=to-3600`、`step=15`，不报错（`metrics/store.go:QueryHistory`）。
 
 **前端筛选控件**
-- 当前唯一实现是审计页 `web/src/views/audit/AuditList.vue`：`NDatePicker type="datetimerange"`（值为毫秒区间，清空为 `null`），提交前 `new Date(ms).toISOString()`，查询前 `page.value = 1` 回到第一页。
+- 统一采用 `NDatePicker type="datetimerange"`（输出标准时间戳区间，清空为 `null`），提交前序列化为 ISO 字符串并重置页码，详见 `DESIGN.md §9.15`。
+
+### 8.15 登录页工程美学与交互规范
+
+登录页（`web/src/views/auth/Login.vue`）作为系统的核心入口门面，定位于严谨、专业的云原生基础设施与堡垒机控制台，**坚决摒弃廉价泛滥的「AI 味」浮夸元素**（如大面积高饱和粉紫霓虹流体弥散光球、旋转光斑、科幻粒子飞舞或塑料毛玻璃眩光）：
+- 采用纯净暗色深底（`#090d16`）、36px 精密工程蓝图网格、以及 RAF 物理阻尼插值鼠标探照灯网格追踪（仅高精度指针设备激活跟随，移动端保持静态居中降级）；
+- 卡片采用微弱磨砂质感（对应 `#131b2e` 底色）、顶缘微高光流线、四角十字定位准星（`.ch-mark`），不堆砌冗余伪状态或硬编码端口；
+- 顶部 Logo 采用纯净无边框贴合渲染（`.login-logo-img` 42px 直接呈现），保持沉浸通透；
+- 严禁任何自行拼凑版本号的行为，严格遵守版本 100% 来源于官方 Release 的铁律（必读约定 3）。完整设计令牌与 CSS 实现详见 `DESIGN.md §9.14`。
+
 
 
 

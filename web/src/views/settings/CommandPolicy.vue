@@ -12,7 +12,7 @@ import {
   NIcon,
   useMessage,
 } from 'naive-ui'
-import { ShieldCheckmarkOutline, TrashOutline, AddOutline, RefreshOutline } from '@vicons/ionicons5'
+import { ShieldCheckmarkOutline, TrashOutline, AddOutline, RefreshOutline, DocumentTextOutline } from '@vicons/ionicons5'
 import { h } from 'vue'
 import {
   getCommandPolicy,
@@ -23,6 +23,8 @@ import {
 } from '../../api/policy'
 import { useTablePagination } from '../../composables/useTablePagination'
 import { fmtDateTime } from '../../utils/time'
+
+defineOptions({ name: 'CommandPolicy' })
 
 const message = useMessage()
 
@@ -274,33 +276,39 @@ onMounted(() => {
       <NSpace justify="end">
         <NButton :loading="saving" type="primary" @click="savePolicy">保存策略</NButton>
       </NSpace>
-
-      <!-- Audit log -->
-      <div class="audit-section">
-        <div class="audit-header">
-          <span class="section-title">命令拦截审计</span>
-          <NSpace align="center" :size="10">
-            <span class="muted">共 {{ auditEntries.length }} 条</span>
-            <NButton size="small" quaternary :loading="auditLoading" @click="loadAudit">
-              <template #icon><NIcon><RefreshOutline /></NIcon></template>
-              刷新
-            </NButton>
-          </NSpace>
-        </div>
-        <NDataTable
-          :columns="auditColumns"
-          :data="auditEntries"
-          :pagination="auditPagination"
-          size="small"
-          :bordered="false"
-          :row-key="(r: CommandAuditEntry) => r.id"
-        >
-          <template #empty>
-            <NEmpty description="暂无命令拦截记录" />
-          </template>
-        </NDataTable>
-      </div>
     </NSpace>
+  </NCard>
+
+  <!-- 命令拦截审计独立卡片 -->
+  <NCard :bordered="false" size="small" style="margin-top: 14px">
+    <template #header>
+      <span style="font-size: 16px; font-weight: 700">
+        <NIcon style="vertical-align: middle; margin-right: 6px"><DocumentTextOutline /></NIcon>
+        命令拦截审计
+      </span>
+    </template>
+    <template #header-extra>
+      <NSpace align="center" :size="10">
+        <span class="muted">共 {{ auditEntries.length }} 条</span>
+        <NButton size="small" quaternary :loading="auditLoading" @click="loadAudit">
+          <template #icon><NIcon><RefreshOutline /></NIcon></template>
+          刷新
+        </NButton>
+      </NSpace>
+    </template>
+
+    <NDataTable
+      :columns="auditColumns"
+      :data="auditEntries"
+      :pagination="auditPagination"
+      size="small"
+      :bordered="false"
+      :row-key="(r: CommandAuditEntry) => r.id"
+    >
+      <template #empty>
+        <NEmpty description="暂无命令拦截记录" />
+      </template>
+    </NDataTable>
   </NCard>
 </template>
 
@@ -337,22 +345,6 @@ onMounted(() => {
     font-family: 'JetBrains Mono', Consolas, monospace;
     font-size: 12px;
     color: var(--text-primary);
-  }
-}
-
-.audit-section {
-  margin-top: 8px;
-
-  .audit-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 8px;
-  }
-
-  .section-title {
-    font-size: 14px;
-    font-weight: 600;
   }
 }
 </style>

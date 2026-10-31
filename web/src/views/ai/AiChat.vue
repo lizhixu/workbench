@@ -8,7 +8,7 @@ import {
   NEmpty,
   useMessage,
 } from 'naive-ui'
-import { ChatbubbleEllipsesOutline, PaperPlaneOutline, SparklesOutline, CopyOutline } from '@vicons/ionicons5'
+import { ChatbubbleEllipsesOutline, SparklesOutline, CopyOutline } from '@vicons/ionicons5'
 import { chat, type ChatMessage, type ChatResponse } from '../../api/ai'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { copyToClipboard } from '../../utils/clipboard'
@@ -295,15 +295,13 @@ onBeforeUnmount(() => {
             </div>
             <NButton
               type="primary"
-              circle
+              size="small"
               class="send-btn"
               :loading="loading"
               :disabled="!inputText.trim()"
-              title="发送"
-              aria-label="发送"
               @click="send()"
             >
-              <template #icon><NIcon><PaperPlaneOutline /></NIcon></template>
+              发送
             </NButton>
           </div>
         </div>
@@ -592,14 +590,7 @@ onBeforeUnmount(() => {
 
       .send-btn {
         flex-shrink: 0;
-        width: 36px;
-        height: 36px;
-        font-size: 16px;
-
-        &:disabled {
-          background-color: var(--bg-hover);
-          color: var(--text-muted);
-        }
+        margin-left: auto;
       }
     }
   }
@@ -634,11 +625,6 @@ onBeforeUnmount(() => {
         .composer-hints {
           /* 窄屏空间紧张，快捷键提示隐藏，只保留发送按钮 */
           display: none;
-        }
-
-        .send-btn {
-          width: 40px;
-          height: 40px;
         }
       }
     }

@@ -28,14 +28,16 @@ const chatBodyRef = ref<HTMLElement | null>(null)
 // ---- 输入框高度拖拽 ----
 // 输入框默认单行高度；拖住上方把手向上拉可增高，消息列表相应让出空间。
 // 下限 MIN_INPUT_H，上限保证消息列表至少留 INPUT_MIN_LIST_H，避免拖到把对话区挤没。
+// 上限同时扣除输入卡底栏（快捷键提示 + 发送按钮）的固定高度，保证的列表高度才是真的。
 const MIN_INPUT_H = 64
 const INPUT_MIN_LIST_H = 180
+const COMPOSER_EXTRA_H = 46
 const inputH = ref(MIN_INPUT_H)
 const resizingInput = ref(false)
 
 function maxInputHeight(): number {
   const bodyH = chatBodyRef.value?.clientHeight ?? 0
-  return Math.max(bodyH - INPUT_MIN_LIST_H, MIN_INPUT_H)
+  return Math.max(bodyH - INPUT_MIN_LIST_H - COMPOSER_EXTRA_H, MIN_INPUT_H)
 }
 
 function startInputResize(e: PointerEvent) {
@@ -272,26 +274,38 @@ onBeforeUnmount(() => {
         >
           <span class="grip" />
         </div>
-        <div class="input-row">
+        <div class="chat-composer">
           <NInput
             v-model:value="inputText"
             type="textarea"
             :rows="2"
-            placeholder="输入你的运维问题，例如：哪台机器磁盘快满了？最近有哪些异常告警？（Shift+Enter 换行，Enter 发送）"
-            class="fixed-chat-input"
+            :bordered="false"
+            placeholder="输入你的运维问题，例如：哪台机器磁盘快满了？最近有哪些异常告警？"
+            class="composer-input"
             :style="{ height: `${inputH}px` }"
             @keydown.enter.exact.prevent="send()"
           />
-          <NButton
-            type="primary"
-            class="send-btn"
-            :loading="loading"
-            :disabled="!inputText.trim()"
-            @click="send()"
-          >
-            <template #icon><NIcon><PaperPlaneOutline /></NIcon></template>
-            发送
-          </NButton>
+          <div class="composer-footer">
+            <div class="composer-hints">
+              <span class="hint-key">Enter</span>
+              <span>发送</span>
+              <span class="hint-dot">·</span>
+              <span class="hint-key">Shift+Enter</span>
+              <span>换行</span>
+            </div>
+            <NButton
+              type="primary"
+              circle
+              class="send-btn"
+              :loading="loading"
+              :disabled="!inputText.trim()"
+              title="发送"
+              aria-label="发送"
+              @click="send()"
+            >
+              <template #icon><NIcon><PaperPlaneOutline /></NIcon></template>
+            </NButton>
+          </div>
         </div>
       </div>
     </div>
@@ -506,24 +520,31 @@ onBeforeUnmount(() => {
       }
     }
 
-    .input-row {
-      display: flex;
-      align-items: flex-end;
-      gap: 10px;
-      width: 100%;
+    /* CherryStudio 风格一体化输入卡：圆角容器承载无边框 textarea 与底部工具行，
+       聚焦时容器整体点亮，而非输入框自身描边。 */
+    .chat-composer {
+      border: 1px solid var(--border-color);
+      border-radius: 14px;
+      background: var(--bg-card);
+      box-shadow: var(--shadow-sm);
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+      overflow: hidden;
 
-      .fixed-chat-input {
-        flex: 1;
-        min-width: 0;
-        min-height: 64px;
+      &:focus-within {
+        border-color: rgba(99, 102, 241, 0.55);
+        box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
+      }
+
+      .composer-input {
+        background-color: transparent;
+        --n-border-radius: 0;
+
+        :deep(.n-input-wrapper) {
+          padding: 10px 14px 4px;
+        }
 
         :deep(.n-input__textarea) {
           height: 100%;
-        }
-
-        :deep(.n-input-wrapper) {
-          height: 100%;
-          padding: 8px 12px;
         }
 
         :deep(textarea) {
@@ -531,15 +552,54 @@ onBeforeUnmount(() => {
           resize: none !important;
           line-height: 1.5;
           font-size: 13.5px;
+          background: transparent;
+        }
+      }
+
+      .composer-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 4px 8px 8px 12px;
+      }
+
+      .composer-hints {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 12px;
+        color: var(--text-muted, #9ca3af);
+        min-width: 0;
+        white-space: nowrap;
+        overflow: hidden;
+
+        .hint-key {
+          font-family: 'JetBrains Mono', Consolas, monospace;
+          font-size: 11px;
+          line-height: 1;
+          padding: 3px 6px;
+          border-radius: 4px;
+          border: 1px solid var(--border-color);
+          background: var(--bg-card-subtle);
+          color: var(--text-secondary);
+        }
+
+        .hint-dot {
+          color: var(--text-muted);
         }
       }
 
       .send-btn {
         flex-shrink: 0;
-        width: 88px;
-        height: 64px;
-        font-size: 14px;
-        font-weight: 500;
+        width: 36px;
+        height: 36px;
+        font-size: 16px;
+
+        &:disabled {
+          background-color: var(--bg-hover);
+          color: var(--text-muted);
+        }
       }
     }
   }
@@ -570,8 +630,16 @@ onBeforeUnmount(() => {
         display: none;
       }
 
-      :deep(.n-input-group) {
-        flex-wrap: wrap;
+      .chat-composer {
+        .composer-hints {
+          /* 窄屏空间紧张，快捷键提示隐藏，只保留发送按钮 */
+          display: none;
+        }
+
+        .send-btn {
+          width: 40px;
+          height: 40px;
+        }
       }
     }
   }

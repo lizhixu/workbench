@@ -68,65 +68,65 @@ type AppPortMapping struct {
 // context (draft base / chat context). Secret values inside it are redacted
 // before anything is sent to the model (see redactFormForLLM).
 type AppFormSnapshot struct {
-	SourceMode      string            `json:"source_mode"` // template|image|compose|github|custom
-	Name            string            `json:"name"`
-	ContainerName   string            `json:"container_name"`
-	HostID          string            `json:"host_id"`
-	TemplateID      string            `json:"template_id"`
-	TemplateParams  map[string]string `json:"template_params"`
-		Image                 string            `json:"image"`
-		ComposeContent        string            `json:"compose_content"`
-		MeshForwardEnabled    bool              `json:"mesh_forward_enabled"`
-		MeshForwardHostID     string            `json:"mesh_forward_host_id"`
-		MeshForwardEntryPort  int               `json:"mesh_forward_entry_port"`
-		MeshForwardTargetPort int               `json:"mesh_forward_target_port"`
-		RepoURL               string            `json:"repo_url"`
-	Branch          string            `json:"branch"`
-	AuthVaultID     string            `json:"auth_vault_id"`
-	AutoDeploy      bool              `json:"auto_deploy"`
-	BuildType       string            `json:"build_type"`
-	Dockerfile      string            `json:"dockerfile"`
-	BuildContext    string            `json:"build_context"`
-	BuildTimeoutSec int               `json:"build_timeout_sec"`
-	Ports           []AppPortMapping  `json:"ports"`
-	EnvVars         map[string]string `json:"env_vars"`
-	Volumes         []string          `json:"volumes"`
-	HealthcheckURL  string            `json:"healthcheck_url"`
-	Domain          string            `json:"domain"`
-	ProxyMode       string            `json:"proxy_mode"`
-	GatewayHostID   string            `json:"gateway_host_id"`
+	SourceMode            string            `json:"source_mode"` // template|image|compose|github|custom
+	Name                  string            `json:"name"`
+	ContainerName         string            `json:"container_name"`
+	HostID                string            `json:"host_id"`
+	TemplateID            string            `json:"template_id"`
+	TemplateParams        map[string]string `json:"template_params"`
+	Image                 string            `json:"image"`
+	ComposeContent        string            `json:"compose_content"`
+	MeshForwardEnabled    bool              `json:"mesh_forward_enabled"`
+	MeshForwardHostID     string            `json:"mesh_forward_host_id"`
+	MeshForwardEntryPort  int               `json:"mesh_forward_entry_port"`
+	MeshForwardTargetPort int               `json:"mesh_forward_target_port"`
+	RepoURL               string            `json:"repo_url"`
+	Branch                string            `json:"branch"`
+	AuthVaultID           string            `json:"auth_vault_id"`
+	AutoDeploy            bool              `json:"auto_deploy"`
+	BuildType             string            `json:"build_type"`
+	Dockerfile            string            `json:"dockerfile"`
+	BuildContext          string            `json:"build_context"`
+	BuildTimeoutSec       int               `json:"build_timeout_sec"`
+	Ports                 []AppPortMapping  `json:"ports"`
+	EnvVars               map[string]string `json:"env_vars"`
+	Volumes               []string          `json:"volumes"`
+	HealthcheckURL        string            `json:"healthcheck_url"`
+	Domain                string            `json:"domain"`
+	ProxyMode             string            `json:"proxy_mode"`
+	GatewayHostID         string            `json:"gateway_host_id"`
 }
 
 // AppDraft is the model-proposed form fill. Every scalar is a pointer so
 // "leave unchanged" (absent) is distinguishable from an explicit value; the
 // frontend applies only the fields that are present.
 type AppDraft struct {
-	SourceType      *string           `json:"source_type,omitempty"` // template|image|raw_compose|git
-	Name            *string           `json:"name,omitempty"`
-	ContainerName   *string           `json:"container_name,omitempty"`
-	HostID          *string           `json:"host_id,omitempty"`
-	TemplateID      *string           `json:"template_id,omitempty"`
-	TemplateParams  map[string]string `json:"template_params,omitempty"`
-		Image                 *string           `json:"image,omitempty"`
-		ComposeContent        *string           `json:"compose_content,omitempty"`
-		MeshForwardEnabled    *bool             `json:"mesh_forward_enabled,omitempty"`
-		MeshForwardHostID     *string           `json:"mesh_forward_host_id,omitempty"`
-		MeshForwardEntryPort  *int              `json:"mesh_forward_entry_port,omitempty"`
-		MeshForwardTargetPort *int              `json:"mesh_forward_target_port,omitempty"`
-		RepoURL               *string           `json:"repo_url,omitempty"`
-	Branch          *string           `json:"branch,omitempty"`
-	AutoDeploy      *bool             `json:"auto_deploy,omitempty"`
-	BuildType       *string           `json:"build_type,omitempty"`
-	Dockerfile      *string           `json:"dockerfile,omitempty"`
-	BuildContext    *string           `json:"build_context,omitempty"`
-	BuildTimeoutSec *int              `json:"build_timeout_sec,omitempty"`
-	Ports           []AppPortMapping  `json:"ports,omitempty"`
-	EnvVars         map[string]string `json:"env_vars,omitempty"`
-	Volumes         []string          `json:"volumes,omitempty"`
-	HealthcheckURL  *string           `json:"healthcheck_url,omitempty"`
-	Domain          *string           `json:"domain,omitempty"`
-	ProxyMode       *string           `json:"proxy_mode,omitempty"`
-	GatewayHostID   *string           `json:"gateway_host_id,omitempty"`
+	SourceType            *string           `json:"source_type,omitempty"` // template|image|raw_compose|git
+	Name                  *string           `json:"name,omitempty"`
+	ContainerName         *string           `json:"container_name,omitempty"`
+	HostID                *string           `json:"host_id,omitempty"`
+	TemplateID            *string           `json:"template_id,omitempty"`
+	TemplateParams        map[string]string `json:"template_params,omitempty"`
+	Image                 *string           `json:"image,omitempty"`
+	ComposeContent        *string           `json:"compose_content,omitempty"`
+	MeshForwardEnabled    *bool             `json:"mesh_forward_enabled,omitempty"`
+	MeshForwardHostID     *string           `json:"mesh_forward_host_id,omitempty"`
+	MeshForwardEntryPort  *int              `json:"mesh_forward_entry_port,omitempty"`
+	MeshForwardTargetPort *int              `json:"mesh_forward_target_port,omitempty"`
+	RepoURL               *string           `json:"repo_url,omitempty"`
+	Branch                *string           `json:"branch,omitempty"`
+	AutoDeploy            *bool             `json:"auto_deploy,omitempty"`
+	BuildType             *string           `json:"build_type,omitempty"`
+	Dockerfile            *string           `json:"dockerfile,omitempty"`
+	BuildContext          *string           `json:"build_context,omitempty"`
+	BuildTimeoutSec       *int              `json:"build_timeout_sec,omitempty"`
+	Ports                 []AppPortMapping  `json:"ports,omitempty"`
+	EnvVars               map[string]string `json:"env_vars,omitempty"`
+	Volumes               []string          `json:"volumes,omitempty"`
+	HealthcheckURL        *string           `json:"healthcheck_url,omitempty"`
+	Domain                *string           `json:"domain,omitempty"`
+	ProxyMode             *string           `json:"proxy_mode,omitempty"`
+	GatewayHostID         *string           `json:"gateway_host_id,omitempty"`
 }
 
 // AppDraftResponse is the sanitized one-shot form draft.
@@ -224,21 +224,140 @@ func templatesContext(templates []AppTemplateInfo) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// extractJSONPayload strips markdown fences and surrounding prose so a
+// stripReasoningTags removes <think>...</think> and <thought>...</thought> blocks
+// emitted by reasoning models (such as DeepSeek-R1, Qwen-QwQ).
+func stripReasoningTags(s string) string {
+	tags := [][2]string{
+		{"<think>", "</think>"},
+		{"<thought>", "</thought>"},
+	}
+	res := s
+	for _, t := range tags {
+		for {
+			start := strings.Index(res, t[0])
+			if start == -1 {
+				break
+			}
+			end := strings.Index(res[start:], t[1])
+			if end == -1 {
+				res = res[:start]
+				break
+			}
+			res = res[:start] + res[start+end+len(t[1]):]
+		}
+	}
+	return strings.TrimSpace(res)
+}
+
+// repairJSON cleans up common LLM JSON syntax issues such as unescaped control
+// characters (raw newlines/tabs inside string literals) and trailing commas before } or ].
+func repairJSON(s string) string {
+	if s == "" {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+	inString := false
+	escaped := false
+	n := len(s)
+
+	for i := 0; i < n; i++ {
+		ch := s[i]
+		if !inString {
+			if ch == '"' {
+				inString = true
+				b.WriteByte(ch)
+			} else if ch == ',' {
+				// Look ahead for trailing comma before } or ]
+				j := i + 1
+				for j < n && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r' || s[j] == '\n') {
+					j++
+				}
+				if j < n && (s[j] == '}' || s[j] == ']') {
+					// Skip trailing comma
+					continue
+				}
+				b.WriteByte(ch)
+			} else {
+				b.WriteByte(ch)
+			}
+		} else {
+			if escaped {
+				escaped = false
+				b.WriteByte(ch)
+			} else if ch == '\\' {
+				escaped = true
+				b.WriteByte(ch)
+			} else if ch == '"' {
+				inString = false
+				b.WriteByte(ch)
+			} else if ch == '\n' {
+				b.WriteString(`\n`)
+			} else if ch == '\r' {
+				// drop CR in string literal
+			} else if ch == '\t' {
+				b.WriteString(`\t`)
+			} else {
+				b.WriteByte(ch)
+			}
+		}
+	}
+	return b.String()
+}
+
+// extractJSONPayload strips markdown fences, reasoning tags and surrounding prose so a
 // strict JSON object can be unmarshalled (mirrors the Nl2Command cleanup).
 func extractJSONPayload(answer string) string {
-	s := strings.TrimSpace(answer)
-	s = strings.TrimPrefix(s, "```json")
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimSuffix(s, "```")
+	s := stripReasoningTags(answer)
+	if i := strings.Index(s, "```"); i >= 0 {
+		after := s[i+3:]
+		if nl := strings.Index(after, "\n"); nl >= 0 {
+			after = after[nl+1:]
+		}
+		if end := strings.Index(after, "```"); end >= 0 {
+			s = after[:end]
+		} else {
+			s = after
+		}
+	}
 	s = strings.TrimSpace(s)
-	if i := strings.Index(s, "{"); i > 0 {
+	if i := strings.Index(s, "{"); i >= 0 {
 		s = s[i:]
 	}
-	if j := strings.LastIndex(s, "}"); j >= 0 && j < len(s)-1 {
+	if j := strings.LastIndex(s, "}"); j >= 0 {
 		s = s[:j+1]
 	}
-	return s
+	return repairJSON(strings.TrimSpace(s))
+}
+
+// fallbackExtractAnswer extracts user-facing answer text when strict JSON unmarshal fails,
+// preventing raw JSON payloads like {"answer": "...", "form_patch": ...} from leaking to users.
+func fallbackExtractAnswer(answer string) string {
+	cleaned := stripReasoningTags(answer)
+	// Try to match "answer"\s*:\s*"(...)"
+	re := regexp.MustCompile(`(?s)"answer"\s*:\s*"((?:[^"\\]|\\.)*)"`)
+	if m := re.FindStringSubmatch(cleaned); len(m) > 1 {
+		var s string
+		if err := json.Unmarshal([]byte(`"`+m[1]+`"`), &s); err == nil && s != "" {
+			return strings.TrimSpace(s)
+		}
+		val := strings.ReplaceAll(m[1], `\n`, "\n")
+		val = strings.ReplaceAll(val, `\"`, `"`)
+		val = strings.ReplaceAll(val, `\\`, `\`)
+		return strings.TrimSpace(val)
+	}
+	// Fallback: strip code fences if any
+	s := cleaned
+	if i := strings.Index(s, "```"); i >= 0 {
+		after := s[i+3:]
+		if nl := strings.Index(after, "\n"); nl >= 0 {
+			after = after[nl+1:]
+		}
+		if end := strings.Index(after, "```"); end >= 0 {
+			s = after[:end]
+		}
+	}
+	return strings.TrimSpace(s)
 }
 
 var composeSecretLineRe = regexp.MustCompile(`(?i)((?:password|passwd|secret|token|api[_-]?key)\s*[:=]\s*)\S+`)
@@ -329,43 +448,43 @@ func sanitizeAppDraft(d *AppDraft, form AppFormSnapshot, hosts []appHostInfo, te
 		tplByID[t.ID] = t
 	}
 
-		// Source type whitelist.
-		if d.SourceType != nil {
-			switch *d.SourceType {
-			case "template", "image", "raw_compose", "git":
-			default:
-				addWarning(fmt.Sprintf("AI 给出的部署来源 %q 不受支持，已忽略", *d.SourceType))
-				d.SourceType = nil
-			}
+	// Source type whitelist.
+	if d.SourceType != nil {
+		switch *d.SourceType {
+		case "template", "image", "raw_compose", "git":
+		default:
+			addWarning(fmt.Sprintf("AI 给出的部署来源 %q 不受支持，已忽略", *d.SourceType))
+			d.SourceType = nil
 		}
+	}
 
-		// 组网转发参数校验
-		if d.MeshForwardEnabled != nil && *d.MeshForwardEnabled {
-			if d.MeshForwardHostID != nil {
-				fwdHost, ok := hostByID[*d.MeshForwardHostID]
-				effHost := form.HostID
-				if d.HostID != nil {
-					effHost = *d.HostID
-				}
-				if !ok {
-					addWarning("AI 选择的组网转发入口主机不存在或不在线，已忽略")
-					d.MeshForwardHostID = nil
-				} else if effHost != "" && *d.MeshForwardHostID == effHost {
-					addWarning("AI 选择的组网转发入口主机与应用主机相同，已忽略")
-					d.MeshForwardHostID = nil
-				} else if fwdHost.MeshIP == "" {
-					addWarning("AI 选择的组网转发入口主机未加入异地组网，将按直连转发，请确认网络可达")
-				}
+	// 组网转发参数校验
+	if d.MeshForwardEnabled != nil && *d.MeshForwardEnabled {
+		if d.MeshForwardHostID != nil {
+			fwdHost, ok := hostByID[*d.MeshForwardHostID]
+			effHost := form.HostID
+			if d.HostID != nil {
+				effHost = *d.HostID
 			}
-			if d.MeshForwardEntryPort != nil && (*d.MeshForwardEntryPort < 1 || *d.MeshForwardEntryPort > 65535) {
-				addWarning("AI 给出的组网转发入口端口不合法，已忽略")
-				d.MeshForwardEntryPort = nil
-			}
-			if d.MeshForwardTargetPort != nil && (*d.MeshForwardTargetPort < 1 || *d.MeshForwardTargetPort > 65535) {
-				addWarning("AI 给出的组网转发目标端口不合法，已忽略")
-				d.MeshForwardTargetPort = nil
+			if !ok {
+				addWarning("AI 选择的组网转发入口主机不存在或不在线，已忽略")
+				d.MeshForwardHostID = nil
+			} else if effHost != "" && *d.MeshForwardHostID == effHost {
+				addWarning("AI 选择的组网转发入口主机与应用主机相同，已忽略")
+				d.MeshForwardHostID = nil
+			} else if fwdHost.MeshIP == "" {
+				addWarning("AI 选择的组网转发入口主机未加入异地组网，将按直连转发，请确认网络可达")
 			}
 		}
+		if d.MeshForwardEntryPort != nil && (*d.MeshForwardEntryPort < 1 || *d.MeshForwardEntryPort > 65535) {
+			addWarning("AI 给出的组网转发入口端口不合法，已忽略")
+			d.MeshForwardEntryPort = nil
+		}
+		if d.MeshForwardTargetPort != nil && (*d.MeshForwardTargetPort < 1 || *d.MeshForwardTargetPort > 65535) {
+			addWarning("AI 给出的组网转发目标端口不合法，已忽略")
+			d.MeshForwardTargetPort = nil
+		}
+	}
 
 	// Host must be one of the online hosts.
 	if d.HostID != nil {
@@ -605,54 +724,54 @@ func sanitizeAppDraft(d *AppDraft, form AppFormSnapshot, hosts []appHostInfo, te
 				}
 			}
 		}
-		case "image":
-			if pickStr(d.Image, form.Image) == "" {
-				addMissing("镜像地址")
-			}
-		case "raw_compose":
-			if pickStr(d.ComposeContent, form.ComposeContent) == "" {
-				addMissing("Compose 内容")
-			}
-		case "git":
-			if pickStr(d.RepoURL, form.RepoURL) == "" {
-				addMissing("Git 仓库地址")
-			}
+	case "image":
+		if pickStr(d.Image, form.Image) == "" {
+			addMissing("镜像地址")
 		}
-		if effSource != "template" && pickStr(d.Name, form.Name) == "" {
-			addMissing("应用名称")
+	case "raw_compose":
+		if pickStr(d.ComposeContent, form.ComposeContent) == "" {
+			addMissing("Compose 内容")
 		}
-
-		effFwdEnabled := form.MeshForwardEnabled
-		if d.MeshForwardEnabled != nil {
-			effFwdEnabled = *d.MeshForwardEnabled
+	case "git":
+		if pickStr(d.RepoURL, form.RepoURL) == "" {
+			addMissing("Git 仓库地址")
 		}
-		if effFwdEnabled {
-			effFwdHost := form.MeshForwardHostID
-			if d.MeshForwardHostID != nil {
-				effFwdHost = *d.MeshForwardHostID
-			}
-			if effFwdHost == "" {
-				addMissing("组网转发入口主机")
-			}
-			effFwdPort := form.MeshForwardEntryPort
-			if d.MeshForwardEntryPort != nil {
-				effFwdPort = *d.MeshForwardEntryPort
-			}
-			if effFwdPort <= 0 {
-				addMissing("组网转发入口端口")
-			}
-		}
-
-		if missing == nil {
-			missing = []string{}
-		}
-		if warnings == nil {
-			warnings = []string{}
-		}
-		return missing, warnings
+	}
+	if effSource != "template" && pickStr(d.Name, form.Name) == "" {
+		addMissing("应用名称")
 	}
 
-	const appAssistSystemRules = `规则：
+	effFwdEnabled := form.MeshForwardEnabled
+	if d.MeshForwardEnabled != nil {
+		effFwdEnabled = *d.MeshForwardEnabled
+	}
+	if effFwdEnabled {
+		effFwdHost := form.MeshForwardHostID
+		if d.MeshForwardHostID != nil {
+			effFwdHost = *d.MeshForwardHostID
+		}
+		if effFwdHost == "" {
+			addMissing("组网转发入口主机")
+		}
+		effFwdPort := form.MeshForwardEntryPort
+		if d.MeshForwardEntryPort != nil {
+			effFwdPort = *d.MeshForwardEntryPort
+		}
+		if effFwdPort <= 0 {
+			addMissing("组网转发入口端口")
+		}
+	}
+
+	if missing == nil {
+		missing = []string{}
+	}
+	if warnings == nil {
+		warnings = []string{}
+	}
+	return missing, warnings
+}
+
+const appAssistSystemRules = `规则：
 	1. 只返回一个 JSON 对象，不要输出任何解释性文字或 markdown 围栏。
 	2. source_type 只能是 "template"、"image"、"raw_compose"、"git" 之一；用户说"部署某个现成软件/模板"时优先 template；给镜像名时用 image；用户贴了或要求 compose 编排时用 raw_compose；给 Git 仓库时用 git。
 	3. host_id 只能从「可用主机」清单中选择 id；用户按主机名或 IP 指代某台时据此匹配；完全没提部署到哪里时留空（不要瞎猜）。
@@ -666,7 +785,7 @@ func sanitizeAppDraft(d *AppDraft, form AppFormSnapshot, hosts []appHostInfo, te
 	11. proxy_mode 为 "gateway" 时 gateway_host_id 只能从「可用主机」清单中选择，优先选有公网IP 的在线主机，且不能与应用主机 host_id 相同；网关到应用主机可走异地组网或直连（公网/内网 IP），组网不是必需条件。用户没有提到域名或反向代理时，不要输出 domain / proxy_mode / gateway_host_id。
 	12. 用户要求"通过某台入口主机中继/转发端口访问该应用"时，设置 mesh_forward_enabled 为 true，mesh_forward_host_id 从「可用主机」清单选择入口主机（优先有公网IP，不能等于应用主机 host_id），mesh_forward_entry_port 为入口主机监听端口，mesh_forward_target_port 为应用暴露端口。`
 
-	const appDraftJSONSpec = `返回 JSON 格式（字段没把握就省略该字段，不要填 null）：
+const appDraftJSONSpec = `返回 JSON 格式（字段没把握就省略该字段，不要填 null）：
 	{"draft":{"source_type":"template","name":"应用名","container_name":"","host_id":"主机id","template_id":"模板id","template_params":{"键":"值"},"image":"镜像","compose_content":"YAML","repo_url":"https://...","branch":"main","build_type":"dockerfile","dockerfile":"Dockerfile","build_context":".","build_timeout_sec":900,"auto_deploy":true,"ports":[{"host":8080,"container":80,"bind_scope":"public"}],"mesh_forward_enabled":false,"mesh_forward_host_id":"","mesh_forward_entry_port":0,"mesh_forward_target_port":0,"env_vars":{"K":"V"},"volumes":["/host:/container"],"healthcheck_url":"","domain":"","proxy_mode":"local","gateway_host_id":""},"explanation":"选型说明","missing":["目标主机"],"warnings":[]}`
 
 // AppDraft turns a natural-language requirement into a sanitized create-app
@@ -826,9 +945,11 @@ func (a *Assistant) AppChat(ctx context.Context, question string, history []Chat
 		FormPatch *AppDraft `json:"form_patch"`
 	}
 	resp := &AppChatResponse{Model: cfg.Model}
-	if err := json.Unmarshal([]byte(extractJSONPayload(answer)), &parsed); err != nil {
-		// Degrade gracefully: a non-JSON reply is still a usable answer.
-		resp.Answer = strings.TrimSpace(answer)
+	rawJSON := extractJSONPayload(answer)
+	if err := json.Unmarshal([]byte(rawJSON), &parsed); err != nil {
+		// Degrade gracefully: try to extract "answer" field if present,
+		// or strip reasoning tags and code fences so raw JSON isn't dumped to user.
+		resp.Answer = fallbackExtractAnswer(answer)
 		return resp, nil
 	}
 	resp.Answer = strings.TrimSpace(parsed.Answer)

@@ -125,12 +125,15 @@ const selectedRepoFullName = ref<string | null>(null)
 
 // GitHub App 已安装仓库（无 PAT 时也能选仓；取数走 App 安装令牌）。
 const appInstalledRepos = ref<GitHubAppInstalledRepo[]>([])
-const githubSourceReady = computed(() => githubAccount.value !== null || appInstalledRepos.value.length > 0)
+const appConfigured = ref(false)
+const githubSourceReady = computed(() => githubAccount.value !== null || appConfigured.value)
 
 async function fetchAppInstalledRepos() {
   try {
     const st = await getGitHubAppStatus()
-    if (st.configured) appInstalledRepos.value = await listGitHubAppRepos()
+    appConfigured.value = st.configured
+    // 断开 App 后必须清空旧清单，否则已移除的安装仓库仍会出现在下拉里。
+    appInstalledRepos.value = st.configured ? await listGitHubAppRepos() : []
   } catch {
     // GitHub App 未配置时静默，PAT 流程不受影响
   }
@@ -715,18 +718,26 @@ const vaultOptions = computed(() => [
 
 const repoOptions = computed(() => {
   const patNames = new Set(githubRepos.value.map((r) => r.full_name))
+  const appNames = new Set(appInstalledRepos.value.map((r) => r.full_name))
+  const patOptions = githubRepos.value.map((r) => ({
+    // 同一仓库只保留账号授权一条；被 App 覆盖的在此点明——推送触发与
+    // 拉码凭据实际都由 App 优先，不能让人误以为是 PAT 在生效。
+    label:
+      `${r.full_name}${r.private ? ' [私有]' : ''}${r.description ? ' - ' + r.description : ''}` +
+      (appNames.has(r.full_name) ? ' · App 已覆盖' : ''),
+    value: r.full_name,
+  }))
+  // App 安装范围内、PAT 列表里没有的仓库才追加，避免同一仓库出现两次。
+  const appOptions = appInstalledRepos.value
+    .filter((r) => !patNames.has(r.full_name))
+    .map((r) => ({ label: r.full_name, value: r.full_name }))
   return [
-    ...githubRepos.value.map((r) => ({
-      label: `${r.full_name}${r.private ? ' [私有]' : ''}${r.description ? ' - ' + r.description : ''}`,
-      value: r.full_name,
-    })),
-    // GitHub App 安装仓库：PAT 列表里没有的才追加，避免同一仓库出现两次。
-    ...appInstalledRepos.value
-      .filter((r) => !patNames.has(r.full_name))
-      .map((r) => ({
-        label: `${r.full_name} [GitHub App]`,
-        value: r.full_name,
-      })),
+    ...(patOptions.length
+      ? [{ type: 'group' as const, key: 'pat', label: 'GitHub 账号（PAT）', children: patOptions }]
+      : []),
+    ...(appOptions.length
+      ? [{ type: 'group' as const, key: 'app', label: 'GitHub App 安装范围', children: appOptions }]
+      : []),
   ]
 })
 
@@ -1419,12 +1430,18 @@ onMounted(loadData)
                   <template v-if="githubAccount">
                     <NAvatar :src="githubAccount.avatar_url" round size="small" />
                     <span style="font-weight: 600">{{ githubAccount.name || githubAccount.login }}</span>
-                    <NTag size="tiny" type="success" :bordered="false">已授权连接</NTag>
+                    <NTag size="tiny" type="success" :bordered="false">GitHub 账号已授权</NTag>
                   </template>
-                  <template v-else>
-                    <NTag size="tiny" type="success" :bordered="false">GitHub App 已配置</NTag>
-                    <span class="hint">可直接从 App 安装仓库中选仓，部署拉取走安装令牌</span>
-                  </template>
+                  <NTag v-if="appConfigured" size="tiny" type="info" :bordered="false">
+                    GitHub App 已配置
+                  </NTag>
+                  <span v-if="appConfigured && !githubAccount" class="hint">
+                    {{
+                      appInstalledRepos.length
+                        ? '可直接从 App 安装仓库中选仓，部署拉取走安装令牌'
+                        : 'App 尚未同步到任何已安装仓库：请到「代码源设置」安装到账号/组织后刷新仓库'
+                    }}
+                  </span>
                 </NSpace>
                 <NSpace align="center" :size="4">
                   <NButton size="tiny" secondary @click="refreshRepoLists" :loading="loadingRepos">

@@ -11,6 +11,7 @@ import {
   chatAppAssistant, generateAppDraft, getAIConfig,
   type AppChatResponse, type AppDraftResponse, type AppFormDraft, type AppFormSnapshot,
 } from '../../api/ai'
+import { renderMarkdown } from '../../utils/markdown'
 
 const props = defineProps<{
   // Live form state (reactive in the parent); read fresh on every request
@@ -284,7 +285,7 @@ onMounted(async () => {
           <div v-if="draftResult" class="draft-result">
             <div v-if="draftResult.explanation" class="explain-card">
               <div class="block-label">AI 的选型说明</div>
-              <div class="explain-text">{{ draftResult.explanation }}</div>
+              <div class="explain-text markdown-body" v-html="renderMarkdown(draftResult.explanation)" />
             </div>
 
             <div v-if="draftResult.missing.length" class="note-block warn">
@@ -336,7 +337,12 @@ onMounted(async () => {
               class="chat-msg"
               :class="m.role"
             >
-              <div class="chat-body">{{ m.content }}</div>
+              <div
+                v-if="m.role === 'assistant'"
+                class="chat-body markdown-body"
+                v-html="renderMarkdown(m.content)"
+              />
+              <div v-else class="chat-body">{{ m.content }}</div>
               <div v-if="m.role === 'assistant' && m.patch" class="patch-card">
                 <div class="patch-title">建议修改</div>
                 <div v-for="line in describePatch(m.patch)" :key="line" class="patch-line">{{ line }}</div>
@@ -583,7 +589,6 @@ onMounted(async () => {
     font-size: 12.5px;
     line-height: 1.65;
     color: var(--text-primary);
-    white-space: pre-wrap;
   }
 }
 
@@ -721,6 +726,10 @@ onMounted(async () => {
       background-color: var(--bg-card);
       border: 1px solid var(--border-color);
       border-radius: 4px 12px 12px 12px;
+
+      &.markdown-body {
+        white-space: normal;
+      }
     }
   }
 
@@ -733,6 +742,167 @@ onMounted(async () => {
 
     &.thinking {
       padding: 10px 12px;
+    }
+  }
+}
+
+.markdown-body {
+  white-space: normal;
+  word-break: break-word;
+
+  :deep(> :first-child) {
+    margin-top: 0;
+  }
+  :deep(> :last-child) {
+    margin-bottom: 0;
+  }
+
+  :deep(p) {
+    margin: 6px 0;
+    line-height: 1.65;
+  }
+
+  :deep(h4),
+  :deep(h5),
+  :deep(h6) {
+    margin: 10px 0 4px;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1.4;
+  }
+
+  :deep(h4) {
+    font-size: 13.5px;
+  }
+  :deep(h5) {
+    font-size: 12.5px;
+  }
+  :deep(h6) {
+    font-size: 12px;
+  }
+
+  :deep(ul),
+  :deep(ol) {
+    margin: 6px 0;
+    padding-left: 18px;
+    line-height: 1.6;
+  }
+
+  :deep(li) {
+    margin: 3px 0;
+  }
+
+  :deep(strong) {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  :deep(em) {
+    font-style: italic;
+  }
+
+  :deep(del) {
+    text-decoration: line-through;
+    opacity: 0.75;
+  }
+
+  :deep(a) {
+    color: var(--primary-color, #6366f1);
+    text-decoration: none;
+    &:hover {
+      text-decoration: underline;
+    }
+  }
+
+  :deep(blockquote) {
+    margin: 8px 0;
+    padding: 6px 10px;
+    border-left: 3px solid var(--primary-color, #6366f1);
+    background: rgba(99, 102, 241, 0.06);
+    border-radius: 0 4px 4px 0;
+    color: var(--text-secondary);
+    font-size: 12px;
+  }
+
+  :deep(hr) {
+    border: none;
+    border-top: 1px solid var(--border-color);
+    margin: 10px 0;
+  }
+
+  :deep(code.md-inline-code) {
+    padding: 1px 5px;
+    margin: 0 2px;
+    border-radius: 4px;
+    background: rgba(125, 125, 125, 0.12);
+    font-family: var(--font-family-mono, monospace);
+    font-size: 11.5px;
+    color: var(--text-primary);
+  }
+
+  :deep(pre.md-code-block) {
+    margin: 8px 0;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: var(--code-box-bg, rgba(0, 0, 0, 0.28));
+    border: 1px solid var(--code-border, var(--border-color));
+    overflow-x: auto;
+    font-family: var(--font-family-mono, monospace);
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--text-primary);
+    position: relative;
+
+    &[data-lang]::before {
+      content: attr(data-lang);
+      position: absolute;
+      top: 4px;
+      right: 8px;
+      font-size: 10px;
+      text-transform: uppercase;
+      color: var(--text-secondary);
+      opacity: 0.7;
+      font-weight: 600;
+    }
+
+    code {
+      font-family: inherit;
+      font-size: inherit;
+      background: transparent;
+      padding: 0;
+      color: inherit;
+    }
+  }
+
+  :deep(.md-table-wrap) {
+    margin: 8px 0;
+    max-width: 100%;
+    overflow-x: auto;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+  }
+
+  :deep(table.md-table) {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11.5px;
+    line-height: 1.5;
+
+    th,
+    td {
+      padding: 5px 8px;
+      border: 1px solid var(--border-color);
+    }
+
+    th {
+      background: rgba(125, 125, 125, 0.08);
+      font-weight: 600;
+      color: var(--text-primary);
+      text-align: left;
+    }
+
+    tr:nth-child(even) td {
+      background: rgba(125, 125, 125, 0.03);
     }
   }
 }

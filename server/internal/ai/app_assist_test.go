@@ -178,10 +178,38 @@ func TestExtractJSONPayload(t *testing.T) {
 		"好的，结果如下：{\"a\":1} 完毕":    `{"a":1}`,
 		`{"a":1}`:       `{"a":1}`,
 		"  {\"a\":1}  ": `{"a":1}`,
+		"<think>思考过程...</think>\n```json\n{\"a\":1}\n```": `{"a":1}`,
+		"{\"a\":1,}":                  `{"a":1}`,
+		"{\"text\":\"line1\nline2\"}": `{"text":"line1\nline2"}`,
 	}
 	for in, want := range cases {
 		if got := extractJSONPayload(in); got != want {
 			t.Fatalf("extractJSONPayload(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFallbackExtractAnswer(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{
+			in:   `{"answer":"建议将端口改为 8080","form_patch":{"image":"nginx"}}`,
+			want: "建议将端口改为 8080",
+		},
+		{
+			in:   "<think>思考过程</think>\n`建议使用 nginx:alpine`",
+			want: "`建议使用 nginx:alpine`",
+		},
+		{
+			in:   "```markdown\n这是普通回复\n```",
+			want: "这是普通回复",
+		},
+	}
+	for _, tc := range cases {
+		if got := fallbackExtractAnswer(tc.in); got != tc.want {
+			t.Fatalf("fallbackExtractAnswer(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }

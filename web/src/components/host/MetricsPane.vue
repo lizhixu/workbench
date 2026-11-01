@@ -89,6 +89,25 @@ function fmtRate(n: number): string {
   return fmtBytes(n) + '/s'
 }
 
+// 速率 y 轴：整条轴按「峰值」统一选单位再保留小数。fmtBytes 是按单个数值
+// 四舍五入的，直接拿去格式化刻度会把相邻刻度压成同一个标签（0 B/s、0 B/s、
+// 1 B/s），这是空闲主机上 y 轴读不清的主要原因。
+function rateAxisMax(peak: number): number {
+  // 留 10% 余量避免曲线贴顶；峰值极小时兜底到 1 KB/s，免得刻度全挤在 0 附近
+  return Math.max(1024, Math.ceil(peak * 1.1))
+}
+
+function rateAxisFormatter(axisMax: number): (v: number) => string {
+  const unit = axisMax >= 1e9 ? 1e9 : axisMax >= 1e6 ? 1e6 : axisMax >= 1e3 ? 1e3 : 1
+  const suffix = unit === 1e9 ? ' GB/s' : unit === 1e6 ? ' MB/s' : unit === 1e3 ? ' KB/s' : ' B/s'
+  return (v: number) => {
+    const scaled = v / unit
+    if (unit === 1) return Math.round(scaled).toString() + suffix
+    const digits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2
+    return scaled.toFixed(digits) + suffix
+  }
+}
+
 // #rrggbb -> rgba() for echarts gradient stops.
 function hexToRgba(hex: string, alpha: number): string {
   const n = parseInt(hex.slice(1), 16)
@@ -123,16 +142,19 @@ function getBaseChartOption(title: string, sub: string, yAxisFormatter?: (v: num
       axisPointer: { type: 'line', lineStyle: { color: isDark ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.15)' } },
     },
     grid: {
+      // containLabel 按刻度文字实际宽度自动占位：固定 left: 54 在窄卡片里会把
+      // "8.00 KB/s" 这类长刻度截掉左半截，这也是截图里 y 轴读不清的主因。
+      containLabel: true,
       top: 48,
-      right: 18,
-      bottom: 24,
-      left: 54,
+      right: 16,
+      bottom: 26,
+      left: 6,
     },
     xAxis: {
       type: 'category',
       boundaryGap: false,
       axisLine: { lineStyle: { color: isDark ? 'rgba(255,255,255,0.1)' : '#e2e8f0' } },
-      axisLabel: { color: isDark ? '#9ca3af' : '#64748b', fontSize: 10 },
+      axisLabel: { color: isDark ? '#9ca3af' : '#64748b', fontSize: 11, margin: 8 },
       splitLine: { show: false },
       data: [] as string[],
     },
@@ -140,10 +162,15 @@ function getBaseChartOption(title: string, sub: string, yAxisFormatter?: (v: num
       type: 'value',
       max: max,
       min: 0,
+      // 刻度少而疏，避免数值轴上挤出一串几乎相同的标签
+      splitNumber: 4,
+      // 小于 1 个单位的刻度（B、ms）四舍五入后会出现重复标签，强制最小步长
+      minInterval: 1,
       axisLine: { show: false },
       axisLabel: {
         color: isDark ? '#9ca3af' : '#64748b',
-        fontSize: 10,
+        fontSize: 11,
+        margin: 8,
         formatter: yAxisFormatter || ((v: number) => v.toString()),
       },
       splitLine: { lineStyle: { color: isDark ? 'rgba(255,255,255,0.06)' : '#f1f5f9' } },
@@ -236,10 +263,12 @@ function updateChartsWithPoints(points: MetricPoint[]) {
 
   // 3. Network
   if (netChart) {
+    const netMax = rateAxisMax(points.reduce((m, p) => Math.max(m, p.net_rx, p.net_tx), 0))
     const opt: any = getBaseChartOption(
       '网络吞吐',
       [`↓ ${fmtRate(latest.net_rx)}`, `↑ ${fmtRate(latest.net_tx)}`].join(METRIC_SEP),
-      (v) => fmtBytes(v) + '/s',
+      rateAxisFormatter(netMax),
+      netMax,
     )
     opt.xAxis.data = times
     opt.tooltip.formatter = (params: any[]) => {
@@ -289,10 +318,12 @@ function updateChartsWithPoints(points: MetricPoint[]) {
 
   // 4. Disk
   if (diskChart) {
+    const diskMax = rateAxisMax(points.reduce((m, p) => Math.max(m, p.disk_read, p.disk_write), 0))
     const opt: any = getBaseChartOption(
       '磁盘读写',
       [`读 ${fmtRate(latest.disk_read)}`, `写 ${fmtRate(latest.disk_write)}`].join(METRIC_SEP),
-      (v) => fmtBytes(v) + '/s',
+      rateAxisFormatter(diskMax),
+      diskMax,
     )
     opt.xAxis.data = times
     opt.tooltip.formatter = (params: any[]) => {

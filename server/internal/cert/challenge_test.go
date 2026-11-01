@@ -1,8 +1,12 @@
 package cert
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -58,6 +62,72 @@ func TestPickSolvers(t *testing.T) {
 				t.Fatalf("pickSolvers = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestFirstWildcard pins the pre-flight wildcard detector: a single "*.host"
+// entry (any case, any surrounding whitespace, mixed with plain names) must
+// force the DNS-01 path before an ACME order is created.
+func TestFirstWildcard(t *testing.T) {
+	cases := []struct {
+		in   []string
+		want string
+		ok   bool
+	}{
+		{[]string{"example.com", "*.example.com"}, "*.example.com", true},
+		{[]string{"  *.EXAMPLE.com  "}, "*.example.com", true},
+		{[]string{"www.example.com", "example.com"}, "", false},
+		{nil, "", false},
+	}
+	for _, c := range cases {
+		got, ok := firstWildcard(c.in)
+		if got != c.want || ok != c.ok {
+			t.Errorf("firstWildcard(%v) = (%q, %v), want (%q, %v)", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// TestPresentTXTLeavesTTLToProvider pins the request shape sent to dns-mng:
+// no ttl field, so dns-mng applies the provider's own default. A hardcoded 300
+// was rejected by Tencent DNSPod ("LimitExceeded.RecordTtlLimit: 记录的TTL值超出了限制",
+// free tier floor is 600), while other providers default to 1/300/3600.
+func TestPresentTXTLeavesTTLToProvider(t *testing.T) {
+	var payload map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/acme/dns01/present" {
+			t.Errorf("path = %q, want /api/acme/dns01/present", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	d := &dnsMngChallenge{baseURL: srv.URL, http: srv.Client()}
+	if err := d.presentTXT("_acme-challenge.example.com", "txt-value"); err != nil {
+		t.Fatalf("presentTXT: %v", err)
+	}
+	if ttl, ok := payload["ttl"]; ok {
+		t.Errorf("payload must not pin ttl (provider defaults differ), got %v", ttl)
+	}
+	if payload["fqdn"] != "_acme-challenge.example.com" || payload["value"] != "txt-value" {
+		t.Errorf("payload = %v", payload)
+	}
+}
+
+// TestIssueACMEWildcardRejectsHTTP01 pins the pre-flight guard: an explicit
+// HTTP-01 preference plus a wildcard identifier must fail before any solver is
+// built (no :80 bind) or any ACME order is created.
+func TestIssueACMEWildcardRejectsHTTP01(t *testing.T) {
+	h := &Hub{}
+	acc := &ACMEAccount{Name: "test", DirectoryURL: "https://acme-v02.api.letsencrypt.org/directory"}
+	_, _, _, _, _, err := h.issueACME(acc, []string{"example.com", "*.example.com"}, ChallengeHTTP01, nil)
+	if err == nil {
+		t.Fatal("issueACME(wildcard, http-01) = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "*.example.com") || !strings.Contains(err.Error(), "DNS-01") {
+		t.Errorf("error = %q, want it to name the wildcard and DNS-01", err)
 	}
 }
 

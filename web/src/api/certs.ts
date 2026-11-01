@@ -14,6 +14,8 @@ export interface ACMEPreset {
   name: string
   directory_url: string
   requires_eab: boolean
+  /** CA rejects newAccount without a contact address (GTS) */
+  requires_contact?: boolean
   description: string
 }
 

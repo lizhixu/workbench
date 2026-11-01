@@ -180,11 +180,18 @@ func (d *dnsMngChallenge) call(path string, body any) error {
 }
 
 // presentTXT creates the _acme-challenge TXT record for fqdn.
+//
+// It deliberately sends no ttl: dns-mng maps a zero/absent TTL to the
+// provider's own default (tencentcloud 600, cloudflare 1 = auto, huaweicloud
+// 300, desec 3600, ...). A hardcoded value cannot be valid for every provider
+// — 300 was rejected by Tencent DNSPod with
+// "LimitExceeded.RecordTtlLimit: 记录的TTL值超出了限制" because its free tier
+// has a 600s floor. The CA validates against the authoritative nameserver, so
+// the provider default is also safe for propagation.
 func (d *dnsMngChallenge) presentTXT(fqdn, value string) error {
 	return d.call("/api/acme/dns01/present", map[string]any{
 		"fqdn":  fqdn,
 		"value": value,
-		"ttl":   300,
 	})
 }
 
@@ -285,6 +292,13 @@ func (a *acmeClient) directory() (map[string]string, error) {
 
 // ensureAccount registers or locates the ACME account for the account key.
 func (a *acmeClient) ensureAccount(accountKey crypto.Signer) error {
+	// Fail before the network round-trip when the CA's contact policy cannot
+	// be satisfied: GTS answers "Accounts must have at least one contact."
+	// which reads as an opaque CA fault to the operator.
+	if err := ValidateAccountContact(a.directoryURL, a.email); err != nil {
+		a.warnStagef("准备账户", "%v", err)
+		return err
+	}
 	a.logStagef("准备账户", "正在获取 ACME 机构 Directory: %s", a.directoryURL)
 	dir, err := a.directory()
 	if err != nil {
@@ -300,10 +314,11 @@ func (a *acmeClient) ensureAccount(accountKey crypto.Signer) error {
 	payload := map[string]any{
 		"termsOfServiceAgreed": true,
 	}
-	// RFC 8555: contact is optional. Let's Encrypt rejects addresses whose
-	// domain lacks a valid public suffix (e.g. the historically seeded
-	// admin@watchman.local), so omit the field entirely when no usable
-	// email is configured instead of sending a placeholder.
+	// RFC 8555 §7.3 makes contact optional; Let's Encrypt even rejects
+	// addresses whose domain lacks a valid public suffix (the historically
+	// seeded admin@watchman.local), so omit the field when no usable email is
+	// configured. CAs that do require it (GTS) are rejected earlier by
+	// ValidateAccountContact with an actionable message.
 	if email := strings.TrimSpace(a.email); email != "" {
 		payload["contact"] = []string{"mailto:" + email}
 	}
@@ -681,10 +696,16 @@ func (a *acmeClient) satisfyAuthorization(authzURL string, accountKey crypto.Sig
 	}
 	candidates := solvers.pickSolvers(authz.Identifier.Type, authz.Identifier.Value, offeredTypes)
 	if len(candidates) == 0 {
-		errMsg := fmt.Sprintf("no usable challenge for %s %q (CA offered: %s; available here: %s)",
-			authz.Identifier.Type, authz.Identifier.Value,
-			strings.Join(sortedKeys(offeredTypes), ", "),
-			strings.Join(solvers.availableTypes(), ", "))
+		var errMsg string
+		if strings.HasPrefix(authz.Identifier.Value, "*.") {
+			errMsg = fmt.Sprintf("泛域名 %q 只能使用 DNS-01 验证：dns-mng 未配置/未启用，或 CA 未下发 dns-01 挑战（CA 提供: %s）",
+				authz.Identifier.Value, strings.Join(sortedKeys(offeredTypes), ", "))
+		} else {
+			errMsg = fmt.Sprintf("no usable challenge for %s %q (CA offered: %s; available here: %s)",
+				authz.Identifier.Type, authz.Identifier.Value,
+				strings.Join(sortedKeys(offeredTypes), ", "),
+				strings.Join(solvers.availableTypes(), ", "))
+		}
 		a.warnStage("挑战选择", errMsg)
 		return fmt.Errorf("%s", errMsg)
 	}

@@ -1,8 +1,13 @@
 package cert
 
 import (
+	"fmt"
+	"net/mail"
+	"net/url"
 	"strings"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 // ACMEProviderPreset represents well-known CA presets.
@@ -11,7 +16,11 @@ type ACMEProviderPreset struct {
 	Name         string `json:"name"`
 	DirectoryURL string `json:"directory_url"`
 	RequiresEAB  bool   `json:"requires_eab"`
-	Description  string `json:"description"`
+	// RequiresContact marks CAs that reject newAccount without a contact
+	// address (RFC 8555 §7.3 makes it optional, but Google Trust Services
+	// answers 400 malformed: "Accounts must have at least one contact.").
+	RequiresContact bool   `json:"requires_contact"`
+	Description     string `json:"description"`
 }
 
 // Presets lists well-known ACME CAs.
@@ -31,18 +40,20 @@ var Presets = []ACMEProviderPreset{
 		Description:  "Let's Encrypt 调试测试环境，无频次限制，颁发未受信任证书。",
 	},
 	{
-		ID:           "google",
-		Name:         "Google Trust Services (GTS)",
-		DirectoryURL: "https://dv.acme-v02.api.pki.goog/directory",
-		RequiresEAB:  true,
-		Description:  "谷歌公共 CA，签发速度极快且 OCSP 稳定，需在 Google Cloud 获取 EAB KID 和 HMAC Key。",
+		ID:              "google",
+		Name:            "Google Trust Services (GTS)",
+		DirectoryURL:    "https://dv.acme-v02.api.pki.goog/directory",
+		RequiresEAB:     true,
+		RequiresContact: true,
+		Description:     "谷歌公共 CA，签发速度极快且 OCSP 稳定，需在 Google Cloud 获取 EAB KID 和 HMAC Key，且必须填写联系邮箱。",
 	},
 	{
-		ID:           "google_staging",
-		Name:         "Google Trust Services (测试环境)",
-		DirectoryURL: "https://dv.acme-v02.test-api.pki.goog/directory",
-		RequiresEAB:  true,
-		Description:  "Google Cloud 测试环境，需通过 gcloud publicca 生成测试 EAB 凭据。",
+		ID:              "google_staging",
+		Name:            "Google Trust Services (测试环境)",
+		DirectoryURL:    "https://dv.acme-v02.test-api.pki.goog/directory",
+		RequiresEAB:     true,
+		RequiresContact: true,
+		Description:     "Google Cloud 测试环境，需通过 gcloud publicca 生成测试 EAB 凭据，且必须填写联系邮箱。",
 	},
 	{
 		ID:           "zerossl",
@@ -94,6 +105,64 @@ func NormalizeDirectoryURL(raw string) string {
 		return fixed
 	}
 	return trimmed
+}
+
+// requiresContactHosts lists ACME directory hosts whose CA rejects
+// newAccount requests without a contact field. Google Trust Services answers
+// 400 malformed ("Accounts must have at least one contact.") instead of
+// honouring the RFC 8555 §7.3 optional-contact rule.
+var requiresContactHosts = []string{"pki.goog"}
+
+// RequiresContact reports whether the CA behind directoryURL demands a
+// contact address. It matches on host (not on the preset ID) so a manually
+// typed GTS directory is enforced the same way as the preset.
+func RequiresContact(directoryURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(directoryURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return false
+	}
+	for _, suffix := range requiresContactHosts {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateAccountContact enforces the CA's contact policy before any request
+// leaves the server, so the operator sees an actionable message instead of
+// the raw CA error ("Accounts must have at least one contact.").
+func ValidateAccountContact(directoryURL, email string) error {
+	email = strings.TrimSpace(email)
+	requiresContact := RequiresContact(directoryURL)
+	if email == "" {
+		if requiresContact {
+			return fmt.Errorf("该 ACME 机构要求至少填写一个联系邮箱（Google Trust Services 不接受空 contact），请补齐「联系邮箱」后重试")
+		}
+		return nil
+	}
+	addr, err := mail.ParseAddress(email)
+	if err != nil {
+		return fmt.Errorf("联系邮箱 %q 格式不正确：%v", email, err)
+	}
+	// Public CAs reject addresses whose domain is not publicly resolvable
+	// (e.g. admin@watchman.local) with urn:ietf:params:acme:error:invalidContact.
+	// Only enforce this for CAs that require a contact: a private CA may
+	// legitimately use an internal mail domain.
+	if requiresContact {
+		// Email domains are case-insensitive, but publicsuffix matches the
+		// literal labels: "EXAMPLE.ORG" is reported as non-ICANN, which would
+		// wrongly reject a valid address.
+		domain := strings.ToLower(addr.Address[strings.LastIndex(addr.Address, "@")+1:])
+		if _, icann := publicsuffix.PublicSuffix(domain); !icann {
+			return fmt.Errorf("联系邮箱 %q 的域名 %q 不是可公开解析的域名，CA 会以 invalidContact 拒绝，请填写真实邮箱", email, domain)
+		}
+	}
+	return nil
 }
 
 // ACMEAccount defines an authorized ACME identity at a Certificate Authority.

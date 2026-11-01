@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"math/big"
 	"net/http"
@@ -192,3 +193,33 @@ func TestEnsureAccountContactOptional(t *testing.T) {
 		t.Errorf("contact = %v, want [mailto:ops@example.org]", p2["contact"])
 	}
 }
+
+// A GTS directory without a contact email must fail before any network call
+// (the CA answers 400 malformed: "Accounts must have at least one contact.").
+// The transport records hits and fails instantly, so a regression that drops
+// the guard shows up as hits != 0 instead of a real (slow, flaky) dial to GTS.
+func TestEnsureAccountRequiresContactFailsFast(t *testing.T) {
+	var hits int
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		hits++
+		return nil, errors.New("network disabled in test")
+	})}
+
+	c := &acmeClient{directoryURL: "https://dv.acme-v02.api.pki.goog/directory", http: client}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.ensureAccount(key)
+	if err == nil || !strings.Contains(err.Error(), "联系邮箱") {
+		t.Fatalf("ensureAccount(GTS, no email) = %v, want a contact-required error", err)
+	}
+	if hits != 0 {
+		t.Errorf("CA was contacted %d time(s) before the contact guard", hits)
+	}
+}
+
+// roundTripFunc adapts a function to http.RoundTripper.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

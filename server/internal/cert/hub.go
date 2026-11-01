@@ -672,6 +672,17 @@ func (h *Hub) issueACME(acc *ACMEAccount, identifiers []string, ch ChallengePref
 	if ch == ChallengeDNS01Manual {
 		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("DNS-01 手动验证需分两步完成（先获取解析记录，管理员添加解析后再确认），请使用 StartManualDNSOrder/ConfirmManualDNSOrder")
 	}
+	// RFC 8555 §8.4: a wildcard authorization only offers dns-01. Detect it up
+	// front so the operator gets an actionable message instead of a mid-flow
+	// "no usable challenge" after the order has already been created.
+	wildcard, hasWildcard := firstWildcard(identifiers)
+	if hasWildcard && ch == ChallengeHTTP01 {
+		msg := fmt.Sprintf("泛域名 %q 只能使用 DNS-01 验证（CA 不会为 *. 前缀下发 http-01 挑战），请把验证方式改为「自动」或「DNS-01」，不能选择 HTTP-01", wildcard)
+		if clog != nil {
+			clog.Warn("挑战选择", msg)
+		}
+		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("%s", msg)
+	}
 	solvers := h.buildSolvers()
 	defer solvers.stop()
 	solvers, err = solvers.applyPreference(ch)
@@ -680,6 +691,13 @@ func (h *Hub) issueACME(acc *ACMEAccount, identifiers []string, ch ChallengePref
 			clog.Warnf("挑战选择", "挑战求解器筛选失败: %v", err)
 		}
 		return nil, nil, time.Time{}, time.Time{}, "", err
+	}
+	if hasWildcard && solvers.dns == nil {
+		msg := fmt.Sprintf("泛域名 %q 必须使用 DNS-01 验证，但当前没有可用的 DNS-01 求解器：请在证书中心配置并启用 dns-mng，或改用「DNS-01（手动解析）」手工添加 TXT 记录", wildcard)
+		if clog != nil {
+			clog.Warn("挑战选择", msg)
+		}
+		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("%s", msg)
 	}
 	if !solvers.hasAny() {
 		msg := "无法完成域名验证：HTTP-01 需要临时监听 80 端口（当前不可用），DNS-01 需要在证书中心配置并启用 dns-mng"

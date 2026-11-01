@@ -160,6 +160,18 @@ func (s *solverSet) excluding(challengeType string) *solverSet {
 	return cp
 }
 
+// firstWildcard returns the first wildcard identifier ("*.example.com") in the
+// list. A wildcard authorization can only be validated with dns-01, so the
+// caller uses this to reject HTTP-01 before an order is created.
+func firstWildcard(identifiers []string) (string, bool) {
+	for _, id := range identifiers {
+		if trimmed := strings.TrimSpace(strings.ToLower(id)); strings.HasPrefix(trimmed, "*.") {
+			return trimmed, true
+		}
+	}
+	return "", false
+}
+
 // pickSolvers returns candidate solvers for one authorization, in preference
 // order. Constraints:
 //   - "ip" identifiers can only be validated with HTTP-01 (RFC 8738);

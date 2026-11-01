@@ -702,6 +702,22 @@ const canPreviewHMAC = computed(
   () => !!accountForm.eab_hmac_key || (!!editingAccountID.value && hasEABHMAC.value && isAdmin.value),
 )
 
+// 与后端 cert.RequiresContact 同一条判据：预设声明的 requires_contact 优先，
+// 主机名兜底（覆盖手工填写的 GTS 地址）。GTS 拒绝不带 contact 的 newAccount，
+// 这里提前拦下并给出可操作的提示。
+const contactRequired = computed(() => {
+  const raw = accountForm.directory_url.trim().replace(/\/+$/, '')
+  if (!raw) return false
+  const preset = presets.value.find((p) => (p.directory_url || '').replace(/\/+$/, '') === raw)
+  if (preset?.requires_contact) return true
+  try {
+    const host = new URL(raw).hostname.toLowerCase()
+    return host === 'pki.goog' || host.endsWith('.pki.goog')
+  } catch {
+    return false
+  }
+})
+
 async function submitAccount() {
   if (!accountForm.name.trim()) {
     message.warning('请填写机构名称')
@@ -709,6 +725,10 @@ async function submitAccount() {
   }
   if (!accountForm.directory_url.trim()) {
     message.warning('请填写 ACME Directory URL')
+    return
+  }
+  if (contactRequired.value && !accountForm.email.trim()) {
+    message.warning('该机构要求填写联系邮箱，否则账户注册会被 CA 拒绝')
     return
   }
   savingAccount.value = true
@@ -773,6 +793,23 @@ async function doImport() {
   }
 }
 
+// 泛域名（*.example.com）在 ACME 里只会拿到 dns-01 挑战，选 HTTP-01 必然失败。
+// 这里提前识别并锁死选项，与后端 issueACME 的前置校验同一条判据。
+const wildcardDetected = computed(() =>
+  issueDomains.value
+    .split(/[\n,]/)
+    .map((d) => d.trim().toLowerCase())
+    .some((d) => d.startsWith('*.')),
+)
+
+// 已选 HTTP-01 后又输入了泛域名：自动退回「自动」，由后端按 DNS-01 执行。
+watch(wildcardDetected, (has) => {
+  if (has && issueChallenge.value === 'http-01') {
+    issueChallenge.value = ''
+    message.info('检测到泛域名，已切换为自动（泛域名强制 DNS-01）')
+  }
+})
+
 async function doIssue() {
   const domains = issueDomains.value
     .split(/[\n,]/)
@@ -780,6 +817,10 @@ async function doIssue() {
     .filter((d) => d.length > 0)
   if (domains.length === 0) {
     message.warning('请填写至少一个域名')
+    return
+  }
+  if (wildcardDetected.value && issueChallenge.value === 'http-01') {
+    message.warning('检测到泛域名（*.），只能使用 DNS-01 验证')
     return
   }
   if (issueChallenge.value === 'dns-01' && !configReady.value) {
@@ -1136,8 +1177,16 @@ onUnmounted(() => {
           <NInput v-model:value="accountForm.directory_url" placeholder="https://..." />
         </NFormItem>
 
-        <NFormItem label="联系邮箱">
-          <NInput v-model:value="accountForm.email" placeholder="可选；留空则不向 CA 提交联系邮箱" />
+        <NFormItem label="联系邮箱" :required="contactRequired">
+          <NInput
+            v-model:value="accountForm.email"
+            :placeholder="contactRequired ? '必填；该机构要求账户至少有一个联系邮箱' : '可选；留空则不向 CA 提交联系邮箱'"
+          />
+          <template v-if="contactRequired" #feedback>
+            <span class="tip-hint">
+              Google Trust Services 会拒绝没有 contact 的账户注册（400 malformed：Accounts must have at least one contact），请填写可公开解析的真实邮箱。
+            </span>
+          </template>
         </NFormItem>
 
         <NFormItem label="EAB Key ID (KID)（ZeroSSL/Google/SSL.com 需填写）">
@@ -1223,13 +1272,16 @@ onUnmounted(() => {
           <NRadioGroup v-model:value="issueChallenge">
             <NSpace>
               <NRadio value="">自动（推荐）</NRadio>
-              <NRadio value="http-01">HTTP-01</NRadio>
+              <NRadio value="http-01" :disabled="wildcardDetected">HTTP-01</NRadio>
               <NRadio value="dns-01">DNS-01（dns-mng）</NRadio>
               <NRadio value="dns-01-manual">DNS-01（手动解析）</NRadio>
             </NSpace>
           </NRadioGroup>
           <template #feedback>
             <span class="muted tip-hint">
+              <template v-if="wildcardDetected">
+                已识别到泛域名（*），CA 只会下发 dns-01 挑战，因此 HTTP-01 不可选；请配置 dns-mng 或使用手动解析。<br />
+              </template>
               自动：普通域名优先 HTTP-01（需 80 端口可被 CA 访问），失败或 80 不可用时回退 DNS-01；
               通配符固定 DNS-01，IP 固定 HTTP-01。显式指定后不再自动回退。
               手动解析：服务端先生成 TXT 记录，您到 DNS 服务商手动添加解析后再确认验证，不依赖 dns-mng。

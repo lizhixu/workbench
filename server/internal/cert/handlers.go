@@ -96,7 +96,7 @@ type accountReq struct {
 	Name         string `json:"name" binding:"required"`
 	ProviderID   string `json:"provider_id"`
 	DirectoryURL string `json:"directory_url" binding:"required"`
-	Email        string `json:"email"` // optional; empty means the ACME newAccount request omits contact (RFC 8555 allows it)
+	Email        string `json:"email"` // optional for RFC 8555 CAs; required by GTS (see ValidateAccountContact)
 	EABKeyID     string `json:"eab_key_id"`
 	EABHMACKey   string `json:"eab_hmac_key"`
 	IsDefault    bool   `json:"is_default"`
@@ -116,6 +116,12 @@ func (h *Handlers) createAccount(c *gin.Context) {
 		EABKeyID:     strings.TrimSpace(req.EABKeyID),
 		EABHMACKey:   strings.TrimSpace(req.EABHMACKey),
 		IsDefault:    req.IsDefault,
+	}
+	// 校验用规范化后的地址：历史预设里的 dv.acme.pki.goog 会被 PutAccount 迁移成
+	// 官方地址，若按旧地址判定会漏掉「GTS 必须有联系邮箱」这条规则。
+	if err := ValidateAccountContact(NormalizeDirectoryURL(acc.DirectoryURL), acc.Email); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 	if err := h.hub.PutAccount(acc); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -146,6 +152,10 @@ func (h *Handlers) updateAccount(c *gin.Context) {
 		old.EABHMACKey = strings.TrimSpace(req.EABHMACKey)
 	}
 	old.IsDefault = req.IsDefault
+	if err := ValidateAccountContact(NormalizeDirectoryURL(old.DirectoryURL), old.Email); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if err := h.hub.PutAccount(old); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

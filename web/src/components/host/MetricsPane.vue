@@ -119,6 +119,26 @@ function fmtTime(ts: number, full = false): string {
   return full ? fmtDateTime(d) : fmtTimeOfDay(d)
 }
 
+// 卡片头部（标题 + 副标题）的垂直节奏：副标题上方（距标题）和下方（距绘图区）
+// 共用同一个 HEADER_GAP，视觉上才是等距的。
+// ECharts 单行文本行高约为字号 × 1.25，于是头部占位为：
+//   TITLE_TOP + 标题行高 + GAP + 副标题行高 + GAP
+// title.itemGap 与 grid.top 都由这组常量推导，改间距只改 HEADER_GAP 一处。
+const TITLE_TOP = 2
+const TITLE_FONT_SIZE = 13
+const SUBTEXT_FONT_SIZE = 11
+const HEADER_GAP = 14
+const TITLE_LINE_HEIGHT = Math.round(TITLE_FONT_SIZE * 1.25) // ≈16
+const SUBTEXT_LINE_HEIGHT = Math.round(SUBTEXT_FONT_SIZE * 1.25) // ≈14
+const CHART_GRID_TOP =
+  TITLE_TOP + TITLE_LINE_HEIGHT + HEADER_GAP + SUBTEXT_LINE_HEIGHT + HEADER_GAP // 60
+
+// 绘图区固定内边距：left 需要容纳最长的 y 轴刻度（"1023 KB/s" 约 55px）+ 轴间距 8 + 余量，
+// 六张图共用同一组数值，绘图区大小才会完全一致。
+const CHART_GRID_LEFT = 70
+const CHART_GRID_RIGHT = 16
+const CHART_GRID_BOTTOM = 26
+
 function getBaseChartOption(title: string, sub: string, yAxisFormatter?: (v: number) => string, max?: number) {
   const isDark = settings.themeMode === 'dark'
   return {
@@ -126,12 +146,11 @@ function getBaseChartOption(title: string, sub: string, yAxisFormatter?: (v: num
     title: {
       text: title,
       subtext: sub,
-      textStyle: { color: isDark ? '#f3f4f6' : '#1e293b', fontSize: 13, fontWeight: 'bold' },
-      subtextStyle: { color: isDark ? '#9ca3af' : '#64748b', fontSize: 11 },
-      // 标题与数值行之间多留一点空隙：13px 粗体标题 + 11px 次级数值贴在一起时
-      // 两行文字会黏成一块（grid.top 48 仍留有 8px 余量，不会压到绘图区）
-      itemGap: 12,
-      top: 2,
+      textStyle: { color: isDark ? '#f3f4f6' : '#1e293b', fontSize: TITLE_FONT_SIZE, fontWeight: 'bold' },
+      subtextStyle: { color: isDark ? '#9ca3af' : '#64748b', fontSize: SUBTEXT_FONT_SIZE },
+      // 标题与副标题之间的空隙；与副标题到绘图区的空隙共用 HEADER_GAP
+      itemGap: HEADER_GAP,
+      top: TITLE_TOP,
       left: 6,
     },
     tooltip: {
@@ -142,13 +161,17 @@ function getBaseChartOption(title: string, sub: string, yAxisFormatter?: (v: num
       axisPointer: { type: 'line', lineStyle: { color: isDark ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.15)' } },
     },
     grid: {
-      // containLabel 按刻度文字实际宽度自动占位：固定 left: 54 在窄卡片里会把
-      // "8.00 KB/s" 这类长刻度截掉左半截，这也是截图里 y 轴读不清的主因。
-      containLabel: true,
-      top: 48,
-      right: 16,
-      bottom: 26,
-      left: 6,
+      // 六张卡片必须共用同一套绘图区几何，否则看起来松紧不一：
+      //   - 用 containLabel 时 ECharts 会把刻度文字实际宽度加进 left，"100%"（≈26px）
+      //     和 "1023 KB/s"（≈55px）会把绘图区起点拉开近 30px，各图宽窄明显不同；
+      //   - 所以这里关掉 containLabel，改用固定 left，六张图的绘图区完全对齐。
+      // left 70 = 最长刻度 55 + 轴间距 8 + 余量 7，保证长刻度也不会被截。
+      containLabel: false,
+      left: CHART_GRID_LEFT,
+      right: CHART_GRID_RIGHT,
+      // = TITLE_TOP + 标题行高 + GAP + 副标题行高 + GAP，与 itemGap 同源，保证副标题上下等距
+      top: CHART_GRID_TOP,
+      bottom: CHART_GRID_BOTTOM,
     },
     xAxis: {
       type: 'category',

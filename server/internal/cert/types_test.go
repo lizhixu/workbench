@@ -98,4 +98,22 @@ func TestValidateAccountContact(t *testing.T) {
 	if err := ValidateAccountContact(gts, "admin@watchman.local"); err == nil {
 		t.Errorf("email domain without a public suffix must be rejected")
 	}
+	// A bare public suffix is not a registrable mail domain: "com" has no
+	// label of its own before the suffix.
+	if err := ValidateAccountContact(gts, "ops@com"); err == nil {
+		t.Errorf("bare public suffix as email domain must be rejected")
+	}
+	if err := ValidateAccountContact(gts, "ops@mail.example.org"); err != nil {
+		t.Errorf("subdomain of a registrable domain must pass, got %v", err)
+	}
+	// Display-name form: ParseAddress unwraps it, the domain check sees
+	// only the addr-spec.
+	if err := ValidateAccountContact(gts, "Ops Team <ops@example.org>"); err != nil {
+		t.Errorf("display-name email must pass, got %v", err)
+	}
+	// The format check is not GTS-only: a malformed address is rejected at
+	// save time even for CAs that accept an empty contact.
+	if err := ValidateAccountContact(le, "not-an-email"); err == nil {
+		t.Errorf("malformed email must be rejected for Let's Encrypt too")
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -189,5 +190,43 @@ func TestACMEError(t *testing.T) {
 		if err == nil || err.Error() != c.want {
 			t.Errorf("acmeError(%q, %d, %q) = %v, want %q", c.action, c.status, c.body, err, c.want)
 		}
+	}
+}
+
+// TestSatisfyAuthorizationWildcardMessage pins the last-resort wording: when
+// the CA offers only http-01 for a wildcard authorization (the dns-01 solver
+// exists but the CA did not issue a dns-01 challenge), the operator gets the
+// Chinese wildcard explanation instead of the generic English
+// "no usable challenge". The fake CA serves the authorization object; the
+// nonce endpoint only needs to hand out a Replay-Nonce header.
+func TestSatisfyAuthorizationWildcardMessage(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nonce", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Replay-Nonce", "test-nonce")
+	})
+	mux.HandleFunc("/authz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"pending","identifier":{"type":"dns","value":"*.example.com"},"challenges":[{"type":"http-01","url":"https://ca.example/authz/1/chal","token":"tok"}]}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &acmeClient{
+		http: srv.Client(),
+		dir:  map[string]string{"newNonce": srv.URL + "/nonce"},
+	}
+	err = c.satisfyAuthorization(srv.URL+"/authz", key, &solverSet{})
+	if err == nil {
+		t.Fatal("satisfyAuthorization(wildcard, http-01 only) = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "*.example.com") || !strings.Contains(err.Error(), "DNS-01") {
+		t.Errorf("error = %q, want it to name the wildcard and DNS-01", err)
+	}
+	if strings.Contains(err.Error(), "no usable challenge") {
+		t.Errorf("error = %q, want the Chinese wildcard wording, not the generic English one", err)
 	}
 }

@@ -117,8 +117,9 @@ func (h *Handlers) createAccount(c *gin.Context) {
 		EABHMACKey:   strings.TrimSpace(req.EABHMACKey),
 		IsDefault:    req.IsDefault,
 	}
-	// 校验用规范化后的地址：历史预设里的 dv.acme.pki.goog 会被 PutAccount 迁移成
-	// 官方地址，若按旧地址判定会漏掉「GTS 必须有联系邮箱」这条规则。
+	// 校验用规范化后的地址，与 PutAccount 落盘的官方地址保持一致：
+	// 历史旧地址 dv.acme.pki.goog 本身也以 .pki.goog 结尾、同样命中规则，
+	// 规范化不是为补判定缺口，而是避免校验与存储用两套地址。
 	if err := ValidateAccountContact(NormalizeDirectoryURL(acc.DirectoryURL), acc.Email); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

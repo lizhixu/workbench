@@ -135,7 +135,10 @@ func RequiresContact(directoryURL string) bool {
 
 // ValidateAccountContact enforces the CA's contact policy before any request
 // leaves the server, so the operator sees an actionable message instead of
-// the raw CA error ("Accounts must have at least one contact.").
+// the raw CA error ("Accounts must have at least one contact."). The address
+// format check applies to every CA (a malformed address is rejected at save
+// time even when the CA would accept an empty contact); the public-suffix
+// check only applies to CAs that require a contact.
 func ValidateAccountContact(directoryURL, email string) error {
 	email = strings.TrimSpace(email)
 	requiresContact := RequiresContact(directoryURL)
@@ -158,8 +161,11 @@ func ValidateAccountContact(directoryURL, email string) error {
 		// literal labels: "EXAMPLE.ORG" is reported as non-ICANN, which would
 		// wrongly reject a valid address.
 		domain := strings.ToLower(addr.Address[strings.LastIndex(addr.Address, "@")+1:])
-		if _, icann := publicsuffix.PublicSuffix(domain); !icann {
-			return fmt.Errorf("联系邮箱 %q 的域名 %q 不是可公开解析的域名，CA 会以 invalidContact 拒绝，请填写真实邮箱", email, domain)
+		suffix, icann := publicsuffix.PublicSuffix(domain)
+		// A bare public suffix (e.g. "com") is not a registrable mail
+		// domain either: it has no label of its own before the suffix.
+		if !icann || suffix == domain {
+			return fmt.Errorf("联系邮箱 %q 的域名 %q 不是可公开解析的注册域名，CA 会以 invalidContact 拒绝，请填写真实邮箱", email, domain)
 		}
 	}
 	return nil

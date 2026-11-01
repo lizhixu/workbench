@@ -131,6 +131,30 @@ func TestIssueACMEWildcardRejectsHTTP01(t *testing.T) {
 	}
 }
 
+// TestIssueACMEWildcardRequiresDNS pins the second pre-flight guard: a
+// wildcard identifier in auto mode must fail before an ACME order is created
+// when no DNS-01 solver is available (dns-mng not configured/enabled). The
+// Hub here has no dns-mng config, so buildSolvers leaves dns nil; the error
+// must point at dns-mng or the manual DNS-01 path, not at a mid-flow
+// "no usable challenge".
+func TestIssueACMEWildcardRequiresDNS(t *testing.T) {
+	h, err := NewHub(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc := &ACMEAccount{Name: "test", DirectoryURL: "https://acme-v02.api.letsencrypt.org/directory"}
+	_, _, _, _, _, err = h.issueACME(acc, []string{"*.example.com"}, ChallengeAuto, nil)
+	if err == nil {
+		t.Fatal("issueACME(wildcard, auto, no dns-mng) = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "*.example.com") || !strings.Contains(err.Error(), "DNS-01") {
+		t.Errorf("error = %q, want it to name the wildcard and DNS-01", err)
+	}
+	if !strings.Contains(err.Error(), "dns-mng") && !strings.Contains(err.Error(), "手动") {
+		t.Errorf("error = %q, want it to point at dns-mng or manual DNS-01", err)
+	}
+}
+
 // TestSolverSetExcluding verifies the order-retry path drops exactly one
 // solver type.
 func TestSolverSetExcluding(t *testing.T) {

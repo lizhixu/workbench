@@ -662,7 +662,7 @@ AI 助手页（`web/src/views/ai/AiChat.vue`）的输入区域采用现代化的
 
 ### 9.16 表单字段说明文字（Hint）的落位规范
 - **一律走 `#feedback` 插槽**：字段的补充说明、机制解释写在 `NFormItem` 的 `<template #feedback>` 里，**严禁**把 `<span>` 直接追加在控件后塞进默认插槽。`.n-form-item-blank` 是 `display: flex; align-items: center` 的横向行，行内说明会被排到控件右侧并反向压缩控件宽度（实测说明折成两行、输入区只剩约一半宽），给 span 加 `display: block` 也无效。
-- **字号与颜色不写内联**：说明文字统一附 `.tip-hint`（纳入 §9.11 的 `appearance.show_tips` 开关），并以局部类承载 12px / `line-height: 1.6` / `color: var(--text-secondary)`（如 `AppDetail.vue` 的 `.forward-hint`）；不得依赖未定义的类名（如只写 `.hint` 而无对应样式规则），否则说明文字退化为正文样式。
+- **字号与颜色不写内联**：说明文字统一附 `.tip-hint`（纳入 §9.11 的 `appearance.show_tips` 开关），并以局部类承载 12px / `line-height: 1.6` / `color: var(--text-secondary)`（如 `AppDetail.vue` 的 `.field-hint`）；不得依赖未定义的类名（如只写 `.hint` 而无对应样式规则），否则说明文字退化为正文样式。
 - **间距由 feedback 区自带**：`feedbackHeightMedium` 默认预留 24px，单行说明正好落在既有间距内，不会把表单撑高；多行说明允许自然折行，但不要再叠加 `margin-top` 之类的内联补偿。
 
 

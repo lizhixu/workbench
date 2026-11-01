@@ -3005,14 +3005,14 @@ onUnmounted(() => {
                     </div>
                     <div style="display: flex; align-items: center; gap: 8px">
                       <NButton dashed size="small" @click="addProxyDomain">添加域名</NButton>
-                      <span class="hint">证书默认自动匹配覆盖该域名的可用证书，无需逐个选择</span>
+                      <span class="field-hint tip-hint">证书默认自动匹配覆盖该域名的可用证书，无需逐个选择</span>
                     </div>
 
                     <!-- 高级：手动指定证书（默认自动匹配，仅特殊场景需要逐个覆盖） -->
                     <NCollapse v-if="proxyActiveDomains.length > 0">
                       <NCollapseItem title="高级：手动指定证书" name="cert-override">
                         <NSpace vertical style="width: 100%">
-                          <span class="hint">默认按域名自动匹配当前可用的覆盖证书；这里可逐域名改用其他证书（如专用多 SAN 证书）。</span>
+                          <span class="field-hint tip-hint">默认按域名自动匹配当前可用的覆盖证书；这里可逐域名改用其他证书（如专用多 SAN 证书）。</span>
                           <div
                             v-for="row in proxyActiveDomains"
                             :key="row.id"
@@ -3110,11 +3110,11 @@ onUnmounted(() => {
                             前往配置
                           </NButton>
                         </NAlert>
-                        <span class="hint">
+                        <span class="field-hint tip-hint">
                           HTTP-01 验证在控制端主机临时监听 80 端口，仅当域名解析到控制端时可用；应用域名通常应选 DNS-01（需 dns-mng 自动解析）。
                         </span>
                       </template>
-                      <span class="hint">
+                      <span class="field-hint tip-hint">
                         通配符域名（如 *.example.com）不支持在线自动签发：请先到
                         <a @click.prevent="router.push('/certs')">证书中心</a>
                         手动 DNS-01 签发后，回到本页保存（或在上方高级中直接指定）。
@@ -3136,7 +3136,7 @@ onUnmounted(() => {
                     placeholder="选择作为反代网关的主机（可走组网或直连，将自动初始化反代容器）"
                     filterable
                   />
-                  <span v-if="proxyForm.mode === 'gateway'" class="hint" style="display: block; margin-top: 4px">
+                  <span v-if="proxyForm.mode === 'gateway'" class="field-hint tip-hint">
                     网关主机不能是应用主机自身；到应用主机可走异地组网（双方均在组网内）或直连（公网/内网 IP），组网非必需
                   </span>
                 </NSpace>
@@ -3234,7 +3234,7 @@ onUnmounted(() => {
                     filterable
                   />
                   <template #feedback>
-                    <span class="forward-hint tip-hint">
+                    <span class="field-hint tip-hint">
                       入口主机不能是应用主机自身；优先选择有公网 IP 的主机以对外暴露服务
                     </span>
                   </template>
@@ -3249,7 +3249,7 @@ onUnmounted(() => {
                     style="width: 100%"
                   />
                   <template #feedback>
-                    <span class="forward-hint tip-hint">
+                    <span class="field-hint tip-hint">
                       入口主机上对外监听并接收客户端连接的 TCP 端口
                     </span>
                   </template>
@@ -3264,7 +3264,7 @@ onUnmounted(() => {
                     style="width: 100%"
                   />
                   <template #feedback>
-                    <span class="forward-hint tip-hint">
+                    <span class="field-hint tip-hint">
                       本应用主机上实际接收流量的服务端口
                     </span>
                   </template>
@@ -3790,10 +3790,10 @@ onUnmounted(() => {
   color: var(--text-secondary);
 }
 
-/* 组网端口转发：字段说明走 NFormItem 的 feedback 槽，稳定落在控件下方并与
-   标签/控件保持同一竖向节奏；此前用行内 span，被表单行的 flex 布局挤到控件
-   右侧、宽度不足而折成两行。 */
-.forward-hint {
+/* 表单字段说明文字（DESIGN.md §9.16）：统一 12px / 1.6 行高 / 次级文字色。
+   在 NFormItem 内必须放进 #feedback 槽，写默认插槽会被 .n-form-item-blank 的
+   flex 横向行挤到控件右侧并压窄控件。 */
+.field-hint {
   display: block;
   font-size: 12px;
   line-height: 1.6;

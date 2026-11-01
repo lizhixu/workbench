@@ -68,6 +68,10 @@ const loadingAccounts = ref(false)
 const showAccountModal = ref(false)
 const editingAccountID = ref<string | null>(null)
 const savingAccount = ref(false)
+// 服务端只回传掩码（••••••••），绝不把掩码当明文回填输入框：既避免泄露形态
+// 被误读成真实密钥，也避免用户点「显示密码」看到一串点号。这里只记住「已有密钥」
+// 这一事实，输入框留空表示保持不变。
+const hasEABHMAC = ref(false)
 
 const accountForm = reactive({
   name: '',
@@ -632,6 +636,7 @@ function openCreateAccount() {
   accountForm.email = ""
   accountForm.eab_key_id = ""
   accountForm.eab_hmac_key = ""
+  hasEABHMAC.value = false
   accountForm.is_default = false
   showAccountModal.value = true
 }
@@ -649,7 +654,9 @@ function openEditAccount(acc: ACMEAccount) {
   accountForm.directory_url = acc.directory_url
   accountForm.email = acc.email
   accountForm.eab_key_id = acc.eab_key_id || ''
-  accountForm.eab_hmac_key = acc.eab_hmac_key || ''
+  // 列表接口返回的是掩码，不能当作密钥回填。
+  hasEABHMAC.value = !!(acc.eab_hmac_key && acc.eab_hmac_key.trim())
+  accountForm.eab_hmac_key = ''
   accountForm.is_default = acc.is_default
   showAccountModal.value = true
 }
@@ -665,11 +672,13 @@ async function submitAccount() {
   }
   savingAccount.value = true
   try {
+    // 编辑时留空 = 保留服务端已有的 HMAC Key（服务端对空值与掩码都不会覆盖）。
+    const payload = { ...accountForm, eab_hmac_key: accountForm.eab_hmac_key.trim() }
     if (editingAccountID.value) {
-      await updateACMEAccount(editingAccountID.value, { ...accountForm })
+      await updateACMEAccount(editingAccountID.value, payload)
       message.success('机构账户已更新')
     } else {
-      await createACMEAccount({ ...accountForm })
+      await createACMEAccount(payload)
       message.success('机构账户已添加')
     }
     showAccountModal.value = false
@@ -1094,13 +1103,17 @@ onUnmounted(() => {
           <NInput v-model:value="accountForm.eab_key_id" placeholder="由 CA 机构控制台生成的 Key ID" />
         </NFormItem>
 
-        <NFormItem label="EAB HMAC Key（密文保存在本地服务器，不向外泄露）">
+        <NFormItem label="EAB HMAC Key（仅保存在本地服务器，接口不回传明文）">
           <NInput
             v-model:value="accountForm.eab_hmac_key"
             type="password"
             show-password-on="click"
-            placeholder="由 CA 机构控制台生成的 HMAC Key"
-          />
+            :placeholder="editingAccountID && hasEABHMAC ? '已配置，留空则保持不变' : '由 CA 机构控制台生成的 HMAC Key'"
+          >
+            <template v-if="editingAccountID && hasEABHMAC && !accountForm.eab_hmac_key" #suffix>
+              <NTag size="tiny" type="success" :bordered="false">已配置</NTag>
+            </template>
+          </NInput>
         </NFormItem>
 
         <NFormItem label="设为默认签发机构">

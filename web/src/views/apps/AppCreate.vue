@@ -481,9 +481,65 @@ const imageProbeSummary = computed(() => {
   return parts.join(' · ')
 })
 
+// 探测值进表单前的过滤与挂载卷生成（与 AI 事实补齐同口径）：
+// 通用运行时变量（PATH/HOSTNAME 等）只是容器底噪，不进表单；但无值声明
+// 不是底噪——Dockerfile / .env.example 里声明了键就是必要的变量，空值以
+// KEY= 形式保留进表单，是提醒用户填，不是编造值；提交前用户看得见。
+const genericProbeEnvKeys = new Set(['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'LANGUAGE', 'HOSTNAME', 'TERM'])
+
+function probeEnvText(vars: Record<string, string>): string {
+  return Object.entries(vars || {})
+    .filter(([k]) => !genericProbeEnvKeys.has(k))
+    .map(([k, v]) => `${k}=${v ?? ''}`)
+    .join('\n')
+}
+
+// 仓库 Dockerfile 模式的环境变量合并：Dockerfile ENV 优先，.env.example
+// 补其余声明键（示例值原样带入、空值留 KEY=，提交前用户核对）；按 key
+// 排序，方便逐项核对。
+function mergeProbeEnvText(primary: Record<string, string>, extra: Record<string, string>): string {
+  const merged = new Map<string, string>()
+  for (const [k, v] of Object.entries(primary || {})) {
+    if (!genericProbeEnvKeys.has(k)) merged.set(k, v ?? '')
+  }
+  for (const [k, v] of Object.entries(extra || {})) {
+    if (!genericProbeEnvKeys.has(k) && !merged.has(k)) merged.set(k, v ?? '')
+  }
+  return [...merged.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n')
+}
+
+function slugifyAppName(s: string): string {
+  const slug = s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  return slug || 'app'
+}
+
+function probeVolumeSpecs(containerPaths: string[], appName: string): string[] {
+  const slug = slugifyAppName(appName)
+  const used = new Set<string>()
+  const specs: string[] = []
+  for (const c of containerPaths || []) {
+    if (!c) continue
+    const seg = c.split('/').filter(Boolean).pop() || 'data'
+    let hostDir = `/opt/apps/${slug}/${seg}`
+    let n = 2
+    while (used.has(hostDir)) hostDir = `/opt/apps/${slug}/${seg}-${n++}`
+    used.add(hostDir)
+    specs.push(`${hostDir}:${c}`)
+  }
+  return specs
+}
+
 function applyImageProbe() {
   const m = imageProbe.value.data
   if (!m) return
+  // 先补名字，挂载卷的宿主路径要用它生成 slug。
+  if (!form.name.trim()) {
+    const seg = (m.repository || '').split('/').pop() || ''
+    if (seg) form.name = seg
+  }
   const real = (m.exposed_ports || []).filter((p) => p > 0 && p <= 65535)
   if (real.length > 0) {
     const isPlaceholder = form.ports.length === 1
@@ -498,19 +554,17 @@ function applyImageProbe() {
         : real.map((p) => ({ host: p, container: p, bind_scope: 'public' as const }))
     }
   }
-  if (!form.env_vars_text.trim() && Object.keys(m.env_vars || {}).length > 0) {
-    form.env_vars_text = Object.entries(m.env_vars)
-      .map(([k, v]) => `${k}=${v}`)
-      .join('\n')
+  if (!form.env_vars_text.trim()) {
+    const text = probeEnvText(m.env_vars || {})
+    if (text) form.env_vars_text = text
+  }
+  if (!form.volumes_text.trim() && (m.volumes || []).length > 0) {
+    form.volumes_text = probeVolumeSpecs(m.volumes, form.name).join('\n')
   }
   if (!form.healthcheck_url.trim() && real.length > 0) {
     form.healthcheck_url = `http://127.0.0.1:${real[0]}/`
   }
-  if (!form.name.trim()) {
-    const seg = (m.repository || '').split('/').pop() || ''
-    if (seg) form.name = seg
-  }
-  message.success('已按镜像真实配置带入端口与环境变量，请核对后提交')
+  message.success('已按镜像真实配置带入端口、环境变量与挂载卷，请核对后提交')
 }
 
 const repoProbe = ref<{ loading: boolean; data: RepoMetadata | null; error: string }>({
@@ -588,6 +642,21 @@ function applyRepoProbeAuto(meta: RepoMetadata) {
   if (!form.name.trim() && meta.name) {
     form.name = meta.name
   }
+  // Dockerfile 模式才补表单级 env/卷：Compose 模式下编排文件本身就是权威，
+  // 表单 env/卷不会被部署使用，填了反而误导。健康检查不自动补：探测只能
+  // 给出端口、给不出该服务是不是 HTTP，静默填 http 探针会让 TCP 服务
+  // （如 Redis）在部署后 60 秒探针失败；留给用户或镜像按钮显式确认。
+  // env 合并 Dockerfile ENV 与 .env.example：示例声明的键都是必要的变量，
+  // 有值原样带入、无值留 KEY= 提醒填写，不因无值就丢掉整项。
+  if (form.build_type === 'dockerfile') {
+    if (!form.env_vars_text.trim()) {
+      const text = mergeProbeEnvText(meta.dockerfile_env || {}, meta.env_example || {})
+      if (text) form.env_vars_text = text
+    }
+    if (!form.volumes_text.trim() && (meta.volumes || []).length > 0) {
+      form.volumes_text = probeVolumeSpecs(meta.volumes, form.name).join('\n')
+    }
+  }
 }
 
 const repoProbeTags = computed(() => {
@@ -604,7 +673,10 @@ const repoProbeTags = computed(() => {
     tags.push(m.language ? `未检出 Dockerfile/Compose（${m.language} 项目）` : '未检出 Dockerfile/Compose')
   }
   const envKeys = Object.keys(m.env_example || {} || {})
-  if (envKeys.length > 0) tags.push(`.env 示例键：${envKeys.slice(0, 6).join('、')}${envKeys.length > 6 ? '…' : ''}`)
+  if (envKeys.length > 0) tags.push(`.env 示例键：${envKeys.slice(0, 6).join('、')}${envKeys.length > 6 ? '…' : ''}${form.build_type === 'dockerfile' ? '（已带入环境变量）' : ''}`)
+  if ((m.volumes || []).length > 0) {
+    tags.push(`数据卷 ${m.volumes.length} 项${form.build_type === 'dockerfile' ? '（已自动带入表单）' : ''}`)
+  }
   return tags
 })
 
@@ -727,6 +799,23 @@ watch(() => form.mesh_forward_enabled, (enabled) => {
     if (!form.mesh_forward_entry_port && form.mesh_forward_target_port) {
       form.mesh_forward_entry_port = form.mesh_forward_target_port
     }
+  }
+})
+
+// 端口是后填进来的（模板/镜像/仓库探测都可能晚于开启转发），目标端口
+// 仍为空时跟随首个端口补齐；已填的值永不覆盖。
+watch(() => form.ports.map((p) => p.host).join(','), () => {
+  if (form.mesh_forward_enabled && !form.mesh_forward_target_port
+    && form.ports.length > 0 && form.ports[0].host > 0) {
+    form.mesh_forward_target_port = form.ports[0].host
+  }
+})
+
+// 切到网关模式时，若只剩一个可选网关（在线且非应用主机），直接选中它。
+watch(() => form.proxy_mode, (mode) => {
+  if (mode === 'gateway' && !form.gateway_host_id) {
+    const candidates = gatewayOptions.value.filter((o) => !o.disabled)
+    if (candidates.length === 1) form.gateway_host_id = candidates[0].value
   }
 })
 
@@ -987,6 +1076,12 @@ async function loadData() {
   const presetHost = typeof route.query.host_id === 'string' ? route.query.host_id : ''
   if (presetHost && hosts.value.some((h) => h.id === presetHost)) {
     form.host_id = presetHost
+  }
+  // 无预选且在线主机只剩一台时直接选中：唯一选项不需要用户再点一次，
+  // 多台时留空让用户自己选，不猜。
+  if (!form.host_id) {
+    const online = hosts.value.filter((h) => h.status === 'online')
+    if (online.length === 1) form.host_id = online[0].id
   }
   await checkGitHubStatus()
 }

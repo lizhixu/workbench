@@ -12,8 +12,8 @@ func TestFindImageRefInText(t *testing.T) {
 	}{
 		{"帮我安装 ghcr.io/xerxes-2/clewdr 这台服务", "ghcr.io/xerxes-2/clewdr"},
 		{"部署 registry.example.com:5000/team/app:v2 到生产", "registry.example.com:5000/team/app:v2"},
-		{"我想装个 nginx", ""},         // single unqualified name: not probed from prose
-		{"每天 12:30 重启", ""},          // time-like token must not match
+		{"我想装个 nginx", ""},                 // single unqualified name: not probed from prose
+		{"每天 12:30 重启", ""},                // time-like token must not match
 		{"看一下 https://github.com/a/b", ""}, // URLs excluded
 		{"", ""},
 	}
@@ -68,8 +68,8 @@ func TestAlignDraftWithFactsImagePrefill(t *testing.T) {
 	if len(d.Ports) != 1 || d.Ports[0].Container != 8484 || d.Ports[0].Host != 8484 {
 		t.Fatalf("ports not prefilled from facts: %+v", d.Ports)
 	}
-	if warnCount(warnings, "预填") != 1 {
-		t.Fatalf("expected prefill warning, got %v", warnings)
+	if warnCount(warnings, "预填映射") != 1 {
+		t.Fatalf("expected port prefill warning, got %v", warnings)
 	}
 }
 
@@ -127,9 +127,9 @@ func TestAlignDraftWithFactsRepoBuildType(t *testing.T) {
 	facts := &appFacts{
 		repoURL: "https://github.com/acme/stack",
 		repo: &AppRepoProbe{
-			RepoURL:   "https://github.com/acme/stack",
-			Branch:    "main",
-			HasCompose: true,
+			RepoURL:     "https://github.com/acme/stack",
+			Branch:      "main",
+			HasCompose:  true,
 			ComposeFile: "compose.yaml",
 		},
 	}
@@ -165,6 +165,111 @@ func TestAlignDraftWithFactsRepoDockerfilePathAndPorts(t *testing.T) {
 	}
 	if warnCount(warnings, "预填") != 1 {
 		t.Fatalf("expected prefill warning, got %v", warnings)
+	}
+}
+
+func TestAlignDraftWithFactsImageEnvVolumesBackfill(t *testing.T) {
+	facts := &appFacts{
+		imageRef: "ghcr.io/acme/svc",
+		image: &AppImageProbe{
+			Reference: "ghcr.io/acme/svc:latest",
+			Ports:     []int{8080},
+			EnvVars: map[string]string{
+				"APP_MODE":     "prod",
+				"CLEWDR_TOKEN": "should-not-fill",
+				"PATH":         "/usr/bin",
+			},
+			Volumes: []string{"/data", "/config"},
+		},
+	}
+	d := &AppDraft{
+		SourceType: strPtr("image"),
+		Name:       strPtr("MySvc"),
+		Image:      strPtr("ghcr.io/acme/svc"),
+	}
+	missing, warnings := sanitizeAppDraft(d, AppFormSnapshot{}, testHosts(), testTemplates(), facts)
+	if d.EnvVars["APP_MODE"] != "prod" {
+		t.Fatalf("non-secret fact env not filled: %+v", d.EnvVars)
+	}
+	if _, ok := d.EnvVars["CLEWDR_TOKEN"]; ok {
+		t.Fatalf("secret fact env must not be filled: %+v", d.EnvVars)
+	}
+	if _, ok := d.EnvVars["PATH"]; ok {
+		t.Fatalf("generic runtime env must not be filled: %+v", d.EnvVars)
+	}
+	found := false
+	for _, m := range missing {
+		if strings.Contains(m, "CLEWDR_TOKEN") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("secret fact env should be missing: %v", missing)
+	}
+	wantVols := []string{"/opt/apps/mysvc/data:/data", "/opt/apps/mysvc/config:/config"}
+	if len(d.Volumes) != len(wantVols) {
+		t.Fatalf("volumes = %v, want %v", d.Volumes, wantVols)
+	}
+	for i, v := range wantVols {
+		if d.Volumes[i] != v {
+			t.Fatalf("volumes = %v, want %v", d.Volumes, wantVols)
+		}
+	}
+	if warnCount(warnings, "预填挂载") != 1 {
+		t.Fatalf("expected volume prefill warning, got %v", warnings)
+	}
+}
+
+func TestAlignDraftWithFactsRepoDockerfileEnv(t *testing.T) {
+	facts := &appFacts{
+		repoURL: "https://github.com/acme/svc",
+		repo: &AppRepoProbe{
+			RepoURL:        "https://github.com/acme/svc",
+			Branch:         "main",
+			HasDockerfile:  true,
+			DockerfilePath: "Dockerfile",
+			DockerfileEnv:  map[string]string{"APP_MODE": "prod", "DB_PASSWORD": "x"},
+			EnvExampleKeys: []string{"API_KEY"},
+		},
+	}
+	d := &AppDraft{SourceType: strPtr("git"), RepoURL: strPtr("https://github.com/acme/svc")}
+	missing, _ := sanitizeAppDraft(d, AppFormSnapshot{}, testHosts(), testTemplates(), facts)
+	if d.EnvVars["APP_MODE"] != "prod" {
+		t.Fatalf("dockerfile env not filled: %+v", d.EnvVars)
+	}
+	for _, want := range []string{"DB_PASSWORD", "API_KEY"} {
+		found := false
+		for _, m := range missing {
+			if strings.Contains(m, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("missing should include %s: %v", want, missing)
+		}
+	}
+}
+
+func TestBuildDraftSourcesImage(t *testing.T) {
+	facts := &appFacts{
+		imageRef: "ghcr.io/acme/svc",
+		image: &AppImageProbe{
+			Reference: "ghcr.io/acme/svc:latest",
+			Ports:     []int{8080},
+			EnvVars:   map[string]string{"APP_MODE": "prod"},
+			Volumes:   []string{"/data"},
+		},
+	}
+	d := &AppDraft{SourceType: strPtr("image"), Name: strPtr("svc"), Image: strPtr("ghcr.io/acme/svc")}
+	sanitizeAppDraft(d, AppFormSnapshot{}, testHosts(), testTemplates(), facts)
+	srcs := buildDraftSources(d, AppFormSnapshot{}, testHosts(), testTemplates(), facts)
+	if len(srcs) != 1 || srcs[0].Kind != "image" {
+		t.Fatalf("sources = %+v, want exactly one image source", srcs)
+	}
+	for _, want := range []string{"端口映射", "环境变量", "挂载卷"} {
+		if !containsString(srcs[0].Fields, want) {
+			t.Fatalf("image source fields = %v, missing %s", srcs[0].Fields, want)
+		}
 	}
 }
 

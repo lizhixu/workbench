@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import {
   NCard,
   NSpace,
@@ -15,7 +15,7 @@ import {
   useMessage,
 } from 'naive-ui'
 import { CheckmarkCircleOutline, EyeOffOutline, EyeOutline, SparklesOutline } from '@vicons/ionicons5'
-import { getAIConfig, revealAIKey, setAIConfig, testAIConfig, type AIConfig } from '../../api/ai'
+import { getAIConfig, revealAIKey, setAIConfig, testAIConfig, listAIModels, type AIConfig } from '../../api/ai'
 
 // 从旧 Settings.vue 抽取：AI 大模型配置与助手
 defineOptions({ name: 'AiConfig' })
@@ -33,6 +33,17 @@ const selectedProvider = ref('deepseek')
 const savingAI = ref(false)
 const testingAI = ref(false)
 const testResult = ref<{ ok: boolean; message: string } | null>(null)
+// 探测到的模型列表（下拉选项）。换服务商/重载配置即清空，避免旧端点的
+// 列表残留到新端点上；探测失败时保持原样，手动输入始终可用。
+const modelOptions = ref<{ label: string; value: string }[]>([])
+const probingModels = ref(false)
+// NSelect 以 null 表空值（§8.3.1 约定），aiConfig.model 本身仍保持 string。
+const modelValue = computed({
+  get: () => aiConfig.value.model || null,
+  set: (v: string | null) => {
+    aiConfig.value.model = v ?? ''
+  },
+})
 // 自定义请求头（键值对编辑器用，保存/测试前同步回 aiConfig.headers）
 const headerPairs = ref<{ key: string; value: string }[]>([])
 
@@ -131,6 +142,8 @@ function handleProviderChange(val: string) {
     aiConfig.value.model = preset.model
     aiConfig.value.provider = val
   }
+  // 预设已换端点，旧探测列表不再可信，清空后由用户重新探测
+  modelOptions.value = []
 }
 
 async function loadAIConfig() {
@@ -140,6 +153,7 @@ async function loadAIConfig() {
       aiConfig.value = data
       // 重新载入后密钥回到掩码态，可见性一并复位（保存后也会走到这里）
       keyVisible.value = false
+      modelOptions.value = []
       headerPairs.value = Object.entries(data.headers || {}).map(([key, value]) => ({ key, value }))
       if (data.provider) {
         selectedProvider.value = data.provider
@@ -193,6 +207,30 @@ async function handleTestAI() {
   }
 }
 
+// 主动探测模型：用表单当前值（未保存也可测）向端点拉取可用模型列表
+// 填入下拉；探测失败不清空已有选项，手动输入始终是兜底。
+async function handleProbeModels() {
+  if (!aiConfig.value.base_url) {
+    message.warning('请先填写 LLM 端点 URL')
+    return
+  }
+  probingModels.value = true
+  try {
+    syncHeadersToConfig()
+    const models = await listAIModels(aiConfig.value)
+    modelOptions.value = models.map((m) => ({ label: m, value: m }))
+    if (models.length === 0) {
+      message.warning('端点未返回可用模型，请手动输入模型名称')
+    } else {
+      message.success(`已探测到 ${models.length} 个可用模型`)
+    }
+  } catch (e: any) {
+    message.error(e.message || '探测模型列表失败')
+  } finally {
+    probingModels.value = false
+  }
+}
+
 onMounted(() => {
   loadAIConfig()
 })
@@ -233,10 +271,25 @@ onMounted(() => {
       </NFormItem>
 
       <NFormItem label="模型名称 (Model)" required>
-        <NInput
-          v-model:value="aiConfig.model"
-          placeholder="例如: deepseek-chat 或 qwen2.5:14b"
-        />
+        <NSpace :wrap="false" style="width: 100%">
+          <NSelect
+            v-model:value="modelValue"
+            :options="modelOptions"
+            tag
+            filterable
+            clearable
+            placeholder="选择探测到的模型，或手动输入模型名称"
+            style="flex: 1; min-width: 0"
+          />
+          <NButton secondary :loading="probingModels" @click="handleProbeModels">
+            探测模型
+          </NButton>
+        </NSpace>
+        <template #feedback>
+          <span class="muted tip-hint">
+            点「探测模型」从当前端点拉取可用模型列表；列表中没有时可直接输入，输入后按回车确认。
+          </span>
+        </template>
       </NFormItem>
 
       <NFormItem label="API Key (密钥)">

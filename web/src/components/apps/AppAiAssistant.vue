@@ -10,7 +10,9 @@ import {
 import {
   chatAppAssistant, generateAppDraft, getAIConfig,
   type AppChatResponse, type AppDraftResponse, type AppFormDraft, type AppFormSnapshot,
+  type CallTrace, type DraftSource, type LLMUsage,
 } from '../../api/ai'
+import AiCallTrace from '../ai/AiCallTrace.vue'
 import { renderMarkdown } from '../../utils/markdown'
 
 const props = defineProps<{
@@ -39,9 +41,11 @@ const QUICK_REQUIREMENTS = [
 // ---- One-shot draft fill ----
 const requirement = ref('')
 const generating = ref(false)
+const generatingStartedAt = ref<number | null>(null)
 const draftResult = ref<AppDraftResponse | null>(null)
 const draftApplied = ref(false)
 const fillError = ref('')
+const fillTrace = ref<CallTrace | null>(null)
 
 async function doGenerate() {
   const req = requirement.value.trim()
@@ -50,14 +54,18 @@ async function doGenerate() {
     return
   }
   generating.value = true
+  generatingStartedAt.value = Date.now()
   fillError.value = ''
+  fillTrace.value = null
   try {
     draftResult.value = await generateAppDraft(req, props.snapshot)
     draftApplied.value = false
   } catch (e: any) {
     fillError.value = e.message || '生成草稿失败'
+    fillTrace.value = e.trace ?? null
   } finally {
     generating.value = false
+    generatingStartedAt.value = null
   }
 }
 
@@ -74,13 +82,32 @@ interface ChatEntry {
   content: string
   patch?: AppFormDraft | null
   patchWarnings?: string[]
+  patchSources?: DraftSource[]
   patchApplied?: boolean
+  trace?: CallTrace | null
+  model?: string
+  usage?: LLMUsage | null
+}
+
+const sourceKindLabels: Record<string, string> = {
+  image: '镜像探测',
+  repo: '仓库探测',
+  template: '模板目录',
+  host: '在线主机',
+}
+
+function describeSource(s: DraftSource): string {
+  const kind = sourceKindLabels[s.kind] || s.kind
+  const fields = s.fields.length ? `：${s.fields.join('、')}` : ''
+  return `${kind} ${s.ref}${fields}`
 }
 
 const chatMessages = ref<ChatEntry[]>([])
 const chatInput = ref('')
 const sending = ref(false)
+const sendingStartedAt = ref<number | null>(null)
 const chatError = ref('')
+const chatTrace = ref<CallTrace | null>(null)
 const chatScrollEl = ref<HTMLElement | null>(null)
 const chatPaneEl = ref<HTMLElement | null>(null)
 const chatComposerEl = ref<HTMLElement | null>(null)
@@ -160,9 +187,11 @@ async function doSend() {
   if (!q || sending.value) return
   chatInput.value = ''
   chatError.value = ''
+  chatTrace.value = null
   const history = chatMessages.value.slice(-10).map((m) => ({ role: m.role, content: m.content }))
   chatMessages.value.push({ role: 'user', content: q })
   sending.value = true
+  sendingStartedAt.value = Date.now()
   await scrollChatToBottom()
   try {
     const resp: AppChatResponse = await chatAppAssistant(q, history, props.snapshot)
@@ -171,12 +200,18 @@ async function doSend() {
       content: resp.answer,
       patch: resp.form_patch ?? null,
       patchWarnings: resp.patch_warnings,
+      patchSources: resp.sources,
       patchApplied: false,
+      trace: resp.trace ?? null,
+      model: resp.model,
+      usage: resp.usage ?? null,
     })
   } catch (e: any) {
     chatError.value = e.message || 'AI 对话失败'
+    chatTrace.value = e.trace ?? null
   } finally {
     sending.value = false
+    sendingStartedAt.value = null
     await scrollChatToBottom()
   }
 }
@@ -276,11 +311,12 @@ onMounted(async () => {
           </div>
 
           <div v-if="generating" class="thinking-row">
-            <span class="thinking-dots"><i /><i /><i /></span>
             <span>AI 正在结合主机与模板目录生成草稿…</span>
           </div>
+          <AiCallTrace v-if="generating" :started-at="generatingStartedAt" />
 
           <NAlert v-if="fillError" type="error" :show-icon="true">{{ fillError }}</NAlert>
+          <AiCallTrace v-if="fillTrace" :trace="fillTrace" default-expanded />
 
           <div v-if="draftResult" class="draft-result">
             <div v-if="draftResult.explanation" class="explain-card">
@@ -299,6 +335,22 @@ onMounted(async () => {
               <div class="block-label">注意事项</div>
               <div v-for="w in draftResult.warnings" :key="w" class="note-line">{{ w }}</div>
             </div>
+
+            <div v-if="draftResult.sources?.length" class="note-block info">
+              <div class="block-label">参考来源（服务端实测，非模型自述）</div>
+              <div v-for="s in draftResult.sources" :key="s.kind + s.ref" class="note-line">
+                {{ describeSource(s) }}
+                <span v-if="s.detail" class="source-detail"> — {{ s.detail }}</span>
+              </div>
+            </div>
+
+            <AiCallTrace
+              v-if="draftResult.trace"
+              :trace="draftResult.trace"
+              :model="draftResult.model"
+              :usage="draftResult.usage"
+              default-expanded
+            />
 
             <NAlert v-if="!hasDraftContent" type="default" :show-icon="false">
               AI 没有给出可填充的字段，可以换个说法再试。
@@ -347,6 +399,10 @@ onMounted(async () => {
                 <div class="patch-title">建议修改</div>
                 <div v-for="line in describePatch(m.patch)" :key="line" class="patch-line">{{ line }}</div>
                 <div v-for="w in m.patchWarnings || []" :key="w" class="patch-warn">{{ w }}</div>
+                <div v-if="m.patchSources?.length" class="patch-sources">
+                  <div class="patch-sources-title">参考来源</div>
+                  <div v-for="s in m.patchSources" :key="s.kind + s.ref" class="patch-source-line">{{ describeSource(s) }}</div>
+                </div>
                 <div class="patch-actions">
                   <NButton
                     size="tiny"
@@ -358,16 +414,21 @@ onMounted(async () => {
                   </NButton>
                 </div>
               </div>
+              <AiCallTrace
+                v-if="m.role === 'assistant' && m.trace"
+                :trace="m.trace"
+                :model="m.model"
+                :usage="m.usage"
+              />
             </div>
 
             <div v-if="sending" class="chat-msg assistant">
-              <div class="chat-body thinking">
-                <span class="thinking-dots"><i /><i /><i /></span>
-              </div>
+              <AiCallTrace :started-at="sendingStartedAt" />
             </div>
           </div>
 
           <NAlert v-if="chatError" type="error" :show-icon="true">{{ chatError }}</NAlert>
+          <AiCallTrace v-if="chatTrace" :trace="chatTrace" default-expanded />
 
           <div
             class="chat-resize-handle"
@@ -615,6 +676,9 @@ onMounted(async () => {
     line-height: 1.6;
     color: var(--text-primary);
   }
+  .source-detail {
+    color: var(--text-secondary);
+  }
 }
 
 .draft-actions {
@@ -624,7 +688,7 @@ onMounted(async () => {
   gap: 6px;
 }
 
-/* ---------- Thinking dots ---------- */
+/* ---------- Thinking row ---------- */
 .thinking-row {
   display: flex;
   align-items: center;
@@ -632,38 +696,6 @@ onMounted(async () => {
   font-size: 12px;
   color: var(--text-secondary);
   padding: 2px;
-}
-
-.thinking-dots {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-
-  i {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background-color: #8b8fa3;
-    animation: ai-dot-bounce 1.2s ease-in-out infinite;
-
-    &:nth-child(2) {
-      animation-delay: 0.15s;
-    }
-    &:nth-child(3) {
-      animation-delay: 0.3s;
-    }
-  }
-}
-
-@keyframes ai-dot-bounce {
-  0%, 60%, 100% {
-    transform: translateY(0);
-    opacity: 0.45;
-  }
-  30% {
-    transform: translateY(-3px);
-    opacity: 1;
-  }
 }
 
 /* ---------- Chat ---------- */
@@ -739,10 +771,6 @@ onMounted(async () => {
     line-height: 1.65;
     white-space: pre-wrap;
     word-break: break-word;
-
-    &.thinking {
-      padding: 10px 12px;
-    }
   }
 }
 
@@ -932,6 +960,24 @@ onMounted(async () => {
     font-size: 11.5px;
     line-height: 1.55;
     color: #d98e00;
+  }
+
+  .patch-sources {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed var(--border-color);
+  }
+  .patch-sources-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 3px;
+  }
+  .patch-source-line {
+    font-size: 11.5px;
+    line-height: 1.55;
+    color: var(--text-secondary);
+    word-break: break-all;
   }
 
   .patch-actions {

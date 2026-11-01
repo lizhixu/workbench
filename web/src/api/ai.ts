@@ -42,6 +42,16 @@ export function testAIConfig(config: Partial<AIConfig>) {
   return unwrap<{ ok: boolean; message: string }>(http.post('/ai/test', config))
 }
 
+// Probe the endpoint's served model list (OpenAI-compatible /models or
+// Ollama /api/tags). The request carries the form's current values, so an
+// unsaved edit can be probed before it is saved; the backend falls back
+// to the saved config for blanks and the masked key sentinel.
+export function listAIModels(config: Partial<AIConfig>) {
+  return unwrap<{ data: { models: string[] } }>(
+    http.post('/ai/models', config, { timeout: 30000 }),
+  ).then((r) => r.data.models)
+}
+
 export function diagnose(hostId: string, query: string, context?: string) {
   return unwrap<{ data: DiagnoseResponse }>(
     http.post('/ai/diagnose', { host_id: hostId, query, context }),
@@ -104,10 +114,36 @@ export interface ChatMessage {
   content: string
 }
 
+// ---- AI call trace (Codex-style step timeline) ----
+
+// One measured stage of an AI call. Durations come from the server around
+// the real work; a step only appears once it actually ran.
+export interface CallStep {
+  key: string
+  label: string
+  status: 'done' | 'failed' | string
+  duration_ms: number
+  detail?: string
+}
+
+export interface CallTrace {
+  steps: CallStep[]
+  total_ms: number
+}
+
+// Token counts reported by the provider; absent when it reports none.
+export interface LLMUsage {
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+}
+
 export interface ChatResponse {
   answer: string
   model: string
   tools_used?: string[]
+  trace?: CallTrace
+  usage?: LLMUsage
 }
 
 export interface HostReport {
@@ -214,19 +250,34 @@ export interface AppFormDraft {
   gateway_host_id?: string
 }
 
+// One grounding reference for a draft/patch, built deterministically by the
+// server from the facts it actually used (never from model prose).
+export interface DraftSource {
+  kind: 'image' | 'repo' | 'template' | 'host' | string
+  ref: string
+  fields: string[]
+  detail: string
+}
+
 export interface AppDraftResponse {
   draft: AppFormDraft
   explanation: string
   missing: string[]
   warnings: string[]
+  sources?: DraftSource[]
   model: string
+  trace?: CallTrace
+  usage?: LLMUsage
 }
 
 export interface AppChatResponse {
   answer: string
   form_patch?: AppFormDraft
   patch_warnings?: string[]
+  sources?: DraftSource[]
   model: string
+  trace?: CallTrace
+  usage?: LLMUsage
 }
 
 export function generateAppDraft(requirement: string, form: AppFormSnapshot) {

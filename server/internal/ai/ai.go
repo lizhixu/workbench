@@ -729,6 +729,8 @@ type ChatResponse struct {
 	Answer  string `json:"answer"`
 	Model   string `json:"model"`
 	ToolsUsed []string `json:"tools_used,omitempty"`
+	Trace     *CallTrace `json:"trace,omitempty"`
+	Usage     *LLMUsage  `json:"usage,omitempty"`
 }
 
 // Chat answers a natural language question using tool calling. The assistant
@@ -744,7 +746,17 @@ func (a *Assistant) Chat(ctx context.Context, question string, history []ChatMes
 
 	// Gather platform context based on the question (poor-man's tool calling:
 	// pre-fetch data that's likely relevant, then let the LLM answer).
-	platformContext := a.gatherPlatformContext(question)
+	// Each stage is timed into the call trace the UI renders as a timeline.
+	tr := newCallTracer()
+	var platformContext string
+	_, _ = tr.run("context", "收集平台数据", func() (string, error) {
+		platformContext = a.gatherPlatformContext(question)
+		detail := fmt.Sprintf("%d 台主机", len(a.reg.ListAgents()))
+		if a.alertStore != nil {
+			detail += fmt.Sprintf("、%d 条近期告警", len(a.alertStore.ListEvents(20)))
+		}
+		return detail, nil
+	})
 
 	// Build conversation history.
 	historyStr := ""
@@ -767,15 +779,29 @@ func (a *Assistant) Chat(ctx context.Context, question string, history []ChatMes
 请用中文回答，给出准确、有用的信息。如果用户问的是某台主机的具体情况，请基于上述数据回答：`,
 		platformContext, historyStr, question)
 
-	answer, err := a.callLLM(ctx, prompt)
+	answer, usage, err := "", (*LLMUsage)(nil), error(nil)
+	_, err = tr.run("llm", "模型调用", func() (string, error) {
+		var callErr error
+		answer, usage, callErr = a.callLLMWithUsage(ctx, prompt)
+		if callErr != nil {
+			return "", callErr
+		}
+		detail := cfg.Model
+		if s := usage.summary(); s != "" {
+			detail += " · " + s
+		}
+		return detail, nil
+	})
 	if err != nil {
-		return nil, err
+		return nil, &TracedError{Trace: tr.trace(), Err: err}
 	}
 
 	return &ChatResponse{
 		Answer:    answer,
 		Model:     cfg.Model,
 		ToolsUsed: []string{"platform_context"},
+		Trace:     tr.trace(),
+		Usage:     usage,
 	}, nil
 }
 
@@ -896,13 +922,25 @@ func buildSystemContext(hostname string, host *rpc.Agent, m *agentpb.MetricsSamp
 }
 
 func (a *Assistant) callLLM(ctx context.Context, prompt string) (string, error) {
-	return callLLMWithConfig(ctx, a.Config(), prompt)
+	answer, _, err := callLLMWithConfigUsage(ctx, a.Config(), prompt)
+	return answer, err
+}
+
+// callLLMWithUsage is callLLM plus the provider-reported token usage (nil
+// when the provider reports none).
+func (a *Assistant) callLLMWithUsage(ctx context.Context, prompt string) (string, *LLMUsage, error) {
+	return callLLMWithConfigUsage(ctx, a.Config(), prompt)
 }
 
 func callLLMWithConfig(ctx context.Context, cfg Config, prompt string) (string, error) {
+	answer, _, err := callLLMWithConfigUsage(ctx, cfg, prompt)
+	return answer, err
+}
+
+func callLLMWithConfigUsage(ctx context.Context, cfg Config, prompt string) (string, *LLMUsage, error) {
 	rawURL := strings.TrimRight(cfg.BaseURL, "/")
 	if rawURL == "" {
-		return "", fmt.Errorf("LLM Base URL is empty")
+		return "", nil, fmt.Errorf("LLM Base URL is empty")
 	}
 
 	// Ollama detection
@@ -928,7 +966,7 @@ func applyCustomHeaders(req *http.Request, cfg Config) {
 	}
 }
 
-func callOllama(ctx context.Context, cfg Config, baseURL string, prompt string) (string, error) {
+func callOllama(ctx context.Context, cfg Config, baseURL string, prompt string) (string, *LLMUsage, error) {
 	targetURL := baseURL
 	if !strings.HasSuffix(targetURL, "/api/generate") {
 		targetURL = targetURL + "/api/generate"
@@ -942,7 +980,7 @@ func callOllama(ctx context.Context, cfg Config, baseURL string, prompt string) 
 
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if cfg.APIKey != "" {
@@ -950,22 +988,32 @@ func callOllama(ctx context.Context, cfg Config, baseURL string, prompt string) 
 	}
 	applyCustomHeaders(req, cfg)
 
-	return doRequest(req, func(data []byte) (string, error) {
+	return doRequest(req, func(data []byte) (string, *LLMUsage, error) {
 		var resp struct {
-			Response string `json:"response"`
-			Error    string `json:"error"`
+			Response       string `json:"response"`
+			Error          string `json:"error"`
+			PromptEvalCount int    `json:"prompt_eval_count"`
+			EvalCount       int    `json:"eval_count"`
 		}
 		if err := json.Unmarshal(data, &resp); err != nil {
-			return "", fmt.Errorf("解析 Ollama 响应失败: %w", err)
+			return "", nil, fmt.Errorf("解析 Ollama 响应失败: %w", err)
 		}
 		if resp.Error != "" {
-			return "", fmt.Errorf("Ollama 返回错误: %s", resp.Error)
+			return "", nil, fmt.Errorf("Ollama 返回错误: %s", resp.Error)
 		}
-		return resp.Response, nil
+		var usage *LLMUsage
+		if resp.PromptEvalCount > 0 || resp.EvalCount > 0 {
+			usage = &LLMUsage{
+				PromptTokens:     resp.PromptEvalCount,
+				CompletionTokens: resp.EvalCount,
+				TotalTokens:      resp.PromptEvalCount + resp.EvalCount,
+			}
+		}
+		return resp.Response, usage, nil
 	})
 }
 
-func callOpenAI(ctx context.Context, cfg Config, baseURL string, prompt string) (string, error) {
+func callOpenAI(ctx context.Context, cfg Config, baseURL string, prompt string) (string, *LLMUsage, error) {
 	targetURL := baseURL
 	if strings.HasSuffix(targetURL, "/chat/completions") {
 		// already has endpoint
@@ -986,7 +1034,7 @@ func callOpenAI(ctx context.Context, cfg Config, baseURL string, prompt string) 
 
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if cfg.APIKey != "" {
@@ -994,44 +1042,57 @@ func callOpenAI(ctx context.Context, cfg Config, baseURL string, prompt string) 
 	}
 	applyCustomHeaders(req, cfg)
 
-	return doRequest(req, func(data []byte) (string, error) {
+	return doRequest(req, func(data []byte) (string, *LLMUsage, error) {
 		var resp struct {
 			Choices []struct {
 				Message struct {
 					Content string `json:"content"`
 				} `json:"message"`
 			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			} `json:"usage"`
 			Error *struct {
 				Message string `json:"message"`
 				Type    string `json:"type"`
 			} `json:"error"`
 		}
 		if err := json.Unmarshal(data, &resp); err != nil {
-			return "", fmt.Errorf("解析 OpenAI 兼容响应失败: %w (原始内容: %s)", err, string(data))
+			return "", nil, fmt.Errorf("解析 OpenAI 兼容响应失败: %w (原始内容: %s)", err, string(data))
 		}
 		if resp.Error != nil && resp.Error.Message != "" {
-			return "", fmt.Errorf("LLM API 返回错误: %s", resp.Error.Message)
+			return "", nil, fmt.Errorf("LLM API 返回错误: %s", resp.Error.Message)
 		}
 		if len(resp.Choices) == 0 {
-			return "", fmt.Errorf("LLM 返回空内容")
+			return "", nil, fmt.Errorf("LLM 返回空内容")
 		}
-		return resp.Choices[0].Message.Content, nil
+		var usage *LLMUsage
+		if resp.Usage != nil {
+			usage = &LLMUsage{
+				PromptTokens:     resp.Usage.PromptTokens,
+				CompletionTokens: resp.Usage.CompletionTokens,
+				TotalTokens:      resp.Usage.TotalTokens,
+			}
+		}
+		return resp.Choices[0].Message.Content, usage, nil
 	})
 }
 
-func doRequest(req *http.Request, parse func([]byte) (string, error)) (string, error) {
+func doRequest(req *http.Request, parse func([]byte) (string, *LLMUsage, error)) (string, *LLMUsage, error) {
 	client := &http.Client{Timeout: 90 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("网络请求失败: %w", err)
+		return "", nil, fmt.Errorf("网络请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("LLM 接口返回 HTTP %d: %s", resp.StatusCode, string(data))
+		return "", nil, fmt.Errorf("LLM 接口返回 HTTP %d: %s", resp.StatusCode, string(data))
 	}
 	return parse(data)
 }

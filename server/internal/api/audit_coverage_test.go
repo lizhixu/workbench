@@ -110,6 +110,7 @@ func TestDeriveMutationActionCoverage(t *testing.T) {
 		{http.MethodGet, "/api/v1/apps"},
 		{http.MethodPost, "/api/v1/ai/diagnose"},
 		{http.MethodPost, "/api/v1/ai/chat"},
+		{http.MethodPost, "/api/v1/ai/models"},
 		{http.MethodPost, "/api/v1/apps/webhook/:token"},
 		{http.MethodPost, "/api/v1/apps/:id/migrate/precheck"},
 	}

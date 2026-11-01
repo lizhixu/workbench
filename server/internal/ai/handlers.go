@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
@@ -28,6 +29,7 @@ func (h *Handlers) Register(authed, admin *gin.RouterGroup) {
 	authed.GET("/ai/config", h.getConfig)
 	authed.PUT("/ai/config", h.setConfig)
 	authed.POST("/ai/test", h.testConnection)
+	authed.POST("/ai/models", h.listModels)
 	authed.POST("/ai/scan-report", h.analyzeScanReport)
 	authed.POST("/ai/scan-report/followup", h.scanReportFollowup)
 	authed.POST("/ai/chat", h.chat)
@@ -169,6 +171,35 @@ func (h *Handlers) testConnection(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "message": result})
 }
 
+func (h *Handlers) listModels(c *gin.Context) {
+	var cfg Config
+	_ = c.ShouldBindJSON(&cfg)
+
+	// Probe with the form's current values so an unsaved edit can be
+	// checked before it is saved; blanks and the masked sentinel fall
+	// back to the saved config, mirroring testConnection.
+	current := h.assistant.Config()
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = current.BaseURL
+	}
+	if cfg.APIKey == "" || cfg.APIKey == "********" {
+		cfg.APIKey = current.APIKey
+	}
+	if cfg.Provider == "" {
+		cfg.Provider = current.Provider
+	}
+	if cfg.Headers == nil {
+		cfg.Headers = current.Headers
+	}
+
+	models, err := h.assistant.ListModels(c.Request.Context(), cfg)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"models": models}})
+}
+
 func (h *Handlers) analyzeScanReport(c *gin.Context) {
 	var body struct {
 		ScanType     string `json:"scan_type"`
@@ -212,6 +243,18 @@ func (h *Handlers) scanReportFollowup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": resp})
 }
 
+// writeAIError returns a 503 for a failed AI call. When the failure carries
+// a partial call trace, it rides along so the UI can render which stage
+// failed instead of only showing the error string.
+func writeAIError(c *gin.Context, err error) {
+	var te *TracedError
+	if errors.As(err, &te) && te.Trace != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": te.Err.Error(), "trace": te.Trace})
+		return
+	}
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+}
+
 func (h *Handlers) chat(c *gin.Context) {
 	var body struct {
 		Question string        `json:"question"`
@@ -227,7 +270,7 @@ func (h *Handlers) chat(c *gin.Context) {
 	}
 	resp, err := h.assistant.Chat(c.Request.Context(), body.Question, body.History)
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		writeAIError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": resp})
@@ -248,7 +291,7 @@ func (h *Handlers) appDraft(c *gin.Context) {
 	}
 	resp, err := h.assistant.AppDraft(c.Request.Context(), body.Requirement, body.Form)
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		writeAIError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": resp})
@@ -270,7 +313,7 @@ func (h *Handlers) appChat(c *gin.Context) {
 	}
 	resp, err := h.assistant.AppChat(c.Request.Context(), body.Question, body.History, body.Form)
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		writeAIError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": resp})

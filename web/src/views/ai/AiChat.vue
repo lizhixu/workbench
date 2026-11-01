@@ -9,7 +9,8 @@ import {
   useMessage,
 } from 'naive-ui'
 import { ChatbubbleEllipsesOutline, SparklesOutline, CopyOutline } from '@vicons/ionicons5'
-import { chat, type ChatMessage, type ChatResponse } from '../../api/ai'
+import { chat, type CallTrace, type ChatMessage, type ChatResponse, type LLMUsage } from '../../api/ai'
+import AiCallTrace from '../../components/ai/AiCallTrace.vue'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { copyToClipboard } from '../../utils/clipboard'
 
@@ -21,7 +22,14 @@ const workspace = useWorkspaceStore()
 
 const inputText = ref('')
 const loading = ref(false)
-const conversations = ref<{ role: 'user' | 'assistant'; content: string }[]>([])
+const loadingStartedAt = ref<number | null>(null)
+const conversations = ref<{
+  role: 'user' | 'assistant'
+  content: string
+  trace?: CallTrace | null
+  model?: string
+  usage?: LLMUsage | null
+}[]>([])
 const chatListRef = ref<HTMLElement | null>(null)
 const chatBodyRef = ref<HTMLElement | null>(null)
 
@@ -112,6 +120,7 @@ async function send(question?: string) {
   conversations.value.push({ role: 'user', content: q })
   inputText.value = ''
   loading.value = true
+  loadingStartedAt.value = Date.now()
   await scrollToBottom()
 
   try {
@@ -121,12 +130,23 @@ async function send(question?: string) {
       .map((m) => ({ role: m.role, content: m.content }))
 
     const resp: ChatResponse = await chat(q, history)
-    conversations.value.push({ role: 'assistant', content: resp.answer })
+    conversations.value.push({
+      role: 'assistant',
+      content: resp.answer,
+      trace: resp.trace ?? null,
+      model: resp.model,
+      usage: resp.usage ?? null,
+    })
   } catch (e: any) {
-    conversations.value.push({ role: 'assistant', content: `抱歉，查询失败：${e.message}` })
+    conversations.value.push({
+      role: 'assistant',
+      content: `抱歉，查询失败：${e.message}`,
+      trace: e.trace ?? null,
+    })
     message.error(e.message || 'AI 问答失败')
   } finally {
     loading.value = false
+    loadingStartedAt.value = null
     await scrollToBottom()
   }
 }
@@ -237,6 +257,12 @@ onBeforeUnmount(() => {
           </div>
           <div class="msg-bubble-wrap">
             <div class="msg-content" v-html="renderMarkdown(msg.content)" />
+            <AiCallTrace
+              v-if="msg.role === 'assistant' && msg.trace"
+              :trace="msg.trace"
+              :model="msg.model"
+              :usage="msg.usage"
+            />
             <button
               class="msg-copy-btn"
               title="复制内容"
@@ -254,6 +280,7 @@ onBeforeUnmount(() => {
           <div class="msg-content">
             <NSpin size="small" />
             <span class="typing-hint">正在思考...</span>
+            <AiCallTrace :started-at="loadingStartedAt" />
           </div>
         </div>
       </div>

@@ -351,7 +351,13 @@ func defaultPortMappings(ports []int) []AppPortMapping {
 
 // alignDraftWithFacts reconciles the draft against probe facts. It runs after
 // the generic port validation, so every port here is already in 1..65535.
-func alignDraftWithFacts(d *AppDraft, form AppFormSnapshot, facts *appFacts, addWarning func(string)) {
+// Besides ports/build_type/dockerfile it backfills env vars and volumes from
+// the same facts (see backfillEnvFromFacts / imageVolumeSpecs): the model is
+// told to ground on facts, but in practice it leaves env/volumes blank
+// unless the user names them, so the server fills them deterministically
+// instead of relying on the model to comply. Secret values are never
+// invented — secret keys surface as missing instead.
+func alignDraftWithFacts(d *AppDraft, form AppFormSnapshot, facts *appFacts, addWarning func(string), addMissing func(string)) {
 	if d == nil || facts == nil {
 		return
 	}
@@ -398,58 +404,224 @@ func alignDraftWithFacts(d *AppDraft, form AppFormSnapshot, facts *appFacts, add
 			}
 		}
 	}
-	if len(real) == 0 {
-		return
-	}
-
-	realSet := make(map[int]bool, len(real))
-	for _, p := range real {
-		realSet[p] = true
-	}
-	effPorts := d.Ports
-	if len(effPorts) == 0 {
-		effPorts = form.Ports
-	}
-	realFmt := formatIntPorts(real)
-	switch {
-	case len(effPorts) == 0:
-		d.Ports = defaultPortMappings(real)
-		addWarning(fmt.Sprintf("已按 %s 的真实暴露端口预填映射：%s", srcLabel, realFmt))
-	default:
-		kept := effPorts[:0]
-		for _, p := range effPorts {
-			if realSet[p.Container] {
-				kept = append(kept, p)
-			}
+	if len(real) > 0 {
+		realSet := make(map[int]bool, len(real))
+		for _, p := range real {
+			realSet[p] = true
 		}
-		if len(kept) == len(effPorts) {
-			// Every mapping already targets a real container port; only
-			// mention real ports left unmapped.
-			var unmapped []int
-			for _, p := range real {
-				found := false
-				for _, m := range kept {
-					if m.Container == p {
-						found = true
-						break
+		effPorts := d.Ports
+		if len(effPorts) == 0 {
+			effPorts = form.Ports
+		}
+		realFmt := formatIntPorts(real)
+		switch {
+		case len(effPorts) == 0:
+			d.Ports = defaultPortMappings(real)
+			addWarning(fmt.Sprintf("已按 %s 的真实暴露端口预填映射：%s", srcLabel, realFmt))
+		default:
+			kept := effPorts[:0]
+			for _, p := range effPorts {
+				if realSet[p.Container] {
+					kept = append(kept, p)
+				}
+			}
+			if len(kept) == len(effPorts) {
+				// Every mapping already targets a real container port; only
+				// mention real ports left unmapped.
+				var unmapped []int
+				for _, p := range real {
+					found := false
+					for _, m := range kept {
+						if m.Container == p {
+							found = true
+							break
+						}
+					}
+					if !found {
+						unmapped = append(unmapped, p)
 					}
 				}
-				if !found {
-					unmapped = append(unmapped, p)
+				if len(unmapped) > 0 {
+					addWarning(fmt.Sprintf("%s 还暴露端口 %s（当前未映射，如需要可自行添加）", srcLabel, formatIntPorts(unmapped)))
 				}
+			} else {
+				if len(kept) == 0 {
+					d.Ports = defaultPortMappings(real)
+				} else {
+					cp := make([]AppPortMapping, len(kept))
+					copy(cp, kept)
+					d.Ports = cp
+				}
+				addWarning(fmt.Sprintf("端口映射与 %s 的真实暴露端口（%s）不符，已按客观探测自动对齐", srcLabel, realFmt))
 			}
-			if len(unmapped) > 0 {
-				addWarning(fmt.Sprintf("%s 还暴露端口 %s（当前未映射，如需要可自行添加）", srcLabel, formatIntPorts(unmapped)))
-			}
-			return
 		}
-		if len(kept) == 0 {
-			d.Ports = defaultPortMappings(real)
-		} else {
-			cp := make([]AppPortMapping, len(kept))
-			copy(cp, kept)
-			d.Ports = cp
-		}
-		addWarning(fmt.Sprintf("端口映射与 %s 的真实暴露端口（%s）不符，已按客观探测自动对齐", srcLabel, realFmt))
 	}
+
+	// Env vars and volumes backfill from the same facts. Compose builds are
+	// excluded on purpose: the compose file itself is authoritative for
+	// services, env and volumes there.
+	if effSource == "image" && facts.image != nil && facts.image.Err == "" &&
+		sameImageRef(pickStrValue(d.Image, form.Image), facts.imageRef) {
+		backfillEnvFromFacts(d, form, facts.image.EnvVars, nil, facts.image.Reference, addWarning, addMissing)
+		if len(d.Volumes) == 0 && len(form.Volumes) == 0 {
+			slug := volumeSlug(d, facts.image.Reference)
+			if specs := imageVolumeSpecs(facts.image.Volumes, slug); len(specs) > 0 {
+				d.Volumes = specs
+				addWarning(fmt.Sprintf("已按 %s 的数据卷路径预填挂载（宿主路径在 /opt/apps/%s/ 下，可改）", facts.image.Reference, slug))
+			}
+		}
+	}
+	if effSource == "git" && facts.repo != nil && facts.repo.Err == "" {
+		repoOK := true
+		if effRepo := pickStrValue(d.RepoURL, form.RepoURL); effRepo != "" && facts.repoURL != "" {
+			repoOK = parseRepoIdentity(effRepo) == parseRepoIdentity(facts.repoURL)
+		}
+		if repoOK {
+			bt := strings.TrimSpace(pickStrValue(d.BuildType, form.BuildType))
+			if bt == "" {
+				bt = "dockerfile"
+			}
+			if bt == "dockerfile" && facts.repo.HasDockerfile {
+				backfillEnvFromFacts(d, form, facts.repo.DockerfileEnv, facts.repo.EnvExampleKeys, "仓库 "+facts.repo.DockerfilePath, addWarning, addMissing)
+			}
+		}
+	}
+}
+
+// genericEnvKeys are base-image runtime variables that carry no app meaning;
+// filling them into the form would only add noise.
+var genericEnvKeys = map[string]bool{
+	"PATH": true, "LANG": true, "LC_ALL": true, "LC_CTYPE": true,
+	"LANGUAGE": true, "HOSTNAME": true, "TERM": true,
+}
+
+// backfillEnvFromFacts merges fact-grounded env vars into the draft without
+// overriding anything the model or the user already set. Non-secret values
+// are filled; secret-keyed entries and value-less .env.example keys are
+// reported as missing instead of invented.
+func backfillEnvFromFacts(d *AppDraft, form AppFormSnapshot, values map[string]string, exampleKeys []string, srcLabel string, addWarning func(string), addMissing func(string)) {
+	have := map[string]bool{}
+	for k := range form.EnvVars {
+		have[k] = true
+	}
+	for k := range d.EnvVars {
+		have[k] = true
+	}
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var filled, secrets []string
+	for _, k := range keys {
+		if have[k] || !envKeyRe.MatchString(k) || genericEnvKeys[k] {
+			continue
+		}
+		v := strings.TrimSpace(values[k])
+		if secretValueKeyRe.MatchString(k) || v == "" {
+			secrets = append(secrets, k)
+			continue
+		}
+		if d.EnvVars == nil {
+			d.EnvVars = make(map[string]string)
+		}
+		d.EnvVars[k] = v
+		have[k] = true
+		filled = append(filled, k)
+		if len(filled) >= 32 {
+			break
+		}
+	}
+	if len(filled) > 0 {
+		addWarning(fmt.Sprintf("已按 %s 预填环境变量：%s（请核对值）", srcLabel, strings.Join(filled, "、")))
+	}
+	var exampleMissing []string
+	for _, k := range exampleKeys {
+		if have[k] || !envKeyRe.MatchString(k) {
+			continue
+		}
+		exampleMissing = append(exampleMissing, k)
+	}
+	if len(secrets) > 0 {
+		for _, k := range secrets {
+			addMissing("环境变量「" + k + "」")
+		}
+		addWarning(fmt.Sprintf("密钥类环境变量 %s 未填值，请手动填写（AI 不编造口令）", strings.Join(secrets, "、")))
+	}
+	if len(exampleMissing) > 0 {
+		for _, k := range exampleMissing {
+			addMissing("环境变量「" + k + "」")
+		}
+		addWarning(fmt.Sprintf("仓库 .env 示例中的变量 %s 需手动填写（示例中无默认值）", strings.Join(exampleMissing, "、")))
+	}
+}
+
+// slugify lowercases and dash-separates a name for use in a host path.
+func slugify(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	lastDash := true
+	for _, ch := range s {
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') {
+			b.WriteRune(ch)
+			lastDash = false
+		} else if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// volumeSlug picks the host-directory slug for image volume backfill: the
+// draft app name when present, else the image repository base name.
+func volumeSlug(d *AppDraft, imageRef string) string {
+	base := ""
+	if d.Name != nil {
+		base = *d.Name
+	}
+	if base == "" {
+		if r, err := registry.ParseReference(imageRef); err == nil {
+			parts := strings.Split(r.Repository, "/")
+			base = parts[len(parts)-1]
+		}
+	}
+	if s := slugify(base); s != "" {
+		return s
+	}
+	return "app"
+}
+
+// imageVolumeSpecs turns probed container paths (e.g. /data) into
+// host:container specs following the template convention
+// (/opt/apps/<slug>/<dir>:/container-path). Named-volume style specs are
+// not invented: every backfilled mount is an explicit bind mount the user
+// can edit in the form.
+func imageVolumeSpecs(containerPaths []string, slug string) []string {
+	used := map[string]bool{}
+	var out []string
+	for _, p := range containerPaths {
+		p = strings.TrimSpace(p)
+		if !strings.HasPrefix(p, "/") || strings.Contains(p, "..") {
+			continue
+		}
+		seg := p
+		if idx := strings.LastIndex(seg, "/"); idx >= 0 {
+			seg = seg[idx+1:]
+		}
+		seg = slugify(seg)
+		if seg == "" {
+			seg = "data"
+		}
+		hostDir := "/opt/apps/" + slug + "/" + seg
+		for i := 2; used[hostDir]; i++ {
+			hostDir = fmt.Sprintf("/opt/apps/%s/%s-%d", slug, seg, i)
+		}
+		used[hostDir] = true
+		out = append(out, hostDir+":"+p)
+		if len(out) >= 16 {
+			break
+		}
+	}
+	return out
 }

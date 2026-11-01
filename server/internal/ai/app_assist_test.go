@@ -98,6 +98,35 @@ func TestSanitizeAppDraftTemplateParamsAndMissing(t *testing.T) {
 	}
 }
 
+func TestSanitizeAppDraftTemplateNonSecretDefaults(t *testing.T) {
+	// Non-secret declared defaults are filled; secret required params stay
+	// missing for the user to set by hand.
+	d := &AppDraft{
+		SourceType: strPtr("template"),
+		HostID:     strPtr("h1"),
+		TemplateID: strPtr("redis"),
+	}
+	missing, warnings := sanitizeAppDraft(d, AppFormSnapshot{}, testHosts(), testTemplates(), nil)
+	if d.TemplateParams["REDIS_DB"] != "0" {
+		t.Fatalf("non-secret template default not filled: %+v", d.TemplateParams)
+	}
+	if _, ok := d.TemplateParams["REDIS_PASSWORD"]; ok {
+		t.Fatalf("secret template default must not be filled: %+v", d.TemplateParams)
+	}
+	found := false
+	for _, m := range missing {
+		if strings.Contains(m, "访问密码") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("secret required param should be missing: %v", missing)
+	}
+	if warnCount(warnings, "模板默认值") != 1 {
+		t.Fatalf("expected template-default warning, got %v", warnings)
+	}
+}
+
 func TestSanitizeAppDraftPatchParamsAgainstFormTemplate(t *testing.T) {
 	// Chat patch without template_id: params are filtered against the
 	// template already selected in the form instead of being dropped.

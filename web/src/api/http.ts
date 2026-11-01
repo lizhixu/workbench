@@ -1,5 +1,6 @@
 // axios instance with JWT injection and 401/403 handling.
 import axios, { AxiosError, type AxiosInstance } from 'axios'
+import type { CallTrace } from './ai'
 
 const baseURL = import.meta.env.VITE_API_BASE || '/api/v1'
 
@@ -23,6 +24,7 @@ http.interceptors.response.use(
   (
     error: AxiosError<{
       error?: string
+      trace?: CallTrace
       needs_confirm?: boolean
       risk_level?: string
       matched_pattern?: string
@@ -41,6 +43,9 @@ http.interceptors.response.use(
     }
     const err = new Error(msg) as Error & {
       status?: number
+      // Failed AI calls carry the partial step trace so the UI can render
+      // which stage failed instead of only the error string.
+      trace?: CallTrace
       needsConfirm?: boolean
       riskLevel?: string
       matchedPattern?: string
@@ -48,6 +53,7 @@ http.interceptors.response.use(
       missingDomains?: string[]
     }
     err.status = status
+    err.trace = data?.trace
     err.needsConfirm = data?.needs_confirm
     err.riskLevel = data?.risk_level
     err.matchedPattern = data?.matched_pattern

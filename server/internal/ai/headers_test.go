@@ -27,7 +27,7 @@ func TestCallOpenAICustomHeaders(t *testing.T) {
 			"X-Empty":       "   ",
 		},
 	}
-	out, err := callOpenAI(context.Background(), cfg, srv.URL, "hi")
+	out, _, err := callOpenAI(context.Background(), cfg, srv.URL, "hi")
 	if err != nil {
 		t.Fatalf("callOpenAI: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestCallOpenAINoCustomHeaders(t *testing.T) {
 	defer srv.Close()
 
 	cfg := Config{BaseURL: srv.URL, Model: "m", APIKey: "sk-123"}
-	if _, err := callOpenAI(context.Background(), cfg, srv.URL, "hi"); err != nil {
+	if _, _, err := callOpenAI(context.Background(), cfg, srv.URL, "hi"); err != nil {
 		t.Fatalf("callOpenAI: %v", err)
 	}
 	if got.Get("Authorization") != "Bearer sk-123" {

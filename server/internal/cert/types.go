@@ -1,6 +1,9 @@
 package cert
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // ACMEProviderPreset represents well-known CA presets.
 type ACMEProviderPreset struct {
@@ -30,14 +33,14 @@ var Presets = []ACMEProviderPreset{
 	{
 		ID:           "google",
 		Name:         "Google Trust Services (GTS)",
-		DirectoryURL: "https://dv.acme.pki.goog/directory",
+		DirectoryURL: "https://dv.acme-v02.api.pki.goog/directory",
 		RequiresEAB:  true,
 		Description:  "谷歌公共 CA，签发速度极快且 OCSP 稳定，需在 Google Cloud 获取 EAB KID 和 HMAC Key。",
 	},
 	{
 		ID:           "google_staging",
 		Name:         "Google Trust Services (测试环境)",
-		DirectoryURL: "https://dv.acme.staging.pki.goog/directory",
+		DirectoryURL: "https://dv.acme-v02.test-api.pki.goog/directory",
 		RequiresEAB:  true,
 		Description:  "Google Cloud 测试环境，需通过 gcloud publicca 生成测试 EAB 凭据。",
 	},
@@ -62,6 +65,35 @@ var Presets = []ACMEProviderPreset{
 		RequiresEAB:  false,
 		Description:  "适用于企业自建 Step-CA、Vault、Pebble 或 LiteSSL 等标准 RFC 8555 兼容服务。",
 	},
+}
+
+// legacyDirectoryURLs maps ACME directory endpoints that earlier builds
+// shipped (or prefilled in the UI) onto their official values.
+//
+// Google Trust Services serves its ACME directory at
+// dv.acme-v02.api.pki.goog (staging: dv.acme-v02.test-api.pki.goog). The
+// earlier short hosts dv.acme.pki.goog / dv.acme.staging.pki.goog are not
+// ACME endpoints at all: they resolve to a generic Google frontend, which
+// answers the TLS handshake with its default multi-SAN *.google.com
+// certificate, so the request dies with
+// "x509: certificate is valid for *.google.com ... not dv.acme.pki.goog".
+var legacyDirectoryURLs = map[string]string{
+	"https://dv.acme.pki.goog/directory":         "https://dv.acme-v02.api.pki.goog/directory",
+	"https://dv.acme.staging.pki.goog/directory": "https://dv.acme-v02.test-api.pki.goog/directory",
+}
+
+// NormalizeDirectoryURL rewrites a known-obsolete ACME directory URL to the
+// official one. Any other value (custom CA, Step-CA, Pebble, ...) is returned
+// unchanged, and a trailing slash is ignored when matching.
+func NormalizeDirectoryURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return raw
+	}
+	if fixed, ok := legacyDirectoryURLs[strings.TrimSuffix(trimmed, "/")]; ok {
+		return fixed
+	}
+	return trimmed
 }
 
 // ACMEAccount defines an authorized ACME identity at a Certificate Authority.

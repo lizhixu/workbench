@@ -275,10 +275,18 @@ func (h *Hub) loadAccounts() error {
 	// admin@watchman.local (and the UI prefilled admin@example.com);
 	// neither has a valid public suffix, so Let's Encrypt rejects them
 	// with invalidContact. Empty means "omit contact", which RFC 8555 allows.
+	//
+	// Also migrate obsolete ACME directory URLs (see legacyDirectoryURLs):
+	// an account saved against a non-existent endpoint keeps failing TLS
+	// verification until the stored URL is corrected.
 	migrated := false
 	for _, acc := range h.accounts {
 		if acc.Email == "admin@watchman.local" || acc.Email == "admin@example.com" {
 			acc.Email = ""
+			migrated = true
+		}
+		if fixed := NormalizeDirectoryURL(acc.DirectoryURL); fixed != acc.DirectoryURL {
+			acc.DirectoryURL = fixed
 			migrated = true
 		}
 	}
@@ -339,6 +347,9 @@ func (h *Hub) PutAccount(acc *ACMEAccount) error {
 	if acc.CreatedAt.IsZero() {
 		acc.CreatedAt = time.Now()
 	}
+	// Never persist an obsolete directory endpoint (see legacyDirectoryURLs):
+	// the UI prefilled one in older builds and clients may still send it.
+	acc.DirectoryURL = NormalizeDirectoryURL(acc.DirectoryURL)
 	// If set as default, clear previous defaults
 	if acc.IsDefault {
 		for _, a := range h.accounts {

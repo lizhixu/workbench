@@ -628,7 +628,7 @@ function openCreateAccount() {
   editingAccountID.value = null
   accountForm.name = "Google Trust Services"
   accountForm.provider_id = "google"
-  accountForm.directory_url = "https://dv.acme.pki.goog/directory"
+  accountForm.directory_url = "https://dv.acme-v02.api.pki.goog/directory"
   accountForm.email = ""
   accountForm.eab_key_id = ""
   accountForm.eab_hmac_key = ""

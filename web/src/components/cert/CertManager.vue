@@ -4,17 +4,19 @@ import {
   NAlert, NButton, NCard, NCollapse, NCollapseItem, NDataTable,
   NDescriptions, NDescriptionsItem, NForm, NFormItem, NIcon, NInput,
   NModal, NPopconfirm, NPopover, NRadio, NRadioGroup, NSelect, NSpace, NSpin,
-  NSwitch, NTabPane, NTabs, NTag, useDialog, useMessage,
+  NSwitch, NTabPane, NTabs, NTag, NTooltip, useDialog, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import {
   AddCircleOutline, CloseCircleOutline, CloudUploadOutline,
   CopyOutline, CreateOutline, DocumentTextOutline, DownloadOutline,
+  EyeOffOutline, EyeOutline,
   LockClosedOutline, RefreshOutline, ShieldCheckmarkOutline, SyncOutline,
   TimeOutline, TrashOutline,
 } from '@vicons/ionicons5'
 import {
-  certDownloadUrl, createACMEAccount, deleteACMEAccount, deleteCert, getCertConfig,
+  certDownloadUrl, createACMEAccount, deleteACMEAccount, deleteCert, getACMEAccountKey,
+  getCertConfig,
   getCertDetail, getCertKey, importCert, issueCert, listACMEAccounts, listCerts, listPresets,
   renewCert, updateACMEAccount, updateCertConfig, updateCertRemark,
   startManualDNSIssue, getManualDNSOrder, confirmManualDNSOrder, cancelManualDNSOrder,
@@ -72,6 +74,10 @@ const savingAccount = ref(false)
 // 被误读成真实密钥，也避免用户点「显示密码」看到一串点号。这里只记住「已有密钥」
 // 这一事实，输入框留空表示保持不变。
 const hasEABHMAC = ref(false)
+// 眼睛预览：仅在点击时经 admin-only 接口按需拉取明文（每次落一条高危审计），
+// 拉回后填入输入框并以明文显示；再次点击收起为密码点。
+const hmacRevealed = ref(false)
+const revealingHMAC = ref(false)
 
 const accountForm = reactive({
   name: '',
@@ -637,6 +643,7 @@ function openCreateAccount() {
   accountForm.eab_key_id = ""
   accountForm.eab_hmac_key = ""
   hasEABHMAC.value = false
+  hmacRevealed.value = false
   accountForm.is_default = false
   showAccountModal.value = true
 }
@@ -657,9 +664,43 @@ function openEditAccount(acc: ACMEAccount) {
   // 列表接口返回的是掩码，不能当作密钥回填。
   hasEABHMAC.value = !!(acc.eab_hmac_key && acc.eab_hmac_key.trim())
   accountForm.eab_hmac_key = ''
+  hmacRevealed.value = false
   accountForm.is_default = acc.is_default
   showAccountModal.value = true
 }
+
+// 眼睛预览：输入框有内容时只切换明/密文显示；编辑已有账户且输入框为空时，
+// 才经管理员专属接口按需拉取服务端保存的真实 Key（每次查看各落一条高危审计，
+// 与证书私钥 / AI API Key 明文查看同惯例）。
+async function toggleHMACPreview() {
+  if (hmacRevealed.value) {
+    hmacRevealed.value = false
+    return
+  }
+  if (accountForm.eab_hmac_key) {
+    hmacRevealed.value = true
+    return
+  }
+  const id = editingAccountID.value
+  if (!id || !hasEABHMAC.value) return
+  revealingHMAC.value = true
+  try {
+    const real = await getACMEAccountKey(id)
+    // 拉取期间用户可能已输入新值，这种情况不覆盖用户输入
+    if (!accountForm.eab_hmac_key) accountForm.eab_hmac_key = real
+    hmacRevealed.value = true
+  } catch (e: any) {
+    message.error(e.message || '读取已保存的 EAB HMAC Key 失败')
+  } finally {
+    revealingHMAC.value = false
+  }
+}
+
+// 眼睛可用条件：输入框里有自己输入的新值（纯前端明/密文切换），或管理员要拉取
+// 服务端保存的真实值——非管理员既不写账户也看不到明文。
+const canPreviewHMAC = computed(
+  () => !!accountForm.eab_hmac_key || (!!editingAccountID.value && hasEABHMAC.value && isAdmin.value),
+)
 
 async function submitAccount() {
   if (!accountForm.name.trim()) {
@@ -1103,15 +1144,40 @@ onUnmounted(() => {
           <NInput v-model:value="accountForm.eab_key_id" placeholder="由 CA 机构控制台生成的 Key ID" />
         </NFormItem>
 
-        <NFormItem label="EAB HMAC Key（仅保存在本地服务器，接口不回传明文）">
+        <NFormItem>
+          <template #label>
+            <span class="eab-label">
+              EAB HMAC Key（仅保存在本地服务器，查看需管理员权限并留痕）
+              <NTag v-if="editingAccountID && hasEABHMAC" size="tiny" type="success" :bordered="false">已配置</NTag>
+            </span>
+          </template>
           <NInput
             v-model:value="accountForm.eab_hmac_key"
-            type="password"
-            show-password-on="click"
+            :type="hmacRevealed ? 'text' : 'password'"
             :placeholder="editingAccountID && hasEABHMAC ? '已配置，留空则保持不变' : '由 CA 机构控制台生成的 HMAC Key'"
           >
-            <template v-if="editingAccountID && hasEABHMAC && !accountForm.eab_hmac_key" #suffix>
-              <NTag size="tiny" type="success" :bordered="false">已配置</NTag>
+            <template #suffix>
+              <NTooltip trigger="hover" :disabled="canPreviewHMAC">
+                <template #trigger>
+                  <span class="eab-eye">
+                    <NButton
+                      quaternary
+                      circle
+                      size="tiny"
+                      tabindex="-1"
+                      :disabled="!canPreviewHMAC"
+                      :loading="revealingHMAC"
+                      :title="hmacRevealed ? '隐藏 EAB HMAC Key' : '预览 EAB HMAC Key'"
+                      @click="toggleHMACPreview"
+                    >
+                      <template #icon>
+                        <NIcon :component="hmacRevealed ? EyeOffOutline : EyeOutline" />
+                      </template>
+                    </NButton>
+                  </span>
+                </template>
+                <span>仅管理员可预览已保存的 EAB HMAC Key</span>
+              </NTooltip>
             </template>
           </NInput>
         </NFormItem>
@@ -1685,6 +1751,18 @@ onUnmounted(() => {
 .key-load-error {
   color: #d03050;
   font-size: 12px;
+}
+
+// EAB HMAC Key 表单项：标签内「已配置」标签与后缀眼睛按钮对齐
+.eab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.eab-eye {
+  display: inline-flex;
+  align-items: center;
 }
 
 .key-warning {

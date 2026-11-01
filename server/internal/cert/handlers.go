@@ -72,6 +72,7 @@ func (h *Handlers) Register(readRG, writeRG *gin.RouterGroup) {
 	writeRG.PUT("/certs/config", h.putConfig)
 	writeRG.POST("/certs/accounts", h.createAccount)
 	writeRG.PUT("/certs/accounts/:id", h.updateAccount)
+	writeRG.POST("/certs/accounts/:id/key", h.revealAccountKey)
 	writeRG.DELETE("/certs/accounts/:id", h.deleteAccount)
 	writeRG.POST("/certs/issue", h.issueCert)
 	writeRG.POST("/certs/manual/:id/confirm", h.confirmManualOrder)
@@ -150,6 +151,26 @@ func (h *Handlers) updateAccount(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": old.Redacted()})
+}
+
+// revealAccountKey returns the stored EAB HMAC key in clear text for the
+// account dialog's preview toggle. Every routine response masks it (see
+// ACMEAccount.Redacted); this endpoint is the single explicit door, kept on
+// the audited admin write group and recorded as cert_account_key_reveal /
+// RiskHigh — the same convention as the certificate private key and the AI
+// API key reveals. POST (not GET) because the shared audit middleware skips
+// GET requests.
+func (h *Handlers) revealAccountKey(c *gin.Context) {
+	acc, ok := h.hub.GetAccount(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+		return
+	}
+	if strings.TrimSpace(acc.EABHMACKey) == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "该机构账户未配置 EAB HMAC Key"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"eab_hmac_key": acc.EABHMACKey}})
 }
 
 func (h *Handlers) deleteAccount(c *gin.Context) {

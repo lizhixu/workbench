@@ -2137,6 +2137,10 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodPost, "/api/v1/certs/accounts", "cert_account_create", "cert", "", "", "添加 ACME 账户"},
 		{http.MethodPut, "/api/v1/certs/accounts/:id", "cert_account_update", "cert", "id", "", "更新 ACME 账户"},
 		{http.MethodDelete, "/api/v1/certs/accounts/:id", "cert_account_delete", "cert", "id", audit.RiskHigh, "删除 ACME 账户"},
+		// EAB HMAC key reveal in the account dialog: same convention as the
+		// cert private key / AI API key reveals — adminOnly + high risk, one
+		// audit row per view. Routine responses only ever carry the mask.
+		{http.MethodPost, "/api/v1/certs/accounts/:id/key", "cert_account_key_reveal", "cert", "id", audit.RiskHigh, "查看 ACME 账户 EAB HMAC Key 明文"},
 		{http.MethodPost, "/api/v1/certs/issue", "cert_issue", "cert", "", audit.RiskHigh, "签发证书"},
 		{http.MethodPost, "/api/v1/certs/manual/:id/confirm", "cert_manual_dns_confirm", "cert", "id", audit.RiskHigh, "确认手动 DNS-01 解析并继续签发"},
 		{http.MethodDelete, "/api/v1/certs/manual/:id", "cert_manual_dns_cancel", "cert", "id", audit.RiskHigh, "取消手动 DNS-01 签发订单"},

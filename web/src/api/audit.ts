@@ -137,6 +137,7 @@ export const actionLabels: Record<string, string> = {
   cert_account_create: '添加 ACME 账户',
   cert_account_update: '更新 ACME 账户',
   cert_account_delete: '删除 ACME 账户',
+  cert_account_key_reveal: '查看 ACME 账户 EAB HMAC Key 明文',
   cert_manual_dns_confirm: '确认手动 DNS-01 解析',
   cert_manual_dns_cancel: '取消手动 DNS-01 订单',
   cert_remark: '编辑证书备注',

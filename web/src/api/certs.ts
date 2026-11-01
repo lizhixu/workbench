@@ -100,6 +100,16 @@ export function deleteACMEAccount(id: string) {
   return unwrap<{ ok: boolean }>(http.delete(`/certs/accounts/${id}`))
 }
 
+// 查看机构账户已保存的 EAB HMAC Key 明文（账户弹窗眼睛按钮按需调用）：常规响应
+// 一律只返回掩码，这里是唯一显式入口——adminOnly + 高危审计
+// （cert_account_key_reveal），与证书私钥 / AI API Key 明文查看同惯例；用 POST
+// 以确保命中审计中间件（其跳过 GET 请求）。
+export function getACMEAccountKey(id: string) {
+  return unwrap<{ data: { eab_hmac_key: string } }>(http.post(`/certs/accounts/${id}/key`)).then(
+    (r) => r.data.eab_hmac_key,
+  )
+}
+
 export function listCerts() {
   return unwrap<{ data: Certificate[] }>(http.get('/certs')).then((r) => r.data)
 }

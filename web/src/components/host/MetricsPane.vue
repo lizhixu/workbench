@@ -31,6 +31,10 @@ const settings = useSettingsStore()
 type TimeSpan = 'realtime' | '1h' | '24h' | '7d'
 const timeSpan = ref<TimeSpan>('realtime')
 
+// 图表副标题（当前值摘要）一行里常常并排 2~3 组指标。11px 字号下单个「·」
+// 与两侧单空格几乎糊成一片，读起来像一串数字连在一起；统一用两侧留白的分隔符。
+const METRIC_SEP = '  ·  '
+
 const loading = ref(true)
 const errorMsg = ref('')
 const currentMetrics = ref<Metrics | null>(null)
@@ -105,6 +109,9 @@ function getBaseChartOption(title: string, sub: string, yAxisFormatter?: (v: num
       subtext: sub,
       textStyle: { color: isDark ? '#f3f4f6' : '#1e293b', fontSize: 13, fontWeight: 'bold' },
       subtextStyle: { color: isDark ? '#9ca3af' : '#64748b', fontSize: 11 },
+      // 标题与数值行之间多留一点空隙：13px 粗体标题 + 11px 次级数值贴在一起时
+      // 两行文字会黏成一块（grid.top 48 仍留有 8px 余量，不会压到绘图区）
+      itemGap: 12,
       top: 2,
       left: 6,
     },
@@ -231,7 +238,7 @@ function updateChartsWithPoints(points: MetricPoint[]) {
   if (netChart) {
     const opt: any = getBaseChartOption(
       '网络吞吐',
-      `↓ ${fmtRate(latest.net_rx)} · ↑ ${fmtRate(latest.net_tx)}`,
+      [`↓ ${fmtRate(latest.net_rx)}`, `↑ ${fmtRate(latest.net_tx)}`].join(METRIC_SEP),
       (v) => fmtBytes(v) + '/s',
     )
     opt.xAxis.data = times
@@ -284,7 +291,7 @@ function updateChartsWithPoints(points: MetricPoint[]) {
   if (diskChart) {
     const opt: any = getBaseChartOption(
       '磁盘读写',
-      `读 ${fmtRate(latest.disk_read)} · 写 ${fmtRate(latest.disk_write)}`,
+      [`读 ${fmtRate(latest.disk_read)}`, `写 ${fmtRate(latest.disk_write)}`].join(METRIC_SEP),
       (v) => fmtBytes(v) + '/s',
     )
     opt.xAxis.data = times
@@ -360,7 +367,7 @@ function updateChartsWithPoints(points: MetricPoint[]) {
         const r = probeReading(latest, c.key)
         return `${c.label} ${r ? pick(r) : '--'}`
       })
-      .join(' · ')
+      .join(METRIC_SEP)
   }
 
   const probeLegend = () => ({

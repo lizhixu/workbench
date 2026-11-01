@@ -3233,9 +3233,11 @@ onUnmounted(() => {
                     placeholder="选择运行 socat 中继容器的主机"
                     filterable
                   />
-                  <span class="hint" style="display: block; margin-top: 4px">
-                    入口主机不能是应用主机自身；优先选择有公网 IP 的主机以对外暴露服务
-                  </span>
+                  <template #feedback>
+                    <span class="forward-hint tip-hint">
+                      入口主机不能是应用主机自身；优先选择有公网 IP 的主机以对外暴露服务
+                    </span>
+                  </template>
                 </NFormItem>
 
                 <NFormItem label="入口监听端口" required>
@@ -3246,9 +3248,11 @@ onUnmounted(() => {
                     :max="65535"
                     style="width: 100%"
                   />
-                  <span class="hint" style="display: block; margin-top: 4px">
-                    入口主机上对外监听并接收客户端连接的 TCP 端口
-                  </span>
+                  <template #feedback>
+                    <span class="forward-hint tip-hint">
+                      入口主机上对外监听并接收客户端连接的 TCP 端口
+                    </span>
+                  </template>
                 </NFormItem>
 
                 <NFormItem label="应用目标端口" required>
@@ -3259,9 +3263,11 @@ onUnmounted(() => {
                     :max="65535"
                     style="width: 100%"
                   />
-                  <span class="hint" style="display: block; margin-top: 4px">
-                    本应用主机上实际接收流量的服务端口
-                  </span>
+                  <template #feedback>
+                    <span class="forward-hint tip-hint">
+                      本应用主机上实际接收流量的服务端口
+                    </span>
+                  </template>
                 </NFormItem>
               </template>
 
@@ -3781,6 +3787,16 @@ onUnmounted(() => {
 .topology-hint {
   margin-top: 10px;
   font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* 组网端口转发：字段说明走 NFormItem 的 feedback 槽，稳定落在控件下方并与
+   标签/控件保持同一竖向节奏；此前用行内 span，被表单行的 flex 布局挤到控件
+   右侧、宽度不足而折成两行。 */
+.forward-hint {
+  display: block;
+  font-size: 12px;
+  line-height: 1.6;
   color: var(--text-secondary);
 }
 

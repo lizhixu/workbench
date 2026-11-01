@@ -660,4 +660,9 @@ AI 助手页（`web/src/views/ai/AiChat.vue`）的输入区域采用现代化的
 - **时区权威感知**：时间格式化工具严格消费后端下发的 `server.timezone` 系统时区配置；当服务端未显式配置时平滑降级为浏览器本地时区。
 - **时间范围筛选控件规范**：凡具备时间范围筛选的列表（如操作审计、会话记录、监控历史等），统一采用 `NDatePicker type="datetimerange"`（输出标准时间戳区间，清空为 `null`），提交接口前通过 `new Date(ms).toISOString()` 序列化为标准 RFC3339 字符串，且在触发筛选时自动重置页码为第一页。
 
+### 9.16 表单字段说明文字（Hint）的落位规范
+- **一律走 `#feedback` 插槽**：字段的补充说明、机制解释写在 `NFormItem` 的 `<template #feedback>` 里，**严禁**把 `<span>` 直接追加在控件后塞进默认插槽。`.n-form-item-blank` 是 `display: flex; align-items: center` 的横向行，行内说明会被排到控件右侧并反向压缩控件宽度（实测说明折成两行、输入区只剩约一半宽），给 span 加 `display: block` 也无效。
+- **字号与颜色不写内联**：说明文字统一附 `.tip-hint`（纳入 §9.11 的 `appearance.show_tips` 开关），并以局部类承载 12px / `line-height: 1.6` / `color: var(--text-secondary)`（如 `AppDetail.vue` 的 `.forward-hint`）；不得依赖未定义的类名（如只写 `.hint` 而无对应样式规则），否则说明文字退化为正文样式。
+- **间距由 feedback 区自带**：`feedbackHeightMedium` 默认预留 24px，单行说明正好落在既有间距内，不会把表单撑高；多行说明允许自然折行，但不要再叠加 `margin-top` 之类的内联补偿。
+
 

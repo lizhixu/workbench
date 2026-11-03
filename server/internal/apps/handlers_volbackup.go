@@ -608,10 +608,10 @@ func (h *AppHandlers) scanVolumeUploads(c *gin.Context) {
 		return
 	}
 
-	items := make([]volumeScanItemResp, 0, len(done))
-	for _, s := range done {
-		match, matched := matchScanVolumes(s.res, candidates)
-		item := volumeScanItemResp{
+		items := make([]volumeScanItemResp, 0, len(done))
+		for _, s := range done {
+			match, matched := matchScanVolumes(s.res, candidates, s.scan.Filename)
+			item := volumeScanItemResp{
 			ArchiveID: s.scan.ArchiveID, Filename: s.scan.Filename,
 			Size: s.scan.Size, SHA256: s.scan.SHA256,
 			Snapshot: s.scan.Snapshot, TopDirs: s.res.topDirs,

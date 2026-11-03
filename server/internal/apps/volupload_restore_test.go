@@ -690,9 +690,98 @@ func TestRunRestoreUploadedBatchOffline(t *testing.T) {
 			t.Fatalf("staged upload %s must be removed after the run", it.Arch.ID)
 		}
 	}
-	for _, tok := range tokens {
-		if _, _, _, _, ok := us.peekToken(tok); ok {
-			t.Fatalf("token %s must be dropped after the run", tok)
+		for _, tok := range tokens {
+			if _, _, _, _, ok := us.peekToken(tok); ok {
+				t.Fatalf("token %s must be dropped after the run", tok)
+			}
+		}
+	}
+
+func TestCleanArchiveStem(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{".data.tar", "data"},
+		{".data.tar.gz", "data"},
+		{"data.tar.gz", "data"},
+		{"pb_data.tgz", "pb_data"},
+		{"C:\\uploads\\.data.tar", "data"},
+		{"/var/tmp/data.tar", "data"},
+		{"_backup-2024_.tar.xz", "backup-2024"},
+		{"..tar", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		got := cleanArchiveStem(c.in)
+		if got != c.want {
+			t.Errorf("cleanArchiveStem(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }
+
+func TestScanVolumeUploadsComposeAppMatching(t *testing.T) {
+	r, _, store, _, _ := newUploadRestoreTestEnv(t, "linux", true)
+	composeContent := `version: "3.0"
+services:
+  certimate:
+    image: certimate/certimate:latest
+    container_name: certimate
+    ports:
+      - 8090:8090
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./data:/app/pb_data
+    restart: unless-stopped`
+
+	app := &Application{
+		ID:             "app_compose",
+		HostID:         "h1",
+		SourceType:     "raw_compose",
+		ComposeContent: composeContent,
+	}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Upload .data.tar with entry data.db
+	tarBytes := writeTestTar(t, map[string]string{"data.db": "sqlite..."})
+	w := postMultipart(t, r, "/apps/app_compose/volume-backups/upload-scan", []uploadPart{
+		filePart("file", ".data.tar", tarBytes),
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s, want 200", w.Code, w.Body.String())
+	}
+	items := decodeScan(t, w)
+	if len(items) != 1 {
+		t.Fatalf("items len=%d, want 1", len(items))
+	}
+	it := items[0]
+	if it.Match != scanMatchUnique {
+		t.Fatalf("match=%s, want %s (matched: %+v)", it.Match, scanMatchUnique, it.Matched)
+	}
+	if len(it.Matched) != 1 {
+		t.Fatalf("matched len=%d, want 1", len(it.Matched))
+	}
+	if it.Matched[0].ContainerPath != "/app/pb_data" {
+		t.Fatalf("matched container_path=%s, want /app/pb_data", it.Matched[0].ContainerPath)
+	}
+	// Verify that /etc/localtime and /etc/timezone were completely excluded (because of ro / isIgnoredInternalMount)
+	for _, m := range it.Matched {
+		if strings.Contains(m.ContainerPath, "localtime") || strings.Contains(m.ContainerPath, "timezone") {
+			t.Fatalf("internal/ro mount matched: %+v", m)
+		}
+	}
+
+	// 2. Commit restore using the matched spec or container path
+	commitW := postJSON(t, r, "/apps/app_compose/volume-backups/upload-commit", map[string]any{
+		"pairs": []map[string]any{
+			{"archive_id": it.ArchiveID, "specs": []string{it.Matched[0].VolumeSpec}},
+		},
+	})
+	if commitW.Code != http.StatusAccepted {
+		t.Fatalf("commit code=%d body=%s, want 202", commitW.Code, commitW.Body.String())
+	}
+}
+

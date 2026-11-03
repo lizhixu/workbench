@@ -477,7 +477,7 @@ func parseVolumeSpec(spec string) (src, dst, mode string, ok bool) {
 // volumeIsBindMount reports whether a volume source is a host directory path
 // (as opposed to a Docker named volume).
 func volumeIsBindMount(src string) bool {
-	if strings.HasPrefix(src, "/") {
+	if strings.HasPrefix(src, "/") || strings.HasPrefix(src, "./") || strings.HasPrefix(src, ".\\") || src == "." {
 		return true
 	}
 	// Windows drive path ("C:\data" / "C:/data"): a third character of two with

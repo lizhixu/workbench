@@ -1811,7 +1811,15 @@ function handleScanFileSelect({ onFinish }: UploadCustomRequestOptions) {
 }
 
 function volumeOptions() {
-  return parsedVolumes.value.map((v) => ({ label: v.spec, value: v.spec }))
+  return parsedVolumes.value
+    .filter((v) => v.mode !== 'ro')
+    .map((v) => {
+      const prefix = v.service ? `[${v.service}] ` : ''
+      return {
+        label: `${prefix}${v.spec}`,
+        value: v.spec,
+      }
+    })
 }
 
 async function doScanUpload() {
@@ -1880,7 +1888,12 @@ function scanRowMatchTagType(r: ScanRow): 'success' | 'warning' | 'error' | 'inf
 
 function scanRowMatchText(r: ScanRow): string {
   if (r.match === 'manifest') return `快照 · 内含 ${r.manifestVolumes.length} 个卷`
-  if (r.match === 'unique') return '已识别'
+  if (r.match === 'unique') {
+    const reason = r.matched[0]?.reason
+    if (reason === 'filename') return '已识别（文件名匹配）'
+    if (reason === 'single_candidate') return '已识别（唯一可用卷）'
+    return '已识别'
+  }
   if (r.match === 'ambiguous') return '识别到多个候选，请选择'
   return '未能识别，请选择目标卷'
 }

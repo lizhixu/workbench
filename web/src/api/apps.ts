@@ -332,8 +332,8 @@ export interface VolumeScanMatch {
   host_path?: string
   service?: string
   volume_type?: string
-  /** manifest（快照清单命中）| container_path（内容路径命中）| basename（目录名命中） */
-  reason: 'manifest' | 'container_path' | 'basename'
+  /** manifest（快照清单命中）| container_path（内容路径命中）| basename（目录名命中）| filename（文件名特征命中）| single_candidate（唯一可用卷） */
+  reason: 'manifest' | 'container_path' | 'basename' | 'filename' | 'single_candidate'
 }
 
 /** 上传识别结果：一份已暂存的备份文件及其目标卷识别状态 */

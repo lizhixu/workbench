@@ -59,7 +59,7 @@ type volumeScanMatch struct {
 	Service       string `json:"service,omitempty"`
 	VolumeType    string `json:"volume_type,omitempty"`
 	// Reason tells the operator why this volume was proposed:
-	// "manifest"（快照清单） | "container_path"（内容路径命中） | "basename"（目录名命中）.
+	// "manifest"（快照清单） | "container_path"（内容路径命中） | "basename"（目录名命中） | "filename"（文件名特征命中） | "single_candidate"（应用唯一可用挂载卷）.
 	Reason string `json:"reason"`
 }
 
@@ -146,168 +146,259 @@ func scanUploadTar(file string) (*tarScanResult, error) {
 			}
 			manifestSeen = true
 		}
-		segments := strings.Split(name, "/")
-		if !res.topSet[segments[0]] {
-			res.topSet[segments[0]] = true
-			if len(res.topDirs) < 20 {
-				res.topDirs = append(res.topDirs, segments[0])
+			segments := strings.Split(name, "/")
+			top := segments[0]
+			if !res.topSet[top] {
+				res.topSet[top] = true
+				if len(res.topDirs) < 20 {
+					res.topDirs = append(res.topDirs, top)
+				}
 			}
-		}
-		if len(res.prefixes) < volumeScanDirCap {
-			res.prefixes[segments[0]] = true
-			if len(segments) >= 2 {
-				res.prefixes[segments[0]+"/"+segments[1]] = true
+			// If top has leading dots or underscores, e.g. ".data", also record "data"
+			cleanTop := strings.TrimLeft(top, "._")
+			if cleanTop != "" && cleanTop != top {
+				res.topSet[cleanTop] = true
 			}
-			if len(segments) >= 3 {
-				res.prefixes[segments[0]+"/"+segments[1]+"/"+segments[2]] = true
-			}
-		}
-	}
-	return res, nil
-}
 
-// volumeScanCandidates collects the app's live target volumes: declared
-// volumes for single-container apps (parseable offline), discovered mounts for
-// Compose apps (needs the agent online; offline degrades to no candidates and
-// the UI falls back to manual selection with an offline hint).
-func volumeScanCandidates(h *AppHandlers, app *Application) []volumeScanCandidate {
-	if isComposeApp(app) {
-		if h.appHub(app.HostID) == nil {
-			return nil
-		}
-		disc, err := h.engine.DiscoverAppVolumes(app)
-		if err != nil {
-			return nil
-		}
-		cands := make([]volumeScanCandidate, 0, len(disc))
-		for _, d := range disc {
-			if d.ReadOnly {
-				continue
-			}
-			cands = append(cands, volumeScanCandidate{
-				Spec: d.VolumeSpec, ContainerPath: d.ContainerPath,
-				HostPath: d.HostPath, Service: d.Service, VolumeType: d.VolumeType,
-			})
-		}
-		return cands
-	}
-	cands := make([]volumeScanCandidate, 0, len(app.Volumes))
-	for _, v := range app.Volumes {
-		spec := strings.TrimSpace(v)
-		if spec == "" {
-			continue
-		}
-		src, dst, _, ok := parseVolumeSpec(spec)
-		if !ok {
-			continue
-		}
-		host := ""
-		vType := "volume"
-		if volumeIsBindMount(src) {
-			host, vType = src, "bind"
-		}
-		cands = append(cands, volumeScanCandidate{Spec: spec, ContainerPath: dst, HostPath: host, VolumeType: vType})
-	}
-	return cands
-}
-
-// matchScanVolumes proposes which live volumes one uploaded file belongs to.
-// A parsed manifest wins outright (exact per-volume mapping); a raw tar is
-// scored by content shape: an entry path equal to (or nested under) the
-// container path is strong, a top-level directory named like the container or
-// host path basename is weaker. All positive matches are returned so the UI
-// can preselect the unique one or let the operator disambiguate.
-func matchScanVolumes(res *tarScanResult, cands []volumeScanCandidate) (match string, matched []volumeScanMatch) {
-	if res.manifest != nil {
-		for _, it := range res.manifest.Volumes {
-			for _, c := range cands {
-				if c.Spec == it.VolumeSpec || (it.ContainerPath != "" && c.ContainerPath == it.ContainerPath) {
-					matched = append(matched, volumeScanMatch{
-						VolumeSpec: c.Spec, ContainerPath: c.ContainerPath,
-						HostPath: c.HostPath, Service: c.Service, VolumeType: c.VolumeType,
-						Reason: "manifest",
-					})
-					break
+			if len(res.prefixes) < volumeScanDirCap {
+				res.prefixes[top] = true
+				if cleanTop != "" {
+					res.prefixes[cleanTop] = true
+				}
+				if len(segments) >= 2 {
+					res.prefixes[segments[0]+"/"+segments[1]] = true
+				}
+				if len(segments) >= 3 {
+					res.prefixes[segments[0]+"/"+segments[1]+"/"+segments[2]] = true
 				}
 			}
 		}
-		if len(matched) > 0 {
-			return scanMatchManifest, matched
-		}
-		return scanMatchNone, matched
+		return res, nil
 	}
 
-	type scored struct {
-		m     volumeScanMatch
-		score int
-	}
-	var hits []scored
-	for _, c := range cands {
-		m := volumeScanMatch{
-			VolumeSpec: c.Spec, ContainerPath: c.ContainerPath,
-			HostPath: c.HostPath, Service: c.Service, VolumeType: c.VolumeType,
+	// cleanArchiveStem extracts the base name of an archive file without archive extensions
+	// (.tar.gz, .tgz, .tar, etc.) and without outer dots/punctuation.
+	// e.g. ".data.tar" -> "data", "pb_data.tar.gz" -> "pb_data", "backup-data.tar" -> "backup-data".
+	func cleanArchiveStem(filename string) string {
+		name := path.Base(strings.ReplaceAll(filename, "\\", "/"))
+		if name == "" || name == "." || name == "/" {
+			return ""
 		}
-		score := 0
-		if container := strings.TrimPrefix(c.ContainerPath, "/"); container != "" {
-			if res.prefixes[container] {
-				score, m.Reason = 3, "container_path"
-			}
-		}
-		if score == 0 {
-			if base := path.Base(c.ContainerPath); base != "" && base != "/" && base != "." && res.topSet[base] {
-				score, m.Reason = 2, "basename"
-			}
-		}
-		if score == 0 && c.HostPath != "" && c.VolumeType == "bind" {
-			if base := path.Base(c.HostPath); base != "" && base != "/" && base != "." && res.topSet[base] {
-				score, m.Reason = 1, "basename"
-			}
-		}
-		if score > 0 {
-			hits = append(hits, scored{m: m, score: score})
-		}
-	}
-	if len(hits) == 0 {
-		return scanMatchNone, matched
-	}
-	sort.SliceStable(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
-	for _, h := range hits {
-		matched = append(matched, h.m)
-	}
-	if len(matched) == 1 {
-		return scanMatchUnique, matched
-	}
-	return scanMatchAmbiguous, matched
-}
-
-// resolveScanCandidates maps one commit pair's requested specs onto live
-// candidate volumes, normalizing container-path-only picks to the current spec
-// string and rejecting anything outside the whitelist. Deduping keys on the
-// resolved candidate, so a pair that names the same volume twice by spec and
-// by container path is still caught.
-func resolveScanCandidates(specs []string, cands []volumeScanCandidate) ([]volumeScanCandidate, error) {
-	seen := make(map[string]bool, len(specs))
-	out := make([]volumeScanCandidate, 0, len(specs))
-	for _, s := range specs {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return nil, errors.New("挂载卷选择为空")
-		}
-		var found *volumeScanCandidate
-		for i := range cands {
-			if cands[i].Spec == s || cands[i].ContainerPath == s {
-				found = &cands[i]
+		lower := strings.ToLower(name)
+		for _, ext := range []string{
+			".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst",
+			".tgz", ".tbz2", ".txz",
+			".tar", ".gz", ".zip", ".bz2", ".xz", ".zst",
+		} {
+			if strings.HasSuffix(lower, ext) {
+				name = name[:len(name)-len(ext)]
 				break
 			}
 		}
-		if found == nil {
-			return nil, fmt.Errorf("只能恢复到应用已声明或已挂载的卷: %s", s)
-		}
-		if seen[found.Spec] {
-			return nil, fmt.Errorf("同一挂载卷在一次导入中只能出现一次: %s", found.Spec)
-		}
-		seen[found.Spec] = true
-		out = append(out, *found)
+		name = strings.Trim(name, "._- ")
+		return name
 	}
-	return out, nil
-}
+
+	// volumeScanCandidates collects the app's live target volumes: declared
+	// volumes for single-container apps (parseable offline), discovered mounts for
+	// Compose apps (dynamically inspected on the agent, falling back to static
+	// ComposeContent parsing when offline or stopped).
+	func volumeScanCandidates(h *AppHandlers, app *Application) []volumeScanCandidate {
+		if isComposeApp(app) {
+			disc, _ := h.engine.DiscoverAppVolumes(app)
+			if len(disc) == 0 {
+				disc = staticComposeVolumes(app)
+			}
+			cands := make([]volumeScanCandidate, 0, len(disc))
+			for _, d := range disc {
+				if d.ReadOnly {
+					continue
+				}
+				cands = append(cands, volumeScanCandidate{
+					Spec: d.VolumeSpec, ContainerPath: d.ContainerPath,
+					HostPath: d.HostPath, Service: d.Service, VolumeType: d.VolumeType,
+				})
+			}
+			return cands
+		}
+		cands := make([]volumeScanCandidate, 0, len(app.Volumes))
+		for _, v := range app.Volumes {
+			spec := strings.TrimSpace(v)
+			if spec == "" {
+				continue
+			}
+			src, dst, mode, ok := parseVolumeSpec(spec)
+			if !ok || mode == "ro" {
+				continue
+			}
+			host := ""
+			vType := "volume"
+			if volumeIsBindMount(src) {
+				host, vType = src, "bind"
+			}
+			cands = append(cands, volumeScanCandidate{Spec: spec, ContainerPath: dst, HostPath: host, VolumeType: vType})
+		}
+		return cands
+	}
+
+	// matchScanVolumes proposes which live volumes one uploaded file belongs to.
+	// A parsed manifest wins outright (exact per-volume mapping); a raw tar is
+	// scored by content shape and filename: an entry path matching the container path
+	// is highest, archive filename stem or directory name matching the container
+	// or host basename follows. When the application has only one writable volume,
+	// it auto-pairs as single_candidate. All positive matches are returned.
+	func matchScanVolumes(res *tarScanResult, cands []volumeScanCandidate, filename string) (match string, matched []volumeScanMatch) {
+		if res.manifest != nil {
+			for _, it := range res.manifest.Volumes {
+				for _, c := range cands {
+					if c.Spec == it.VolumeSpec || (it.ContainerPath != "" && c.ContainerPath == it.ContainerPath) {
+						matched = append(matched, volumeScanMatch{
+							VolumeSpec: c.Spec, ContainerPath: c.ContainerPath,
+							HostPath: c.HostPath, Service: c.Service, VolumeType: c.VolumeType,
+							Reason: "manifest",
+						})
+						break
+					}
+				}
+			}
+			if len(matched) > 0 {
+				return scanMatchManifest, matched
+			}
+			return scanMatchNone, matched
+		}
+
+		type scored struct {
+			m     volumeScanMatch
+			score int
+		}
+		var hits []scored
+		stem := cleanArchiveStem(filename)
+
+		for _, c := range cands {
+			m := volumeScanMatch{
+				VolumeSpec: c.Spec, ContainerPath: c.ContainerPath,
+				HostPath: c.HostPath, Service: c.Service, VolumeType: c.VolumeType,
+			}
+			score := 0
+
+			// 1. Exact or prefix match of container path inside tar (score: 30)
+			if container := strings.TrimPrefix(c.ContainerPath, "/"); container != "" {
+				if res.prefixes[container] {
+					score, m.Reason = 30, "container_path"
+				}
+			}
+
+			base := path.Base(c.ContainerPath)
+			hostBase := path.Base(c.HostPath)
+			if hostBase == "" || hostBase == "." || hostBase == "/" {
+				if src, _, _, ok := parseVolumeSpec(c.Spec); ok {
+					hostBase = path.Base(src)
+				}
+			}
+
+			// 2. Archive filename stem matches container or host basename (score: 25 / 18)
+			if stem != "" {
+				stemLower := strings.ToLower(stem)
+				baseLower := strings.ToLower(base)
+				hostBaseLower := strings.ToLower(hostBase)
+				if (baseLower != "" && baseLower != "/" && baseLower != "." && stemLower == baseLower) ||
+					(hostBaseLower != "" && hostBaseLower != "/" && hostBaseLower != "." && stemLower == hostBaseLower) {
+					if score < 25 {
+						score, m.Reason = 25, "filename"
+					}
+				} else if (len(hostBaseLower) >= 3 && strings.Contains(stemLower, hostBaseLower)) ||
+					(len(baseLower) >= 3 && strings.Contains(stemLower, baseLower)) {
+					if score < 18 {
+						score, m.Reason = 18, "filename"
+					}
+				}
+			}
+
+			// 3. Top-level directory inside tar matches container basename (score: 20)
+			if base != "" && base != "/" && base != "." && res.topSet[base] {
+				if score < 20 {
+					score, m.Reason = 20, "basename"
+				}
+			}
+
+			// 4. Top-level directory inside tar matches host basename (score: 15)
+			if hostBase != "" && hostBase != "/" && hostBase != "." && res.topSet[hostBase] {
+				if score < 15 {
+					score, m.Reason = 15, "basename"
+				}
+			}
+
+			if score > 0 {
+				hits = append(hits, scored{m: m, score: score})
+			}
+		}
+
+		if len(hits) == 0 {
+			if len(cands) == 1 {
+				return scanMatchUnique, []volumeScanMatch{{
+					VolumeSpec:    cands[0].Spec,
+					ContainerPath: cands[0].ContainerPath,
+					HostPath:      cands[0].HostPath,
+					Service:       cands[0].Service,
+					VolumeType:    cands[0].VolumeType,
+					Reason:        "single_candidate",
+				}}
+			}
+			return scanMatchNone, matched
+		}
+
+		sort.SliceStable(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
+		for _, h := range hits {
+			matched = append(matched, h.m)
+		}
+		if len(matched) == 1 {
+			return scanMatchUnique, matched
+		}
+		if hits[0].score > hits[1].score && hits[0].score >= 20 {
+			return scanMatchUnique, []volumeScanMatch{hits[0].m}
+		}
+		return scanMatchAmbiguous, matched
+	}
+
+	// resolveScanCandidates maps one commit pair's requested specs onto live
+	// candidate volumes, normalizing container-path-only picks to the current spec
+	// string and rejecting anything outside the whitelist. Deduping keys on the
+	// resolved candidate, so a pair that names the same volume twice by spec and
+	// by container path is still caught.
+	func resolveScanCandidates(specs []string, cands []volumeScanCandidate) ([]volumeScanCandidate, error) {
+		seen := make(map[string]bool, len(specs))
+		out := make([]volumeScanCandidate, 0, len(specs))
+		for _, s := range specs {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				return nil, errors.New("挂载卷选择为空")
+			}
+			var found *volumeScanCandidate
+			_, sDst, _, sOk := parseVolumeSpec(s)
+			for i := range cands {
+				if cands[i].Spec == s || cands[i].ContainerPath == s {
+					found = &cands[i]
+					break
+				}
+				if sOk && cands[i].ContainerPath != "" && cands[i].ContainerPath == sDst {
+					found = &cands[i]
+					break
+				}
+				if sOk {
+					if _, cDst, _, cOk := parseVolumeSpec(cands[i].Spec); cOk && cDst == sDst {
+						found = &cands[i]
+						break
+					}
+				}
+			}
+			if found == nil {
+				return nil, fmt.Errorf("只能恢复到应用已声明或已挂载的卷: %s", s)
+			}
+			if seen[found.Spec] {
+				return nil, fmt.Errorf("同一挂载卷在一次导入中只能出现一次: %s", found.Spec)
+			}
+			seen[found.Spec] = true
+			out = append(out, *found)
+		}
+		return out, nil
+	}

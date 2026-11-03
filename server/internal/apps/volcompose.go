@@ -3,7 +3,10 @@ package apps
 import (
 	"fmt"
 	"path"
+	"sort"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 
 	"watchman/server/internal/rpc"
 )
@@ -83,6 +86,7 @@ func isIgnoredInternalMount(containerPath string) bool {
 	cp := path.Clean(containerPath)
 	switch cp {
 	case "/etc/hosts", "/etc/hostname", "/etc/resolv.conf",
+		"/etc/localtime", "/etc/timezone",
 		"/var/run/docker.sock", "/run/docker.sock",
 		"/proc", "/sys", "/dev":
 		return true
@@ -91,6 +95,140 @@ func isIgnoredInternalMount(containerPath string) bool {
 		return true
 	}
 	return false
+}
+
+type staticComposeYAML struct {
+	Services map[string]staticComposeService `yaml:"services"`
+}
+
+type staticComposeService struct {
+	Volumes []any `yaml:"volumes"`
+}
+
+// staticComposeVolumes parses app.ComposeContent statically when dynamic container
+// inspection on the host is unavailable (containers stopped, not yet deployed, or agent offline).
+func staticComposeVolumes(app *Application) []DiscoveredVolume {
+	if app == nil || strings.TrimSpace(app.ComposeContent) == "" {
+		return nil
+	}
+	var cf staticComposeYAML
+	if err := yaml.Unmarshal([]byte(app.ComposeContent), &cf); err != nil {
+		return nil
+	}
+	if len(cf.Services) == 0 {
+		return nil
+	}
+
+	// Sort service names for deterministic volume order
+	svcNames := make([]string, 0, len(cf.Services))
+	for name := range cf.Services {
+		svcNames = append(svcNames, name)
+	}
+	sort.Strings(svcNames)
+
+	type mountKey struct {
+		spec    string
+		service string
+	}
+	seen := make(map[mountKey]bool)
+	var out []DiscoveredVolume
+
+	for _, svcName := range svcNames {
+		svc := cf.Services[svcName]
+		for _, raw := range svc.Volumes {
+			var spec, hostPath, volType string
+			var isRO bool
+			var dst string
+
+			switch v := raw.(type) {
+			case string:
+				v = strings.TrimSpace(v)
+				if v == "" {
+					continue
+				}
+				src, d, mode, ok := parseVolumeSpec(v)
+				if !ok {
+					continue
+				}
+				if isIgnoredInternalMount(d) {
+					continue
+				}
+				dst = d
+				isRO = mode == "ro"
+				spec = v
+				if volumeIsBindMount(src) {
+					volType = "bind"
+					if strings.HasPrefix(src, "/") || (len(src) >= 3 && src[1] == ':' && (src[2] == '/' || src[2] == '\\')) {
+						hostPath = src
+					} else {
+						// Relative bind mount path like "./data"
+						cleanRel := strings.TrimPrefix(strings.TrimPrefix(src, "."), "/")
+						cleanRel = strings.TrimPrefix(cleanRel, "\\")
+						hostPath = path.Join("/var/lib/watchman/apps", app.ID, cleanRel)
+					}
+				} else {
+					volType = "volume"
+					hostPath = ""
+				}
+
+			case map[string]any:
+				t, _ := v["type"].(string)
+				src, _ := v["source"].(string)
+				tgt, _ := v["target"].(string)
+				ro, _ := v["read_only"].(bool)
+				src = strings.TrimSpace(src)
+				tgt = strings.TrimSpace(tgt)
+				if tgt == "" || !strings.HasPrefix(tgt, "/") {
+					continue
+				}
+				if isIgnoredInternalMount(tgt) {
+					continue
+				}
+				dst = tgt
+				isRO = ro
+				if t == "bind" || volumeIsBindMount(src) {
+					volType = "bind"
+					spec = src + ":" + tgt
+					if isRO {
+						spec += ":ro"
+					}
+					if strings.HasPrefix(src, "/") || (len(src) >= 3 && src[1] == ':' && (src[2] == '/' || src[2] == '\\')) {
+						hostPath = src
+					} else {
+						cleanRel := strings.TrimPrefix(strings.TrimPrefix(src, "."), "/")
+						cleanRel = strings.TrimPrefix(cleanRel, "\\")
+						hostPath = path.Join("/var/lib/watchman/apps", app.ID, cleanRel)
+					}
+				} else {
+					volType = "volume"
+					spec = src + ":" + tgt
+					if isRO {
+						spec += ":ro"
+					}
+					hostPath = ""
+				}
+
+			default:
+				continue
+			}
+
+			key := mountKey{spec: spec, service: svcName}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			out = append(out, DiscoveredVolume{
+				VolumeSpec:    spec,
+				VolumeType:    volType,
+				HostPath:      hostPath,
+				ContainerPath: dst,
+				Service:       svcName,
+				ReadOnly:      isRO,
+			})
+		}
+	}
+	return out
 }
 
 // parseComposeDiscoverOutput parses stdout from composeDiscoverScript into structured DiscoveredVolumes.
@@ -185,7 +323,8 @@ func parseComposeDiscoverOutput(stdout []byte) []DiscoveredVolume {
 
 // DiscoverAppVolumes inspects the host to discover all operational volumes of an application.
 // For single-container apps, it parses app.Volumes and optionally enriches mountpoints.
-// For Compose apps, it queries docker volume and container mounts on the agent.
+// For Compose apps, it queries docker volume and container mounts on the agent, falling back
+// to static parsing of app.ComposeContent when the agent is offline or containers are not running.
 func (e *Engine) DiscoverAppVolumes(app *Application) ([]DiscoveredVolume, error) {
 	if app == nil {
 		return nil, fmt.Errorf("app is nil")
@@ -193,22 +332,21 @@ func (e *Engine) DiscoverAppVolumes(app *Application) ([]DiscoveredVolume, error
 
 	hub := e.volumeHub(app)
 	if isComposeApp(app) {
-		if hub == nil {
+		var disc []DiscoveredVolume
+		if hub != nil {
+			proj := composeProjectName(app.ID)
+			res, err := execOnAgent(hub, "voldisc-"+randomToken(4), composeDiscoverScript(proj), 30)
+			if err == nil && res.GetExitCode() == 0 {
+				disc = parseComposeDiscoverOutput(res.GetStdout())
+			}
+		}
+		if len(disc) == 0 {
+			disc = staticComposeVolumes(app)
+		}
+		if len(disc) == 0 && hub == nil && strings.TrimSpace(app.ComposeContent) == "" {
 			return nil, fmt.Errorf("目标主机 Agent 不在线，无法动态发现 Compose 挂载卷")
 		}
-		proj := composeProjectName(app.ID)
-		res, err := execOnAgent(hub, "voldisc-"+randomToken(4), composeDiscoverScript(proj), 30)
-		if err != nil {
-			return nil, fmt.Errorf("查询 Compose 挂载卷失败: %v", err)
-		}
-		if res.GetExitCode() != 0 {
-			msg := strings.TrimSpace(string(res.GetStderr()))
-			if msg == "" {
-				msg = fmt.Sprintf("exit %d", res.GetExitCode())
-			}
-			return nil, fmt.Errorf("查询 Compose 挂载卷失败: %s", msg)
-		}
-		return parseComposeDiscoverOutput(res.GetStdout()), nil
+		return disc, nil
 	}
 
 	// Single-container app

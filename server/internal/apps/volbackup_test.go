@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -91,17 +92,45 @@ func TestVolumeResolveMountpointScript(t *testing.T) {
 	}
 }
 
-func TestVolumeRestoreScript(t *testing.T) {
-	script := volumeRestoreScript("/opt/data", "/var/backups/watchman/apps/app1/vbk_x.tar.gz",
-		"/var/backups/watchman/apps/app1/vbk_x.pre-restore.tar.gz")
-	if !strings.Contains(script, "/var/backups/watchman/apps/app1/vbk_x.pre-restore.tar.gz") {
+// The restore core must lean on GNU tar's compression auto-detection: an
+// operator-uploaded archive may be a plain uncompressed .tar (piped straight
+// out of `docker cp`), so the manifest probe and both extraction branches
+// must use -tf/-xf, never the gzip-only -tzf/-xzf.
+func TestVolumeMultiRestoreScript(t *testing.T) {
+	script := volumeMultiRestoreScript("/var/backups/watchman/apps/app1/vbk_x.tar.gz",
+		"/var/backups/watchman/apps/app1/safety", true,
+		[]RestoreTarget{{Index: 0, DestDir: "/opt/data", Spec: "/opt/data:/data"}})
+
+	if !strings.Contains(script, `tar -tf '/var/backups/watchman/apps/app1/vbk_x.tar.gz' manifest.json`) {
+		t.Errorf("manifest probe must use auto-detect -tf:\n%s", script)
+	}
+	if strings.Contains(script, "-tzf") || strings.Contains(script, "-xzf") {
+		t.Errorf("restore must not hardcode gzip flags:\n%s", script)
+	}
+	if !strings.Contains(script, `tar -C '/opt/data' -xf '/var/backups/watchman/apps/app1/vbk_x.tar.gz' --strip-components=2 'volumes/vol_0'`) {
+		t.Errorf("snapshot branch missing strip-components extract:\n%s", script)
+	}
+	if !strings.Contains(script, "tar -C '/opt/data' -xf '/var/backups/watchman/apps/app1/vbk_x.tar.gz'") {
+		t.Errorf("plain-tar branch missing direct extract:\n%s", script)
+	}
+	if !strings.Contains(script, "pre-restore-0.tar.gz") {
 		t.Errorf("restore script missing safety copy:\n%s", script)
 	}
-	if !strings.Contains(script, `tar -C '/opt/data' -xzf '/var/backups/watchman/apps/app1/vbk_x.tar.gz'`) {
-		t.Errorf("restore script missing untar:\n%s", script)
+	if !strings.Contains(script, "find '/opt/data' -mindepth 1 -maxdepth 1") {
+		t.Errorf("clean restore must wipe child entries in place:\n%s", script)
 	}
 	if !strings.Contains(script, "[ -f ") || !strings.Contains(script, "归档文件不存在") {
 		t.Errorf("restore script must check the archive exists:\n%s", script)
+	}
+}
+
+// The upload preflight probe must auto-detect compression too: a plain .tar
+// without an operator-supplied SHA must survive the probe and only be
+// rejected at the actual unpack if it is not a tar at all.
+func TestVolumeTarProbeScript(t *testing.T) {
+	script := volumeTarProbeScript("/var/backups/watchman/apps/app1/vbk_x.tar")
+	if !strings.Contains(script, `tar -tf '/var/backups/watchman/apps/app1/vbk_x.tar'`) || strings.Contains(script, "-tzf") {
+		t.Errorf("probe must use auto-detect -tf, not gzip-only -tzf:\n%s", script)
 	}
 }
 
@@ -352,6 +381,21 @@ func TestStaleVolumeArchivesCountsOnlySuccess(t *testing.T) {
 	// A snapshot job's retention count overrides the package default.
 	if got := staleVolumeArchives(all, "/a:/a", 2); len(got) != 5 {
 		t.Fatalf("keep=2 stale = %d records, want 5", len(got))
+	}
+}
+
+// The keep knob: a manual backup (noPruneVolumes) must never trigger the
+// prune, any other non-positive value falls back to the default, and a
+// scheduled job's positive window passes through verbatim.
+func TestEffectiveVolumeKeep(t *testing.T) {
+	if keep, ok := effectiveVolumeKeep(noPruneVolumes); ok || keep != 0 {
+		t.Fatalf("noPruneVolumes: keep=%d ok=%v, want manual backup to opt out of pruning", keep, ok)
+	}
+	if keep, ok := effectiveVolumeKeep(0); !ok || keep != volumeRetention {
+		t.Fatalf("zero keep: keep=%d ok=%v, want default %d", keep, ok, volumeRetention)
+	}
+	if keep, ok := effectiveVolumeKeep(7); !ok || keep != 7 {
+		t.Fatalf("job keep: keep=%d ok=%v, want 7 verbatim", keep, ok)
 	}
 }
 
@@ -636,16 +680,16 @@ func TestVolumeBackupRejectedWhileDeploying(t *testing.T) {
 }
 
 func TestVolumeBackupSupported(t *testing.T) {
-	cases := []struct {
-		app  Application
-		want bool
-	}{
-		{app: Application{SourceType: "image"}, want: true},
-		{app: Application{SourceType: "template"}, want: true},
-		{app: Application{SourceType: "git", BuildType: "dockerfile"}, want: true},
-		{app: Application{SourceType: "git", BuildType: "compose"}, want: false},
-		{app: Application{SourceType: "raw_compose"}, want: false},
-	}
+		cases := []struct {
+			app  Application
+			want bool
+		}{
+			{app: Application{SourceType: "image"}, want: true},
+			{app: Application{SourceType: "template"}, want: true},
+			{app: Application{SourceType: "git", BuildType: "dockerfile"}, want: true},
+			{app: Application{SourceType: "git", BuildType: "compose"}, want: true},
+			{app: Application{SourceType: "raw_compose"}, want: true},
+		}
 	for _, tc := range cases {
 		if got := volumeBackupSupported(&tc.app); got != tc.want {
 			t.Errorf("volumeBackupSupported(%s/%s) = %v, want %v", tc.app.SourceType, tc.app.BuildType, got, tc.want)
@@ -726,7 +770,7 @@ func TestVolumeBackupRejectsUndeclaredSpec(t *testing.T) {
 	}
 }
 
-func TestVolumeBackupRejectsComposeApp(t *testing.T) {
+func TestVolumeBackupSupportsComposeApp(t *testing.T) {
 	r, store, _ := newVolumeTestRouter(t)
 	app := &Application{ID: "app1", HostID: "h1", SourceType: "raw_compose", ComposeContent: "services: {}"}
 	if err := store.PutApp(app); err != nil {
@@ -734,8 +778,9 @@ func TestVolumeBackupRejectsComposeApp(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/apps/app1/volume-backups", nil))
-	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "Compose") {
-		t.Fatalf("compose app must be rejected: code=%d body=%s", w.Code, w.Body.String())
+	// Compose app is supported and passes volume validation; it reaches the host agent check (503).
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("compose app should be supported: code=%d body=%s, want 503 (agent offline)", w.Code, w.Body.String())
 	}
 }
 
@@ -944,6 +989,36 @@ func TestVolumeBackupNoteLengthLimit(t *testing.T) {
 	}
 }
 
+// The retention knob must accept its full legal range and reject anything
+// beyond the per-app metadata cap: a retention larger than the store itself
+// would be a lie the prune can never honor.
+func TestVolumeBackupRetentionRange(t *testing.T) {
+	r, store, _ := newVolumeTestRouter(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image", Volumes: []string{"/opt/a:/a"}}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, bad := range []string{`{"retention":-1}`, `{"retention":101}`} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/apps/app1/volume-backups", strings.NewReader(bad)))
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "最大保留份数") {
+			t.Fatalf("retention %s: code=%d body=%s", bad, w.Code, w.Body.String())
+		}
+	}
+
+	// Zero (omitted knob) stays legal — a manual backup simply skips the
+	// prune; with a resolvable local target the request proceeds past
+	// validation and stops at the offline agent (503) instead of a 400.
+	for _, ok := range []string{`{"retention":0,"target_id":"local"}`, `{"retention":100,"target_id":"local"}`, `{"target_id":"local"}`} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/apps/app1/volume-backups", strings.NewReader(ok)))
+		if w.Code == http.StatusBadRequest {
+			t.Fatalf("retention %s should pass validation: code=%d body=%s", ok, w.Code, w.Body.String())
+		}
+	}
+}
+
 // fakeSnapshotJobStore records which app's scheduled backup jobs were dropped.
 type fakeSnapshotJobStore struct {
 	deleted []string
@@ -1114,5 +1189,96 @@ func TestPurgeVolumeArchivesCallerHoldsSlot(t *testing.T) {
 	e.releaseVolumeSlot(app.ID)
 	if e.VolumeBusy(app.ID) {
 		t.Fatal("caller release must free the slot")
+	}
+}
+
+// TestRunAppVolumeBackupSpecValidation locks the job-target parsing on the
+// engine path: "ALL" and a declared comma list pass the allowlist (and fall
+// through to the offline gate), an undeclared spec or a blank list is
+// rejected before any slot is taken.
+func TestRunAppVolumeBackupSpecValidation(t *testing.T) {
+	e, store, _ := newVolumeTestEngine(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image", Volumes: []string{"/opt/a:/a", "/opt/b:/b"}}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+
+	// ALL passes the spec allowlist and fails later at the offline gate.
+	if err := e.RunAppVolumeBackup("app1", "ALL", "", "default", 7); err == nil || !strings.Contains(err.Error(), "Agent 不在线") {
+		t.Fatalf("ALL target should reach the offline gate, got %v", err)
+	}
+	// A declared comma selection behaves the same.
+	if err := e.RunAppVolumeBackup("app1", "/opt/a:/a,/opt/b:/b", "", "default", 7); err == nil || !strings.Contains(err.Error(), "Agent 不在线") {
+		t.Fatalf("declared multi target should reach the offline gate, got %v", err)
+	}
+	// An undeclared spec inside the list is rejected by name.
+	err := e.RunAppVolumeBackup("app1", "/opt/a:/a,/opt/x:/x", "", "default", 7)
+	if err == nil || !strings.Contains(err.Error(), "只能备份应用已声明的挂载卷: /opt/x:/x") {
+		t.Fatalf("undeclared spec: got %v", err)
+	}
+	// A list that parses to nothing counts as "no volume selected".
+	err = e.RunAppVolumeBackup("app1", " , , ", "", "default", 7)
+	if err == nil || !strings.Contains(err.Error(), "必须选择挂载卷") {
+		t.Fatalf("blank list: got %v", err)
+	}
+	if e.VolumeBusy("app1") {
+		t.Fatal("rejected runs must not leak the volume slot")
+	}
+}
+
+// TestListAppVolumeArchivesSelectionFilter locks the job-history scoping: a
+// job sees exactly the archives whose snapshot matches its volume selection
+// ("ALL" = the whole declared set), regardless of the "ALL" multi-volume
+// label on the archive record.
+func TestListAppVolumeArchivesSelectionFilter(t *testing.T) {
+	e, store, vols := newVolumeTestEngine(t)
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "image", Volumes: []string{"/opt/a:/a", "/opt/b:/b"}}
+	if err := store.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+	items := func(specs ...string) []VolumeItemArchive {
+		out := make([]VolumeItemArchive, len(specs))
+		for i, s := range specs {
+			out[i] = VolumeItemArchive{VolumeSpec: s, ContainerPath: s}
+		}
+		return out
+	}
+	put := func(id string, spec string, its []VolumeItemArchive) {
+		t.Helper()
+		if err := vols.PutArchive(&VolumeArchive{
+			ID: id, AppID: "app1", HostID: "h1", VolumeSpec: spec, Volumes: its,
+			Status: VolumeBackupSuccess, StorageTarget: "s3_test",
+		}); err != nil {
+			t.Fatalf("PutArchive %s: %v", id, err)
+		}
+	}
+	put("vbk_full", "ALL", items("/opt/a:/a", "/opt/b:/b"))
+	put("vbk_one", "/opt/a:/a", items("/opt/a:/a"))
+	put("vbk_other", "ALL", items("/opt/a:/a", "/opt/c:/c"))
+	// Plain upload-restore record: no item list, only the spec label.
+	put("vbk_plain", "/opt/a:/a", nil)
+
+	ids := func(spec string) []string {
+		t.Helper()
+		out := []string{}
+		for _, a := range e.ListAppVolumeArchives("app1", spec) {
+			out = append(out, a.ID)
+		}
+		return out
+	}
+	if got := ids("ALL"); !reflect.DeepEqual(got, []string{"vbk_full"}) {
+		t.Fatalf("ALL filter = %v, want [vbk_full]", got)
+	}
+	if got := ids("/opt/a:/a"); !reflect.DeepEqual(got, []string{"vbk_one", "vbk_plain"}) {
+		t.Fatalf("single filter = %v, want [vbk_one vbk_plain]", got)
+	}
+	if got := ids("/opt/a:/a,/opt/b:/b"); !reflect.DeepEqual(got, []string{"vbk_full"}) {
+		t.Fatalf("multi filter = %v, want [vbk_full]", got)
+	}
+	if got := ids("/opt/c:/c"); len(got) != 0 {
+		t.Fatalf("non-matching selection = %v, want empty", got)
+	}
+	if got := ids(""); len(got) != 4 {
+		t.Fatalf("empty filter must list all archives, got %v", got)
 	}
 }

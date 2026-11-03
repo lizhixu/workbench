@@ -221,31 +221,57 @@ export function migrateApp(id: string, req: MigrateAppRequest) {
   ).then((r) => r.data)
 }
 
-/** 应用挂载卷备份归档（volbackup.go 的 HTTP 面，归档存 S3） */
+/** 应用运行时挂载卷（单容器声明卷或 Compose 动态发现卷） */
+export interface DiscoveredVolume {
+  volume_spec: string
+  volume_type: string // "bind" | "volume"
+  host_path: string
+  container_path: string
+  service?: string
+  read_only?: boolean
+}
+
+/** 归档内单个卷元数据 */
+export interface VolumeItemArchive {
+  volume_spec: string
+  volume_type?: string
+  host_path?: string
+  container_path?: string
+  service?: string
+  size?: number
+  sha256?: string
+}
+
+/** 应用挂载卷备份归档（volbackup.go 的 HTTP 面，支持 S3 与本地存储） */
 export interface VolumeArchive {
   id: string
   app_id: string
   host_id: string
-  /** 原始 docker -v 规格，如 "/opt/apps/redis/data:/data" */
+  /** 原始 docker -v 规格，多卷快照时为 "ALL" */
   volume_spec: string
   /** 解析后的宿主机数据目录（bind 路径或 Docker 具名卷挂载点） */
   host_path: string
   /** 容器内路径 */
   container_path: string
-  /** 归档写入的 S3 存储目标（备份时冻结，切换默认目标不影响旧归档） */
+  /** 快照包含的全部挂载卷清单 */
+  volumes?: VolumeItemArchive[]
+  /** 备份一致性模式：online (在线) | pause (暂停写) | stop (停机冷备) */
+  consistency_mode?: 'online' | 'pause' | 'stop'
+  /** 归档写入的存储目标（"local" | S3 目标 ID） */
   storage_target: string
   storage_target_name?: string
-  /** S3 对象键（含目标前缀），如 "apps/app1/vbk_x.tar.gz" */
+  /** 存储路径（本地相对路径或 S3 对象键） */
   storage_path: string
   size: number
   sha256?: string
-  /** running | success | failed | uploaded（uploaded = 上传恢复记录，无 S3 对象） */
+  /** running | success | failed | uploaded（uploaded = 上传恢复记录） */
   status: string
-  /** 归档来源：空 = 面板备份，upload = 上传恢复记录 */
+  /** 归档来源：空/manual = 面板备份，job = 快照定时任务，upload = 上传恢复记录 */
   source?: string
   error?: string
   note?: string
   created_at: string
+  finished_at?: string
   /** 最近一次从该归档恢复的时间/结果（success | failed）与失败原因 */
   last_restore_at?: string
   last_restore_status?: string
@@ -266,19 +292,32 @@ export interface VolumeBackupListResp {
   offset: number
   page_size: number
   s3: VolumeS3Status
+  volumes?: DiscoveredVolume[]
 }
 
 export function listVolumeBackups(id: string, params?: { volume?: string; offset?: number; page_size?: number }) {
   return unwrap<VolumeBackupListResp>(http.get(`/apps/${id}/volume-backups`, { params }))
 }
 
-export function backupAppVolumes(id: string, req: { volumes?: string[]; note?: string; target_id?: string }) {
+export function getAppVolumes(id: string) {
+  return unwrap<{ data: DiscoveredVolume[] }>(http.get(`/apps/${id}/volumes`)).then((r) => r.data)
+}
+
+export function backupAppVolumes(id: string, req: {
+  volumes?: string[]
+  note?: string
+  target_id?: string
+  consistency_mode?: 'online' | 'pause' | 'stop'
+}) {
   return unwrap<{ ok: boolean; message: string }>(http.post(`/apps/${id}/volume-backups`, req))
 }
 
-export function restoreVolumeArchive(id: string, archiveId: string) {
+export function restoreVolumeArchive(id: string, archiveId: string, req?: {
+  clean_restore?: boolean
+  volumes?: string[]
+}) {
   return unwrap<{ ok: boolean; message: string }>(
-    http.post(`/apps/${id}/volume-backups/${archiveId}/restore`),
+    http.post(`/apps/${id}/volume-backups/${archiveId}/restore`, req || {}),
   )
 }
 
@@ -286,14 +325,59 @@ export function deleteVolumeArchive(id: string, archiveId: string) {
   return unwrap<{ ok: boolean }>(http.delete(`/apps/${id}/volume-backups/${archiveId}`))
 }
 
+/** 上传识别：一份已暂存文件自动识别出的一个候选目标卷 */
+export interface VolumeScanMatch {
+  volume_spec: string
+  container_path?: string
+  host_path?: string
+  service?: string
+  volume_type?: string
+  /** manifest（快照清单命中）| container_path（内容路径命中）| basename（目录名命中） */
+  reason: 'manifest' | 'container_path' | 'basename'
+}
+
+/** 上传识别结果：一份已暂存的备份文件及其目标卷识别状态 */
+export interface VolumeScanItem {
+  archive_id: string
+  filename: string
+  size: number
+  sha256: string
+  /** 本系统导出的多卷快照 tar（内嵌 manifest.json） */
+  snapshot: boolean
+  /** 归档顶层目录/文件名（展示识别依据用） */
+  top_dirs?: string[]
+  /** 快照内声明的全部卷清单 */
+  manifest_volumes?: VolumeItemArchive[]
+  /** manifest（快照清单）| unique（唯一命中）| ambiguous（多个候选）| none（未识别） */
+  match: 'manifest' | 'unique' | 'ambiguous' | 'none'
+  matched: VolumeScanMatch[]
+}
+
 /**
- * 上传备份文件并恢复到指定挂载卷：multipart 直传（文件可能达 GB 级，
- * 不设 axios 超时）；服务端 202 受理后异步执行恢复，返回归档记录 id
- * 供详情页轮询其最近恢复结果。
+ * 离线上传第一步：把备份文件直传面板暂存，服务端解开 tar 读取内容并
+ * 自动识别每份文件该恢复到哪个挂载卷（快照读内嵌 manifest.json，裸 tar
+ * 按顶层目录与容器路径匹配）。识别结果回显给操作员过目，确认走
+ * commitVolumeUploadRestore。文件可能达 GB 级，不设 axios 超时。
  */
-export function uploadVolumeRestore(id: string, form: FormData) {
-  return unwrap<{ ok: boolean; archive_id: string; message: string }>(
-    http.post(`/apps/${id}/volume-backups/upload-restore`, form, { timeout: 0 }),
+export function scanVolumeUploads(id: string, form: FormData) {
+  return unwrap<{ ok: boolean; items: VolumeScanItem[] }>(
+    http.post(`/apps/${id}/volume-backups/upload-scan`, form, { timeout: 0 }),
+  )
+}
+
+/**
+ * 离线上传第二步：提交识别/改选后的（文件 → 目标卷）配对。服务端校验后
+ * 202 受理异步执行一次批量恢复（全部文件校验通过后一次停机、逐卷解包、
+ * 一次重启），返回归档记录 id 列表（archive_id 为首个，兼容单目标调用方）
+ * 供详情页轮询各自最近恢复结果。SHA256 由服务端在暂存时计算，提交即
+ * 作为 Agent 下载后的硬校验，不再依赖客户端手工填写。
+ */
+export function commitVolumeUploadRestore(
+  id: string,
+  pairs: { archive_id: string; specs: string[] }[],
+) {
+  return unwrap<{ ok: boolean; archive_id: string; archive_ids: string[]; message: string }>(
+    http.post(`/apps/${id}/volume-backups/upload-commit`, { pairs }, { timeout: 0 }),
   )
 }
 

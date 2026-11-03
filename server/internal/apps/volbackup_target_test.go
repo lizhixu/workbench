@@ -33,30 +33,34 @@ func TestResolveVolumeBackupTarget(t *testing.T) {
 	engine := &Engine{s3: newTargetSelectionStore()}
 
 	// An explicit target wins over the default.
-	if got, err := engine.resolveVolumeBackupTarget("t-minio"); err != nil || got.ID != "t-minio" {
-		t.Errorf("explicit target: got (%v, %v), want (t-minio, nil)", got, err)
+	if got, isLocal, err := engine.resolveVolumeBackupTarget("t-minio"); err != nil || isLocal || got.ID != "t-minio" {
+		t.Errorf("explicit target: got (%v, %v, %v), want (t-minio, false, nil)", got, isLocal, err)
+	}
+	// Local target resolves as local
+	if got, isLocal, err := engine.resolveVolumeBackupTarget("local"); err != nil || !isLocal || got.ID != StorageTargetLocal {
+		t.Errorf("local target: got (%v, %v, %v), want (local, true, nil)", got, isLocal, err)
 	}
 	// Whitespace-only input counts as omitted, not as an unknown id.
-	if got, err := engine.resolveVolumeBackupTarget("  "); err != nil || got.ID != "t-r2" {
-		t.Errorf("blank target: got (%v, %v), want (t-r2, nil)", got, err)
+	if got, isLocal, err := engine.resolveVolumeBackupTarget("  "); err != nil || isLocal || got.ID != "t-r2" {
+		t.Errorf("blank target: got (%v, %v, %v), want (t-r2, false, nil)", got, isLocal, err)
 	}
 	// Omitted input falls back to the default target.
-	if got, err := engine.resolveVolumeBackupTarget(""); err != nil || got.ID != "t-r2" {
-		t.Errorf("omitted target: got (%v, %v), want (t-r2, nil)", got, err)
+	if got, isLocal, err := engine.resolveVolumeBackupTarget(""); err != nil || isLocal || got.ID != "t-r2" {
+		t.Errorf("omitted target: got (%v, %v, %v), want (t-r2, false, nil)", got, isLocal, err)
 	}
 	// An unknown id must not silently fall back to the default.
-	if _, err := engine.resolveVolumeBackupTarget("t-gone"); !errors.Is(err, errVolumeTargetUnknown) {
+	if _, _, err := engine.resolveVolumeBackupTarget("t-gone"); !errors.Is(err, errVolumeTargetUnknown) {
 		t.Errorf("unknown target: err = %v, want errVolumeTargetUnknown", err)
 	}
 
 	// Without a default, an explicit valid target still resolves: choosing
 	// a destination must not require a default to exist.
 	noDefault := &Engine{s3: newTargetSelectionStoreNoDefault()}
-	if got, err := noDefault.resolveVolumeBackupTarget("t-minio"); err != nil || got.ID != "t-minio" {
-		t.Errorf("explicit without default: got (%v, %v), want (t-minio, nil)", got, err)
+	if got, isLocal, err := noDefault.resolveVolumeBackupTarget("t-minio"); err != nil || isLocal || got.ID != "t-minio" {
+		t.Errorf("explicit without default: got (%v, %v, %v), want (t-minio, false, nil)", got, isLocal, err)
 	}
 	// Without a default and without a choice, there is nowhere to upload to.
-	if _, err := noDefault.resolveVolumeBackupTarget(""); !errors.Is(err, errVolumeTargetNone) {
+	if _, _, err := noDefault.resolveVolumeBackupTarget(""); !errors.Is(err, errVolumeTargetNone) {
 		t.Errorf("no target at all: err = %v, want errVolumeTargetNone", err)
 	}
 }

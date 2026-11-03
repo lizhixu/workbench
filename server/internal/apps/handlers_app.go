@@ -78,10 +78,11 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	readRG.GET("/apps/:id/deployments/:depID", h.getDeployment)
 	readRG.POST("/apps/:id/deployments/:depID/diagnose", h.diagnoseDeployment)
 	readRG.GET("/apps/:id/status", h.appStatus)
-	// App volume backup/restore: archive listing and download are reads (the
-	// download 302s to a pre-signed S3 GET).
-	readRG.GET("/apps/:id/volume-backups", h.listVolumeBackups)
-	readRG.GET("/apps/:id/volume-backups/:archiveID/download", h.downloadVolumeBackup)
+		// App volume backup/restore: archive listing and download are reads (the
+		// download 302s to a pre-signed S3 GET).
+		readRG.GET("/apps/:id/volume-backups", h.listVolumeBackups)
+		readRG.GET("/apps/:id/volume-backups/:archiveID/download", h.downloadVolumeBackup)
+		readRG.GET("/apps/:id/volumes", h.getAppVolumes)
 
 	// Image / repository metadata probing: read-only ground-truth fetchers used
 	// by the create-form auto-fill hints and the AI app assistant. No state is
@@ -111,9 +112,13 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	writeRG.POST("/apps/:id/volume-backups", h.createVolumeBackup)
 	writeRG.POST("/apps/:id/volume-backups/:archiveID/restore", h.restoreVolumeBackup)
 	writeRG.DELETE("/apps/:id/volume-backups/:archiveID", h.deleteVolumeBackup)
-	// Upload-restore: the browser uploads a backup file, the panel stages
-	// it, and the agent pulls it back for the shared restore core.
-	writeRG.POST("/apps/:id/volume-backups/upload-restore", h.uploadVolumeBackupRestore)
+	// Upload-restore runs in two phases: the scan stages the files on the
+	// panel and auto-recognizes their target volumes; the commit consumes the
+	// reviewed pairings and lets the agent pull the bytes back for the shared
+	// restore core. Both mutate panel/app state, so both ride the audited
+	// write group.
+	writeRG.POST("/apps/:id/volume-backups/upload-scan", h.scanVolumeUploads)
+	writeRG.POST("/apps/:id/volume-backups/upload-commit", h.commitVolumeUploadRestore)
 
 	// Git provider webhooks: no JWT, token-in-path authentication.
 	public.POST("/apps/webhook/:token", h.webhook)

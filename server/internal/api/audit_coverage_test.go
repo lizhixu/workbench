@@ -28,7 +28,8 @@ func TestDeriveMutationActionCoverage(t *testing.T) {
 		{http.MethodPost, "/api/v1/apps/:id/migrate", "app_migrate", "app", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/apps/:id/volume-backups", "app_volume_backup", "app", ""},
 		{http.MethodPost, "/api/v1/apps/:id/volume-backups/:archiveID/restore", "app_volume_restore", "app", audit.RiskHigh},
-		{http.MethodPost, "/api/v1/apps/:id/volume-backups/upload-restore", "app_volume_restore_upload", "app", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/apps/:id/volume-backups/upload-scan", "app_volume_upload_scan", "app", audit.RiskMedium},
+		{http.MethodPost, "/api/v1/apps/:id/volume-backups/upload-commit", "app_volume_upload_restore", "app", audit.RiskHigh},
 		{http.MethodDelete, "/api/v1/apps/:id/volume-backups/:archiveID", "app_volume_backup_delete", "app", audit.RiskHigh},
 		{http.MethodDelete, "/api/v1/apps/:id/proxy", "app_proxy_unbind", "app", audit.RiskHigh},
 		// Cert hub.

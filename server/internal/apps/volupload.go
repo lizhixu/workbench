@@ -35,7 +35,29 @@ const (
 	// volumeUploadTokenTTL bounds the agent's download window; it matches
 	// the S3 presign TTL the normal restore uses.
 	volumeUploadTokenTTL = 2 * time.Hour
+
+	// volumeScanStagedTTL bounds how long a scan-staged file may sit on the
+	// panel awaiting its commit: the two-phase flow (scan → operator review →
+	// commit) must not turn the staging dir into permanent storage. It shares
+	// the token TTL so both halves of one import expire together.
+	volumeScanStagedTTL = volumeUploadTokenTTL
 )
+
+// stagedScan remembers what upload-scan learned about one staged file: the
+// server-computed SHA256 (the commit's hard integrity check) and, for a
+// multi-volume snapshot tar, its parsed manifest. Scan entries live only in
+// memory: a panel restart purges every staged file, so no entry can ever
+// point at a file that still exists.
+type stagedScan struct {
+	ArchiveID string
+	AppID     string
+	Filename  string
+	Size      int64
+	SHA256    string
+	Snapshot  bool
+	Manifest  *SnapshotManifest
+	StagedAt  time.Time
+}
 
 var errVolumeUploadTooLarge = errors.New("上传文件不能超过 2GB")
 
@@ -54,6 +76,7 @@ type VolumeUploadStore struct {
 	dir    string
 	log    *slog.Logger
 	tokens map[string]*volumeUploadToken
+	scans  map[string]*stagedScan
 }
 
 // NewVolumeUploadStore creates the staging directory and purges any files a
@@ -72,7 +95,7 @@ func NewVolumeUploadStore(dataDir string, log *slog.Logger) (*VolumeUploadStore,
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("收紧上传目录权限失败: %w", err)
 	}
-	s := &VolumeUploadStore{dir: dir, log: log, tokens: make(map[string]*volumeUploadToken)}
+	s := &VolumeUploadStore{dir: dir, log: log, tokens: make(map[string]*volumeUploadToken), scans: make(map[string]*stagedScan)}
 	s.purgeStale()
 	return s, nil
 }
@@ -209,6 +232,75 @@ func (s *VolumeUploadStore) DropTokenByArchive(archiveID string) {
 		if t.archiveID == archiveID {
 			delete(s.tokens, tok)
 		}
+	}
+}
+
+// PutScan registers what upload-scan learned about a staged file.
+func (s *VolumeUploadStore) PutScan(sc *stagedScan) {
+	s.mu.Lock()
+	s.scans[sc.ArchiveID] = sc
+	s.mu.Unlock()
+}
+
+// PeekScan returns a staged scan entry without consuming it; ok=false when the
+// panel restarted since the scan (startup purges the staging dir) or the file
+// was already committed.
+func (s *VolumeUploadStore) PeekScan(appID, archiveID string) (*stagedScan, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sc, exists := s.scans[archiveID]
+	if !exists || sc.AppID != appID {
+		return nil, false
+	}
+	return sc, true
+}
+
+// TakeScan atomically consumes a scan entry: the commit owns the staged file
+// from here on, so a second commit of the same upload can never double-restore.
+func (s *VolumeUploadStore) TakeScan(appID, archiveID string) (*stagedScan, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sc, exists := s.scans[archiveID]
+	if !exists || sc.AppID != appID {
+		return nil, false
+	}
+	delete(s.scans, archiveID)
+	return sc, true
+}
+
+// DropScan forgets a staged scan entry together with its file.
+func (s *VolumeUploadStore) DropScan(archiveID string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.scans, archiveID)
+	s.mu.Unlock()
+	os.Remove(s.Path(archiveID))
+}
+
+// SweepScans removes scan-staged files older than the TTL: an operator who
+// walks away between scan and commit must not leave uploads on the panel
+// forever. Runs at the start of every scan call, so no timer is needed.
+func (s *VolumeUploadStore) SweepScans() {
+	if s == nil {
+		return
+	}
+	cutoff := time.Now().Add(-volumeScanStagedTTL)
+	s.mu.Lock()
+	var stale []string
+	for id, sc := range s.scans {
+		if sc.StagedAt.Before(cutoff) {
+			stale = append(stale, id)
+			delete(s.scans, id)
+		}
+	}
+	s.mu.Unlock()
+	for _, id := range stale {
+		os.Remove(s.Path(id))
+	}
+	if len(stale) > 0 {
+		s.log.Info("swept expired volume upload scans", "count", len(stale))
 	}
 }
 

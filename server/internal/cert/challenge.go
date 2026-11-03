@@ -120,7 +120,18 @@ func (h *Hub) buildSolvers() *solverSet {
 	}
 	hc := &http01Challenge{addr: http01ListenAddr}
 	if err := hc.start(); err != nil {
-		h.log.Warn("http-01 challenge unavailable", "err", err)
+		if sharedHTTP01Serving() {
+			// The panel's own HTTP stack is serving :80 and answers the
+			// challenge path from the shared registry, so http-01 stays
+			// usable even though the temporary bind failed — without this, a
+			// panel with a bound domain (its standard-port listener owns :80)
+			// could never validate http-01 and every auto issuance would be
+			// forced onto DNS-01.
+			h.log.Warn("http-01 temporary listener unavailable, challenges served by the panel port 80 listener", "err", err)
+			s.http = hc
+		} else {
+			h.log.Warn("http-01 challenge unavailable", "err", err)
+		}
 	} else {
 		s.http = hc
 	}
@@ -175,19 +186,19 @@ func firstWildcard(identifiers []string) (string, bool) {
 // pickSolvers returns candidate solvers for one authorization, in preference
 // order. Constraints:
 //   - "ip" identifiers can only be validated with HTTP-01 (RFC 8738);
-//   - wildcard DNS identifiers ("*.example.com") can only use DNS-01;
+//   - wildcard DNS identifiers ("*.example.com" or authz.wildcard:true) can only use DNS-01;
 //   - plain DNS identifiers prefer HTTP-01 (no external dependency) and fall
 //     back to DNS-01 when HTTP-01 is unavailable.
 //
 // Only solvers whose challenge type was offered by the CA are returned.
-func (s *solverSet) pickSolvers(idType, value string, offered map[string]bool) []challengeSolver {
+func (s *solverSet) pickSolvers(idType, value string, wildcard bool, offered map[string]bool) []challengeSolver {
 	var order []challengeSolver
 	switch {
 	case idType == "ip":
 		if s.http != nil {
 			order = []challengeSolver{s.http}
 		}
-	case strings.HasPrefix(value, "*."):
+	case wildcard || strings.HasPrefix(value, "*."):
 		if s.dns != nil {
 			order = []challengeSolver{s.dns}
 		}
@@ -237,9 +248,6 @@ func (d *dnsMngChallenge) Present(domain, token, keyAuthz string) (func(), error
 	if err := d.presentTXT(fqdn, txtValue); err != nil {
 		return nil, err
 	}
-	// DNS propagation: dns-mng publishes synchronously to the provider, but
-	// authoritative resolvers need some time to catch up.
-	time.Sleep(20 * time.Second)
 	return func() {
 		if err := d.cleanupTXT(fqdn, txtValue); err != nil && d.log != nil {
 			d.log.Warn("dns-01 cleanup failed", "fqdn", fqdn, "err", err)
@@ -263,6 +271,7 @@ func (h *http01Challenge) remove(token string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.values, token)
+	clearSharedHTTP01Token(token)
 }
 
 // challengeFailedError reports that an authorization failed after the CA was

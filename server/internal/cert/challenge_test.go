@@ -35,26 +35,28 @@ func solverTypeNames(solvers []challengeSolver) []string {
 func TestPickSolvers(t *testing.T) {
 	both := map[string]bool{"http-01": true, "dns-01": true}
 	dnsOfferedOnly := map[string]bool{"dns-01": true}
-	cases := []struct {
-		name          string
-		set           *solverSet
-		idType, value string
-		offered       map[string]bool
-		want          []string
-	}{
-		{"dns prefers http-01 then dns-01", stubSolverSet(true, true), "dns", "example.com", both, []string{"http-01", "dns-01"}},
-		{"dns without http falls back to dns-01", stubSolverSet(false, true), "dns", "example.com", both, []string{"dns-01"}},
-		{"dns without dns-mng uses http-01", stubSolverSet(true, false), "dns", "example.com", both, []string{"http-01"}},
-		{"wildcard requires dns-01", stubSolverSet(true, true), "dns", "*.example.com", both, []string{"dns-01"}},
-		{"wildcard without dns-mng has no solver", stubSolverSet(true, false), "dns", "*.example.com", both, nil},
-		{"ip requires http-01", stubSolverSet(true, true), "ip", "1.2.3.4", both, []string{"http-01"}},
-		{"ip without http has no solver", stubSolverSet(false, true), "ip", "1.2.3.4", both, nil},
-		{"offered challenge types filter solvers", stubSolverSet(true, true), "dns", "example.com", dnsOfferedOnly, []string{"dns-01"}},
-		{"no solvers available", stubSolverSet(false, false), "dns", "example.com", both, nil},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := solverTypeNames(tc.set.pickSolvers(tc.idType, tc.value, tc.offered))
+		cases := []struct {
+			name          string
+			set           *solverSet
+			idType, value string
+			wildcard      bool
+			offered       map[string]bool
+			want          []string
+		}{
+			{"dns prefers http-01 then dns-01", stubSolverSet(true, true), "dns", "example.com", false, both, []string{"http-01", "dns-01"}},
+			{"dns without http falls back to dns-01", stubSolverSet(false, true), "dns", "example.com", false, both, []string{"dns-01"}},
+			{"dns without dns-mng uses http-01", stubSolverSet(true, false), "dns", "example.com", false, both, []string{"http-01"}},
+			{"wildcard by prefix requires dns-01", stubSolverSet(true, true), "dns", "*.example.com", false, both, []string{"dns-01"}},
+			{"wildcard by authz flag requires dns-01", stubSolverSet(true, true), "dns", "example.com", true, both, []string{"dns-01"}},
+			{"wildcard without dns-mng has no solver", stubSolverSet(true, false), "dns", "*.example.com", false, both, nil},
+			{"ip requires http-01", stubSolverSet(true, true), "ip", "1.2.3.4", false, both, []string{"http-01"}},
+			{"ip without http has no solver", stubSolverSet(false, true), "ip", "1.2.3.4", false, both, nil},
+			{"offered challenge types filter solvers", stubSolverSet(true, true), "dns", "example.com", false, dnsOfferedOnly, []string{"dns-01"}},
+			{"no solvers available", stubSolverSet(false, false), "dns", "example.com", false, both, nil},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got := solverTypeNames(tc.set.pickSolvers(tc.idType, tc.value, tc.wildcard, tc.offered))
 			if len(got) == 0 && len(tc.want) == 0 {
 				return
 			}

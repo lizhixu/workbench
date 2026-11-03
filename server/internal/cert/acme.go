@@ -2,6 +2,7 @@ package cert
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -133,6 +134,10 @@ func (h *http01Challenge) present(token, keyAuthz string) {
 		h.values = make(map[string]string)
 	}
 	h.values[token] = keyAuthz
+	// Also publish to the shared registry: when the panel's own :80 listener
+	// answers the challenge path (start() failed because the panel holds the
+	// port), it serves this token from there.
+	setSharedHTTP01Token(token, keyAuthz)
 }
 
 func (h *http01Challenge) stop() {
@@ -143,6 +148,13 @@ func (h *http01Challenge) stop() {
 		h.srv = nil
 	}
 	h.ln = nil
+	// Belt-and-suspenders for error paths that skip a per-challenge cleanup:
+	// drop any token this instance left in the shared registry. Issuance flows
+	// hold acmeMu for their whole run, so no concurrent issuance owns shared
+	// tokens at this point.
+	for token := range h.values {
+		clearSharedHTTP01Token(token)
+	}
 	h.values = nil
 }
 
@@ -355,9 +367,15 @@ func (a *acmeClient) ensureAccount(accountKey crypto.Signer) error {
 // identifiers may mix DNS names and IP literals. Each authorization is
 // validated with the usable challenge solvers in preference order (HTTP-01
 // first for plain DNS names, DNS-01 for wildcards, HTTP-01 only for IP
-// literals). When a solver fails at the CA, the order is retried once with
-// the remaining solvers, because a failed challenge poisons its authorization
-// and a fresh order is required to fall back.
+// literals). When a solver fails at the CA and another mechanism remains
+// usable, the order is retried once with the remaining solvers, because a
+// failed challenge poisons its authorization and a fresh order is required
+// to fall back. When nothing is left to fall back to — the operator pinned
+// the mechanism explicitly (the preference already narrowed the set to one
+// solver), or only one mechanism was usable at all — the original failure is
+// returned directly; re-ordering with an empty solver set would just burn a
+// fresh CA order and bury the real validation error under a meaningless
+// "no usable challenge" message.
 func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []string, solvers *solverSet) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
 	excluded := ""
 	for {
@@ -368,6 +386,16 @@ func (a *acmeClient) obtainCertificate(accountKey crypto.Signer, identifiers []s
 		}
 		var cfe *challengeFailedError
 		if !errors.As(err, &cfe) || excluded != "" {
+			return nil, nil, time.Time{}, time.Time{}, "", err
+		}
+		if cfe.solverType == "dns-01" {
+			if wildcard, ok := firstWildcard(identifiers); ok {
+				a.warnStagef("挑战选择", "泛域名 %q 仅支持 DNS-01 验证，DNS-01 失败后无法回退至 HTTP-01，签发终止", wildcard)
+				return nil, nil, time.Time{}, time.Time{}, "", err
+			}
+		}
+		if !solvers.excluding(cfe.solverType).hasAny() {
+			a.warnStagef("挑战选择", "验证方式 %s 失败，且没有其他可用验证方式可回退，签发终止", cfe.solverType)
 			return nil, nil, time.Time{}, time.Time{}, "", err
 		}
 		excluded = cfe.solverType
@@ -400,6 +428,7 @@ type authorization struct {
 		Type  string `json:"type"`
 		Value string `json:"value"`
 	} `json:"identifier"`
+	Wildcard   bool             `json:"wildcard,omitempty"`
 	Challenges []authzChallenge `json:"challenges"`
 }
 
@@ -480,8 +509,18 @@ func (a *acmeClient) fetchAuthorization(authzURL string, accountKey crypto.Signe
 // triggerChallenge asks the CA to validate the challenge (RFC 8555 §7.5.1:
 // an empty JSON object acknowledges the challenge).
 func (a *acmeClient) triggerChallenge(challengeURL string, accountKey crypto.Signer) error {
-	_, _, _, err := a.jwsRequest(challengeURL, map[string]any{}, a.kid, accountKey, false)
-	return err
+	body, _, status, err := a.jwsRequest(challengeURL, map[string]any{}, a.kid, accountKey, false)
+	if err != nil {
+		return err
+	}
+	// RFC 8555 §7.5.1: a successful trigger answers 200 with the updated
+	// challenge object. Anything else carries a problem document — polling
+	// the authorization afterwards would just run out the clock and report
+	// a generic "authorization timeout" that discards the CA's reason.
+	if status/100 != 2 {
+		return acmeError("challenge trigger", status, body)
+	}
+	return nil
 }
 
 // waitOrderReady polls the order until its status becomes "ready".
@@ -630,6 +669,18 @@ func (a *acmeClient) finalizeOrder(orderURL string, order *acmeOrder, accountKey
 	return pemBytes, keyPem, first.NotBefore, first.NotAfter, first.Issuer.CommonName, nil
 }
 
+// pendingChallenge tracks a challenge that has been presented and awaits CA validation.
+type pendingChallenge struct {
+	authzURL   string
+	identifier string
+	wildcard   bool
+	solverType string
+	chalURL    string
+	isDNS      bool
+	dnsFQDN    string
+	dnsTXT     string
+}
+
 // attemptOrder runs a single order -> authorizations -> finalize -> cert
 // pass using the given solvers.
 func (a *acmeClient) attemptOrder(accountKey crypto.Signer, identifiers []string, solvers *solverSet) (certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, err error) {
@@ -638,13 +689,20 @@ func (a *acmeClient) attemptOrder(accountKey crypto.Signer, identifiers []string
 		return nil, nil, time.Time{}, time.Time{}, "", err
 	}
 
-	// 2. Satisfy each authorization, picking (and falling back between) the
-	// usable challenge solvers. The solvers were probed when built and stay
-	// up for the whole order.
-	for _, authzURL := range order.Authorizations {
-		if err := a.satisfyAuthorization(authzURL, accountKey, solvers); err != nil {
-			return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("authorization: %w", err)
+	var cleanups []func()
+	defer func() {
+		if len(cleanups) > 0 {
+			a.logStagef("清理挑战", "统一清理 %d 项挑战临时凭据...", len(cleanups))
+			for _, cl := range cleanups {
+				cl()
+			}
 		}
+	}()
+
+	var authzErr error
+	cleanups, authzErr = a.satisfyAuthorizations(order.Authorizations, accountKey, solvers)
+	if authzErr != nil {
+		return nil, nil, time.Time{}, time.Time{}, "", fmt.Errorf("authorization: %w", authzErr)
 	}
 
 	// 3. Poll order until ready.
@@ -662,103 +720,175 @@ type challengeRef struct {
 	token string
 }
 
-// satisfyAuthorization completes one authorization, trying the usable
-// challenge solvers in preference order (see solverSet.pickSolvers). A solver
-// whose Present fails is skipped before the CA is contacted; the first
-// solver that presents successfully is submitted to the CA. A CA-side
-// validation failure is returned as *challengeFailedError so the caller can
-// retry the order with the remaining solvers (a failed challenge poisons its
-// authorization, so fallback requires a fresh order).
-func (a *acmeClient) satisfyAuthorization(authzURL string, accountKey crypto.Signer, solvers *solverSet) error {
-	a.logStagef("挑战选择", "正在获取授权详情: %s", authzURL)
-	authz, err := a.fetchAuthorization(authzURL, accountKey)
-	if err != nil {
-		a.warnStagef("挑战选择", "获取授权详情失败: %v", err)
-		return err
-	}
-	if authz.Status == "valid" {
-		a.logStagef("挑战选择", "域名/IP %q 此前已验证通过 (status=valid)，无需重复挑战", authz.Identifier.Value)
-		return nil
-	}
+// satisfyAuthorizations handles the multi-authorization batch workflow (RFC 8555 best practices):
+//  1. Phase 1 & 2 (Preparation & Batch Present): Inspect each authorization, select candidate solver,
+//     and call Present so all challenge responses (e.g. multiple TXT records at the same FQDN) coexist.
+//  2. Phase 3 (Propagation Check): Verify DNS-01 TXT records on authoritative nameservers before contacting CA.
+//  3. Phase 4 (Unified Trigger): Notify CA for all challenges in batch.
+//  4. Phase 5 (Unified Poll): Poll each authorization until valid.
+//
+// The returned cleanups slice holds deferred cleanup functions for all presented challenges;
+// the caller must ensure they are called when the order finishes or fails.
+func (a *acmeClient) satisfyAuthorizations(authzURLs []string, accountKey crypto.Signer, solvers *solverSet) ([]func(), error) {
+	var cleanups []func()
+	var pending []*pendingChallenge
 
 	thumbprint, err := keyThumbprint(accountKey)
 	if err != nil {
-		return err
+		return cleanups, err
 	}
 
-	offered := make(map[string]challengeRef, len(authz.Challenges))
-	offeredTypes := make(map[string]bool, len(authz.Challenges))
-	for _, ch := range authz.Challenges {
-		if _, ok := offered[ch.Type]; !ok {
-			offered[ch.Type] = challengeRef{url: ch.URL, token: ch.Token}
-			offeredTypes[ch.Type] = true
-		}
-	}
-	candidates := solvers.pickSolvers(authz.Identifier.Type, authz.Identifier.Value, offeredTypes)
-	if len(candidates) == 0 {
-		var errMsg string
-		if strings.HasPrefix(authz.Identifier.Value, "*.") {
-			errMsg = fmt.Sprintf("泛域名 %q 只能使用 DNS-01 验证：dns-mng 未配置/未启用，或 CA 未下发 dns-01 挑战（CA 提供: %s）",
-				authz.Identifier.Value, strings.Join(sortedKeys(offeredTypes), ", "))
-		} else {
-			errMsg = fmt.Sprintf("no usable challenge for %s %q (CA offered: %s; available here: %s)",
-				authz.Identifier.Type, authz.Identifier.Value,
-				strings.Join(sortedKeys(offeredTypes), ", "),
-				strings.Join(solvers.availableTypes(), ", "))
-		}
-		a.warnStage("挑战选择", errMsg)
-		return fmt.Errorf("%s", errMsg)
-	}
-
-	a.logStagef("挑战选择", "域名/IP %q: CA 提供挑战 [%s], 本地选用 [%s]",
-		authz.Identifier.Value,
-		strings.Join(sortedKeys(offeredTypes), ", "),
-		candidates[0].Type())
-
-	var presentErrs []string
-	for _, sv := range candidates {
-		ref := offered[sv.Type()]
-		if ref.token == "" {
-			continue
-		}
-		keyAuthz := ref.token + "." + thumbprint
-
-		switch sv.Type() {
-		case "http-01":
-			a.logStagef("挑战呈现", "HTTP-01 验证: 在本地 80 端口注册端点 /.well-known/acme-challenge/%s", ref.token)
-		case "dns-01":
-			fqdn := dns01RecordHost(authz.Identifier.Value)
-			txt := dns01TXTValue(keyAuthz)
-			a.logStagef("挑战呈现", "DNS-01 验证: 请求 dns-mng 添加 TXT 记录 %s = %s 并等待生效 (20秒)...", fqdn, txt)
-		}
-
-		cleanup, err := sv.Present(authz.Identifier.Value, ref.token, keyAuthz)
+	// Phase 1 & 2: Preparation and Batch Present
+	for _, authzURL := range authzURLs {
+		a.logStagef("挑战选择", "正在获取授权详情: %s", authzURL)
+		authz, err := a.fetchAuthorization(authzURL, accountKey)
 		if err != nil {
-			// Present failed before the CA was involved: safe to try the next solver.
-			a.warnStagef("挑战呈现", "挑战方式 %s 呈现失败: %v", sv.Type(), err)
-			presentErrs = append(presentErrs, fmt.Sprintf("%s: %v", sv.Type(), err))
+			a.warnStagef("挑战选择", "获取授权详情失败: %v", err)
+			return cleanups, err
+		}
+		if authz.Status == "valid" {
+			a.logStagef("挑战选择", "域名/IP %q 此前已验证通过 (status=valid)，无需重复挑战", authz.Identifier.Value)
 			continue
 		}
-		a.logStagef("挑战呈现", "%s 挑战呈现就绪", strings.ToUpper(sv.Type()))
 
-		a.logStagef("CA验证", "通知 CA 开始校验 %s 挑战: %s", strings.ToUpper(sv.Type()), ref.url)
-		if err := a.triggerChallenge(ref.url, accountKey); err != nil {
-			cleanup()
+		offered := make(map[string]challengeRef, len(authz.Challenges))
+		offeredTypes := make(map[string]bool, len(authz.Challenges))
+		for _, ch := range authz.Challenges {
+			if _, ok := offered[ch.Type]; !ok {
+				offered[ch.Type] = challengeRef{url: ch.URL, token: ch.Token}
+				offeredTypes[ch.Type] = true
+			}
+		}
+
+		candidates := solvers.pickSolvers(authz.Identifier.Type, authz.Identifier.Value, authz.Wildcard, offeredTypes)
+		if len(candidates) == 0 {
+			var errMsg string
+			if authz.Wildcard || strings.HasPrefix(authz.Identifier.Value, "*.") {
+				errMsg = fmt.Sprintf("泛域名 %q 只能使用 DNS-01 验证：dns-mng 未配置/未启用，或 CA 未下发 dns-01 挑战（CA 提供: %s）",
+					authz.Identifier.Value, strings.Join(sortedKeys(offeredTypes), ", "))
+			} else {
+				errMsg = fmt.Sprintf("no usable challenge for %s %q (CA offered: %s; available here: %s)",
+					authz.Identifier.Type, authz.Identifier.Value,
+					strings.Join(sortedKeys(offeredTypes), ", "),
+					strings.Join(solvers.availableTypes(), ", "))
+			}
+			a.warnStage("挑战选择", errMsg)
+			return cleanups, fmt.Errorf("%s", errMsg)
+		}
+
+		a.logStagef("挑战选择", "域名/IP %q (wildcard=%v): CA 提供挑战 [%s], 本地选用 [%s]",
+			authz.Identifier.Value, authz.Wildcard,
+			strings.Join(sortedKeys(offeredTypes), ", "),
+			candidates[0].Type())
+
+		var presented *pendingChallenge
+		var presentErrs []string
+		for _, sv := range candidates {
+			ref := offered[sv.Type()]
+			if ref.token == "" {
+				continue
+			}
+			keyAuthz := ref.token + "." + thumbprint
+
+			switch sv.Type() {
+			case "http-01":
+				a.logStagef("挑战呈现", "HTTP-01 验证: 注册挑战端点 /.well-known/acme-challenge/%s (80 端口)", ref.token)
+			case "dns-01":
+				fqdn := dns01RecordHost(authz.Identifier.Value)
+				txt := dns01TXTValue(keyAuthz)
+				a.logStagef("挑战呈现", "DNS-01 验证: 请求 dns-mng 添加 TXT 记录 %s = %s", fqdn, txt)
+			}
+
+			cleanup, err := sv.Present(authz.Identifier.Value, ref.token, keyAuthz)
+			if err != nil {
+				a.warnStagef("挑战呈现", "挑战方式 %s 呈现失败: %v", sv.Type(), err)
+				presentErrs = append(presentErrs, fmt.Sprintf("%s: %v", sv.Type(), err))
+				continue
+			}
+			a.logStagef("挑战呈现", "%s 挑战呈现就绪 (%s)", strings.ToUpper(sv.Type()), authz.Identifier.Value)
+			cleanups = append(cleanups, cleanup)
+
+			pc := &pendingChallenge{
+				authzURL:   authzURL,
+				identifier: authz.Identifier.Value,
+				wildcard:   authz.Wildcard,
+				solverType: sv.Type(),
+				chalURL:    ref.url,
+			}
+			if sv.Type() == "dns-01" {
+				pc.isDNS = true
+				pc.dnsFQDN = dns01RecordHost(authz.Identifier.Value)
+				pc.dnsTXT = dns01TXTValue(keyAuthz)
+			}
+			presented = pc
+			break
+		}
+		if presented == nil {
+			return cleanups, fmt.Errorf("all challenge solvers failed to present for %q: %s",
+				authz.Identifier.Value, strings.Join(presentErrs, "; "))
+		}
+		pending = append(pending, presented)
+	}
+
+	// Phase 3: Authoritative propagation check for DNS-01 challenges.
+	var dnsChecks []*pendingChallenge
+	for _, pc := range pending {
+		if pc.isDNS {
+			dnsChecks = append(dnsChecks, pc)
+		}
+	}
+	if len(dnsChecks) > 0 {
+		a.logStagef("挑战呈现", "等待 DNS-01 记录在权威域名服务器生效 (共 %d 条记录)...", len(dnsChecks))
+		ctx, cancel := context.WithTimeout(context.Background(), dns01PropagationCheckTimeout)
+		defer cancel()
+		for _, pc := range dnsChecks {
+			a.logStagef("挑战呈现", "正在校验权威 NS 解析: %s TXT %s", pc.dnsFQDN, pc.dnsTXT)
+			if err := dns01AuthoritativeCheck(ctx, pc.dnsFQDN, pc.dnsTXT); err != nil {
+				a.warnStagef("挑战呈现", "权威 NS 传播校验失败: %v", err)
+				return cleanups, fmt.Errorf("DNS 权威服务器传播校验失败: %w", err)
+			}
+		}
+		a.logStagef("挑战呈现", "DNS-01 全部 TXT 记录已在权威 NS 生效，准备通知 CA 验证")
+	}
+
+	// Phase 4: Unified trigger.
+	for _, pc := range pending {
+		a.logStagef("CA验证", "通知 CA 开始校验 %s 挑战: %s (域名: %s)", strings.ToUpper(pc.solverType), pc.chalURL, pc.identifier)
+		if err := a.triggerChallenge(pc.chalURL, accountKey); err != nil {
 			a.warnStagef("CA验证", "通知 CA 触发校验失败: %v", err)
-			return &challengeFailedError{solverType: sv.Type(), identifier: authz.Identifier.Value, err: fmt.Errorf("challenge notify: %w", err)}
+			return cleanups, &challengeFailedError{
+				solverType: pc.solverType,
+				identifier: pc.identifier,
+				err:        fmt.Errorf("challenge notify: %w", err),
+			}
 		}
-		err = a.pollAuthorization(authzURL, accountKey)
-		cleanup()
-		a.logStagef("清理挑战", "已清理 %s 挑战临时凭据 (%s)", strings.ToUpper(sv.Type()), authz.Identifier.Value)
-		if err != nil {
-			a.warnStagef("CA验证", "CA 校验 %s 未通过: %v", authz.Identifier.Value, err)
-			return &challengeFailedError{solverType: sv.Type(), identifier: authz.Identifier.Value, err: err}
-		}
-		a.logStagef("CA验证", "域名/IP %q 验证成功，授权已生效", authz.Identifier.Value)
-		return nil
 	}
-	return fmt.Errorf("all challenge solvers failed to present for %q: %s",
-		authz.Identifier.Value, strings.Join(presentErrs, "; "))
+
+	// Phase 5: Unified poll for authorization validity.
+	for _, pc := range pending {
+		a.logStagef("CA验证", "正在等待 CA 确认授权有效: %s (%s)", pc.identifier, pc.authzURL)
+		if err := a.pollAuthorization(pc.authzURL, accountKey); err != nil {
+			a.warnStagef("CA验证", "CA 校验 %s 未通过: %v", pc.identifier, err)
+			return cleanups, &challengeFailedError{
+				solverType: pc.solverType,
+				identifier: pc.identifier,
+				err:        err,
+			}
+		}
+		a.logStagef("CA验证", "域名/IP %q 验证成功，授权已生效", pc.identifier)
+	}
+
+	return cleanups, nil
+}
+
+// satisfyAuthorization completes one authorization. Kept for single-authorization
+// operations and backwards compatibility.
+func (a *acmeClient) satisfyAuthorization(authzURL string, accountKey crypto.Signer, solvers *solverSet) error {
+	cleanups, err := a.satisfyAuthorizations([]string{authzURL}, accountKey, solvers)
+	for _, cl := range cleanups {
+		cl()
+	}
+	return err
 }
 
 func sortedKeys(m map[string]bool) []string {

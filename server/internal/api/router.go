@@ -126,6 +126,28 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	r := gin.New()
 	r.Use(gin.Recovery(), requestLogger(log))
 
+	// ACME HTTP-01 challenge answering (infrastructure path). While an
+	// issuance is in flight, GET /.well-known/acme-challenge/<token> is
+	// answered from the cert hub's shared registry by the panel's own HTTP
+	// stack: a panel with a bound domain serves :80 itself (panelsec standard
+	// ports), so the issuance flow's temporary :80 listener can never bind and
+	// this is the only way the CA's fetch reaches the response. The middleware
+	// runs ahead of the security guards on purpose — the CA's fetch is always
+	// plain HTTP and carries whatever Host the validated identifier resolves
+	// to (an IP literal for IP certificates), so it must not be domain-gated,
+	// HTTPS-redirected or hidden behind the secure entry. Read-only and
+	// stateless, exempt from the operation audit (§7, same example as agent
+	// enroll / webhooks). Requests that match no active challenge fall through
+	// to the normal panel handling.
+	cert.SetSharedHTTP01Probe(func() bool { return panelsec.StandardPortListening(80) })
+	r.Use(func(c *gin.Context) {
+		if cert.ServeSharedHTTP01(c.Writer, c.Request) {
+			c.Abort()
+			return
+		}
+		c.Next()
+	})
+
 	// Secure entry (安全入口): once enabled in system settings, the panel can
 	// only be logged in through the secret entry URL. The guard 404s direct
 	// page/API access without a valid JWT or entry cookie; agent

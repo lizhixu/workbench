@@ -680,16 +680,16 @@ func TestVolumeBackupRejectedWhileDeploying(t *testing.T) {
 }
 
 func TestVolumeBackupSupported(t *testing.T) {
-		cases := []struct {
-			app  Application
-			want bool
-		}{
-			{app: Application{SourceType: "image"}, want: true},
-			{app: Application{SourceType: "template"}, want: true},
-			{app: Application{SourceType: "git", BuildType: "dockerfile"}, want: true},
-			{app: Application{SourceType: "git", BuildType: "compose"}, want: true},
-			{app: Application{SourceType: "raw_compose"}, want: true},
-		}
+	cases := []struct {
+		app  Application
+		want bool
+	}{
+		{app: Application{SourceType: "image"}, want: true},
+		{app: Application{SourceType: "template"}, want: true},
+		{app: Application{SourceType: "git", BuildType: "dockerfile"}, want: true},
+		{app: Application{SourceType: "git", BuildType: "compose"}, want: true},
+		{app: Application{SourceType: "raw_compose"}, want: true},
+	}
 	for _, tc := range cases {
 		if got := volumeBackupSupported(&tc.app); got != tc.want {
 			t.Errorf("volumeBackupSupported(%s/%s) = %v, want %v", tc.app.SourceType, tc.app.BuildType, got, tc.want)

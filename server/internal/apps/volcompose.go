@@ -12,12 +12,12 @@ import (
 // application (either declared on a single-container app or inspected from
 // a Docker Compose project).
 type DiscoveredVolume struct {
-	VolumeSpec    string `json:"volume_spec"`               // e.g. /host:/container or volname:/container
-	VolumeType    string `json:"volume_type"`               // "bind" | "volume"
-	HostPath      string `json:"host_path"`                 // resolved host directory or volume mountpoint
-	ContainerPath string `json:"container_path"`            // mount path inside container
-	Service       string `json:"service,omitempty"`         // compose service name when applicable
-	ReadOnly      bool   `json:"read_only"`                 // read-only flag (:ro)
+	VolumeSpec    string `json:"volume_spec"`       // e.g. /host:/container or volname:/container
+	VolumeType    string `json:"volume_type"`       // "bind" | "volume"
+	HostPath      string `json:"host_path"`         // resolved host directory or volume mountpoint
+	ContainerPath string `json:"container_path"`    // mount path inside container
+	Service       string `json:"service,omitempty"` // compose service name when applicable
+	ReadOnly      bool   `json:"read_only"`         // read-only flag (:ro)
 }
 
 // isComposeApp reports whether an application is managed by Docker Compose.

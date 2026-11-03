@@ -608,13 +608,13 @@ func main() {
 	installHandler.UpgradePubKey = api.UpgradePubKeyHex
 	installHandler.ManifestPath = *manifestPath
 	installHandler.RegisterRoutes(hr)
-	// Allow up to 2100MB for the application volume backup upload-restore
-	// route (which accepts archives up to 2GB + multipart overhead).
-	// All other endpoints retain the 512MB body ceiling.
+	// Allow up to 21000MB for the application volume backup upload-scan
+	// route (up to 10 files at the 2GB per-file cap, plus multipart
+	// overhead). All other endpoints retain the 512MB body ceiling.
 	maxBytesHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		limit := int64(512 << 20)
-		if strings.HasSuffix(r.URL.Path, "/volume-backups/upload-restore") {
-			limit = 2100 << 20
+		if strings.HasSuffix(r.URL.Path, "/volume-backups/upload-scan") {
+			limit = 21000 << 20
 		}
 		http.MaxBytesHandler(hr, limit).ServeHTTP(w, r)
 	})

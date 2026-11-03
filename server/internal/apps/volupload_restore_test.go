@@ -204,15 +204,15 @@ type scanRespItem struct {
 	TopDirs         []string            `json:"top_dirs"`
 	ManifestVolumes []VolumeItemArchive `json:"manifest_volumes"`
 	Match           string              `json:"match"`
-	Matched         []volumeScanMatch    `json:"matched"`
+	Matched         []volumeScanMatch   `json:"matched"`
 }
 
 func decodeScan(t *testing.T, w *httptest.ResponseRecorder) []scanRespItem {
 	t.Helper()
 	var resp struct {
-		OK    bool            `json:"ok"`
-		Items []scanRespItem  `json:"items"`
-		Error string          `json:"error"`
+		OK    bool           `json:"ok"`
+		Items []scanRespItem `json:"items"`
+		Error string         `json:"error"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode scan body %q: %v", w.Body.String(), err)

@@ -913,7 +913,6 @@ func (h *AppHandlers) commitVolumeUploadRestore(c *gin.Context) {
 	})
 }
 
-
 // downloadVolumeUpload serves an operator-uploaded restore file to the
 // managed host's agent: the token in the path is the only credential
 // (single-use, 2h TTL), mirroring the webhook token-in-path pattern. No JWT:

@@ -124,12 +124,12 @@ const (
 
 // VolumeItemArchive records one volume entry within a multi-volume app snapshot.
 type VolumeItemArchive struct {
-	VolumeSpec    string `json:"volume_spec"`               // e.g. /host:/container[:ro] or named:/container
-	VolumeType    string `json:"volume_type"`               // "bind" | "volume"
-	HostPath      string `json:"host_path"`                 // resolved host dir or volume mountpoint
-	ContainerPath string `json:"container_path"`            // path inside the container
-	Service       string `json:"service,omitempty"`         // compose service name when applicable
-	Size          int64  `json:"size,omitempty"`            // extracted volume size in bytes
+	VolumeSpec    string `json:"volume_spec"`       // e.g. /host:/container[:ro] or named:/container
+	VolumeType    string `json:"volume_type"`       // "bind" | "volume"
+	HostPath      string `json:"host_path"`         // resolved host dir or volume mountpoint
+	ContainerPath string `json:"container_path"`    // path inside the container
+	Service       string `json:"service,omitempty"` // compose service name when applicable
+	Size          int64  `json:"size,omitempty"`    // extracted volume size in bytes
 	SHA256        string `json:"sha256,omitempty"`
 }
 
@@ -160,11 +160,11 @@ type VolumeArchive struct {
 	// Source distinguishes panel backups ("", historical) from records
 	// created by an upload-restore ("upload"): the latter have no S3 object
 	// and their bytes live only as a temporary panel upload until restored.
-	Source    string    `json:"source,omitempty"`
-	Error     string    `json:"error,omitempty"`
-		Note       string     `json:"note,omitempty"`
-		CreatedAt  time.Time  `json:"created_at"`
-		FinishedAt *time.Time `json:"finished_at,omitempty"`
+	Source     string     `json:"source,omitempty"`
+	Error      string     `json:"error,omitempty"`
+	Note       string     `json:"note,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
 
 	// Restore outcome lives on the archive so the panel can show whether the
 	// last restore from this archive succeeded without a separate history.
@@ -248,39 +248,39 @@ func NewVolumeStore(dataDir string, log *slog.Logger) (*VolumeStore, error) {
 			a.Error = "控制端重启，任务已中断"
 			stale = true
 		}
-			if a.Source == VolumeArchiveSourceUpload && a.Status == VolumeBackupUploaded && a.LastRestoreStatus == "" {
-				now := time.Now()
-				a.LastRestoreAt = &now
-				a.LastRestoreStatus = VolumeBackupFailed
-				a.LastRestoreError = "控制端重启，上传恢复已中断"
-				stale = true
-			}
-			// Backward compatibility: materialize legacy single-volume records into the multi-volume slice
-			if len(a.Volumes) == 0 && (a.VolumeSpec != "" || a.HostPath != "") {
-				vType := "bind"
-				if !strings.Contains(a.VolumeSpec, "/") && strings.Contains(a.VolumeSpec, ":") {
-					vType = "volume"
-				}
-				a.Volumes = []VolumeItemArchive{
-					{
-						VolumeSpec:    a.VolumeSpec,
-						VolumeType:    vType,
-						HostPath:      a.HostPath,
-						ContainerPath: a.ContainerPath,
-						Size:          a.Size,
-						SHA256:        a.SHA256,
-					},
-				}
-			}
-			s.byID[volumeArchiveKey(a.AppID, a.ID)] = a
+		if a.Source == VolumeArchiveSourceUpload && a.Status == VolumeBackupUploaded && a.LastRestoreStatus == "" {
+			now := time.Now()
+			a.LastRestoreAt = &now
+			a.LastRestoreStatus = VolumeBackupFailed
+			a.LastRestoreError = "控制端重启，上传恢复已中断"
+			stale = true
 		}
-		if stale {
-			if err := s.saveLocked(); err != nil {
-				s.log.Warn("reconcile interrupted volume archives failed", "err", err)
+		// Backward compatibility: materialize legacy single-volume records into the multi-volume slice
+		if len(a.Volumes) == 0 && (a.VolumeSpec != "" || a.HostPath != "") {
+			vType := "bind"
+			if !strings.Contains(a.VolumeSpec, "/") && strings.Contains(a.VolumeSpec, ":") {
+				vType = "volume"
+			}
+			a.Volumes = []VolumeItemArchive{
+				{
+					VolumeSpec:    a.VolumeSpec,
+					VolumeType:    vType,
+					HostPath:      a.HostPath,
+					ContainerPath: a.ContainerPath,
+					Size:          a.Size,
+					SHA256:        a.SHA256,
+				},
 			}
 		}
-		return s, nil
+		s.byID[volumeArchiveKey(a.AppID, a.ID)] = a
 	}
+	if stale {
+		if err := s.saveLocked(); err != nil {
+			s.log.Warn("reconcile interrupted volume archives failed", "err", err)
+		}
+	}
+	return s, nil
+}
 
 func volumeArchiveKey(appID, id string) string { return appID + "|" + id }
 
@@ -2311,7 +2311,7 @@ func (e *Engine) RestoreAppVolumeByID(appID, archiveID string) error {
 	if e.volumeHub(app) == nil {
 		return e.recordVolumeRestoreFailure(arch, snapshots.ErrVolumeRestoreOffline)
 	}
-		_, err := e.runRestoreAppVolume(app, arch, RestoreVolumeOptions{CleanRestore: true})
+	_, err := e.runRestoreAppVolume(app, arch, RestoreVolumeOptions{CleanRestore: true})
 	return err
 }
 

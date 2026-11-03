@@ -47,7 +47,7 @@ const (
 const (
 	scanMatchManifest  = "manifest"  // snapshot tar: manifest.json mapped to live volumes
 	scanMatchUnique    = "unique"    // exactly one candidate volume matched
-	scanMatchAmbiguous = "ambiguous"  // several candidates matched: operator must pick
+	scanMatchAmbiguous = "ambiguous" // several candidates matched: operator must pick
 	scanMatchNone      = "none"      // nothing matched: operator must pick
 )
 

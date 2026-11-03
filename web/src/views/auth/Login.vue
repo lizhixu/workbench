@@ -1,13 +1,30 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { NCard, NForm, NFormItem, NInput, NButton, NSpace, NIcon, useMessage } from 'naive-ui'
-import { PersonOutline, LockClosedOutline } from '@vicons/ionicons5'
+import {
+  NCard,
+  NForm,
+  NFormItem,
+  NInput,
+  NButton,
+  NSpace,
+  NIcon,
+  NTooltip,
+  useMessage,
+} from 'naive-ui'
+import {
+  PersonOutline,
+  LockClosedOutline,
+  SunnyOutline,
+  MoonOutline,
+} from '@vicons/ionicons5'
 import { useAuthStore } from '../../stores/auth'
+import { useSettingsStore } from '../../stores/settings'
 
 const router = useRouter()
 const route = useRoute()
 const auth = useAuthStore()
+const settings = useSettingsStore()
 const message = useMessage()
 
 const username = ref('admin')
@@ -102,19 +119,34 @@ async function handleLogin() {
 
 <template>
   <div ref="containerRef" class="login-bg">
-    <!-- 1. 精密工程蓝图网格（底层常驻暗色网格） -->
+    <!-- 0. 顶部右上角亮/暗主题快速切换 -->
+    <div class="theme-toggle-wrap">
+      <NTooltip trigger="hover">
+        <template #trigger>
+          <NButton
+            quaternary
+            circle
+            size="small"
+            class="theme-toggle-btn"
+            @click="settings.toggleTheme"
+          >
+            <template #icon>
+              <NIcon size="18">
+                <SunnyOutline v-if="settings.themeMode === 'dark'" />
+                <MoonOutline v-else />
+              </NIcon>
+            </template>
+          </NButton>
+        </template>
+        <span>切换至 {{ settings.themeMode === 'dark' ? '亮色' : '暗色' }}模式</span>
+      </NTooltip>
+    </div>
+
+    <!-- 1. 精密工程蓝图网格（底层常驻工程网格） -->
     <div class="bg-grid-base" aria-hidden="true" />
 
     <!-- 2. 鼠标探照灯揭示的高亮网格（仅在光标周围细腻被照亮，纯粹线条无光圈光斑） -->
     <div class="bg-grid-spotlight" aria-hidden="true" />
-
-    <!-- 3. 工程坐标十字准星（模拟控制面板精密定位锚点） -->
-    <div class="tech-crosshairs" aria-hidden="true">
-      <span class="ch-mark ch-tl">+</span>
-      <span class="ch-mark ch-tr">+</span>
-      <span class="ch-mark ch-bl">+</span>
-      <span class="ch-mark ch-br">+</span>
-    </div>
 
     <!-- 4. 核心登录卡片 -->
     <div class="login-card-wrap">
@@ -181,7 +213,6 @@ async function handleLogin() {
   display: flex;
   align-items: center;
   justify-content: center;
-  background-color: #090d16;
   padding: 16px;
   box-sizing: border-box;
   overflow: hidden;
@@ -190,6 +221,71 @@ async function handleLogin() {
   --mouse-x: 50%;
   --mouse-y: 50%;
   --spotlight-opacity: 0.5;
+
+  // 暗色模式设计令牌（默认基准）
+  --login-bg-color: #090d16;
+  --login-grid-base-color: rgba(255, 255, 255, 0.025);
+  --login-grid-spotlight-color: rgba(129, 140, 248, 0.16);
+  --login-card-bg: rgba(19, 27, 46, 0.82);
+  --login-card-border: 1px solid rgba(255, 255, 255, 0.08);
+  --login-card-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.03);
+  --login-beam-color: rgba(99, 102, 241, 0.7);
+  --login-title-color: #f8fafc;
+  --login-sub-color: #94a3b8;
+  --login-icon-color: #64748b;
+  --login-hint-color: #64748b;
+  --login-theme-btn-color: #94a3b8;
+  --login-theme-btn-hover: #f8fafc;
+  // 输入框 autofill 适配：Chrome 自动填充强制给 input 涂白底，
+  // 在暗色卡片上极为刺眼。用 -webkit-box-shadow 内阴影覆盖 autofill 背景色。
+  --login-input-autofill-bg: #1a233a;
+  --login-input-autofill-text: #d1d5db;
+
+  background: var(--login-bg-color);
+  transition: background 0.3s ease;
+}
+
+// 亮色覆盖：`:global()` 必须包裹整条选择器。只写 `:global(html.light) .login-bg`
+// 会被 scoped 编译器截断成裸 `html.light`（.login-bg 被丢弃），变量落在 html 上被
+// 元素自身的暗色声明压制，亮色覆盖从未生效——故整条选择器都要进 :global()。
+:global(html.light .login-bg) {
+  // 亮色模式设计令牌（白纸工程制图：明亮、清爽、层次分明——
+  // 毫米图纸线肉眼可辨、卡片是高对比纯白浮层，而非暗色设计的淡色涂装）
+  --login-bg-color: linear-gradient(180deg, #f9fafd 0%, #eef2f8 100%);
+  --login-grid-base-color: rgba(100, 116, 139, 0.09);
+  --login-grid-spotlight-color: rgba(99, 102, 241, 0.3);
+  --login-card-bg: rgba(255, 255, 255, 0.92);
+  --login-card-border: 1px solid #e2e8f0;
+  --login-card-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.04),
+    0 8px 24px -6px rgba(15, 23, 42, 0.08),
+    0 24px 48px -16px rgba(15, 23, 42, 0.12);
+  --login-beam-color: rgba(99, 102, 241, 0.6);
+  --login-title-color: #0f172a;
+  --login-sub-color: #64748b;
+  --login-icon-color: #94a3b8;
+  --login-hint-color: #64748b;
+  --login-theme-btn-color: #64748b;
+  --login-theme-btn-hover: #0f172a;
+  --login-input-autofill-bg: #ffffff;
+  --login-input-autofill-text: #334155;
+}
+
+// 0. 主题切换按钮：右上角固定
+.theme-toggle-wrap {
+  position: absolute;
+  top: 20px;
+  right: 24px;
+  z-index: 10;
+
+  .theme-toggle-btn {
+    color: var(--login-theme-btn-color);
+    transition: color 0.2s ease;
+
+    &:hover {
+      color: var(--login-theme-btn-hover);
+    }
+  }
 }
 
 // 1. 基础静态网格：超细线条常驻底板（纯净深色无色晕）
@@ -198,21 +294,21 @@ async function handleLogin() {
   inset: 0;
   pointer-events: none;
   background-image:
-    linear-gradient(to right, rgba(255, 255, 255, 0.025) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+    linear-gradient(to right, var(--login-grid-base-color) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--login-grid-base-color) 1px, transparent 1px);
   background-size: 36px 36px;
   mask-image: radial-gradient(ellipse 75% 65% at 50% 48%, #000 20%, transparent 85%);
   -webkit-mask-image: radial-gradient(ellipse 75% 65% at 50% 48%, #000 20%, transparent 85%);
 }
 
-// 4. 探照灯高亮网格：鼠标扫过区域网格优雅浮现（Linear/Vercel 式工程师质感）
+// 2. 探照灯高亮网格：鼠标扫过区域网格优雅浮现（Linear/Vercel 式工程师质感）
 .bg-grid-spotlight {
   position: absolute;
   inset: 0;
   pointer-events: none;
   background-image:
-    linear-gradient(to right, rgba(129, 140, 248, 0.16) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(129, 140, 248, 0.16) 1px, transparent 1px);
+    linear-gradient(to right, var(--login-grid-spotlight-color) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--login-grid-spotlight-color) 1px, transparent 1px);
   background-size: 36px 36px;
   mask-image: radial-gradient(
     circle 340px at var(--mouse-x, 50%) var(--mouse-y, 50%),
@@ -230,31 +326,7 @@ async function handleLogin() {
   transition: opacity 0.4s ease;
 }
 
-// 5. 四个工程十字定位标：对齐锚点
-.tech-crosshairs {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  max-width: 880px;
-  max-height: 640px;
-  margin: auto;
-
-  .ch-mark {
-    position: absolute;
-    font-family: 'JetBrains Mono', Consolas, monospace;
-    font-size: 15px;
-    line-height: 1;
-    color: rgba(255, 255, 255, 0.16);
-    user-select: none;
-  }
-
-  .ch-tl { top: 32px; left: 32px; }
-  .ch-tr { top: 32px; right: 32px; }
-  .ch-bl { bottom: 32px; left: 32px; }
-  .ch-br { bottom: 32px; right: 32px; }
-}
-
-// 6. 登录卡片容器与卡片质感
+// 4. 登录卡片容器与卡片质感
 .login-card-wrap {
   position: relative;
   width: 410px;
@@ -271,24 +343,24 @@ async function handleLogin() {
     background: linear-gradient(
       90deg,
       transparent 0%,
-      rgba(99, 102, 241, 0.7) 50%,
+      var(--login-beam-color) 50%,
       transparent 100%
     );
     z-index: 3;
     pointer-events: none;
+    transition: background 0.3s ease;
   }
 }
 
 .login-card {
   width: 100%;
   border-radius: 12px;
-  background: rgba(19, 27, 46, 0.82) !important;
+  background: var(--login-card-bg) !important;
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.08) !important;
-  box-shadow:
-    0 24px 48px -12px rgba(0, 0, 0, 0.7),
-    0 0 0 1px rgba(255, 255, 255, 0.03);
+  border: var(--login-card-border) !important;
+  box-shadow: var(--login-card-shadow);
+  transition: background 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
 
   .login-header {
     display: flex;
@@ -314,22 +386,43 @@ async function handleLogin() {
         margin: 0;
         font-size: 17px;
         font-weight: 700;
-        color: #f8fafc;
+        color: var(--login-title-color);
         line-height: 1.3;
         letter-spacing: 0.2px;
+        transition: color 0.3s ease;
       }
 
       .login-sub {
         font-size: 11.5px;
-        color: #94a3b8;
+        color: var(--login-sub-color);
         letter-spacing: 0.1px;
+        transition: color 0.3s ease;
       }
     }
   }
 
   .input-icon {
-    color: #64748b;
+    color: var(--login-icon-color);
     margin-right: 2px;
+    transition: color 0.3s ease;
+  }
+
+  // Chrome/Edge 自动填充：强制给 input 涂白底 + 黄底高亮，
+  // 在暗色磨砂卡片上极为刺眼。用 -webkit-box-shadow 内阴影覆盖
+  // autofill 背景色（Chrome 不会覆盖 box-shadow），同时用
+  // -webkit-text-fill-color 固定文字色。transition 5000s 是为了
+  // 让 autofill 注入时的颜色变化不触发动画闪烁。
+  :deep(input:-webkit-autofill),
+  :deep(input:-webkit-autofill:focus),
+  :deep(input:-webkit-autofill:hover),
+  :deep(textarea:-webkit-autofill),
+  :deep(select:-webkit-autofill) {
+    -webkit-text-fill-color: var(--login-input-autofill-text);
+    -webkit-box-shadow: 0 0 0 1000px var(--login-input-autofill-bg) inset;
+    caret-color: var(--login-input-autofill-text);
+    transition: background-color 5000s ease-in-out 0s,
+      color 5000s ease-in-out 0s,
+      -webkit-text-fill-color 5000s ease-in-out 0s;
   }
 
   .login-btn {
@@ -343,14 +436,16 @@ async function handleLogin() {
   margin-top: 14px;
   text-align: center;
   font-size: 11.5px;
-  color: #64748b;
+  color: var(--login-hint-color);
   letter-spacing: 0.2px;
+  transition: color 0.3s ease;
 }
 
 // 移动端响应式处理：屏幕较窄时隐藏边缘装饰，防止喧宾夺主
 @media (max-width: 768px) {
-  .tech-crosshairs {
-    display: none;
+  .theme-toggle-wrap {
+    top: 12px;
+    right: 12px;
   }
 
   .login-bg {

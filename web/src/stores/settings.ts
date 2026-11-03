@@ -157,12 +157,17 @@ export const useSettingsStore = defineStore('settings', () => {
     const prev = themeMode.value
     themeMode.value = mode
     localStorage.setItem(LS_THEME_KEY, mode)
-    // Fire-and-forget: the UI updates instantly, the server sync follows.
-    // On failure roll back so UI and server never disagree silently.
-    saveUserKeys({ [SETTING_KEYS.themeMode]: mode }).catch(() => {
-      themeMode.value = prev
-      localStorage.setItem(LS_THEME_KEY, prev)
-    })
+    // Only sync to server if authenticated; in logged-out states (e.g. /login),
+    // localStorage is the single source of truth and avoids 401 rollbacks.
+    const token = localStorage.getItem('watchman_token')
+    if (token) {
+      // Fire-and-forget: the UI updates instantly, the server sync follows.
+      // On failure roll back so UI and server never disagree silently.
+      saveUserKeys({ [SETTING_KEYS.themeMode]: mode }).catch(() => {
+        themeMode.value = prev
+        localStorage.setItem(LS_THEME_KEY, prev)
+      })
+    }
   }
 
   function toggleTheme() {

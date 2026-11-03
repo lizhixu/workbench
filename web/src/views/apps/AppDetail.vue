@@ -2,15 +2,16 @@
 import { computed, h, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  NAlert, NButton, NCard, NCode, NCollapse, NCollapseItem, NDataTable, NDescriptions, NDescriptionsItem,
-  NEmpty, NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPagination, NPopconfirm, NRadio, NRadioGroup,
+  NAlert, NButton, NCard, NCheckbox, NCheckboxGroup, NCode, NCollapse, NCollapseItem, NDataTable, NDescriptions, NDescriptionsItem,
+  NEmpty, NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPagination, NPopconfirm, NPopover, NRadio, NRadioGroup,
   NSelect, NSpace, NSpin, NSwitch, NTabPane, NTabs, NUpload,
   NTag, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns, UploadCustomRequestOptions, UploadFileInfo } from 'naive-ui'
 import {
+  AddOutline,
   ArrowBackOutline, BuildOutline, CloudUploadOutline, CopyOutline,
-  DownloadOutline,
+  DownloadOutline, FolderOutline,
   GitCommitOutline, MoveOutline, PlayOutline, RefreshOutline, SparklesOutline, StopOutline,
   SwapHorizontalOutline, TrashOutline,
 } from '@vicons/ionicons5'
@@ -19,8 +20,9 @@ import {
   rollbackApp, startApp, stopApp, updateApp, syncAppWebhook, type AppEntity, type AppStatus, type Deployment,
   type AIDiagnosis,
   backupAppVolumes, listVolumeBackups, restoreVolumeArchive, deleteVolumeArchive,
-  uploadVolumeRestore,
-  volumeArchiveDownloadUrl, type VolumeArchive,
+  scanVolumeUploads, commitVolumeUploadRestore,
+  volumeArchiveDownloadUrl, type VolumeArchive, type DiscoveredVolume,
+  type VolumeScanMatch, type VolumeItemArchive,
 } from '../../api/apps'
 import {
   listBackupJobs, createBackupJob, updateBackupJob, deleteBackupJob, runBackupJob,
@@ -36,7 +38,7 @@ import {
   getGitHubAppStatus, switchAppToGitHubApp, type GitHubAppStatus,
 } from '../../api/git'
 import { bothMeshed } from '../../utils/mesh'
-import { fmtDate, fmtDateTime, fmtTime } from '../../utils/time'
+import { fmtDateTime } from '../../utils/time'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useAuthStore } from '../../stores/auth'
 import OpsTunnelModal from '../../components/tunnels/OpsTunnelModal.vue'
@@ -1126,9 +1128,11 @@ const volumeBackups = ref<VolumeArchive[]>([])
 const volumeBackupTotal = ref(0)
 const volumePage = ref(1)
 const volumePageSize = ref(10)
+const discoveredVolumes = ref<DiscoveredVolume[]>([])
 // 备份位置选项（NSelect 空值约定 §8.3.1：未选 = null，不用 ''）。
 const s3Targets = ref<S3Target[]>([])
-const selectedBackupTargetId = ref<string | null>(null)
+const selectedBackupTargetId = ref<string | null>('local')
+const backupConsistencyMode = ref<'online' | 'pause' | 'stop'>('online')
 const volBackupNote = ref('')
 const selectedVolumeSpecs = ref<string[]>([])
 const backingVolumes = ref(false)
@@ -1139,8 +1143,41 @@ const volumeListLoading = ref(false)
 // 备份的 running 记录可能晚于 202 几百毫秒才落库、恢复只在终态回写归档，因此
 // 用一个有界轮询窗口覆盖「已受理但记录尚未反映」的空窗，而不是只看 running。
 const volumePollUntil = ref(0)
-const restoringArchiveID = ref('')
-const restoreBaseline = ref('')
+// 等待终态的归档集合（上传恢复一次会产生 N 条记录；归档恢复恒为 1 条），
+// restoreBaselines 记录受理时各归档的 last_restore_at，变化即该条已落终态。
+const restoringArchiveIDs = ref<string[]>([])
+const restoreBaselines = ref<Record<string, string>>({})
+
+// 恢复弹窗控制（支持整应用快照选择性恢复与纯净回滚选项）
+const showRestoreModal = ref(false)
+const restoreTargetArchive = ref<VolumeArchive | null>(null)
+const restoreCleanOption = ref(true)
+const restoreSelectedVolumes = ref<string[]>([])
+
+// 手动备份弹窗控制
+const showSnapshotModal = ref(false)
+const snapshotAllVolumes = ref(true)
+
+function openSnapshotModal() {
+  snapshotAllVolumes.value = true
+  selectedVolumeSpecs.value = []
+  volBackupNote.value = ''
+  backupConsistencyMode.value = 'online'
+  if (selectedBackupTargetId.value == null) {
+    const def = s3Targets.value.find((t) => t.is_default)
+    selectedBackupTargetId.value = def ? def.id : 'local'
+  }
+  showSnapshotModal.value = true
+}
+
+// 离线上传恢复弹窗控制
+const showUploadRestoreModal = ref(false)
+
+function openUploadRestoreModal() {
+  scanFileList.value = []
+  scanRows.value = []
+  showUploadRestoreModal.value = true
+}
 
 interface ParsedVolume {
   spec: string
@@ -1148,10 +1185,30 @@ interface ParsedVolume {
   dst: string
   mode: string
   bind: boolean
+  service?: string
 }
 
+const isCompose = computed(() => {
+  const a = app.value
+  if (!a) return false
+  if (a.source_type === 'raw_compose') return true
+  if (a.source_type === 'git' && (a.build_type ?? '').toLowerCase() === 'compose') return true
+  return false
+})
+
 // 与后端 parseVolumeSpec 同规则解析展示：Windows 盘符（C:\data:/data）不切开。
+// 优先使用后端动态发现的卷清单（Compose 服务卷与单容器卷），未探测到时回落静态 volumes 声明。
 const parsedVolumes = computed<ParsedVolume[]>(() => {
+  if (discoveredVolumes.value.length > 0) {
+    return discoveredVolumes.value.map((v) => ({
+      spec: v.volume_spec,
+      src: v.host_path,
+      dst: v.container_path,
+      mode: v.read_only ? 'ro' : '',
+      bind: v.volume_type === 'bind',
+      service: v.service,
+    }))
+  }
   const out: ParsedVolume[] = []
   for (const spec of app.value?.volumes ?? []) {
     const parts = spec.split(':')
@@ -1167,32 +1224,43 @@ const parsedVolumes = computed<ParsedVolume[]>(() => {
   return out
 })
 
-// Compose 应用的挂载卷在编排文件中声明，应用级备份不覆盖（后端同款 400）。
-const volumeBackupSupported = computed(() => {
-  const a = app.value
-  if (!a) return false
-  if (a.source_type === 'raw_compose') return false
-  if (a.source_type === 'git' && (a.build_type ?? '').toLowerCase() === 'compose') return false
-  return true
+const backupTargetOptions = computed(() => {
+  const opts: { label: string; value: string }[] = [
+    { label: '受管主机本地存储 (/var/backups)', value: 'local' },
+  ]
+  const def = s3Targets.value.find((t) => t.is_default)
+  if (def) {
+    opts.push({ label: `默认 S3 目标: ${def.name} (${def.bucket})`, value: def.id })
+  }
+  for (const t of s3Targets.value) {
+    if (def && t.id === def.id) continue
+    opts.push({ label: `S3 目标: ${t.name} (${t.bucket})`, value: t.id })
+  }
+  return opts
 })
 
-// 备份位置选项只在首屏与页签切回时拉一次，不跟归档 5 秒轮询走——
-// 目标清单几乎不变，轮询里反复拉只是多余请求。
+const consistencyOptions = [
+  { label: '在线快照（无业务停顿）', value: 'online' },
+  { label: '写暂停（秒级挂起，完成后恢复）', value: 'pause' },
+  { label: '停机冷备（停机打包后启动，强一致）', value: 'stop' },
+]
+
+// 备份位置选项只在首屏与页签切回时拉一次，不跟归档 5 秒轮询走。
 async function loadS3Targets() {
   try {
     const list = await listS3Targets()
     s3Targets.value = list
-    // 已选目标被删掉时回到默认；从未选过时默认预选默认目标（有默认时），
-    // 无默认则保持未选，强制用户显式挑一个（Dokploy 式显式选择）。
-    if (selectedBackupTargetId.value && !list.some((t) => t.id === selectedBackupTargetId.value)) {
-      selectedBackupTargetId.value = null
+    if (selectedBackupTargetId.value && selectedBackupTargetId.value !== 'local' && !list.some((t) => t.id === selectedBackupTargetId.value)) {
+      selectedBackupTargetId.value = 'local'
     }
     if (selectedBackupTargetId.value == null) {
-      selectedBackupTargetId.value = list.find((t) => t.is_default)?.id ?? null
+      const def = list.find((t) => t.is_default)
+      selectedBackupTargetId.value = def ? def.id : 'local'
     }
   } catch {
-    // 目标拉取失败不弹错：备份按钮由 selectedBackupTargetId 门控，
-    // 用户仍可从归档列表与恢复入口正常工作。
+    if (selectedBackupTargetId.value == null) {
+      selectedBackupTargetId.value = 'local'
+    }
   }
 }
 
@@ -1213,12 +1281,37 @@ const togglingJobId = ref('')
 let appBackupJobsReqSeq = 0
 const jobForm = reactive({
   name: '',
-  target: null as string | null,
+  // 挂载卷多选（'ALL' 哨兵 = 整应用全部卷，与后端 snapshots.AppVolumeTargetAll 对应）。
+  targets: [] as string[],
+  allVolumes: true,
   storage_target: 'default',
   cron: '0 3 * * *',
   retention: 7,
   enabled: true,
 })
+
+// 解析任务的挂载卷选择：ALL = 全部；否则逗号清单（兼容历史单卷任务）。
+function jobTargetToSelection(target: string): { all: boolean; specs: string[] } {
+  if (target === 'ALL') return { all: true, specs: [] }
+  return { all: false, specs: target ? target.split(',').filter(Boolean) : [] }
+}
+
+// 任务「目标卷」的提交值：勾选「全部」或选中了全部选项时归一为 ALL（整应用
+// 任务会跟随后续新增的挂载卷），否则提交逗号拼接的多选清单（与后端契约一致）。
+function jobFormTarget(): string {
+  if (jobForm.allVolumes ||
+      (jobForm.targets.length > 0 && jobForm.targets.length === parsedVolumes.value.length)) {
+    return 'ALL'
+  }
+  return jobForm.targets.join(',')
+}
+
+// 任务表「目标卷」文案：ALL → 全部；多选 → N 个卷（悬停看原始清单）。
+function appVolumeTargetLabel(target: string): string {
+  if (target === 'ALL') return '全部挂载卷'
+  if (target.includes(',')) return `${target.split(',').length} 个挂载卷`
+  return target
+}
 
 const appBackupJobsSorted = computed(() =>
   [...appBackupJobs.value].sort((a, b) => (b.created_at || '').localeCompare(a.created_at || '')),
@@ -1276,7 +1369,9 @@ function openJobModal(job?: BackupJob) {
   if (job) {
     editingJobId.value = job.id
     jobForm.name = job.name
-    jobForm.target = job.target
+    const sel = jobTargetToSelection(job.target)
+    jobForm.targets = sel.specs
+    jobForm.allVolumes = sel.all
     jobForm.storage_target = job.storage_target || 'default'
     jobForm.cron = job.schedule?.cron ?? ''
     jobForm.retention = job.retention || 7
@@ -1284,7 +1379,9 @@ function openJobModal(job?: BackupJob) {
   } else {
     editingJobId.value = null
     jobForm.name = app.value ? `${app.value.name} 数据卷备份` : ''
-    jobForm.target = parsedVolumes.value[0]?.spec ?? null
+    // 新建计划默认整应用全部卷：定时计划的常规口径，后续新增卷自动纳入。
+    jobForm.targets = []
+    jobForm.allVolumes = true
     const def = s3Targets.value.find((t) => t.is_default)
     jobForm.storage_target = def ? 'default' : (s3Targets.value[0]?.id ?? 'default')
     jobForm.cron = '0 3 * * *'
@@ -1300,20 +1397,21 @@ async function submitJob() {
     message.warning('请填写任务名称')
     return
   }
-  if (!jobForm.target) {
-    message.warning('请选择要备份的挂载卷')
+  if (!jobForm.allVolumes && jobForm.targets.length === 0) {
+    message.warning('请选择要备份的挂载卷，或勾选全部挂载卷')
     return
   }
   if (!jobStorageOptions.value.some((o) => o.value === jobForm.storage_target)) {
     message.warning('请先在「快照备份 → S3 存储」中添加存储目标')
     return
   }
+  const target = jobFormTarget()
   savingJob.value = true
   try {
     if (editingJobId.value) {
       await updateBackupJob(editingJobId.value, {
         name: jobForm.name.trim(),
-        target: jobForm.target,
+        target,
         storage_target: jobForm.storage_target,
         retention: jobForm.retention,
         cron: jobForm.cron.trim(),
@@ -1326,7 +1424,7 @@ async function submitJob() {
         host_id: '',
         kind: 'app_volume',
         app_id: appId.value,
-        target: jobForm.target,
+        target,
         storage_target: jobForm.storage_target,
         retention: jobForm.retention,
         cron: jobForm.cron.trim(),
@@ -1396,7 +1494,7 @@ const backupJobColumns = computed<DataTableColumns<BackupJob>>(() => [
   { title: '任务名称', key: 'name', width: 150, render: (r) => h('span', { style: 'font-weight: 600' }, r.name) },
   {
     title: '目标卷', key: 'target', ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'mono-font', style: 'font-size: 12px' }, r.target),
+    render: (r) => h('span', { class: 'mono-font', style: 'font-size: 12px', title: r.target }, appVolumeTargetLabel(r.target)),
   },
   {
     title: '备份位置', key: 'storage_target', width: 160,
@@ -1418,12 +1516,12 @@ const backupJobColumns = computed<DataTableColumns<BackupJob>>(() => [
       : h(NTag, { size: 'small', bordered: false, type: r.enabled ? 'success' : 'default' }, { default: () => r.enabled ? '启用' : '停用' }),
   },
   {
-    title: '最近执行', key: 'last_run', width: 130,
+    title: '最近执行', key: 'last_run', width: 170,
     render: (r) => {
       if (!r.last_run) return renderVolDash()
       return h(NSpace, { size: 4, align: 'center' }, {
         default: () => [
-          renderVolTime(r.last_run),
+          h('span', { class: 'mono-font', style: 'font-size: 12px' }, formatTime(r.last_run)),
           r.last_error ? h(NTag, { size: 'tiny', type: 'error', bordered: false }, { default: () => '失败' }) : null,
         ],
       })
@@ -1444,7 +1542,7 @@ const backupJobColumns = computed<DataTableColumns<BackupJob>>(() => [
             onClick: () => doRunTask(r),
           }, { default: () => '立即备份' }),
           h(NButton, {
-            size: 'tiny', secondary: true,
+            size: 'tiny',
             disabled: volumeBusy.value || deploying.value,
             onClick: () => openJobModal(r),
           }, { default: () => '编辑' }),
@@ -1465,8 +1563,8 @@ const backupJobColumns = computed<DataTableColumns<BackupJob>>(() => [
 let volumeBackupsReqSeq = 0
 
 function clearVolumeRestoreState() {
-  restoringArchiveID.value = ''
-  restoreBaseline.value = ''
+  restoringArchiveIDs.value = []
+  restoreBaselines.value = {}
 }
 
 function expireVolumePollWindow() {
@@ -1488,6 +1586,9 @@ async function loadVolumeBackups(silent = false) {
       page_size: volumePageSize.value,
     })
     if (seq !== volumeBackupsReqSeq) return
+    if (res.volumes) {
+      discoveredVolumes.value = res.volumes
+    }
     if (res.total > 0 && res.data.length === 0 && volumePage.value > 1) {
       volumePage.value = Math.max(1, Math.ceil(res.total / volumePageSize.value))
       return loadVolumeBackups(silent)
@@ -1497,30 +1598,42 @@ async function loadVolumeBackups(silent = false) {
     if (volumeBackupRunning.value) {
       // 备份仍在进行：保持轮询。
       volumePollUntil.value = Math.max(volumePollUntil.value, Date.now() + 60_000)
-    } else if (restoringArchiveID.value) {
-      // 恢复结束会回写 last_restore_at；一旦变化即停止窗口与按钮 loading。
-      let target = volumeBackups.value.find((a) => a.id === restoringArchiveID.value)
-      let listedAll = false
-      if (!target) {
-        // 目标归档不在当前分页（恢复后翻页，或上传恢复时停在第 2 页）：
-        // 只看当前页永远观测不到恢复结束，按钮会锁到窗口过期，故全量查一
-        // 次。应用归档上限 100 条，一个请求即可覆盖。
+    } else if (restoringArchiveIDs.value.length) {
+      // 恢复结束会回写各归档的 last_restore_at；全部变化即停止窗口与按钮 loading。
+      // done = 每条都变化；missing = 部分记录不在当前列表（翻页或批量新记录），
+      // 全量查一次再判（应用归档上限 100 条，一个请求即可覆盖）。
+      const waitState = (list: VolumeArchive[]): 'done' | 'waiting' | 'missing' => {
+        let missing = false
+        for (const id of restoringArchiveIDs.value) {
+          const t = list.find((a) => a.id === id)
+          if (!t) {
+            missing = true
+            continue
+          }
+          if ((t.last_restore_at || '') === (restoreBaselines.value[id] || '')) return 'waiting'
+        }
+        return missing ? 'missing' : 'done'
+      }
+      const state = waitState(volumeBackups.value)
+      if (state === 'done') {
+        clearVolumeRestoreState()
+        volumePollUntil.value = 0
+      } else if (state === 'missing') {
         try {
           const all = await listVolumeBackups(appId.value, { offset: 0, page_size: 100 })
           if (seq !== volumeBackupsReqSeq) return
-          target = all.data.find((a) => a.id === restoringArchiveID.value)
-          listedAll = true
+          // 全量列表里也没有 = 归档已被删除（例如他人操作），没有可等待的记录。
+          const fullState = waitState(all.data)
+          if (fullState === 'done' || fullState === 'missing') {
+            clearVolumeRestoreState()
+            volumePollUntil.value = 0
+          } else {
+            expireVolumePollWindow()
+          }
         } catch {
           // 查询失败不改变现状，下次轮询再试。
+          expireVolumePollWindow()
         }
-      }
-      if (target && (target.last_restore_at || '') !== restoreBaseline.value) {
-        clearVolumeRestoreState()
-        volumePollUntil.value = 0
-      } else if (listedAll && !target) {
-        // 全量列表里也没有：归档已被删除（例如他人操作），没有可等待的记录。
-        clearVolumeRestoreState()
-        volumePollUntil.value = 0
       } else {
         expireVolumePollWindow()
       }
@@ -1537,7 +1650,7 @@ async function loadVolumeBackups(silent = false) {
 const volumeBackupRunning = computed(() => volumeBackups.value.some((a) => a.status === 'running'))
 const volumeBusy = computed(() =>
   volumeBackupRunning.value
-  || !!restoringArchiveID.value
+  || restoringArchiveIDs.value.length > 0
   || backingVolumes.value
   || uploadingRestore.value
   || !!runningJobId.value,
@@ -1560,25 +1673,12 @@ async function refreshVolumeBackups() {
   await loadVolumeBackups()
 }
 
-// 归档时间按「日期 / 时刻」两行排版：日期弱化，时刻保持等宽可扫读。
-function formatShortTime(v?: string) {
-  if (!v) return { date: '—', clock: '' }
+// 时间统一走面板时区（AGENTS.md §8.14 与 DESIGN.md §9.15）；零值时间（0001-01-01）是“还没发生”。
+function formatTime(v?: string) {
+  if (!v) return '-'
   const d = new Date(v)
-  if (Number.isNaN(d.getTime()) || d.getUTCFullYear() < 1970) return { date: '—', clock: '' }
-  return {
-    date: fmtDate(d).slice(5),
-    clock: fmtTime(d).slice(0, 5),
-  }
-}
-
-// render 生成的节点由 NDataTable 渲染，拿不到本组件的 scoped 作用域，
-// 因此单元格样式只走内联 style 与全局 .mono-font（global.scss）。
-function renderVolTime(v?: string) {
-  const t = formatShortTime(v)
-  return h('div', { style: 'display:flex;flex-direction:column;line-height:1.4' }, [
-    h('span', { style: 'font-size:12px;color:var(--n-text-color-3)' }, t.date),
-    h('span', { class: 'mono-font' }, t.clock || '—'),
-  ])
+  if (Number.isNaN(d.getTime()) || d.getUTCFullYear() < 1970) return '-'
+  return fmtDateTime(d)
 }
 
 const renderVolDash = () => h('span', { style: 'color: var(--n-text-color-3)' }, '—')
@@ -1590,20 +1690,28 @@ async function copyArchiveSHA(sha: string) {
 
 async function doBackupVolumes() {
   if (!canWrite.value || volumeBusy.value || deploying.value) return
-  const targetId = selectedBackupTargetId.value
-  if (!targetId) {
-    message.warning('请先选择备份位置；若还没有存储目标，先在「快照备份 → S3 存储」中添加')
-    return
-  }
+  const targetId = selectedBackupTargetId.value || 'local'
   backingVolumes.value = true
   try {
     const note = volBackupNote.value.trim()
-    const payload = selectedVolumeSpecs.value.length > 0
-      ? { volumes: selectedVolumeSpecs.value, note, target_id: targetId }
-      : { note, target_id: targetId }
+    // 手动备份不传 retention：一次性安全副本不做滚动裁剪，保留策略归定时计划。
+    const payload: {
+      volumes?: string[]
+      note?: string
+      target_id?: string
+      consistency_mode?: 'online' | 'pause' | 'stop'
+    } = {
+      note,
+      target_id: targetId,
+      consistency_mode: backupConsistencyMode.value,
+    }
+    if (!snapshotAllVolumes.value && selectedVolumeSpecs.value.length > 0) {
+      payload.volumes = selectedVolumeSpecs.value
+    }
     await backupAppVolumes(appId.value, payload)
     volumePollUntil.value = Date.now() + 30 * 60_000
-    message.success('备份任务已开始，完成后归档会出现在下方列表')
+    message.success('快照备份任务已开始，完成后归档会出现在下方列表')
+    showSnapshotModal.value = false
     await loadVolumeBackups()
   } catch (e: any) {
     message.error(e.message || '启动备份失败')
@@ -1612,19 +1720,35 @@ async function doBackupVolumes() {
   }
 }
 
-async function doRestoreArchive(a: VolumeArchive) {
-  if (!canWrite.value || a.status !== 'success' || volumeBusy.value || deploying.value) return
+function openRestoreModal(a: VolumeArchive) {
+  restoreTargetArchive.value = a
+  restoreCleanOption.value = true
+  restoreSelectedVolumes.value = a.volumes && a.volumes.length > 0
+    ? a.volumes.map((v) => v.volume_spec)
+    : (a.volume_spec && a.volume_spec !== 'ALL' ? [a.volume_spec] : [])
+  showRestoreModal.value = true
+}
+
+async function doRestoreArchive() {
+  const a = restoreTargetArchive.value
+  if (!a || !canWrite.value || a.status !== 'success' || volumeBusy.value || deploying.value) return
   restoringArchive.value = a.id
-  restoringArchiveID.value = a.id
-  restoreBaseline.value = a.last_restore_at || ''
+  restoringArchiveIDs.value = [a.id]
+  restoreBaselines.value = { [a.id]: a.last_restore_at || '' }
+  showRestoreModal.value = false
   try {
-    const res = await restoreVolumeArchive(appId.value, a.id)
+    const req: { clean_restore: boolean; volumes?: string[] } = {
+      clean_restore: restoreCleanOption.value,
+    }
+    if (a.volumes && a.volumes.length > 0 && restoreSelectedVolumes.value.length > 0 && restoreSelectedVolumes.value.length < a.volumes.length) {
+      req.volumes = restoreSelectedVolumes.value
+    }
+    const res = await restoreVolumeArchive(appId.value, a.id, req)
     volumePollUntil.value = Date.now() + 30 * 60_000
     message.success(res.message || '恢复任务已开始')
     await loadVolumeBackups()
   } catch (e: any) {
-    restoringArchiveID.value = ''
-    restoreBaseline.value = ''
+    clearVolumeRestoreState()
     message.error(e.message || '恢复失败')
   } finally {
     restoringArchive.value = ''
@@ -1648,60 +1772,139 @@ function downloadArchive(a: VolumeArchive) {
   window.open(volumeArchiveDownloadUrl(appId.value, a.id), '_blank')
 }
 
-// ---- 上传备份并恢复 ----
-// 浏览器到不了被管主机，文件先经面板暂存、再由 Agent 一次性回拉，
-// 之后走与归档恢复同一条执行链（校验→停机→安全副本→解包→重启）。
-// NUpload 只做文件选择，真正的上传在确认弹窗后由提交按钮发起。
-const uploadTargetVolume = ref<string | null>(null)
-const uploadFileList = ref<UploadFileInfo[]>([])
-const uploadFile = ref<File | null>(null)
-const uploadSha = ref('')
+// ---- 离线备份上传与恢复（两步：上传识别 → 确认恢复）----
+// 浏览器到不了被管主机，文件先经面板暂存、再由 Agent 一次性回拉。
+// 第一步把文件整批上传，服务端解开 tar 读内容自动识别每份文件该进哪个
+// 挂载卷（本系统快照读内嵌 manifest.json，docker cp 裸 tar 按顶层目录与
+// 容器路径匹配），识别结果在此过目/改选；第二步确认后服务端一次批量恢
+// 复——全部文件校验通过后一次停机、逐卷解包、一次重启，任何一份失败整
+// 批取消（不产生部分导入）。SHA256 由服务端在暂存时计算并作为 Agent
+// 回拉的硬校验，无需手工填写。NUpload 只做文件选择，真正的上传在点
+// 「上传并识别」时整批发起。
+const VOLUME_UPLOAD_PAIR_CAP = 10
 
-function handleUploadSelect({ file, onFinish }: UploadCustomRequestOptions) {
-  if (file.file) uploadFile.value = file.file
-  // 只选文件不上传：标记完成，避免文件行一直停在上传中状态。
+interface ScanRow {
+  key: number
+  archiveID: string
+  filename: string
+  size: number
+  sha256: string
+  snapshot: boolean
+  /** manifest（快照清单命中）| unique（唯一命中）| ambiguous（多候选）| none（未识别） */
+  match: 'manifest' | 'unique' | 'ambiguous' | 'none'
+  matched: VolumeScanMatch[]
+  manifestVolumes: VolumeItemArchive[]
+  topDirs: string[]
+  /** 已选目标卷（快照行可多选子集，普通行单选）；值为当前应用的挂载卷规格 */
+  specs: string[]
+}
+
+let scanRowKeySeq = 0
+
+const scanFileList = ref<UploadFileInfo[]>([])
+const scanning = ref(false)
+const scanRows = ref<ScanRow[]>([])
+
+function handleScanFileSelect({ onFinish }: UploadCustomRequestOptions) {
+  // 只暂存选择，不上传：文件在「上传并识别」时整批发给面板。
   onFinish()
 }
 
-function handleUploadRemove() {
-  uploadFile.value = null
-  return true
+function volumeOptions() {
+  return parsedVolumes.value.map((v) => ({ label: v.spec, value: v.spec }))
 }
 
-async function doUploadRestore() {
-  if (!canWrite.value || volumeBusy.value || deploying.value) return
-  if (!uploadTargetVolume.value) {
-    message.warning('请选择要恢复到的挂载卷')
+async function doScanUpload() {
+  if (!canWrite.value) return
+  const files = scanFileList.value.map((f) => f.file).filter(Boolean) as File[]
+  if (!files.length) {
+    message.warning('请先选择要上传的备份文件（可一次多选）')
     return
   }
-  if (!uploadFile.value) {
-    message.warning('请选择备份文件')
+  if (files.length > VOLUME_UPLOAD_PAIR_CAP) {
+    message.warning(`一次最多上传 ${VOLUME_UPLOAD_PAIR_CAP} 个文件`)
     return
   }
-  const sha = uploadSha.value.trim().toLowerCase()
-  if (sha && !/^[0-9a-f]{64}$/.test(sha)) {
-    message.warning('SHA256 格式无效（应为 64 位十六进制）')
-    return
-  }
-  uploadingRestore.value = true
+  scanning.value = true
   try {
     const form = new FormData()
-    form.append('file', uploadFile.value)
-    form.append('volume_spec', uploadTargetVolume.value)
-    if (sha) form.append('sha256', sha)
-    const res = await uploadVolumeRestore(appId.value, form)
-    // 复用恢复轮询：新记录的 last_restore_at 变化即判定恢复结束。
-    restoringArchiveID.value = res.archive_id
-    restoreBaseline.value = ''
+    files.forEach((f) => form.append('file', f))
+    const res = await scanVolumeUploads(appId.value, form)
+    scanRows.value = res.items.map((it) => ({
+      key: ++scanRowKeySeq,
+      archiveID: it.archive_id,
+      filename: it.filename,
+      size: it.size,
+      sha256: it.sha256,
+      snapshot: it.snapshot,
+      match: it.match,
+      matched: it.matched || [],
+      manifestVolumes: it.manifest_volumes || [],
+      topDirs: it.top_dirs || [],
+      // 快照/唯一命中的行预选识别结果；多候选与未识别的行留给操作员改选。
+      specs: it.match === 'manifest' || it.match === 'unique' ? (it.matched || []).map((m) => m.volume_spec) : [],
+    }))
+    scanFileList.value = []
+    const auto = scanRows.value.filter((r) => r.specs.length > 0).length
+    message.success(`已上传 ${res.items.length} 份文件，${auto} 份自动匹配到目标卷；请核对配对后确认恢复`)
+  } catch (e: any) {
+    message.error(e.message || '上传识别失败')
+  } finally {
+    scanning.value = false
+  }
+}
+
+function removeScanRow(idx: number) {
+  scanRows.value.splice(idx, 1)
+}
+
+// 每份文件至少选了一个目标卷，且同一卷未被两份文件同时占用。
+const scanRowsReady = computed(() => {
+  if (!scanRows.value.length) return false
+  const seen = new Set<string>()
+  for (const r of scanRows.value) {
+    if (!r.specs.length) return false
+    for (const s of r.specs) {
+      if (seen.has(s)) return false
+      seen.add(s)
+    }
+  }
+  return true
+})
+
+function scanRowMatchTagType(r: ScanRow): 'success' | 'warning' | 'error' | 'info' {
+  if (r.match === 'manifest' || r.match === 'unique') return 'success'
+  if (r.match === 'ambiguous') return 'warning'
+  return 'error'
+}
+
+function scanRowMatchText(r: ScanRow): string {
+  if (r.match === 'manifest') return `快照 · 内含 ${r.manifestVolumes.length} 个卷`
+  if (r.match === 'unique') return '已识别'
+  if (r.match === 'ambiguous') return '识别到多个候选，请选择'
+  return '未能识别，请选择目标卷'
+}
+
+async function doCommitRestore() {
+  if (!canWrite.value || volumeBusy.value || deploying.value) return
+  if (!scanRowsReady.value) return
+  uploadingRestore.value = true
+  try {
+    const res = await commitVolumeUploadRestore(
+      appId.value,
+      scanRows.value.map((r) => ({ archive_id: r.archiveID, specs: r.specs })),
+    )
+    // 复用恢复轮询：批量记录逐条回写 last_restore_at，全部变化即判定结束。
+    restoringArchiveIDs.value = res.archive_ids?.length ? res.archive_ids : [res.archive_id]
+    restoreBaselines.value = {}
     volumePollUntil.value = Date.now() + 30 * 60_000
     message.success(res.message || '恢复任务已开始')
-    uploadFileList.value = []
-    uploadFile.value = null
-    uploadSha.value = ''
-    uploadTargetVolume.value = null
+    scanRows.value = []
+    scanFileList.value = []
+    showUploadRestoreModal.value = false
     await loadVolumeBackups()
   } catch (e: any) {
-    message.error(e.message || '上传恢复失败')
+    message.error(e.message || '恢复任务发起失败')
   } finally {
     uploadingRestore.value = false
   }
@@ -1723,52 +1926,104 @@ function formatBytes(b: number) {
   return `${(b / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`
 }
 
-const volumeColumns = computed<DataTableColumns<ParsedVolume>>(() => [
-  {
-    title: '挂载规格', key: 'spec', ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'mono-font' }, r.spec),
-  },
-  {
-    title: '类型', key: 'bind', width: 120,
-    render: (r) => h(
-      NTag,
-      { size: 'small', bordered: false, type: r.bind ? 'info' : 'success' },
-      { default: () => (r.bind ? '宿主机目录' : 'Docker 具名卷') },
-    ),
-  },
-  {
-    title: '宿主机路径 / 卷名', key: 'src', ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'mono-font' }, r.src),
-  },
-  {
-    title: '容器内路径', key: 'dst', ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'mono-font' }, r.dst),
-  },
-  {
-    title: '模式', key: 'mode', width: 80,
-    render: (r) => h(
-      'span',
-      { style: r.mode === 'ro' ? 'color: var(--n-text-color-3)' : '' },
-      r.mode === 'ro' ? '只读' : '读写',
-    ),
-  },
-])
+const volumeColumns = computed<DataTableColumns<ParsedVolume>>(() => {
+  const cols: DataTableColumns<ParsedVolume> = []
+  if (parsedVolumes.value.some((v) => !!v.service)) {
+    cols.push({
+      title: '所属服务', key: 'service', width: 130,
+      render: (r) => r.service ? h(NTag, { size: 'small', bordered: false, type: 'info' }, { default: () => r.service }) : renderVolDash(),
+    })
+  }
+  cols.push(
+    {
+      title: '挂载规格', key: 'spec', ellipsis: { tooltip: true },
+      render: (r) => h('span', { class: 'mono-font' }, r.spec),
+    },
+    {
+      title: '类型', key: 'bind', width: 120,
+      render: (r) => h(
+        NTag,
+        { size: 'small', bordered: false, type: r.bind ? 'info' : 'success' },
+        { default: () => (r.bind ? '宿主机目录' : 'Docker 具名卷') },
+      ),
+    },
+    {
+      title: '宿主机路径 / 卷名', key: 'src', ellipsis: { tooltip: true },
+      render: (r) => h('span', { class: 'mono-font' }, r.src),
+    },
+    {
+      title: '容器内路径', key: 'dst', ellipsis: { tooltip: true },
+      render: (r) => h('span', { class: 'mono-font' }, r.dst),
+    },
+    {
+      title: '模式', key: 'mode', width: 80,
+      render: (r) => h(
+        'span',
+        { style: r.mode === 'ro' ? 'color: var(--n-text-color-3)' : '' },
+        r.mode === 'ro' ? '只读' : '读写',
+      ),
+    },
+  )
+  return cols
+})
 
 const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
-  { title: '时间', key: 'created_at', width: 80, render: (r) => renderVolTime(r.created_at) },
+  { title: '创建时间', key: 'created_at', width: 166, render: (r) => h('span', { class: 'mono-font' }, formatTime(r.created_at)) },
   {
-    title: '挂载卷', key: 'volume_spec', minWidth: 170, ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'mono-font' }, r.volume_spec),
+    title: '快照内容 / 挂载卷', key: 'volume_spec', minWidth: 180, ellipsis: { tooltip: true },
+    render: (r) => {
+      if (r.volumes && r.volumes.length > 1) {
+        return h(NSpace, { size: 6, align: 'center' }, () => [
+          h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => `整应用快照 (${r.volumes?.length} 卷)` }),
+          h(NPopover, { trigger: 'hover' }, {
+            trigger: () => h(NButton, { text: true, size: 'tiny', type: 'primary' }, { default: () => '查看包含卷' }),
+            default: () => h('div', { style: 'max-width: 380px; padding: 4px;' }, [
+              h('div', { style: 'font-weight: 600; margin-bottom: 6px; font-size: 13px;' }, '包含的挂载卷清单'),
+              h('div', { style: 'display: flex; flex-direction: column; gap: 4px;' },
+                r.volumes?.map((v) => h('div', { class: 'mono-font', style: 'font-size: 12px; display: flex; align-items: center; gap: 4px;' }, [
+                  v.service ? h(NTag, { size: 'tiny', bordered: false, type: 'info' }, { default: () => v.service }) : null,
+                  h('span', null, v.volume_spec),
+                ]))
+              ),
+            ]),
+          }),
+        ])
+      }
+      if (r.volumes && r.volumes.length === 1) {
+        const v = r.volumes[0]
+        return h('span', { class: 'mono-font' }, [
+          v.service ? h(NTag, { size: 'tiny', bordered: false, type: 'info', style: 'margin-right: 4px' }, { default: () => v.service }) : null,
+          v.volume_spec,
+        ])
+      }
+      return h('span', { class: 'mono-font' }, r.volume_spec || 'ALL')
+    },
   },
   {
-    // S3 去向：目标名弱化前置，对象键等宽承接；完整「目标 · 键」由单元格 tooltip 给出。
-    title: '存储位置（S3）', key: 'storage_path', minWidth: 200, ellipsis: { tooltip: true },
-    render: (r) => (r.storage_path
-      ? h('span', { class: 'mono-font' }, [
-        h('span', { style: 'color: var(--n-text-color-3)' }, `${r.storage_target_name || r.storage_target} · `),
-        r.storage_path,
-      ])
-      : renderVolDash()),
+    title: '模式', key: 'consistency_mode', width: 88,
+    render: (r) => {
+      const mode = r.consistency_mode || 'online'
+      if (mode === 'stop') return h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => '停机冷备' })
+      if (mode === 'pause') return h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '写暂停' })
+      return h(NTag, { size: 'small', type: 'default', bordered: false }, { default: () => '在线快照' })
+    },
+  },
+  {
+    title: '存储位置', key: 'storage_path', minWidth: 200, ellipsis: { tooltip: true },
+    render: (r) => {
+      if (r.storage_target === 'local' || (!r.storage_target && r.storage_path?.startsWith('/var/backups'))) {
+        return h('span', { class: 'mono-font' }, [
+          h(NTag, { size: 'small', type: 'default', bordered: false, style: 'margin-right: 4px' }, { default: () => '本地存储' }),
+          r.storage_path,
+        ])
+      }
+      return r.storage_path
+        ? h('span', { class: 'mono-font' }, [
+          h(NTag, { size: 'small', type: 'success', bordered: false, style: 'margin-right: 4px' }, { default: () => r.storage_target_name || 'S3' }),
+          r.storage_path,
+        ])
+        : renderVolDash()
+    },
   },
   {
     title: '大小', key: 'size', width: 88,
@@ -1782,15 +2037,15 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
       : volArchiveStatusTag(r.status),
   },
   {
-    title: '最近恢复', key: 'last_restore', width: 148,
+    title: '最近恢复', key: 'last_restore', width: 190,
     render: (r) => {
       if (!r.last_restore_at) return renderVolDash()
       const failed = r.last_restore_status === 'failed'
       const cell = [
-        h('div', { style: 'display:flex;align-items:center;gap:6px' }, [
+        h('div', { style: 'display:flex;align-items:center;gap:6px;white-space:nowrap' }, [
           h(
             NTag,
-            { size: 'small', bordered: false, type: failed ? 'error' : 'success' },
+            { size: 'tiny', bordered: false, type: failed ? 'error' : 'success' },
             { default: () => (failed ? '失败' : '成功') },
           ),
           h('span', { class: 'mono-font', style: 'font-size: 12px' }, formatTime(r.last_restore_at)),
@@ -1840,29 +2095,23 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
     render: (r) => h(NSpace, { size: 6, wrap: false }, () => [
       canWrite.value && r.status === 'success'
         ? h(
-          NPopconfirm,
-          { onPositiveClick: () => doRestoreArchive(r) },
+          NButton,
           {
-            trigger: () => h(
-              NButton,
-              {
-                size: 'tiny', secondary: true, type: 'warning',
-                loading: restoringArchive.value === r.id || restoringArchiveID.value === r.id,
-                disabled: deploying.value || (volumeBusy.value && restoringArchiveID.value !== r.id),
-              },
-              {
-                default: () => '恢复',
-                icon: () => h(NIcon, null, { default: () => h(SwapHorizontalOutline) }),
-              },
-            ),
-            default: () => '恢复将自动停止应用容器，用该归档覆盖卷数据（覆盖前保留当前状态安全副本），完成后自动重启容器。确认继续？',
+            size: 'tiny', secondary: true, type: 'warning',
+            loading: restoringArchive.value === r.id || restoringArchiveIDs.value.includes(r.id),
+            disabled: deploying.value || (volumeBusy.value && !restoringArchiveIDs.value.includes(r.id)),
+            onClick: () => openRestoreModal(r),
+          },
+          {
+            default: () => '恢复',
+            icon: () => h(NIcon, null, { default: () => h(SwapHorizontalOutline) }),
           },
         )
         : null,
       r.status === 'success'
         ? h(
           NButton,
-          { size: 'tiny', secondary: true, onClick: () => downloadArchive(r) },
+          { size: 'tiny', onClick: () => downloadArchive(r) },
           {
             default: () => '下载',
             icon: () => h(NIcon, null, { default: () => h(DownloadOutline) }),
@@ -2128,7 +2377,7 @@ const columns = computed<DataTableColumns<Deployment>>(() => [
       h(NSpace, { size: 6, wrap: false }, {
         default: () => {
           const btns = [
-            h(NButton, { size: 'tiny', secondary: true, onClick: () => openLog(r) }, { default: () => '日志' }),
+            h(NButton, { size: 'tiny', onClick: () => openLog(r) }, { default: () => '日志' }),
           ]
           if (canWrite.value && isActiveDep(r)) {
             btns.push(
@@ -2187,14 +2436,6 @@ const columns = computed<DataTableColumns<Deployment>>(() => [
       }),
   },
 ])
-
-// 时间统一走面板时区（AGENTS.md 8.14）；零值时间（0001-01-01）是“还没发生”。
-function formatTime(v?: string) {
-  if (!v) return '-'
-  const d = new Date(v)
-  if (Number.isNaN(d.getTime()) || d.getUTCFullYear() < 1970) return '-'
-  return fmtDateTime(d)
-}
 
 function fmtDuration(ms?: number) {
   if (!ms || ms < 0) return '-'
@@ -2257,7 +2498,7 @@ function startPolling() {
       if (volumeBackupRunning.value || Date.now() < volumePollUntil.value) {
         loadVolumeBackups(true)
         loadAppBackupJobs()
-      } else if (restoringArchiveID.value) {
+      } else if (restoringArchiveIDs.value.length) {
         expireVolumePollWindow()
       }
     }
@@ -2422,7 +2663,7 @@ onUnmounted(() => {
         <NTabPane name="overview" tab="概览">
           <div class="overview-scroll">
             <NSpace justify="end" style="margin-bottom: 10px">
-              <NButton v-if="canWrite" size="small" secondary @click="openEdit">
+              <NButton v-if="canWrite" size="small" @click="openEdit">
                 编辑配置
               </NButton>
             </NSpace>
@@ -2474,7 +2715,7 @@ onUnmounted(() => {
                     <span class="mono">
                       {{ p.host }}:{{ p.container }}<template v-if="p.bind_scope === 'mesh'">（仅组网）</template>
                     </span>
-                    <NButton size="tiny" secondary @click="openTunnel(p.host)">
+                    <NButton size="tiny" @click="openTunnel(p.host)">
                       <template #icon><NIcon :component="SwapHorizontalOutline" /></template>
                       隧道
                     </NButton>
@@ -2504,13 +2745,12 @@ onUnmounted(() => {
                 系统已自动通过已连接的 GitHub 账号在仓库中配置了 Webhook。每当向 <code>{{ app.branch || 'main' }}</code> 分支推送代码（git push）时，将自动触发构建并重新部署（无需手动配置 Webhook）。
               </div>
               <div style="margin-top: 8px">
-                <NButton size="tiny" secondary :loading="syncingWebhook" @click="doSyncWebhook">
+                <NButton size="tiny" :loading="syncingWebhook" @click="doSyncWebhook">
                   重新同步 Webhook
                 </NButton>
                 <NButton
                   v-if="githubAppStatus?.configured"
                   size="tiny"
-                  secondary
                   :loading="switchingToApp"
                   style="margin-left: 8px"
                   @click="doSwitchToGitHubApp"
@@ -2529,19 +2769,18 @@ onUnmounted(() => {
               </span>
               <div class="webhook-row">
                 <NCode :code="webhookURL" />
-                <NButton size="tiny" secondary @click="copyWebhook">
+                <NButton size="tiny" @click="copyWebhook">
                   <template #icon>
                     <NIcon><CopyOutline /></NIcon>
                   </template>
                   复制
                 </NButton>
-                <NButton v-if="app.repo_url?.includes('github.com')" size="tiny" secondary :loading="syncingWebhook" @click="doSyncWebhook">
+                <NButton v-if="app.repo_url?.includes('github.com')" size="tiny" :loading="syncingWebhook" @click="doSyncWebhook">
                   重试自动同步
                 </NButton>
                 <NButton
                   v-if="app.repo_url?.includes('github.com') && githubAppStatus?.configured"
                   size="tiny"
-                  secondary
                   :loading="switchingToApp"
                   @click="doSwitchToGitHubApp"
                 >
@@ -2553,143 +2792,193 @@ onUnmounted(() => {
         </NTabPane>
 
         <NTabPane name="volumes" tab="数据卷备份">
-          <div class="overview-scroll">
-            <NAlert v-if="!volumeBackupSupported" type="warning" style="margin-bottom: 12px">
-              <template #header>Compose 应用的挂载卷在编排文件中声明</template>
-              应用级备份只覆盖应用声明的挂载卷；Compose 服务的卷请在「快照备份」中按目录或 Docker 卷备份。
-              <NButton size="tiny" secondary style="margin-left: 8px" @click="$router.push('/snapshots')">
-                前往快照备份
-              </NButton>
-            </NAlert>
-            <NAlert v-else-if="parsedVolumes.length === 0" type="default" :show-icon="false" style="margin-bottom: 12px">
-              该应用未配置挂载卷。挂载卷可在「编辑配置」中添加（宿主路径:容器路径），保存并重新部署后生效。
+          <div class="overview-scroll vol-tab-pane">
+            <NAlert v-if="parsedVolumes.length === 0" type="default" :show-icon="false" style="margin-bottom: 4px">
+              <template v-if="isCompose">
+                尚未发现挂载卷，服务启动后自动发现。
+              </template>
+              <template v-else>
+                未配置挂载卷，可在「编辑配置」中添加（宿主路径:容器路径）。
+              </template>
             </NAlert>
             <template v-else>
-              <NAlert v-if="s3Targets.length === 0" type="warning" style="margin-bottom: 12px">
-                <template #header>还没有 S3 存储目标</template>
-                数据卷归档统一存放在 S3（不在应用主机留存），请先在「快照备份 → S3 存储」中添加存储目标，添加后即可在本页发起备份时选择。
-                <NButton size="tiny" secondary style="margin-left: 8px" @click="$router.push('/snapshots')">
-                  前往 S3 存储配置
-                </NButton>
-              </NAlert>
-              <NAlert v-else type="info" style="margin-bottom: 12px">
-                备份将卷数据目录打包为 tar.gz，直传下方所选的 S3 存储目标，
-                每卷保留最近 5 份成功归档。备份在容器运行中直接打包，属于在线文件快照——数据库等对跨文件一致性敏感的
-                应用建议选业务低峰期执行。恢复时会先下载归档并校验 SHA256，<strong>自动停止应用容器</strong>、
-                保留当前状态安全副本后解压覆盖，完成后自动重启容器。
-                <div style="margin-top: 6px">
-                  定时备份任务在下方「备份任务」中创建与管理（调度执行仍由快照模块负责，归档与本页共用同一份记录），全部任务也可在快照备份页按应用聚合查看。
-                  <NButton secondary size="tiny" style="margin-left: 6px" @click="$router.push('/snapshots')">前往快照备份</NButton>
-                </div>
-              </NAlert>
+              <!-- 卡片 1：应用挂载卷 -->
+              <NCard size="small" :bordered="true" class="vol-block-card">
+                <template #header>
+                  <div class="vol-card-title">
+                    <span>应用挂载卷</span>
+                    <NTag size="small" :bordered="false" round type="info">
+                      已发现 {{ parsedVolumes.length }} 个挂载卷
+                    </NTag>
+                    <NTag v-if="isCompose" size="small" :bordered="false" type="warning">
+                      Compose 复合服务
+                    </NTag>
+                  </div>
+                </template>
+                <template #header-extra>
+                  <NSpace align="center" :size="8">
+                    <span v-if="volumeBusy" class="vol-busy-hint">
+                      <NIcon class="spinning"><RefreshOutline /></NIcon>
+                      快照任务执行中
+                    </span>
+                    <NButton
+                      v-if="canWrite"
+                      type="primary"
+                      size="small"
+                      :disabled="volumeBusy || deploying"
+                      @click="openSnapshotModal"
+                    >
+                      <template #icon>
+                        <NIcon><CloudUploadOutline /></NIcon>
+                      </template>
+                      手动备份
+                    </NButton>
+                  </NSpace>
+                </template>
 
-              <!-- 应用挂载卷清单（数据量 = 应用声明的卷数，天然有限，属 §8.2 例外：不分页） -->
-              <div class="vol-section">
-                <div class="vol-section-title">应用挂载卷</div>
+                <!-- 挂载卷列表（应用声明/探测卷数天然有限，属 §8.2 例外：不分页） -->
                 <NDataTable
                   :columns="volumeColumns"
                   :data="parsedVolumes"
                   size="small"
                   :bordered="false"
                 />
-              </div>
+              </NCard>
 
-              <!-- 发起备份 -->
-              <div v-if="canWrite" class="vol-section">
-                <div class="vol-section-title">发起备份</div>
-                <NSpace vertical :size="10">
-                  <div class="vol-form-row">
-                    <NSelect
-                      v-model:value="selectedVolumeSpecs"
-                      multiple
-                      clearable
-                      :options="parsedVolumes.map((v) => ({ label: v.spec, value: v.spec }))"
-                      placeholder="全部挂载卷（不选则备份所有）"
-                    />
-                    <NSelect
-                      v-model:value="selectedBackupTargetId"
-                      :options="s3Targets.map((t) => ({ label: `${t.name} · ${t.bucket}`, value: t.id }))"
-                      placeholder="请选择备份位置"
-                      :disabled="s3Targets.length === 0"
-                    />
+              <!-- 卡片 2：备份归档记录 -->
+              <NCard size="small" :bordered="true" class="vol-block-card">
+                <template #header>
+                  <div class="vol-card-title">
+                    <span>备份归档记录</span>
+                    <NTag v-if="volumeBackupTotal > 0" size="small" :bordered="false" round type="default">
+                      共 {{ volumeBackupTotal }} 份
+                    </NTag>
                   </div>
-                  <div class="vol-backup-row">
-                    <NInput
-                      v-model:value="volBackupNote"
-                      placeholder="备注（可选）"
-                      style="flex: 1; min-width: 200px"
-                      :maxlength="200"
-                      show-count
-                    />
+                </template>
+                <template #header-extra>
+                  <NSpace align="center" :size="8">
+                    <span v-if="volumeBusy" class="vol-busy-hint">
+                      <NIcon class="spinning"><RefreshOutline /></NIcon>
+                      每 5 秒自动刷新
+                    </span>
                     <NButton
-                      type="primary"
+                      v-if="canWrite"
                       size="small"
-                      :loading="backingVolumes"
-                      :disabled="!selectedBackupTargetId || volumeBusy || deploying"
-                      @click="doBackupVolumes"
+                      :disabled="volumeBusy || deploying"
+                      @click="openUploadRestoreModal"
                     >
                       <template #icon>
-                        <NIcon><CloudUploadOutline /></NIcon>
+                        <NIcon><FolderOutline /></NIcon>
                       </template>
-                      {{ volumeBusy ? '任务执行中' : '开始备份' }}
+                      离线导入恢复
                     </NButton>
-                    <span v-if="volumeBusy" class="vol-busy-hint">
-                      <NIcon><RefreshOutline /></NIcon>
-                      归档状态每 5 秒自动刷新
-                    </span>
-                  </div>
-                </NSpace>
-              </div>
-
-              <!-- 备份任务（快照 app_volume 任务，详情页直接管理；任务数 = 本应用任务数，天然有限，属 §8.2 例外：不分页） -->
-              <div class="vol-section">
-                <div class="vol-section-title">
-                  <span>
-                    备份任务
-                    <span v-if="appBackupJobs.length > 0" class="vol-count">（{{ appBackupJobs.length }} 个）</span>
-                  </span>
-                  <NSpace :size="6">
-                    <NButton v-if="canWrite" size="tiny" secondary @click="openJobModal()">新建备份任务</NButton>
-                    <NButton size="tiny" secondary :loading="backupJobsLoading" @click="refreshBackupJobs">刷新</NButton>
+                    <NButton size="small" :loading="volumeListLoading" @click="refreshVolumeBackups">
+                      <template #icon>
+                        <NIcon><RefreshOutline /></NIcon>
+                      </template>
+                      刷新归档
+                    </NButton>
                   </NSpace>
+                </template>
+
+                <div class="vol-archive-table-wrap">
+                  <NDataTable
+                    :columns="volArchiveColumns"
+                    :data="volumeBackups"
+                    size="small"
+                    :bordered="false"
+                    :loading="volumeListLoading"
+                    :scroll-x="1440"
+                    :row-key="(r: VolumeArchive) => r.id"
+                  >
+                    <template #empty>
+                      <NEmpty description="暂无备份归档" size="small" />
+                    </template>
+                  </NDataTable>
+                  <div class="table-pagination-bar">
+                    <NPagination
+                      :page="volumePage"
+                      :page-size="volumePageSize"
+                      :item-count="volumeBackupTotal"
+                      :page-sizes="[10, 20, 50]"
+                      show-size-picker
+                      @update:page="changeVolumePage"
+                      @update:page-size="changeVolumePageSize"
+                    />
+                  </div>
                 </div>
+              </NCard>
+
+              <!-- 卡片 3：定时备份计划 -->
+              <NCard size="small" :bordered="true" class="vol-block-card">
+                <template #header>
+                  <div class="vol-card-title">
+                    <span>定时备份计划</span>
+                    <NTag v-if="appBackupJobs.length > 0" size="small" :bordered="false" round type="default">
+                      {{ appBackupJobs.length }} 个计划
+                    </NTag>
+                  </div>
+                </template>
+                <template #header-extra>
+                  <NSpace :size="8" align="center">
+                    <NButton v-if="canWrite" size="small" @click="openJobModal()">
+                      <template #icon>
+                        <NIcon><AddOutline /></NIcon>
+                      </template>
+                      新建备份计划
+                    </NButton>
+                    <NButton size="small" :loading="backupJobsLoading" @click="refreshBackupJobs">
+                      <template #icon>
+                        <NIcon><RefreshOutline /></NIcon>
+                      </template>
+                      刷新
+                    </NButton>
+                    <NButton size="small" quaternary @click="$router.push('/snapshots')">备份中心</NButton>
+                  </NSpace>
+                </template>
+
                 <NDataTable
                   :columns="backupJobColumns"
                   :data="appBackupJobsSorted"
                   size="small"
                   :bordered="false"
                   :loading="backupJobsLoading"
-                  :scroll-x="1080"
+                  :scroll-x="1140"
                   :row-key="(r: BackupJob) => r.id"
                 >
                   <template #empty>
-                    <NEmpty
-                      :description="canWrite ? '暂无备份任务，点「新建备份任务」为本应用创建定时备份' : '暂无备份任务'"
-                      size="small"
-                    />
+                    <NEmpty description="暂无备份计划" size="small" />
                   </template>
                 </NDataTable>
-                <p class="muted tip-hint" style="margin-top: 8px">
-                  备份任务由快照备份模块调度执行，运行产生的归档与下方「备份归档」共用同一份记录；任务行的最近执行与上次错误即备份日志。
-                </p>
-              </div>
+              </NCard>
 
+              <!-- 模态框：编辑/新建任务 -->
               <NModal
                 v-model:show="showJobModal"
                 preset="card"
-                :title="editingJobId ? '编辑备份任务' : '新建备份任务'"
+                :title="editingJobId ? '编辑备份计划' : '新建备份计划'"
                 style="width: 560px; max-width: 94vw"
+                :closable="true"
+                :mask-closable="true"
               >
                 <NForm label-placement="top">
                   <NFormItem label="任务名称" required>
                     <NInput v-model:value="jobForm.name" placeholder="如 每日凌晨备份数据卷" />
                   </NFormItem>
                   <NFormItem label="目标卷" required>
-                    <NSelect
-                      v-model:value="jobForm.target"
-                      :options="parsedVolumes.map((v) => ({ label: v.spec, value: v.spec }))"
-                      placeholder="选择要备份的挂载卷"
-                    />
+                    <div class="appvol-select-col">
+                      <NSelect
+                        v-model:value="jobForm.targets"
+                        multiple
+                        clearable
+                        :options="parsedVolumes.map((v) => ({ label: v.service ? `[${v.service}] ${v.spec}` : v.spec, value: v.spec }))"
+                        :disabled="jobForm.allVolumes"
+                        :placeholder="jobForm.allVolumes ? '全部挂载卷' : '选择要备份的卷（可多选）'"
+                      />
+                      <NCheckbox v-model:checked="jobForm.allVolumes">
+                        全部挂载卷（新增卷自动纳入备份）
+                      </NCheckbox>
+                    </div>
                   </NFormItem>
                   <NFormItem label="备份位置" required>
                     <NSelect
@@ -2722,100 +3011,237 @@ onUnmounted(() => {
                 </template>
               </NModal>
 
-              <!-- 上传备份并恢复：文件先经面板暂存、再由 Agent 回拉，恢复语义与归档恢复一致 -->
-              <div v-if="canWrite" class="vol-section">
-                <div class="vol-section-title">
-                  <span>上传备份并恢复</span>
-                </div>
-                <NSpace vertical :size="10">
-                  <div class="vol-form-row">
+              <!-- 模态框：恢复快照 -->
+              <NModal
+                v-model:show="showRestoreModal"
+                preset="card"
+                title="恢复挂载卷快照"
+                style="width: 580px; max-width: 94vw"
+                :closable="true"
+                :mask-closable="true"
+              >
+                <NAlert type="warning" :bordered="false" style="margin-bottom: 14px">
+                  将<strong>自动停止应用容器</strong>，用归档数据覆盖挂载卷（覆盖前保留当前状态安全副本），完成后自动重启。
+                </NAlert>
+                <NForm label-placement="top">
+                  <NFormItem label="归档信息">
+                    <div class="mono-font" style="font-size: 13px">
+                      ID: {{ restoreTargetArchive?.id }}
+                      <span v-if="restoreTargetArchive?.size" style="margin-left: 8px">大小: {{ formatBytes(restoreTargetArchive.size) }}</span>
+                    </div>
+                  </NFormItem>
+                  <NFormItem v-if="restoreTargetArchive && restoreTargetArchive.volumes && restoreTargetArchive.volumes.length > 1" label="恢复范围（多卷快照）">
+                    <NCheckboxGroup v-model:value="restoreSelectedVolumes">
+                      <NSpace vertical :size="6">
+                        <NCheckbox
+                          v-for="v in restoreTargetArchive.volumes"
+                          :key="v.volume_spec"
+                          :value="v.volume_spec"
+                        >
+                          <span class="mono-font">
+                            <NTag v-if="v.service" size="tiny" :bordered="false" type="info" style="margin-right: 4px">{{ v.service }}</NTag>
+                            {{ v.volume_spec }}
+                          </span>
+                        </NCheckbox>
+                      </NSpace>
+                    </NCheckboxGroup>
+                    <p class="muted tip-hint" style="margin-top: 4px">
+                      留空或全选恢复全部挂载卷。
+                    </p>
+                  </NFormItem>
+                  <NFormItem label="纯净回滚选项">
+                    <NCheckbox v-model:checked="restoreCleanOption">
+                      清空现有卷目录残留文件（推荐，纯净快照回滚）
+                    </NCheckbox>
+                    <p class="muted tip-hint" style="margin-top: 4px">
+                      解压前清空卷目录残留文件，彻底回滚到快照时刻。
+                    </p>
+                  </NFormItem>
+                </NForm>
+                <template #footer>
+                  <NSpace justify="end">
+                    <NButton @click="showRestoreModal = false">取消</NButton>
+                    <NButton
+                      type="warning"
+                      :loading="restoringArchive === restoreTargetArchive?.id"
+                      @click="doRestoreArchive"
+                    >
+                      确认开始恢复
+                    </NButton>
+                  </NSpace>
+                </template>
+              </NModal>
+
+              <!-- 模态框：手动数据卷备份 -->
+              <NModal
+                v-model:show="showSnapshotModal"
+                preset="card"
+                title="手动数据卷备份"
+                style="width: 540px; max-width: 94vw"
+                :closable="true"
+                :mask-closable="true"
+              >
+                <NAlert type="info" :show-icon="false" style="margin-bottom: 14px">
+                  即时创建数据卷快照（安全副本），用于升级、维护或日常备份，不影响定时备份计划。
+                </NAlert>
+                <NForm label-placement="top">
+                  <NFormItem label="备份范围（目标挂载卷）" required>
+                    <div class="appvol-select-col">
+                      <NSelect
+                        v-model:value="selectedVolumeSpecs"
+                        multiple
+                        clearable
+                        :options="parsedVolumes.map((v) => ({ label: v.service ? `[${v.service}] ${v.spec}` : v.spec, value: v.spec }))"
+                        :disabled="snapshotAllVolumes"
+                        :placeholder="snapshotAllVolumes ? '全部挂载卷（整应用快照）' : '选择要快照的卷（可多选）'"
+                      />
+                      <NCheckbox v-model:checked="snapshotAllVolumes">
+                        全部挂载卷（整应用快照，推荐）
+                      </NCheckbox>
+                    </div>
+                  </NFormItem>
+                  <NFormItem label="备份存储位置" required>
                     <NSelect
-                      v-model:value="uploadTargetVolume"
-                      :options="parsedVolumes.map((v) => ({ label: v.spec, value: v.spec }))"
-                      placeholder="选择要恢复到的挂载卷"
+                      v-model:value="selectedBackupTargetId"
+                      :options="backupTargetOptions"
+                      placeholder="请选择备份位置"
                     />
+                  </NFormItem>
+                  <NFormItem label="写入一致性模式" required>
+                    <NSelect
+                      v-model:value="backupConsistencyMode"
+                      :options="consistencyOptions"
+                    />
+                    <template #feedback>
+                      <span class="tip-hint">
+                        在线快照不中断服务；写暂停短暂挂起写入；停机冷备安全停止容器打包后自动恢复。
+                      </span>
+                    </template>
+                  </NFormItem>
+                  <NFormItem label="备注说明">
                     <NInput
-                      v-model:value="uploadSha"
-                      placeholder="可选：文件 SHA256（填了才校验）"
-                      class="mono-font"
+                      v-model:value="volBackupNote"
+                      placeholder="可选，如 升级前数据冷备"
+                      :maxlength="200"
+                      show-count
                     />
+                  </NFormItem>
+                </NForm>
+                <template #footer>
+                  <NSpace justify="end">
+                    <NButton @click="showSnapshotModal = false">取消</NButton>
+                    <NButton
+                      type="primary"
+                      :loading="backingVolumes"
+                      :disabled="!selectedBackupTargetId || volumeBusy || deploying || (!snapshotAllVolumes && selectedVolumeSpecs.length === 0)"
+                      @click="doBackupVolumes"
+                    >
+                      开始快照备份
+                    </NButton>
+                  </NSpace>
+                </template>
+              </NModal>
+
+              <!-- 模态框：离线备份上传与恢复 -->
+              <NModal
+                v-model:show="showUploadRestoreModal"
+                preset="card"
+                title="离线备份上传与恢复"
+                style="width: 680px; max-width: 94vw"
+                :closable="true"
+                :mask-closable="true"
+              >
+                <NAlert type="info" :bordered="false" style="margin-bottom: 14px">
+                  应急灾备流程：单份文件 ≤ 2GB，支持上传整应用快照或单卷归档（.tar/.tar.gz/.tgz）。控制端将自动解析文件结构并匹配挂载卷，恢复时将<strong>停止容器并覆盖现有数据</strong>。
+                </NAlert>
+                <NSpace vertical :size="14">
+                  <div class="vol-upload-action-row">
+                    <NUpload
+                      v-model:file-list="scanFileList"
+                      :multiple="true"
+                      :max="VOLUME_UPLOAD_PAIR_CAP"
+                      accept=".tar,.tar.gz,.tgz,application/x-tar,application/gzip"
+                      :custom-request="handleScanFileSelect"
+                      :show-upload-button="false"
+                    >
+                      <NButton size="small">
+                        <template #icon><NIcon><FolderOutline /></NIcon></template>
+                        选择备份文件
+                      </NButton>
+                    </NUpload>
+                    <NButton
+                      type="primary"
+                      size="small"
+                      :loading="scanning"
+                      :disabled="scanFileList.length === 0"
+                      @click="doScanUpload"
+                    >
+                      <template #icon><NIcon><CloudUploadOutline /></NIcon></template>
+                      上传并识别（{{ scanFileList.length }} 份）
+                    </NButton>
                   </div>
-                  <NUpload
-                    v-model:file-list="uploadFileList"
-                    :max="1"
-                    :multiple="false"
-                    accept=".tar.gz,.tgz,application/gzip"
-                    :custom-request="handleUploadSelect"
-                    @remove="handleUploadRemove"
+
+                  <div v-if="scanRows.length === 0 && scanFileList.length === 0" class="vol-upload-empty-hint">
+                    暂未选择离线备份文件，支持上传整应用快照或单卷归档（.tar / .tar.gz / .tgz）
+                  </div>
+
+                  <div
+                    v-for="(row, idx) in scanRows"
+                    :key="row.key"
+                    class="vol-pair-row"
                   >
-                    <NButton secondary>选择备份文件（.tar.gz）</NButton>
-                  </NUpload>
-                  <NAlert type="warning">
-                    恢复将自动停止应用容器，用上传文件覆盖所选卷数据（覆盖前保留当前状态安全副本），完成后自动重启容器。
-                    文件先暂存面板、恢复结束即删（不超过 2GB）；Agent 须能通过面板地址回拉文件，拉取或校验失败在停机前即报错，不产生停机。
-                  </NAlert>
-                  <div>
-                    <NPopconfirm @positive-click="doUploadRestore">
+                    <div class="vol-scan-file">
+                      <span class="vol-scan-name mono-font">{{ row.filename }}</span>
+                      <span class="vol-scan-size">{{ formatBytes(row.size) }}</span>
+                      <NTag size="small" :bordered="false" :type="scanRowMatchTagType(row)">
+                        {{ scanRowMatchText(row) }}
+                      </NTag>
+                    </div>
+                    <div v-if="row.snapshot" class="vol-scan-targets">
+                      <NCheckboxGroup v-model:value="row.specs">
+                        <NCheckbox
+                          v-for="m in row.matched"
+                          :key="m.volume_spec"
+                          :value="m.volume_spec"
+                          :label="m.volume_spec"
+                        />
+                      </NCheckboxGroup>
+                      <span v-if="row.matched.length === 0" class="vol-scan-hint">
+                        快照内没有匹配的挂载卷
+                      </span>
+                    </div>
+                    <NSelect
+                      v-else
+                      v-model:value="row.specs[0]"
+                      class="vol-pair-spec"
+                      :options="volumeOptions()"
+                      :placeholder="row.match === 'none' ? '未能自动识别，请选择目标挂载卷' : '选择要恢复到的目标挂载卷'"
+                    />
+                    <NButton quaternary size="small" @click="removeScanRow(idx)">
+                      移除
+                    </NButton>
+                  </div>
+                </NSpace>
+                <template #footer>
+                  <NSpace justify="end">
+                    <NButton @click="showUploadRestoreModal = false">
+                      {{ scanRows.length > 0 ? '取消' : '关闭' }}
+                    </NButton>
+                    <NPopconfirm v-if="scanRows.length > 0" @positive-click="doCommitRestore">
                       <template #trigger>
                         <NButton
                           type="warning"
                           :loading="uploadingRestore"
-                          :disabled="!uploadTargetVolume || !uploadFile || volumeBusy || deploying"
+                          :disabled="!scanRowsReady || volumeBusy || deploying"
                         >
-                          上传并恢复
+                          确认并开始恢复（{{ scanRows.length }} 份文件）
                         </NButton>
                       </template>
-                      确认把上传文件恢复到所选挂载卷？恢复会覆盖该卷现有数据。
+                      确认按配对恢复 {{ scanRows.length }} 份文件？将停止容器、覆盖目标卷现有数据后自动重启；任一文件失败整批取消。
                     </NPopconfirm>
-                  </div>
-                </NSpace>
-              </div>
-
-              <!-- 归档历史 -->
-              <div class="vol-section">
-                <div class="vol-section-title">
-                  <span>
-                    备份归档
-                    <span v-if="volumeBackupTotal > 0" class="vol-count">（共 {{ volumeBackupTotal }} 份）</span>
-                  </span>
-                  <NButton size="tiny" secondary :loading="volumeListLoading" @click="refreshVolumeBackups">
-                    <template #icon>
-                      <NIcon><RefreshOutline /></NIcon>
-                    </template>
-                    刷新
-                  </NButton>
-                </div>
-                <NCard size="small" :bordered="false" class="vol-archive-card table-flex-fill">
-                  <NDataTable
-                    flex-height
-                    :columns="volArchiveColumns"
-                    :data="volumeBackups"
-                    size="small"
-                    :bordered="false"
-                    :loading="volumeListLoading"
-                    :scroll-x="1240"
-                    :row-key="(r: VolumeArchive) => r.id"
-                  >
-                    <template #empty>
-                      <NEmpty
-                        :description="s3Targets.length > 0 ? '暂无备份归档，选好备份位置与挂载卷后点「开始备份」' : '暂无备份归档'"
-                        size="small"
-                      />
-                    </template>
-                  </NDataTable>
-                  <div class="table-pagination-bar">
-                    <NPagination
-                      :page="volumePage"
-                      :page-size="volumePageSize"
-                      :item-count="volumeBackupTotal"
-                      :page-sizes="[10, 20, 50]"
-                      show-size-picker
-                      @update:page="changeVolumePage"
-                      @update:page-size="changeVolumePageSize"
-                    />
-                  </div>
-                </NCard>
-              </div>
+                  </NSpace>
+                </template>
+              </NModal>
             </template>
           </div>
         </NTabPane>
@@ -2836,7 +3262,7 @@ onUnmounted(() => {
                 </span>
               </div>
               <NSpace :size="8" align="center">
-                <NButton size="small" secondary :loading="loading" @click="reloadDeployments">
+                <NButton size="small" :loading="loading" @click="reloadDeployments">
                   <template #icon>
                     <NIcon><RefreshOutline /></NIcon>
                   </template>
@@ -3048,7 +3474,7 @@ onUnmounted(() => {
                           >
                             签发并重试绑定
                           </NButton>
-                          <NButton v-else size="small" secondary @click="router.push('/certs')">
+                          <NButton v-else size="small" @click="router.push('/certs')">
                             前往证书中心
                           </NButton>
                         </NSpace>
@@ -3325,7 +3751,7 @@ onUnmounted(() => {
             </template>
             <NAlert v-else type="default" :show-icon="false">未配置环境变量</NAlert>
             <NSpace v-if="canWrite" justify="end" style="margin-top: 12px">
-              <NButton size="small" secondary @click="addEnvRow">添加变量</NButton>
+              <NButton size="small" @click="addEnvRow">添加变量</NButton>
               <NButton size="small" :loading="savingEnv" @click="saveEnv(false)">保存</NButton>
               <NButton size="small" type="primary" :loading="savingEnv || deploying" @click="saveEnv(true)">
                 保存并重新部署
@@ -3348,13 +3774,13 @@ onUnmounted(() => {
             <NSwitch v-model:value="followLog" size="small" />
             <span class="log-follow-label">自动跟随</span>
           </NSpace>
-          <NButton size="tiny" secondary :loading="logRefreshing" @click="reloadLog">
+          <NButton size="tiny" :loading="logRefreshing" @click="reloadLog">
             <template #icon>
               <NIcon><RefreshOutline /></NIcon>
             </template>
             刷新
           </NButton>
-          <NButton size="tiny" secondary @click="copyLog">
+          <NButton size="tiny" @click="copyLog">
             <template #icon>
               <NIcon><CopyOutline /></NIcon>
             </template>
@@ -3489,7 +3915,7 @@ onUnmounted(() => {
               />
               <NButton size="tiny" quaternary type="error" @click="editForm.ports.splice(idx, 1)">删除</NButton>
             </div>
-            <NButton size="tiny" secondary @click="editForm.ports.push({ host: null, container: null, bind_scope: 'public' })">
+            <NButton size="tiny" @click="editForm.ports.push({ host: null, container: null, bind_scope: 'public' })">
               添加端口
             </NButton>
           </div>
@@ -3545,7 +3971,7 @@ onUnmounted(() => {
           <div style="font-weight: 600; margin-bottom: 6px">推荐执行命令：</div>
           <div v-for="(cmd, idx) in aiResult.commands" :key="idx" class="cmd-box">
             <NCode :code="cmd" />
-            <NButton size="tiny" secondary @click="copyToClipboard(cmd).then(() => message.success('已复制命令'))">复制</NButton>
+            <NButton size="tiny" @click="copyToClipboard(cmd).then(() => message.success('已复制命令'))">复制</NButton>
           </div>
         </div>
       </div>
@@ -3671,42 +4097,160 @@ onUnmounted(() => {
   font-size: 12px;
 }
 
-/* 数据卷备份页签：三个子区块共用同一标题层级，归档表宽度由 scroll-x 兜住 */
-.vol-section {
-  margin-bottom: 18px;
+/* 数据卷备份页签：卡片分块布局规范（DESIGN.md §9） */
+.vol-tab-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 4px 2px 24px 0;
 }
 
-.vol-section:last-child {
-  margin-bottom: 0;
+.vol-block-card {
+  flex-shrink: 0;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+
+  &:hover {
+    border-color: var(--border-dashed);
+  }
+
+  :deep(.n-card-header) {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  :deep(.n-card__content),
+  :deep(.n-card-content) {
+    padding: 0 !important;
+    min-width: 0;
+
+    &:first-child {
+      padding-top: 0 !important;
+    }
+
+    &:last-child {
+      padding-bottom: 0 !important;
+    }
+  }
+
+  .table-pagination-bar {
+    padding: 10px 16px;
+    box-sizing: border-box;
+  }
 }
 
-.vol-archive-card {
-  height: 380px;
-}
-
-.vol-section-title {
+.vol-card-title {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  min-height: 28px;
-  font-size: 13px;
+  gap: 8px;
+  font-size: 14px;
   font-weight: 600;
-  margin-bottom: 10px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-primary);
 }
 
-/* 表单并排一行：窄屏自动换行，固定宽输入不再挤出容器 */
-.vol-form-row {
+.vol-card-desc {
+  margin: 0 0 12px 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* 备份目标卷：多选下拉 + 「全部」勾选的纵向排布 */
+.appvol-select-col {
   display: flex;
-  gap: 10px;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.vol-upload-action-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   flex-wrap: wrap;
 }
 
-.vol-form-row > * {
-  flex: 1;
-  min-width: 240px;
+.vol-upload-empty-hint {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+  border: 1px dashed var(--border-dashed);
+  border-radius: 8px;
+  background: var(--bg-card-subtle);
+}
+
+/* 上传识别行：文件信息与目标卷选择同行铺开，快照行卷勾选组换行铺满 */
+.vol-pair-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--bg-card-subtle);
+  border: 1px solid var(--border-subtle);
+  transition: border-color 0.2s ease, background-color 0.2s ease;
+
+  &:hover {
+    border-color: var(--border-color);
+  }
+
+  > .vol-pair-spec {
+    flex: 1;
+    min-width: 220px;
+  }
+
+  > .vol-scan-file {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 220px;
+
+    > .vol-scan-name {
+      font-size: 13px;
+      font-weight: 500;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 280px;
+      color: var(--text-primary);
+    }
+
+    > .vol-scan-size {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+  }
+
+  > .vol-scan-targets {
+    flex: 1 1 100%;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding-left: 4px;
+  }
+}
+
+.vol-scan-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.vol-archive-table-wrap {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
 }
 
 .vol-modal-row {
@@ -3714,31 +4258,31 @@ onUnmounted(() => {
   gap: 12px;
   flex-wrap: wrap;
   align-items: flex-start;
-}
 
-.vol-modal-row > .n-form-item {
-  margin-bottom: 18px;
-}
-
-.vol-count {
-  margin-left: 4px;
-  font-weight: 400;
-  color: var(--n-text-color-3, var(--text-secondary));
-}
-
-.vol-backup-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
+  > .n-form-item {
+    margin-bottom: 18px;
+  }
 }
 
 .vol-busy-hint {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   font-size: 12px;
-  color: var(--n-text-color-3, var(--text-secondary));
+  color: #f59e0b;
+}
+
+.spinning {
+  animation: vol-spin 1.2s linear infinite;
+}
+
+@keyframes vol-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .topology-box {

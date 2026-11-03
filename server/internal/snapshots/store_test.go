@@ -3,6 +3,7 @@ package snapshots
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -132,5 +133,48 @@ func TestDeleteJobsByApp(t *testing.T) {
 	}
 	if len(reopened.ListJobs()) != 2 {
 		t.Errorf("ListJobs after restart = %d, want 2", len(reopened.ListJobs()))
+	}
+}
+
+// TestParseAppVolumeSpecList locks the app_volume job target contract: "ALL"
+// selects every declared volume, any other target is a comma-joined spec list
+// (single spec = the pre-multi-select form), blanks and duplicates are dropped.
+func TestParseAppVolumeSpecList(t *testing.T) {
+	cases := []struct {
+		target string
+		specs  []string
+		all    bool
+	}{
+		{"ALL", nil, true},
+		{" all ", nil, true},
+		{"/opt/a:/a", []string{"/opt/a:/a"}, false},
+		{"/opt/a:/a,/opt/b:/b", []string{"/opt/a:/a", "/opt/b:/b"}, false},
+		{" /opt/a:/a , /opt/b:/b ,, /opt/a:/a ", []string{"/opt/a:/a", "/opt/b:/b"}, false},
+		{"", nil, false},
+		{" , , ", nil, false},
+	}
+	for _, tc := range cases {
+		specs, all := ParseAppVolumeSpecList(tc.target)
+		if all != tc.all {
+			t.Errorf("ParseAppVolumeSpecList(%q) all = %v, want %v", tc.target, all, tc.all)
+		}
+		if !reflect.DeepEqual(specs, tc.specs) {
+			t.Errorf("ParseAppVolumeSpecList(%q) = %v, want %v", tc.target, specs, tc.specs)
+		}
+	}
+}
+
+func TestNormalizeAppVolumeTarget(t *testing.T) {
+	if got := NormalizeAppVolumeTarget(" all "); got != AppVolumeTargetAll {
+		t.Errorf("NormalizeAppVolumeTarget(\" all \") = %q, want ALL", got)
+	}
+	if got := NormalizeAppVolumeTarget(" /opt/a:/a , /opt/b:/b "); got != "/opt/a:/a,/opt/b:/b" {
+		t.Errorf("NormalizeAppVolumeTarget(list) = %q, want trimmed join", got)
+	}
+	if got := NormalizeAppVolumeTarget("/opt/a:/a"); got != "/opt/a:/a" {
+		t.Errorf("NormalizeAppVolumeTarget(single) = %q, want unchanged", got)
+	}
+	if got := NormalizeAppVolumeTarget(" , , "); got != "" {
+		t.Errorf("NormalizeAppVolumeTarget(blanks) = %q, want empty", got)
 	}
 }

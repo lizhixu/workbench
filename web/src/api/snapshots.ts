@@ -66,6 +66,7 @@ export interface CreateJobReq {
   name: string
   host_id: string
   kind: JobKind
+  /** dir 路径 / 卷名 / 数据库容器名；app_volume 为 'ALL'（全部挂载卷）或逗号拼接的卷规格清单 */
   target: string
   app_id?: string
   db_type?: string

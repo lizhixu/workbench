@@ -140,6 +140,9 @@ func (h *Handlers) createJob(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+		// Canonical form ("ALL" or the deduped comma list) so the stored job
+		// and the frontend parse identically.
+		req.Target = NormalizeAppVolumeTarget(req.Target)
 		hostID = target.HostID
 		appID = target.AppID
 	}
@@ -197,6 +200,11 @@ func (h *Handlers) updateJob(c *gin.Context) {
 		if existing.Kind == KindDir && (strings.Contains(target, "..") || !strings.HasPrefix(target, "/")) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "目录必须是绝对路径且不能包含 .."})
 			return
+		}
+		// Canonicalize an app_volume selection ("ALL" or the deduped comma
+		// list) so validation, storage and the job history agree on one form.
+		if existing.Kind == KindAppVolume {
+			target = NormalizeAppVolumeTarget(target)
 		}
 	}
 	name := existing.Name
@@ -327,23 +335,31 @@ func (h *Handlers) listArchives(c *gin.Context) {
 }
 
 // resolveAppVolumeJob validates an app_volume job request against the app
-// engine: the target must be one of the app's declared volumes and the
-// destination must be an existing S3 target (these archives are S3-only).
+// engine: the target selects "ALL" or a subset of the app's declared volumes
+// (comma-joined specs), and the destination must be an existing S3 target
+// (these archives are S3-only).
 func (h *Handlers) resolveAppVolumeJob(appID, spec, storageTarget string) (*AppVolumeTarget, error) {
 	target, err := h.engine.ResolveAppVolume(strings.TrimSpace(appID))
 	if err != nil {
 		return nil, err
 	}
-	spec = strings.TrimSpace(spec)
-	declared := false
-	for _, v := range target.Volumes {
-		if strings.TrimSpace(v) == spec {
-			declared = true
-			break
+	specs, all := ParseAppVolumeSpecList(spec)
+	if !all {
+		if len(specs) == 0 {
+			return nil, fmt.Errorf("应用数据卷备份必须选择挂载卷")
 		}
-	}
-	if !declared {
-		return nil, fmt.Errorf("只能选择应用已声明的挂载卷: %s", spec)
+		for _, s := range specs {
+			declared := false
+			for _, v := range target.Volumes {
+				if strings.TrimSpace(v) == s {
+					declared = true
+					break
+				}
+			}
+			if !declared {
+				return nil, fmt.Errorf("只能选择应用已声明的挂载卷: %s", s)
+			}
+		}
 	}
 	switch strings.TrimSpace(storageTarget) {
 	case "":

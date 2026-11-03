@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, h, onActivated, onMounted, reactive, ref, watch } from 'vue'
 import {
-  NAlert, NButton, NCard, NDataTable, NEmpty, NForm, NFormItem, NIcon, NInput,
+  NAlert, NButton, NCard, NCheckbox, NDataTable, NEmpty, NForm, NFormItem, NIcon, NInput,
   NInputNumber, NModal, NPopconfirm, NRadio, NRadioButton, NRadioGroup, NSelect,
   NSpace, NSwitch, NTabPane, NTabs, NTag, useMessage,
 } from 'naive-ui'
@@ -74,7 +74,9 @@ const hostOptions = ref<{ label: string; value: string }[]>([])
 const apps = ref<AppEntity[]>([])
 // NSelect 空值必须用 null（AGENTS.md §8.3.1），'' 会渲染幽灵选中态。
 const selectedAppID = ref<string | null>(null)
-const selectedAppVolume = ref<string | null>(null)
+// 挂载卷多选（'ALL' 哨兵 = 整应用全部卷，与后端 snapshots.AppVolumeTargetAll 对应）。
+const selectedAppVolumes = ref<string[]>([])
+const jobAllVolumes = ref(false)
 
 const selectedApp = computed(() => apps.value.find((a) => a.id === selectedAppID.value) || null)
 const defaultS3 = computed(() => s3Targets.value.find((t) => t.is_default) || null)
@@ -96,6 +98,23 @@ const appOptions = computed(() =>
 const appVolumeOptions = computed(() =>
   (selectedApp.value?.volumes ?? []).map((v) => ({ label: v, value: v })),
 )
+
+// 任务目标卷的提交值：勾选「全部」或选中了全部选项时归一为 ALL（整应用任务
+// 会跟随后续新增的挂载卷），否则提交逗号拼接的多选清单（与后端契约一致）。
+function appVolumeJobTarget(): string {
+  if (jobAllVolumes.value ||
+      (selectedAppVolumes.value.length > 0 && selectedAppVolumes.value.length === appVolumeOptions.value.length)) {
+    return 'ALL'
+  }
+  return selectedAppVolumes.value.join(',')
+}
+
+// 任务「目标对象」的挂载卷文案：ALL → 全部；多选 → N 个卷。
+function appVolumeTargetLabel(target: string): string {
+  if (target === 'ALL') return '全部挂载卷'
+  if (target.includes(',')) return `${target.split(',').length} 个挂载卷`
+  return target
+}
 
 // 应用数据卷归档仅支持 S3：不提供「本地主机」选项，也给不出默认目标时引导去配置。
 const appVolumeStorageOptions = computed(() => {
@@ -219,7 +238,9 @@ const columns = computed<DataTableColumns<BackupJob>>(() => [
         return h(NSpace, { size: 6, align: 'center' }, {
           default: () => [
             h('span', { style: 'font-weight: 500' }, app?.name || r.app_id || '应用已删除'),
-            h('span', { class: 'mono-font', style: { fontSize: '11px' } }, r.target),
+            h('span', {
+              class: 'mono-font', style: { fontSize: '11px' }, title: r.target,
+            }, appVolumeTargetLabel(r.target)),
           ],
         })
       }
@@ -581,7 +602,8 @@ async function loadApps() {
 
 function openCreateJob() {
   selectedAppID.value = null
-  selectedAppVolume.value = null
+  selectedAppVolumes.value = []
+  jobAllVolumes.value = false
   showCreate.value = true
 }
 
@@ -683,8 +705,8 @@ async function submitCreate() {
       message.warning('请选择要备份的应用')
       return
     }
-    if (!selectedAppVolume.value) {
-      message.warning('请选择要备份的挂载卷')
+    if (!jobAllVolumes.value && selectedAppVolumes.value.length === 0) {
+      message.warning('请选择要备份的挂载卷，或勾选全部挂载卷')
       return
     }
     if (!s3Targets.value.length) {
@@ -695,7 +717,7 @@ async function submitCreate() {
       ...form,
       host_id: '',
       app_id: selectedAppID.value,
-      target: selectedAppVolume.value,
+      target: appVolumeJobTarget(),
       db_type: '',
       db_name: '',
     }
@@ -962,16 +984,27 @@ onActivated(() => {
                 :options="appOptions"
                 placeholder="选择已声明挂载卷的应用"
                 filterable
-                @update:value="selectedAppVolume = null"
+                @update:value="selectedAppVolumes = []"
               />
             </NFormItem>
             <NFormItem label="挂载卷" required style="flex: 1">
-              <NSelect
-                v-model:value="selectedAppVolume"
-                :options="appVolumeOptions"
-                :disabled="!selectedAppID"
-                placeholder="选择要备份的卷"
-              />
+              <div class="appvol-select-col">
+                <NSelect
+                  v-model:value="selectedAppVolumes"
+                  multiple
+                  clearable
+                  :options="appVolumeOptions"
+                  :disabled="!selectedAppID || jobAllVolumes"
+                  :placeholder="jobAllVolumes ? '全部挂载卷' : '选择要备份的卷（可多选）'"
+                />
+                <NCheckbox
+                  :checked="jobAllVolumes"
+                  :disabled="!selectedAppID"
+                  @update:checked="jobAllVolumes = $event"
+                >
+                  全部挂载卷（新增卷自动纳入备份）
+                </NCheckbox>
+              </div>
             </NFormItem>
           </NSpace>
           <NAlert v-if="!appOptions.length" type="info" :show-icon="true" style="margin-bottom: 12px">
@@ -1150,6 +1183,14 @@ onActivated(() => {
 </template>
 
 <style scoped lang="scss">
+// 应用数据卷多选 + 「全部」勾选的纵向排布（挂载卷表单项内部）。
+.appvol-select-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
 .snapshots-view {
   gap: 14px;
   overflow: hidden;

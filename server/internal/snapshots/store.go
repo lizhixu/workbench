@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -28,12 +29,49 @@ const (
 	// KindDatabase hot-dumps a database running in a container
 	// (mysql / postgres / redis / mongo).
 	KindDatabase JobKind = "database"
-	// KindAppVolume archives one declared volume of an application managed by
-	// the app center. The app engine owns the semantics (declared-volume
-	// allowlist, S3-only archives, SHA-verified restore with container
-	// stop/start); this module owns the job, schedule and unified history.
+	// KindAppVolume archives one or more declared volumes of an application
+	// managed by the app center. The app engine owns the semantics
+	// (declared-volume allowlist, S3-only archives, SHA-verified restore with
+	// container stop/start); this module owns the job, schedule and unified
+	// history.
 	KindAppVolume JobKind = "app_volume"
 )
+
+// AppVolumeTargetAll is the app_volume job target sentinel meaning "every
+// declared volume of the app" — a whole-app job follows volumes added later,
+// instead of pinning a frozen spec list.
+const AppVolumeTargetAll = "ALL"
+
+// ParseAppVolumeSpecList parses one app_volume job target. "ALL" selects every
+// declared volume; any other target is a comma-joined list of volume specs —
+// a single spec is the pre-multi-select form and parses to a one-element
+// list. Blank and duplicate entries are dropped, preserving order.
+func ParseAppVolumeSpecList(target string) (specs []string, all bool) {
+	target = strings.TrimSpace(target)
+	if strings.EqualFold(target, AppVolumeTargetAll) {
+		return nil, true
+	}
+	seen := make(map[string]bool, 4)
+	for _, part := range strings.Split(target, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" || seen[part] {
+			continue
+		}
+		seen[part] = true
+		specs = append(specs, part)
+	}
+	return specs, false
+}
+
+// NormalizeAppVolumeTarget canonicalizes an app_volume job target for storage:
+// "ALL" when every volume is selected, otherwise the comma-joined spec list.
+func NormalizeAppVolumeTarget(target string) string {
+	specs, all := ParseAppVolumeSpecList(target)
+	if all {
+		return AppVolumeTargetAll
+	}
+	return strings.Join(specs, ",")
+}
 
 // Schedule describes when a job runs. Cron is a 5-field expression; an empty
 // cron with Manual=true means the job only runs when triggered by hand.
@@ -52,7 +90,8 @@ type Job struct {
 	// derived from the app at creation time.
 	AppID string `json:"app_id,omitempty"`
 	// Target: dir path, volume name, container name (database), or the
-	// application's volume spec "src:dst" (app_volume).
+	// app_volume volume selection — "ALL" (every declared volume) or a
+	// comma-joined list of "src:dst" specs (a bare spec = single volume).
 	Target string `json:"target"`
 	// DBType for KindDatabase: mysql | postgres | redis | mongo.
 	DBType string `json:"db_type,omitempty"`

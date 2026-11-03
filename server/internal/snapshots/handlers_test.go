@@ -1,6 +1,7 @@
 package snapshots
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -11,6 +12,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"watchman/proto/agentpb"
+	"watchman/server/internal/rpc"
 )
 
 // fakeAppVolumeHost implements AppVolumeHost for handler tests.
@@ -227,5 +231,148 @@ func TestUpdateJobPartialTargetKeepsExisting(t *testing.T) {
 	got, _ = store.GetJob("bk_1")
 	if got.Target != "/opt/a:/a" || got.Name != "renamed" {
 		t.Fatalf("rejected updates must not mutate the job: %+v", got)
+	}
+}
+
+// newAppVolumeHandlerTestWithAgent builds the handler stack on a real registry
+// with one online agent, so createJob's agent-online gate passes and the
+// stored job can be asserted.
+func newAppVolumeHandlerTestWithAgent(t *testing.T, host *fakeAppVolumeHost) (*gin.Engine, *Store) {
+	t.Helper()
+	_, store := newAppVolumeHandlerTest(t, host)
+	reg := rpc.NewRegistry(t.TempDir(), nil)
+	tok := reg.IssueEnrollToken()
+	if _, _, err := reg.Register(context.Background(), &agentpb.RegisterRequest{
+		EnrollToken: tok, AgentId: host.hostID, Hostname: host.hostID, Os: "linux", Arch: "amd64",
+	}, ""); err != nil {
+		t.Fatalf("Register %s: %v", host.hostID, err)
+	}
+	engine := NewEngine(nil, store, nil)
+	engine.SetAppVolumeHost(host)
+	h := NewHandlers(reg, store, engine)
+	r := gin.New()
+	h.Register(r.Group(""), r.Group(""))
+	return r, store
+}
+
+func postCreateAppVolumeJob(t *testing.T, r *gin.Engine, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/backups/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	return w
+}
+
+// TestCreateAppVolumeJobMultiSelect locks the job target contract end to end:
+// "ALL" (whole-app job) and comma-joined subsets store canonically, an
+// undeclared spec or a blank list is rejected up front.
+func TestCreateAppVolumeJobMultiSelect(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	host := &fakeAppVolumeHost{hostID: "h1", volumes: []string{"/opt/a:/a", "/opt/b:/b"}}
+	r, store := newAppVolumeHandlerTestWithAgent(t, host)
+
+	w := postCreateAppVolumeJob(t, r, `{"name":"whole","host_id":"","kind":"app_volume","app_id":"app1","target":"ALL","storage_target":"s3_t","cron":"0 3 * * *","enabled":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create ALL job: code=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// Find the stored job by name (IDs are random).
+	var whole, subset *Job
+	for _, j := range store.ListJobs() {
+		switch j.Name {
+		case "whole":
+			whole = j
+		case "subset":
+			subset = j
+		}
+	}
+	if whole == nil {
+		t.Fatal("ALL job not stored")
+	}
+	if whole.Target != "ALL" {
+		t.Fatalf("ALL job target = %q, want ALL", whole.Target)
+	}
+
+	// Comma-joined subset with blanks/duplicates normalizes to the canonical list.
+	w = postCreateAppVolumeJob(t, r, `{"name":"subset","host_id":"","kind":"app_volume","app_id":"app1","target":" /opt/a:/a , /opt/b:/b ,, /opt/a:/a ","storage_target":"s3_t","cron":"","enabled":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create subset job: code=%d body=%s", w.Code, w.Body.String())
+	}
+	for _, j := range store.ListJobs() {
+		if j.Name == "subset" {
+			subset = j
+		}
+	}
+	if subset == nil {
+		t.Fatal("subset job not stored")
+	}
+	if subset.Target != "/opt/a:/a,/opt/b:/b" {
+		t.Fatalf("subset job target = %q, want normalized join", subset.Target)
+	}
+
+	// Undeclared spec inside a multi selection is rejected.
+	w = postCreateAppVolumeJob(t, r, `{"name":"bad","host_id":"","kind":"app_volume","app_id":"app1","target":"/opt/a:/a,/opt/x:/x","storage_target":"s3_t","enabled":true}`)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "只能选择应用已声明的挂载卷") {
+		t.Fatalf("undeclared spec: code=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// A list that parses to nothing is rejected as "no volume selected".
+	w = postCreateAppVolumeJob(t, r, `{"name":"bad2","host_id":"","kind":"app_volume","app_id":"app1","target":" , , ","storage_target":"s3_t","enabled":true}`)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "必须选择挂载卷") {
+		t.Fatalf("blank list: code=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestUpdateAppVolumeJobTargetNormalizes exercises the partial-update path:
+// a target change re-validates the allowlist and stores the canonical form.
+func TestUpdateAppVolumeJobTargetNormalizes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	host := &fakeAppVolumeHost{hostID: "h1", volumes: []string{"/opt/a:/a", "/opt/b:/b"}}
+	r, store := newAppVolumeHandlerTestWithAgent(t, host)
+	job := &Job{ID: "bk_1", Name: "j", HostID: "h1", Kind: KindAppVolume, AppID: "app1",
+		Target: "/opt/a:/a", StorageTarget: "s3_t", Retention: 7, Enabled: true, Schedule: Schedule{Cron: "0 3 * * *"}}
+	if err := store.PutJob(job); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	body, _ := json.Marshal(map[string]any{"target": " /opt/a:/a , /opt/b:/b "})
+	req := httptest.NewRequest(http.MethodPut, "/backups/jobs/bk_1", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update target: code=%d body=%s", w.Code, w.Body.String())
+	}
+	got, _ := store.GetJob("bk_1")
+	if got.Target != "/opt/a:/a,/opt/b:/b" {
+		t.Fatalf("updated target = %q, want normalized join", got.Target)
+	}
+
+	// Switching the job to whole-app via any case form stores the ALL sentinel.
+	body, _ = json.Marshal(map[string]any{"target": "all"})
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPut, "/backups/jobs/bk_1", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update to ALL: code=%d body=%s", w.Code, w.Body.String())
+	}
+	got, _ = store.GetJob("bk_1")
+	if got.Target != AppVolumeTargetAll {
+		t.Fatalf("updated target = %q, want ALL", got.Target)
+	}
+
+	// Undeclared target on update is rejected and keeps the previous value.
+	body, _ = json.Marshal(map[string]any{"target": "/opt/x:/x"})
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPut, "/backups/jobs/bk_1", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("undeclared update: code=%d body=%s", w.Code, w.Body.String())
+	}
+	got, _ = store.GetJob("bk_1")
+	if got.Target != AppVolumeTargetAll {
+		t.Fatalf("rejected update must keep ALL, got %q", got.Target)
 	}
 }

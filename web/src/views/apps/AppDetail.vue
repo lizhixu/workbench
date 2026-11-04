@@ -1176,6 +1176,7 @@ const showUploadRestoreModal = ref(false)
 function openUploadRestoreModal() {
   scanFileList.value = []
   scanRows.value = []
+  restoreConfirming.value = false
   showUploadRestoreModal.value = true
 }
 
@@ -1804,6 +1805,18 @@ let scanRowKeySeq = 0
 const scanFileList = ref<UploadFileInfo[]>([])
 const scanning = ref(false)
 const scanRows = ref<ScanRow[]>([])
+// 二次确认就地展开在弹窗页脚：破坏性恢复不使用浮层气泡，避免遮挡待核对的文件列表
+const restoreConfirming = ref(false)
+
+function closeUploadRestoreModal() {
+  restoreConfirming.value = false
+  showUploadRestoreModal.value = false
+}
+
+// 弹窗被关闭（右上角 ×、遮罩点击）或重新打开时，确认态一律回退到核对步骤
+watch(showUploadRestoreModal, (open) => {
+  if (!open) restoreConfirming.value = false
+})
 
 function handleScanFileSelect({ onFinish }: UploadCustomRequestOptions) {
   // 只暂存选择，不上传：文件在「上传并识别」时整批发给面板。
@@ -1834,6 +1847,7 @@ async function doScanUpload() {
     return
   }
   scanning.value = true
+  restoreConfirming.value = false
   try {
     const form = new FormData()
     files.forEach((f) => form.append('file', f))
@@ -1864,20 +1878,33 @@ async function doScanUpload() {
 
 function removeScanRow(idx: number) {
   scanRows.value.splice(idx, 1)
+  // 配对结果变化后必须重新核对，确认态回退
+  if (!scanRows.value.length) restoreConfirming.value = false
 }
 
+const scanRowsTotalSize = computed(() => scanRows.value.reduce((sum, r) => sum + (r.size || 0), 0))
+
 // 每份文件至少选了一个目标卷，且同一卷未被两份文件同时占用。
-const scanRowsReady = computed(() => {
-  if (!scanRows.value.length) return false
+// 未配对与卷冲突是两种不同的问题，分别给出可读提示，避免只有一句「未就绪」。
+const scanRowsIssue = computed<'none' | 'unpaired' | 'conflict'>(() => {
+  if (!scanRows.value.length) return 'none'
   const seen = new Set<string>()
   for (const r of scanRows.value) {
-    if (!r.specs.length) return false
+    if (!r.specs.length) return 'unpaired'
     for (const s of r.specs) {
-      if (seen.has(s)) return false
+      if (seen.has(s)) return 'conflict'
       seen.add(s)
     }
   }
-  return true
+  return 'none'
+})
+
+const scanRowsReady = computed(() => scanRows.value.length > 0 && scanRowsIssue.value === 'none')
+
+const scanRowsIssueText = computed(() => {
+  if (scanRowsIssue.value === 'conflict') return '同一挂载卷被多份文件同时占用，请调整配对后再恢复'
+  if (scanRowsIssue.value === 'unpaired') return '仍有文件未选择目标挂载卷，配对完整后才能开始恢复'
+  return ''
 })
 
 function scanRowMatchTagType(r: ScanRow): 'success' | 'warning' | 'error' | 'info' {
@@ -1924,6 +1951,7 @@ async function doCommitRestore() {
     await loadVolumeBackups()
   } catch (e: any) {
     message.error(e.message || '恢复任务发起失败')
+    restoreConfirming.value = false
   } finally {
     uploadingRestore.value = false
   }
@@ -3166,14 +3194,14 @@ onUnmounted(() => {
                 v-model:show="showUploadRestoreModal"
                 preset="card"
                 title="离线备份上传与恢复"
-                style="width: 680px; max-width: 94vw"
+                style="width: 760px; max-width: 94vw"
                 :closable="true"
                 :mask-closable="true"
               >
                 <NAlert type="info" :bordered="false" style="margin-bottom: 14px">
                   应急灾备流程：单份文件 ≤ 2GB，支持上传整应用快照或单卷归档（.tar/.tar.gz/.tgz）。控制端将自动解析文件结构并匹配挂载卷，恢复时将<strong>停止容器并覆盖现有数据</strong>。
                 </NAlert>
-                <NSpace vertical :size="14">
+                <NSpace vertical :size="12">
                   <div class="vol-upload-action-row">
                     <NUpload
                       v-model:file-list="scanFileList"
@@ -3204,61 +3232,100 @@ onUnmounted(() => {
                     暂未选择离线备份文件，支持上传整应用快照或单卷归档（.tar / .tar.gz / .tgz）
                   </div>
 
-                  <div
-                    v-for="(row, idx) in scanRows"
-                    :key="row.key"
-                    class="vol-pair-row"
-                  >
-                    <div class="vol-scan-file">
-                      <span class="vol-scan-name mono-font">{{ row.filename }}</span>
-                      <span class="vol-scan-size">{{ formatBytes(row.size) }}</span>
-                      <NTag size="small" :bordered="false" :type="scanRowMatchTagType(row)">
-                        {{ scanRowMatchText(row) }}
-                      </NTag>
-                    </div>
-                    <div v-if="row.snapshot" class="vol-scan-targets">
-                      <NCheckboxGroup v-model:value="row.specs">
-                        <NCheckbox
-                          v-for="m in row.matched"
-                          :key="m.volume_spec"
-                          :value="m.volume_spec"
-                          :label="m.volume_spec"
+                  <div v-if="scanRows.length > 0" class="vol-restore-summary">
+                    <span class="vol-restore-summary-text">
+                      已识别 <strong>{{ scanRows.length }}</strong> 份文件，合计 {{ formatBytes(scanRowsTotalSize) }}；请核对每份文件的目标挂载卷
+                    </span>
+                    <NTag size="small" :bordered="false" :type="scanRowsReady ? 'success' : 'warning'">
+                      {{ scanRowsReady ? '配对完成' : scanRowsIssue === 'conflict' ? '目标卷重复' : '存在未配对文件' }}
+                    </NTag>
+                  </div>
+                  <div v-if="scanRowsIssueText" class="vol-restore-issue-hint">
+                    {{ scanRowsIssueText }}
+                  </div>
+
+                  <!-- 行数上限 10 份，超长时在弹窗内滚动，避免把弹窗撑出屏幕 -->
+                  <div v-if="scanRows.length > 0" class="vol-restore-list">
+                    <div
+                      v-for="(row, idx) in scanRows"
+                      :key="row.key"
+                      class="vol-pair-row"
+                    >
+                      <div class="vol-scan-file">
+                        <span class="vol-scan-name mono-font" :title="row.filename">{{ row.filename }}</span>
+                        <span class="vol-scan-size">{{ formatBytes(row.size) }}</span>
+                        <NTag size="small" :bordered="false" :type="scanRowMatchTagType(row)">
+                          {{ scanRowMatchText(row) }}
+                        </NTag>
+                      </div>
+                      <div v-if="row.snapshot" class="vol-scan-targets">
+                        <span class="vol-scan-targets-label">恢复到</span>
+                        <NCheckboxGroup v-model:value="row.specs">
+                          <NCheckbox
+                            v-for="m in row.matched"
+                            :key="m.volume_spec"
+                            :value="m.volume_spec"
+                            :label="m.volume_spec"
+                          />
+                        </NCheckboxGroup>
+                        <span v-if="row.matched.length === 0" class="vol-scan-hint">
+                          快照内没有匹配的挂载卷
+                        </span>
+                      </div>
+                      <div v-else class="vol-scan-targets">
+                        <span class="vol-scan-targets-label">恢复到</span>
+                        <NSelect
+                          v-model:value="row.specs[0]"
+                          class="vol-pair-spec"
+                          size="small"
+                          :options="volumeOptions()"
+                          :placeholder="row.match === 'none' ? '未能自动识别，请选择目标挂载卷' : '选择要恢复到的目标挂载卷'"
                         />
-                      </NCheckboxGroup>
-                      <span v-if="row.matched.length === 0" class="vol-scan-hint">
-                        快照内没有匹配的挂载卷
-                      </span>
+                      </div>
+                      <NButton quaternary size="small" @click="removeScanRow(idx)">
+                        移除
+                      </NButton>
                     </div>
-                    <NSelect
-                      v-else
-                      v-model:value="row.specs[0]"
-                      class="vol-pair-spec"
-                      :options="volumeOptions()"
-                      :placeholder="row.match === 'none' ? '未能自动识别，请选择目标挂载卷' : '选择要恢复到的目标挂载卷'"
-                    />
-                    <NButton quaternary size="small" @click="removeScanRow(idx)">
-                      移除
-                    </NButton>
                   </div>
                 </NSpace>
                 <template #footer>
-                  <NSpace justify="end">
-                    <NButton @click="showUploadRestoreModal = false">
-                      {{ scanRows.length > 0 ? '取消' : '关闭' }}
-                    </NButton>
-                    <NPopconfirm v-if="scanRows.length > 0" @positive-click="doCommitRestore">
-                      <template #trigger>
+                  <div class="vol-restore-footer">
+                    <!-- 破坏性操作的二次确认就地展开在页脚，不再用浮层气泡遮挡待核对的文件列表 -->
+                    <NAlert
+                      v-if="restoreConfirming"
+                      type="warning"
+                      :bordered="false"
+                      class="vol-restore-confirm"
+                    >
+                      <template #header>
+                        确认恢复这 {{ scanRows.length }} 份文件？
+                      </template>
+                      将停止容器，用备份内容覆盖目标挂载卷的现有数据，完成后自动重启；任一文件校验或解包失败则整批取消，不产生部分导入。
+                    </NAlert>
+                    <NSpace justify="end" :size="10">
+                      <template v-if="!restoreConfirming">
+                        <NButton @click="closeUploadRestoreModal">
+                          {{ scanRows.length > 0 ? '取消' : '关闭' }}
+                        </NButton>
                         <NButton
+                          v-if="scanRows.length > 0"
                           type="warning"
-                          :loading="uploadingRestore"
                           :disabled="!scanRowsReady || volumeBusy || deploying"
+                          @click="restoreConfirming = true"
                         >
                           确认并开始恢复（{{ scanRows.length }} 份文件）
                         </NButton>
                       </template>
-                      确认按配对恢复 {{ scanRows.length }} 份文件？将停止容器、覆盖目标卷现有数据后自动重启；任一文件失败整批取消。
-                    </NPopconfirm>
-                  </NSpace>
+                      <template v-else>
+                        <NButton :disabled="uploadingRestore" @click="restoreConfirming = false">
+                          返回核对
+                        </NButton>
+                        <NButton type="error" :loading="uploadingRestore" @click="doCommitRestore">
+                          确认恢复
+                        </NButton>
+                      </template>
+                    </NSpace>
+                  </div>
                 </template>
               </NModal>
             </template>
@@ -4206,13 +4273,49 @@ onUnmounted(() => {
   background: var(--bg-card-subtle);
 }
 
-/* 上传识别行：文件信息与目标卷选择同行铺开，快照行卷勾选组换行铺满 */
-.vol-pair-row {
+/* 识别结果汇总条：左说明右状态标签，与下方文件行保持同一视觉节奏 */
+.vol-restore-summary {
   display: flex;
   align-items: center;
-  gap: 10px;
+  justify-content: space-between;
+  gap: 12px;
   flex-wrap: wrap;
-  padding: 10px 14px;
+
+  > .vol-restore-summary-text {
+    font-size: 13px;
+    color: var(--text-secondary);
+
+    strong {
+      color: var(--text-primary);
+      font-weight: 600;
+    }
+  }
+}
+
+/* 配对问题提示：仅在不满足恢复条件时出现，说明为什么按钮不可点 */
+.vol-restore-issue-hint {
+  font-size: 12px;
+  color: #e0a020;
+}
+
+/* 文件行上限 10 份，超出时弹窗内滚动，避免撑破弹窗高度 */
+.vol-restore-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 268px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+}
+
+/* 上传识别行：三列网格（文件信息 / 目标卷 / 移除），多行之间列宽严格对齐 */
+.vol-pair-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 10px 12px;
   border-radius: 8px;
   background: var(--bg-card-subtle);
   border: 1px solid var(--border-subtle);
@@ -4222,47 +4325,83 @@ onUnmounted(() => {
     border-color: var(--border-color);
   }
 
-  > .vol-pair-spec {
-    flex: 1;
-    min-width: 220px;
-  }
-
   > .vol-scan-file {
     display: flex;
     align-items: center;
-    gap: 8px;
-    flex: 1;
-    min-width: 220px;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    min-width: 0;
 
     > .vol-scan-name {
+      flex: 1 1 140px;
+      min-width: 0;
       font-size: 13px;
       font-weight: 500;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
-      max-width: 280px;
       color: var(--text-primary);
     }
 
     > .vol-scan-size {
+      flex-shrink: 0;
       font-size: 12px;
       color: var(--text-muted);
     }
   }
 
   > .vol-scan-targets {
-    flex: 1 1 100%;
+    min-width: 0;
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 8px;
     flex-wrap: wrap;
-    padding-left: 4px;
+
+    > .vol-scan-targets-label {
+      flex-shrink: 0;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    > .n-checkbox-group {
+      flex: 1;
+      min-width: 0;
+    }
+
+    /* 单选行：下拉吃掉标签右侧的剩余宽度，不与标签换行 */
+    > .vol-pair-spec {
+      flex: 1 1 180px;
+      min-width: 0;
+    }
+  }
+}
+
+/* 窄屏：目标卷退到第二行，避免三列被压成碎片 */
+@media (max-width: 720px) {
+  .vol-pair-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+
+    > .vol-scan-targets {
+      grid-column: 1 / -1;
+    }
   }
 }
 
 .vol-scan-hint {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* 页脚：确认提示与按钮纵向排列，提示不遮挡上方待核对的文件列表 */
+.vol-restore-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+
+  > .vol-restore-confirm {
+    text-align: left;
+  }
 }
 
 .vol-archive-table-wrap {

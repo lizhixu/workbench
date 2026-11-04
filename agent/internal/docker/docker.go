@@ -116,12 +116,27 @@ func (m *Manager) run(op *agentpb.DockerOp) {
 		return
 	}
 
-	args, ok := dockerArgs(op.GetOp(), op.GetContainer(), op.GetImage())
-	if !ok {
-		result.Ok = false
-		result.Error = fmt.Sprintf("unknown docker op: %s", op.GetOp())
-		m.send(result)
-		return
+	// "logs" likewise takes op-specific args (tail/since/timestamps) via
+	// args_json, so it gets its own argv builder instead of dockerArgs.
+	var args []string
+	if op.GetOp() == "logs" {
+		var err error
+		args, err = logsArgs(op.GetContainer(), op.GetArgsJson())
+		if err != nil {
+			result.Ok = false
+			result.Error = err.Error()
+			m.send(result)
+			return
+		}
+	} else {
+		var ok bool
+		args, ok = dockerArgs(op.GetOp(), op.GetContainer(), op.GetImage())
+		if !ok {
+			result.Ok = false
+			result.Error = fmt.Sprintf("unknown docker op: %s", op.GetOp())
+			m.send(result)
+			return
+		}
 	}
 
 	out, err := exec.CommandContext(ctx, "docker", args...).Output()
@@ -325,6 +340,60 @@ func (m *Manager) runRun(ctx context.Context, op *agentpb.DockerOp, result *agen
 	result.PayloadJson = []byte(`{"container_id":` + strconv.Quote(strings.TrimSpace(string(out))) + `}`)
 }
 
+// logSinceRe is the allowlist for the logs op's since value: a docker
+// duration like 24h. Anything else (timestamps, free text, leading dashes)
+// fails closed in logsArgs so a crafted value can never smuggle extra
+// docker flags — argv form means no shell is involved either way.
+var logSinceRe = regexp.MustCompile(`^[0-9]+[smhd]$`)
+
+// logsArgs builds `docker logs` argv from args_json:
+// {"tail":200,"since":"24h","timestamps":true} — all fields optional.
+// tail defaults to 200 and must be 1..10000; since "" or "all" means no
+// --since flag. Old agents ignore args_json for logs and keep returning
+// --tail 200, so a new panel talking to an old agent degrades to the
+// default tail without breaking.
+func logsArgs(container string, argsJSON []byte) ([]string, error) {
+	if container == "" {
+		return nil, fmt.Errorf("logs: container is required")
+	}
+	if strings.HasPrefix(container, "-") {
+		return nil, fmt.Errorf("logs: invalid container name %q", container)
+	}
+	tail := 200
+	since := ""
+	timestamps := false
+	if len(argsJSON) > 0 {
+		var args struct {
+			Tail       *int   `json:"tail"`
+			Since      string `json:"since"`
+			Timestamps bool   `json:"timestamps"`
+		}
+		if err := json.Unmarshal(argsJSON, &args); err != nil {
+			return nil, fmt.Errorf("logs: invalid args_json: %w", err)
+		}
+		if args.Tail != nil {
+			tail = *args.Tail
+		}
+		since = args.Since
+		timestamps = args.Timestamps
+	}
+	if tail < 1 || tail > 10000 {
+		return nil, fmt.Errorf("logs: tail out of range: %d", tail)
+	}
+	if since != "" && since != "all" && !logSinceRe.MatchString(since) {
+		return nil, fmt.Errorf("logs: invalid since: %q", since)
+	}
+	argv := []string{"logs", "--tail", strconv.Itoa(tail)}
+	if since != "" && since != "all" {
+		argv = append(argv, "--since", since)
+	}
+	if timestamps {
+		argv = append(argv, "--timestamps")
+	}
+	argv = append(argv, container)
+	return argv, nil
+}
+
 // dockerArgs maps an op to its `docker` CLI argv.
 func dockerArgs(op, container, image string) ([]string, bool) {
 	switch op {
@@ -340,8 +409,6 @@ func dockerArgs(op, container, image string) ([]string, bool) {
 		return []string{"restart", container}, true
 	case "rm":
 		return []string{"rm", "-f", container}, true
-	case "logs":
-		return []string{"logs", "--tail", "200", container}, true
 	case "inspect":
 		return []string{"inspect", container}, true
 	case "remove_image":

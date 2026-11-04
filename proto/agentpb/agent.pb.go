@@ -2244,6 +2244,10 @@ type DockerOp struct {
 	// args_json carries op-specific options:
 	// - For op "run": {"name":"...","ports":[...],"volumes":[...],"env":[...],"restart_policy":"...","command":[...]}
 	// - For op "set_mirrors": {"mirrors":["https://...","https://..."]}
+	// - For op "logs": {"tail":200,"since":"24h","timestamps":true} — tail
+	//   1..10000 (default 200), since "" or "all" means no --since flag,
+	//   otherwise a docker duration like 1h/24h/168h; old agents ignore
+	//   args_json for logs and keep returning --tail 200.
 	// all fields optional; empty dynamic rows are skipped.
 	ArgsJson      []byte `protobuf:"bytes,5,opt,name=args_json,json=argsJson,proto3" json:"args_json,omitempty"`
 	unknownFields protoimpl.UnknownFields

@@ -43,6 +43,7 @@ import { copyToClipboard } from '../../utils/clipboard'
 import { useAuthStore } from '../../stores/auth'
 import OpsTunnelModal from '../../components/tunnels/OpsTunnelModal.vue'
 import AppMigrateModal from '../../components/apps/AppMigrateModal.vue'
+import AppRuntimeLogs from '../../components/apps/AppRuntimeLogs.vue'
 import CertLogModal from '../../components/cert/CertLogModal.vue'
 import { useCertIssuance } from '../../composables/useCertIssuance'
 
@@ -3413,6 +3414,12 @@ onUnmounted(() => {
                 />
               </div>
             </NCard>
+          </div>
+        </NTabPane>
+
+        <NTabPane name="logs" tab="运行日志">
+          <div class="overview-scroll">
+            <AppRuntimeLogs :app="app" :active="activeTab === 'logs'" :can-write="canWrite" />
           </div>
         </NTabPane>
 

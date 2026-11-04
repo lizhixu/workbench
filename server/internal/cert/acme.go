@@ -839,11 +839,17 @@ func (a *acmeClient) satisfyAuthorizations(authzURLs []string, accountKey crypto
 	}
 	if len(dnsChecks) > 0 {
 		a.logStagef("挑战呈现", "等待 DNS-01 记录在权威域名服务器生效 (共 %d 条记录)...", len(dnsChecks))
-		ctx, cancel := context.WithTimeout(context.Background(), dns01PropagationCheckTimeout)
+		// One extra interval of margin beyond the propagation budget lets the
+		// polling loop always end on its diagnostic timeout message instead of
+		// racing a raw context.DeadlineExceeded at the last instant.
+			ctx, cancel := context.WithTimeout(context.Background(), dns01PropagationCheckTimeout+30*time.Second)
 		defer cancel()
 		for _, pc := range dnsChecks {
 			a.logStagef("挑战呈现", "正在校验权威 NS 解析: %s TXT %s", pc.dnsFQDN, pc.dnsTXT)
-			if err := dns01AuthoritativeCheck(ctx, pc.dnsFQDN, pc.dnsTXT); err != nil {
+			err := dns01AuthoritativeCheck(ctx, func(format string, args ...any) {
+				a.logStagef("挑战呈现", format, args...)
+			}, pc.dnsFQDN, pc.dnsTXT)
+			if err != nil {
 				a.warnStagef("挑战呈现", "权威 NS 传播校验失败: %v", err)
 				return cleanups, fmt.Errorf("DNS 权威服务器传播校验失败: %w", err)
 			}

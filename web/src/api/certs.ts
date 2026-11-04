@@ -33,6 +33,7 @@ export interface ACMEAccount {
 
 export interface Certificate {
   id: string
+  status?: 'pending' | 'issued' | 'failed' | string
   account_id?: string
   domains: string[]
   not_before: string
@@ -182,7 +183,7 @@ export interface CertLog {
 }
 
 export function issueCert(domains: string[], accountId?: string, challenge?: ChallengeMode) {
-  return unwrap<{ ok: boolean; task_id?: string; data?: IssueTask; message: string }>(
+  return unwrap<{ ok: boolean; task_id?: string; cert_id?: string; data?: IssueTask; message: string }>(
     http.post('/certs/issue', { domains, account_id: accountId, challenge: challenge || undefined }),
   )
 }

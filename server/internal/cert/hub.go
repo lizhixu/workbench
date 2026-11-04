@@ -34,11 +34,20 @@ type Config struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// Certificate lifecycle status. Empty is treated as issued for records written
+// before the field existed.
+const (
+	CertStatusPending = "pending" // 签发中：点击申请即建档的占位记录，等待 ACME 完成
+	CertStatusIssued  = "issued"  // 已签发
+	CertStatusFailed  = "failed"  // 签发失败
+)
+
 // Certificate is one issued certificate with its PEM material.
 type Certificate struct {
 	ID        string    `json:"id"`
 	AccountID string    `json:"account_id,omitempty"` // ID of the ACMEAccount that issued this cert
 	Domains   []string  `json:"domains"`              // SANs, e.g. ["*.example.com", "example.com"]
+	Status    string    `json:"status,omitempty"`     // pending | issued | failed；空值按 issued 兼容存量
 	CertPEM   string    `json:"-"`
 	KeyPEM    string    `json:"-"`
 	NotBefore time.Time `json:"not_before"`
@@ -404,6 +413,7 @@ func (h *Hub) loadCerts() error {
 		h.log.Warn("cert index corrupted, starting empty", "err", err)
 		return nil
 	}
+	needSave := false
 	for _, c := range list {
 		certB, errCert := os.ReadFile(h.certFile(c.ID))
 		keyB, errKey := os.ReadFile(h.keyFile(c.ID))
@@ -413,7 +423,20 @@ func (h *Hub) loadCerts() error {
 		} else {
 			c.LastError = "certificate material missing on disk"
 		}
+		// 重启对账：残留的「签发中」占位记录不可能还在推进（签发协程已随
+		// 进程消失），置为失败，避免前端永远显示签发中。与 loadTasks 把
+		// running 任务对账为 failed 同一语义。
+		if c.Status == CertStatusPending {
+			c.Status = CertStatusFailed
+			c.LastError = "服务重启，签发中断"
+			needSave = true
+		}
 		h.certs[c.ID] = c
+	}
+	if needSave {
+		if err := h.saveCertsLocked(); err != nil {
+			h.log.Warn("persist interrupted pending certs failed", "err", err)
+		}
 	}
 	return nil
 }
@@ -507,6 +530,11 @@ func (h *Hub) findByDomain(domain string, usableOnly bool) (*Certificate, bool) 
 	var best *Certificate
 	bestRank := certMatchRank{}
 	for _, c := range h.certs {
+		// 占位/失败的证书记录不参与域名匹配：它们没有可用材料，绝不能在
+		// cover 探测、used-by 反查或 SNI 回退中遮蔽同域名的真实证书。
+		if c.Status == CertStatusPending || c.Status == CertStatusFailed {
+			continue
+		}
 		if usableOnly && CertUnusableReason(c, now) != "" {
 			continue
 		}
@@ -623,6 +651,7 @@ func (h *Hub) storeResult(id string, accountID string, domains []string, certPEM
 		ID:        id,
 		AccountID: accountID,
 		Domains:   domains,
+		Status:    CertStatusIssued,
 		CertPEM:   string(certPEM),
 		KeyPEM:    string(keyPEM),
 		NotBefore: notBefore,
@@ -646,6 +675,38 @@ func (h *Hub) markError(id, msg string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if c, ok := h.certs[id]; ok {
+		c.LastError = msg
+		c.Renewing = false
+		_ = h.saveCertsLocked()
+	}
+}
+
+// createPendingCert registers the placeholder certificate record the moment an
+// issuance is accepted, so the UI shows a「签发中」row immediately instead of
+// only after the ACME flow succeeds. The record carries no key material and a
+// zero validity window, so it is never usable for serving traffic; the issuing
+// goroutine later fills it in place (storeResult) or marks it failed.
+func (h *Hub) createPendingCert(id, accountID string, domains []string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.certs[id] = &Certificate{
+		ID:        id,
+		AccountID: accountID,
+		Domains:   append([]string(nil), domains...),
+		Status:    CertStatusPending,
+		AutoRenew: true,
+		CreatedAt: time.Now(),
+	}
+	return h.saveCertsLocked()
+}
+
+// markIssueFailed flips a pending placeholder to failed, recording the cause so
+// the row shows「签发失败」with an inspectable log. Best-effort persistence.
+func (h *Hub) markIssueFailed(id, msg string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if c, ok := h.certs[id]; ok {
+		c.Status = CertStatusFailed
 		c.LastError = msg
 		c.Renewing = false
 		_ = h.saveCertsLocked()
@@ -798,7 +859,7 @@ func (h *Hub) IssueWithChallenge(identifiers []string, accountID string, ch Chal
 }
 
 // StartIssueTask creates a background ACME issuance task and returns its tracking record.
-func (h *Hub) StartIssueTask(identifiers []string, accountID string, ch ChallengePreference) (*IssueTask, error) {
+func (h *Hub) StartIssueTask(identifiers []string, accountID string, ch ChallengePreference) (*IssueTask, *Certificate, error) {
 	clean := make([]string, 0, len(identifiers))
 	for _, d := range identifiers {
 		d = strings.TrimSpace(strings.ToLower(d))
@@ -807,40 +868,58 @@ func (h *Hub) StartIssueTask(identifiers []string, accountID string, ch Challeng
 		}
 	}
 	if len(clean) == 0 {
-		return nil, fmt.Errorf("至少需要一个域名或 IP")
+		return nil, nil, fmt.Errorf("至少需要一个域名或 IP")
 	}
 
 	var acc *ACMEAccount
 	if accountID != "" {
 		got, ok := h.GetAccount(accountID)
 		if !ok {
-			return nil, fmt.Errorf("ACME 机构账户 %s 不存在", accountID)
+			return nil, nil, fmt.Errorf("ACME 机构账户 %s 不存在", accountID)
 		}
 		acc = got
 	} else {
 		got, err := h.GetDefaultAccount()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		acc = got
 	}
 
+	// 提前预生成证书 ID 与任务 ID，并在协程启动前立即落一条「签发中」占位
+	// 记录，让用户点击申请后列表立刻可见。
+	certID := "crt_" + randomHex(8)
+	if err := h.createPendingCert(certID, acc.ID, clean); err != nil {
+		return nil, nil, fmt.Errorf("创建证书占位记录失败: %w", err)
+	}
+
 	task, err := h.CreateIssueTaskWithError(clean, acc.ID, string(ch))
 	if err != nil {
-		return nil, fmt.Errorf("保存签发任务失败: %w", err)
+		return nil, nil, fmt.Errorf("保存签发任务失败: %w", err)
 	}
+
+	// 将任务与证书互相绑定（IssueTask.CertID 指向预生成的 certID）。
+	_ = h.UpdateIssueTaskWithError(task.ID, func(t *IssueTask) {
+		t.CertID = certID
+	})
+	task.CertID = certID
 
 	clog := newCertLogger(task.ID, h.log)
 	h.RegisterLiveLog(task.ID, clog)
+	// 同时让证书 ID 也能实时消费（日志弹窗可直接用证书 ID 或任务 ID 查看）
+	h.RegisterLiveLog(certID, clog)
 
 	go func() {
 		defer h.UnregisterLiveLog(task.ID)
+		defer h.UnregisterLiveLog(certID)
 		h.acmeMu.Lock()
 		defer h.acmeMu.Unlock()
 		clog.Logf("准备账户", "启动证书签发任务 [%s], 域名/IP: %s, 挑战机制: %s", task.ID, strings.Join(clean, ", "), string(ch))
 		certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, clean, ch, clog)
 		if err != nil {
 			clog.Warnf("完成入库", "证书签发失败: %v", err)
+			h.markIssueFailed(certID, err.Error())
+			_ = h.SaveCertLog(certID, clog.String())
 			if updateErr := h.UpdateIssueTaskWithError(task.ID, func(t *IssueTask) {
 				t.Status = TaskFailed
 				t.Error = err.Error()
@@ -850,10 +929,11 @@ func (h *Hub) StartIssueTask(identifiers []string, accountID string, ch Challeng
 			}
 			return
 		}
-		certID := "crt_" + randomHex(8)
 		clog.Logf("完成入库", "证书获取完成，正在入库: ID=%s", certID)
 		if err := h.storeResult(certID, acc.ID, clean, certPEM, keyPEM, notBefore, notAfter, issuer, true); err != nil {
 			clog.Warnf("完成入库", "证书存储失败: %v", err)
+			h.markIssueFailed(certID, err.Error())
+			_ = h.SaveCertLog(certID, clog.String())
 			if updateErr := h.UpdateIssueTaskWithError(task.ID, func(t *IssueTask) {
 				t.Status = TaskFailed
 				t.CertID = certID
@@ -878,7 +958,8 @@ func (h *Hub) StartIssueTask(identifiers []string, accountID string, ch Challeng
 		}
 	}()
 
-	return task, nil
+	certCopy, _ := h.Get(certID)
+	return task, certCopy, nil
 }
 
 // Import stores a user-supplied certificate (issued through another channel,

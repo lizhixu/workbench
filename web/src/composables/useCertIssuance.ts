@@ -50,8 +50,9 @@ export function useCertIssuance() {
   }
 
   async function pollTask(taskId: string): Promise<IssueTask | null> {
-    // 自动 DNS-01 一般数十秒内完成；5 分钟无终态按超时处理，日志弹窗仍可回看。
-    for (let i = 0; i < 150; i++) {
+    // 自动 DNS-01 等待窗口与后端权威 NS 传播校验（最长 10 分钟）对齐；
+    // 10 分钟（300 * 2s）无终态按超时处理，日志弹窗仍可回看。
+    for (let i = 0; i < 300; i++) {
       await new Promise((r) => setTimeout(r, 2000))
       if (disposed) return null
       try {

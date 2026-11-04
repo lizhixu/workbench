@@ -242,7 +242,7 @@ func TestStartIssueTaskStoresRecordEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	task, err := h.StartIssueTask([]string{"127.0.0.1"}, "", ChallengeAuto)
+	task, _, err := h.StartIssueTask([]string{"127.0.0.1"}, "", ChallengeAuto)
 	if err != nil {
 		t.Fatalf("StartIssueTask: %v", err)
 	}
@@ -413,7 +413,7 @@ func TestIssuePinnedDNS01SurfacesRealFailure(t *testing.T) {
 
 		// Stub propagation check and min wait for fast test execution.
 		oldCheck := dns01AuthoritativeCheck
-		dns01AuthoritativeCheck = func(ctx context.Context, fqdn, want string) error { return nil }
+		dns01AuthoritativeCheck = func(ctx context.Context, logf func(string, ...any), fqdn, want string) error { return nil }
 		defer func() { dns01AuthoritativeCheck = oldCheck }()
 		oldMinWait := dns01PropagationMinWait
 		dns01PropagationMinWait = 0
@@ -618,7 +618,7 @@ func TestIssueBatchPresentDNS01EndToEnd(t *testing.T) {
 	defer dnsMng.Close()
 
 	oldCheck := dns01AuthoritativeCheck
-	dns01AuthoritativeCheck = func(ctx context.Context, fqdn, want string) error {
+	dns01AuthoritativeCheck = func(ctx context.Context, logf func(string, ...any), fqdn, want string) error {
 		recordEvent(fmt.Sprintf("dns-check:%s:%s", fqdn, want))
 		return nil
 	}
@@ -745,7 +745,7 @@ func TestIssueBatchPresentPropagationFailNoTrigger(t *testing.T) {
 	defer dnsMng.Close()
 
 	oldCheck := dns01AuthoritativeCheck
-	dns01AuthoritativeCheck = func(ctx context.Context, fqdn, want string) error {
+	dns01AuthoritativeCheck = func(ctx context.Context, logf func(string, ...any), fqdn, want string) error {
 		return fmt.Errorf("simulated authoritative propagation timeout for %s", fqdn)
 	}
 	defer func() { dns01AuthoritativeCheck = oldCheck }()
@@ -819,7 +819,7 @@ func TestIssueRetryGuardWildcardDNSFailNoReorder(t *testing.T) {
 	defer dnsMng.Close()
 
 	oldCheck := dns01AuthoritativeCheck
-	dns01AuthoritativeCheck = func(ctx context.Context, fqdn, want string) error { return nil }
+	dns01AuthoritativeCheck = func(ctx context.Context, logf func(string, ...any), fqdn, want string) error { return nil }
 	defer func() { dns01AuthoritativeCheck = oldCheck }()
 
 	oldMinWait := dns01PropagationMinWait

@@ -196,7 +196,7 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
     key: 'last_error',
     width: 135,
     render: (r) => {
-      if (r.renewing) {
+      if (r.status === 'pending' || r.renewing) {
         return h(
           NButton,
           {
@@ -207,11 +207,12 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
           },
           {
             icon: () => h(NIcon, { class: 'rotating' }, { default: () => h(SyncOutline) }),
-            default: () => '续期中 · 日志',
+            default: () => (r.status === 'pending' ? '签发中 · 日志' : '续期中 · 日志'),
           },
         )
       }
-      if (r.last_error) {
+      if (r.last_error || r.status === 'failed') {
+        const errText = r.last_error || '签发失败'
         return h(
           NPopover,
           { trigger: 'hover', placement: 'top', showArrow: false },
@@ -233,7 +234,7 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
               ),
             default: () => [
               h('div', { style: 'font-size: 11px; color: #999; margin-bottom: 4px' }, '最近一次失败原因（点击查看完整日志）'),
-              h('div', { style: 'font-size: 12px; line-height: 1.6; word-break: break-all; max-width: 340px; max-height: 200px; overflow: auto;' }, r.last_error),
+              h('div', { style: 'font-size: 12px; line-height: 1.6; word-break: break-all; max-width: 340px; max-height: 200px; overflow: auto;' }, errText),
             ],
           },
         )
@@ -269,16 +270,26 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
     title: '自动续签',
     key: 'auto_renew',
     width: 90,
-    render: (r) =>
-      r.auto_renew
+    render: (r) => {
+      if (r.status === 'pending') {
+        return h('span', { style: 'color: #999' }, '-')
+      }
+      return r.auto_renew
         ? h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => '自动续签' })
-        : h(NTag, { size: 'small', type: 'warning', bordered: false, title: '该证书不会自动续期，到期前将经告警中心提醒，请手动重新签发或上传' }, { default: () => '手动维护' }),
+        : h(NTag, { size: 'small', type: 'warning', bordered: false, title: '该证书不会自动续期，到期前将经告警中心提醒，请手动重新签发或上传' }, { default: () => '手动维护' })
+    },
   },
   {
     title: '过期时间',
     key: 'not_after',
     width: 120,
     render: (row) => {
+      if (row.status === 'pending') {
+        return h('span', { style: 'color: #999' }, '签发中')
+      }
+      if (row.status === 'failed' || !row.not_after || new Date(row.not_after).getTime() === 0) {
+        return h('span', { style: 'color: #999' }, '-')
+      }
       const days = daysLeft(row)
       const type = days > 30 ? 'success' : days > 7 ? 'warning' : 'error'
       return h('span', null, [
@@ -290,29 +301,47 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 185,
+    width: 230,
     fixed: 'right',
     render: (r) =>
       h(NSpace, { size: 6, wrap: false }, {
         default: () => [
-          // 文字按钮放前面（详情、续期），图标按钮放后面（下载、删除），视觉统一规整
+          // 文字按钮放前面（详情、编辑、申请），图标按钮放后面（下载、删除），视觉统一规整
           h(NButton, { size: 'tiny', secondary: true, onClick: () => openDetail(r) }, { default: () => '详情' }),
-          // 手动上传的证书没有 ACME 账户：续期会被服务端回落到默认账户重新签发并
-          // 覆盖上传的材料，语义上应为「重新上传」而非续期，故不展示续期按钮。
+          h(NButton, { size: 'tiny', secondary: true, onClick: () => openEditRemark(r) }, { default: () => '编辑' }),
+          // 手动上传的证书没有 ACME 账户：申请会被服务端回落到默认账户重新签发并
+          // 覆盖上传的材料，语义上应为「重新上传」而非申请，故不展示申请按钮。
           ...(r.source === 'manual_upload'
             ? []
-            : [h(NButton, { size: 'tiny', secondary: true, onClick: () => doRenew(r) }, { default: () => '续期' })]),
-          h(
-            NButton,
-            { size: 'tiny', secondary: true, title: '下载证书（.crt 公钥链，不含私钥）', onClick: () => window.open(certDownloadUrl(r.id), '_blank') },
-            { icon: () => h(NIcon, null, { default: () => h(DownloadOutline) }) },
-          ),
+            : [
+                h(
+                  NButton,
+                  {
+                    size: 'tiny',
+                    secondary: true,
+                    disabled: r.status === 'pending' || r.renewing,
+                    title: r.status === 'pending' ? '签发中，暂不可重复申请' : '重新申请签发证书',
+                    onClick: () => doRenew(r),
+                  },
+                  { default: () => '申请' },
+                ),
+              ]),
+          // 未签发完成或签发失败的占位记录无证书材料，隐藏下载按钮
+          ...(r.status === 'pending' || r.status === 'failed'
+            ? []
+            : [
+                h(
+                  NButton,
+                  { size: 'tiny', secondary: true, title: '下载证书（.crt 公钥链，不含私钥）', onClick: () => window.open(certDownloadUrl(r.id), '_blank') },
+                  { icon: () => h(NIcon, null, { default: () => h(DownloadOutline) }) },
+                ),
+              ]),
           h(
             NPopconfirm,
             { onPositiveClick: () => doDelete(r) },
             {
               trigger: () => h(NButton, { size: 'tiny', secondary: true, type: 'error' }, { default: () => h(NIcon, null, { default: () => h(TrashOutline) }) }),
-              default: () => `确定删除证书（${r.domains[0]} 等）？`,
+              default: () => `确定删除证书（${r.domains[0] || r.id} 等）？`,
             },
           ),
         ],
@@ -320,28 +349,28 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
   },
 ])
 
-// ---- 证书备注行内编辑（PUT /certs/:id/remark，仅元信息，adminOnly + 审计） ----
-const remarkEditId = ref<string | null>(null)
+// ---- 证书备注编辑（PUT /certs/:id/remark，仅元信息，adminOnly + 审计） ----
+const showRemarkModal = ref(false)
+const editingRemarkCert = ref<Certificate | null>(null)
 const remarkDraft = ref('')
 const remarkSaving = ref(false)
 
-function startEditRemark(r: Certificate) {
-  if (remarkEditId.value === r.id) {
-    remarkEditId.value = null
-    return
-  }
+function openEditRemark(r: Certificate) {
+  editingRemarkCert.value = r
   remarkDraft.value = r.remark || ''
-  remarkEditId.value = r.id
+  showRemarkModal.value = true
 }
 
-async function saveRemark(r: Certificate) {
-  if (remarkSaving.value) return
+async function saveRemarkModal() {
+  if (!editingRemarkCert.value || remarkSaving.value) return
   remarkSaving.value = true
   try {
-    const updated = await updateCertRemark(r.id, remarkDraft.value.trim())
-    r.remark = updated.remark
+    const updated = await updateCertRemark(editingRemarkCert.value.id, remarkDraft.value.trim())
+    editingRemarkCert.value.remark = updated.remark
+    const found = certs.value.find((c) => c.id === editingRemarkCert.value?.id)
+    if (found) found.remark = updated.remark
     message.success('备注已保存')
-    remarkEditId.value = null
+    showRemarkModal.value = false
   } catch (e: any) {
     message.error(e?.message || '备注保存失败')
   } finally {
@@ -349,7 +378,7 @@ async function saveRemark(r: Certificate) {
   }
 }
 
-// 备注单元格：内容省略展示 + 铅笔按钮弹出编辑框（点击空白处自动关闭）。
+// 备注单元格：内容省略展示 + 铅笔按钮打开备注编辑弹窗。
 function renderRemarkCell(r: Certificate) {
   return h(NSpace, { size: 2, align: 'center', wrap: false }, {
     default: () => [
@@ -364,44 +393,9 @@ function renderRemarkCell(r: Certificate) {
         r.remark || '-',
       ),
       h(
-        NPopover,
-        {
-          show: remarkEditId.value === r.id,
-          'onUpdate:show': (v: boolean) => {
-            if (!v && !remarkSaving.value) remarkEditId.value = null
-          },
-          trigger: 'manual',
-          placement: 'left',
-        },
-        {
-          trigger: () =>
-            h(
-              NButton,
-              { size: 'tiny', quaternary: true, title: '编辑备注', onClick: () => startEditRemark(r) },
-              { icon: () => h(NIcon, null, { default: () => h(CreateOutline) }) },
-            ),
-          default: () =>
-            h('div', { style: 'width: 280px' }, [
-              h('div', { style: 'font-weight: 600; margin-bottom: 6px' }, `备注 · ${r.domains[0] || ''}`),
-              h(NInput, {
-                value: remarkDraft.value,
-                'onUpdate:value': (v: string) => {
-                  remarkDraft.value = v
-                },
-                type: 'textarea',
-                rows: 3,
-                maxlength: 200,
-                showCount: true,
-                placeholder: '记录证书用途、申请人等（最多 200 字）',
-              }),
-              h(NSpace, { justify: 'end', style: 'margin-top: 8px' }, {
-                default: () => [
-                  h(NButton, { size: 'tiny', onClick: () => { remarkEditId.value = null } }, { default: () => '取消' }),
-                  h(NButton, { size: 'tiny', type: 'primary', loading: remarkSaving.value, onClick: () => saveRemark(r) }, { default: () => '保存' }),
-                ],
-              }),
-            ]),
-        },
+        NButton,
+        { size: 'tiny', quaternary: true, title: '编辑备注', onClick: () => openEditRemark(r) },
+        { icon: () => h(NIcon, null, { default: () => h(CreateOutline) }) },
       ),
     ],
   })
@@ -470,8 +464,10 @@ function formatDate(v: string) {
 
 type TagType = 'default' | 'success' | 'warning' | 'error' | 'info'
 
-// 列表与详情弹窗共用的状态标签判定（续期中/异常优先，随后按有效期判定）
+// 列表与详情弹窗共用的状态标签判定（签发中/失败/续期中/异常优先，随后按有效期判定）
 function certStatus(c: Certificate): { type: TagType; text: string } {
+  if (c.status === 'pending') return { type: 'info', text: '签发中' }
+  if (c.status === 'failed') return { type: 'error', text: '签发失败' }
   if (c.renewing) return { type: 'info', text: '续期中' }
   if (c.last_error) return { type: 'error', text: '异常' }
   const now = Date.now()
@@ -762,10 +758,12 @@ async function doDeleteAccount(acc: ACMEAccount) {
 }
 
 function openIssue() {
-  // 不再强制要求 dns-mng：普通域名优先走 HTTP-01（临时监听 80 端口）即可签发；
-  // 未接入 80 端口或通配符域名才需要 dns-mng（DNS-01）。
   issueDomains.value = ''
   issueChallenge.value = ''
+  if (!selectedIssueAccountID.value && accounts.value.length > 0) {
+    const def = accounts.value.find((a) => a.is_default) || accounts.value[0]
+    if (def) selectedIssueAccountID.value = def.id
+  }
   showIssue.value = true
 }
 
@@ -843,9 +841,12 @@ async function doIssue() {
     if (res.task_id) {
       openTaskLog(res.task_id, domains)
     }
-    // 签发是异步的（DNS-01 需等待 TXT 生效），签发后每 5 秒刷新一次、
-    // 最长 2 分钟，直到新证书出现在列表中。
-    const before = new Set(certs.value.map((c) => c.id))
+    // 点击立刻产生证书记录：立即重新拉取证书列表展示「签发中」占位记录
+    await loadCerts()
+
+    // 签发是异步的（DNS-01 需等待 TXT 生效，最长 10 分钟），签发后每 5 秒刷新一次、
+    // 最多轮询 120 次（共 10 分钟），直到新证书完成签发（issued 或 failed）。
+    const targetCertId = res.cert_id
     let tries = 0
     const timer = setInterval(async () => {
       tries++
@@ -854,10 +855,20 @@ async function doIssue() {
       } catch {
         /* 忽略单次刷新失败 */
       }
-      const arrived = certs.value.some((c) => !before.has(c.id))
-      if (arrived || tries >= 24) {
+      if (targetCertId) {
+        const found = certs.value.find((c) => c.id === targetCertId)
+        if (found && found.status !== 'pending') {
+          clearInterval(timer)
+          if (found.status === 'issued') {
+            message.success('证书签发成功')
+          } else if (found.status === 'failed') {
+            message.error(found.last_error || '证书签发失败')
+          }
+          return
+        }
+      }
+      if (tries >= 120) {
         clearInterval(timer)
-        if (arrived) message.success('新证书已签发完成')
       }
     }, 5000)
   } catch (e: any) {
@@ -947,11 +958,11 @@ function pollManualOrder() {
 async function doRenew(cert: Certificate) {
   try {
     const res = await renewCert(cert.id)
-    message.success(res.message || '续期请求已受理')
+    message.success(res.message || '申请请求已受理')
     cert.renewing = true
     openCertLog(cert)
   } catch (e: any) {
-    message.error(e.message || '续期失败')
+    message.error(e.message || '申请失败')
   }
 }
 
@@ -1247,24 +1258,24 @@ onUnmounted(() => {
     <NModal
       v-model:show="showIssue"
       preset="card"
-      title="申请 SSL 证书（ACME）"
-      style="width: 560px; max-width: 94vw"
+      title="申请 SSL 证书"
+      style="width: 520px; max-width: 94vw"
     >
-      <NAlert type="info" :show-icon="true" class="tip-hint" style="margin-bottom: 12px">
-        普通域名优先通过 HTTP-01 验证签发（需服务器 80 端口可被 CA 访问，签发时临时监听）；80 端口不可用时自动回退到 DNS-01（需配置 dns-mng）。通配符域名仅支持 DNS-01，需将 DNS 解析托管在 dns-mng 接入的云解析厂商，或选择「DNS-01（手动解析）」由管理员手动添加 TXT 记录。
-      </NAlert>
-
       <NForm label-placement="top">
-        <NFormItem label="选择签发 CA 机构">
-          <NSelect v-model:value="selectedIssueAccountID" :options="accountSelectOptions" placeholder="选择 ACME 机构账户" />
+        <NFormItem label="CA 机构账户">
+          <NSelect
+            v-model:value="selectedIssueAccountID"
+            :options="accountSelectOptions"
+            placeholder="选择 ACME 机构账户"
+          />
         </NFormItem>
 
-        <NFormItem label="域名列表（每行一个，支持通配符）" required>
+        <NFormItem label="域名列表" required>
           <NInput
             v-model:value="issueDomains"
             type="textarea"
             :rows="3"
-            placeholder="*.example.com&#10;example.com"
+            placeholder="*.example.com&#10;example.com（每行一个）"
           />
         </NFormItem>
 
@@ -1273,18 +1284,25 @@ onUnmounted(() => {
             <NSpace>
               <NRadio value="">自动（推荐）</NRadio>
               <NRadio value="http-01" :disabled="wildcardDetected">HTTP-01</NRadio>
-              <NRadio value="dns-01">DNS-01（dns-mng）</NRadio>
+              <NRadio value="dns-01">DNS-01（自动）</NRadio>
               <NRadio value="dns-01-manual">DNS-01（手动解析）</NRadio>
             </NSpace>
           </NRadioGroup>
           <template #feedback>
-            <span class="muted tip-hint">
-              <template v-if="wildcardDetected">
-                已识别到泛域名（*），CA 只会下发 dns-01 挑战，因此 HTTP-01 不可选；请配置 dns-mng 或使用手动解析。<br />
-              </template>
-              自动：普通域名优先 HTTP-01（需 80 端口可被 CA 访问），失败或 80 不可用时回退 DNS-01；
-              通配符固定 DNS-01，IP 固定 HTTP-01。显式指定后不再自动回退。
-              手动解析：服务端先生成 TXT 记录，您到 DNS 服务商手动添加解析后再确认验证，不依赖 dns-mng。
+            <span v-if="wildcardDetected" class="field-hint text-amber tip-hint">
+              包含泛域名，仅支持 DNS 验证
+            </span>
+            <span v-else-if="issueChallenge === 'http-01'" class="field-hint tip-hint">
+              需服务器 80 端口可被 CA 访问（不支持泛域名）
+            </span>
+            <span v-else-if="issueChallenge === 'dns-01'" class="field-hint tip-hint">
+              依赖证书中心 dns-mng 自动添加/清理 TXT 解析
+            </span>
+            <span v-else-if="issueChallenge === 'dns-01-manual'" class="field-hint tip-hint">
+              提交后需手动前往 DNS 服务商添加 TXT 解析记录
+            </span>
+            <span v-else class="field-hint tip-hint">
+              普通域名优先 HTTP-01，不可用时自动回退 DNS 验证
             </span>
           </template>
         </NFormItem>
@@ -1558,10 +1576,37 @@ onUnmounted(() => {
           </template>
           </template>
         </div>
-      </NSpin>
-    </NModal>
+	      </NSpin>
+	    </NModal>
 
-    <!-- 证书执行日志 / 签发任务日志弹窗 -->
+	    <!-- 编辑证书备注弹窗 -->
+	    <NModal
+	      v-model:show="showRemarkModal"
+	      preset="card"
+	      title="编辑证书备注"
+	      style="width: 440px; max-width: 94vw"
+	    >
+	      <NForm label-placement="top">
+	        <NFormItem :label="`备注 · ${editingRemarkCert?.domains?.[0] || editingRemarkCert?.id || ''}`">
+	          <NInput
+	            v-model:value="remarkDraft"
+	            type="textarea"
+	            :rows="3"
+	            maxlength="200"
+	            show-count
+	            placeholder="记录证书用途、申请人等（最多 200 字）"
+	          />
+	        </NFormItem>
+	      </NForm>
+	      <template #footer>
+	        <NSpace justify="end">
+	          <NButton @click="showRemarkModal = false">取消</NButton>
+	          <NButton type="primary" :loading="remarkSaving" @click="saveRemarkModal">保存</NButton>
+	        </NSpace>
+	      </template>
+	    </NModal>
+
+	    <!-- 证书执行日志 / 签发任务日志弹窗 -->
     <CertLogModal
       v-model:show="showLogModal"
       :cert-id="logModalCertId"
@@ -1821,6 +1866,16 @@ onUnmounted(() => {
   margin: 8px 0 0;
   font-size: 12px;
   color: #d03050;
+}
+
+.field-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+
+  &.text-amber {
+    color: #f59e0b;
+  }
 }
 
 :deep(.rotating) {

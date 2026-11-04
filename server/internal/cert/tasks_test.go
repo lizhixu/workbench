@@ -260,9 +260,88 @@ func TestCertLogPersistenceAndEndpoints(t *testing.T) {
 		t.Errorf("unexpected task response: %v", taskResp.Data)
 	}
 
-	// Delete cert log
-	hub.DeleteCertLog(certID)
-	if _, err := os.Stat(expectedPath); !os.IsNotExist(err) {
-		t.Errorf("expected log file deleted, err = %v", err)
+		// Delete cert log
+		hub.DeleteCertLog(certID)
+		if _, err := os.Stat(expectedPath); !os.IsNotExist(err) {
+			t.Errorf("expected log file deleted, err = %v", err)
+		}
+	}
+
+func TestPendingCertLifecycleAndDomainExclusion(t *testing.T) {
+	dataDir := t.TempDir()
+	hub, err := NewHub(dataDir, nil)
+	if err != nil {
+		t.Fatalf("NewHub: %v", err)
+	}
+
+	certID := "crt_pending1"
+	domains := []string{"test.example.com", "*.test.example.com"}
+	accountID := "acc_test1"
+
+	// 1. createPendingCert
+	if err := hub.createPendingCert(certID, accountID, domains); err != nil {
+		t.Fatalf("createPendingCert: %v", err)
+	}
+
+	c, ok := hub.Get(certID)
+	if !ok {
+		t.Fatalf("expected pending cert in hub, got none")
+	}
+	if c.Status != CertStatusPending {
+		t.Errorf("status = %q, want %q", c.Status, CertStatusPending)
+	}
+	if len(c.Domains) != 2 || c.AccountID != accountID {
+		t.Errorf("unexpected cert fields: domains=%v, acc=%q", c.Domains, c.AccountID)
+	}
+
+	// 2. findByDomain must exclude pending cert
+	found, ok := hub.FindByDomain("test.example.com")
+	if ok || found != nil {
+		t.Errorf("FindByDomain returned pending cert: %v, want nil", found)
+	}
+	usable, ok := hub.FindUsableByDomain("test.example.com")
+	if ok || usable != nil {
+		t.Errorf("FindUsableByDomain returned pending cert: %v, want nil", usable)
+	}
+
+	// 3. markIssueFailed
+	hub.markIssueFailed(certID, "DNS-01 验证超时")
+	cFailed, ok := hub.Get(certID)
+	if !ok {
+		t.Fatalf("expected cert after fail, got none")
+	}
+	if cFailed.Status != CertStatusFailed {
+		t.Errorf("status = %q, want %q", cFailed.Status, CertStatusFailed)
+	}
+	if cFailed.LastError != "DNS-01 验证超时" {
+		t.Errorf("last_error = %q, want 'DNS-01 验证超时'", cFailed.LastError)
+	}
+
+	// findByDomain must also exclude failed cert
+	if foundFailed, ok := hub.FindByDomain("test.example.com"); ok || foundFailed != nil {
+		t.Errorf("FindByDomain returned failed cert: %v, want nil", foundFailed)
+	}
+
+	// 4. Restart reconciliation: pending -> failed
+	certPendingOrphan := "crt_orphan1"
+	if err := hub.createPendingCert(certPendingOrphan, accountID, []string{"orphan.example.com"}); err != nil {
+		t.Fatalf("create orphan pending: %v", err)
+	}
+
+	// Reload hub from same dataDir
+	hub2, err := NewHub(dataDir, nil)
+	if err != nil {
+		t.Fatalf("NewHub reload: %v", err)
+	}
+	orphanReloaded, ok := hub2.Get(certPendingOrphan)
+	if !ok {
+		t.Fatalf("expected orphan cert after reload")
+	}
+	if orphanReloaded.Status != CertStatusFailed {
+		t.Errorf("reloaded orphan status = %q, want %q", orphanReloaded.Status, CertStatusFailed)
+	}
+	if !strings.Contains(orphanReloaded.LastError, "服务重启") {
+		t.Errorf("reloaded orphan last_error = %q, want restart explanation", orphanReloaded.LastError)
 	}
 }
+

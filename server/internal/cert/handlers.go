@@ -401,7 +401,7 @@ func (h *Handlers) issueCert(c *gin.Context) {
 		return
 	}
 
-	task, err := h.hub.StartIssueTask(req.Domains, req.AccountID, ch)
+	task, cert, err := h.hub.StartIssueTask(req.Domains, req.AccountID, ch)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -409,6 +409,7 @@ func (h *Handlers) issueCert(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{
 		"ok":      true,
 		"task_id": task.ID,
+		"cert_id": cert.ID,
 		"data":    task,
 		"message": "签发请求已受理，正在后台执行",
 	})

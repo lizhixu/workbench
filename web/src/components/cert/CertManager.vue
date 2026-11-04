@@ -869,6 +869,15 @@ async function doIssue() {
       }
       if (tries >= 120) {
         clearInterval(timer)
+        // 10 分钟观察窗口只覆盖传播等待：多域名订单的 CA 逐授权轮询还
+        // 可能更久。窗口结束不是失败——后台仍在执行，列表 30 秒刷新会
+        // 自动带回终态；静默停表会让用户误以为签发卡死了。
+        if (targetCertId) {
+          const found = certs.value.find((c) => c.id === targetCertId)
+          if (found && found.status === 'pending') {
+            message.info('证书仍在签发中（已等待 10 分钟，后台继续执行），列表每 30 秒刷新，完成后状态会自动更新')
+          }
+        }
       }
     }, 5000)
   } catch (e: any) {

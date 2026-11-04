@@ -49,9 +49,11 @@ export function useCertIssuance() {
     }
   }
 
-  async function pollTask(taskId: string): Promise<IssueTask | null> {
+  async function pollTask(taskId: string): Promise<IssueTask | 'timeout' | null> {
     // 自动 DNS-01 等待窗口与后端权威 NS 传播校验（最长 10 分钟）对齐；
-    // 10 分钟（300 * 2s）无终态按超时处理，日志弹窗仍可回看。
+    // 10 分钟（300 * 2s）无终态返回 'timeout'：只是观察窗口结束，后台
+    // 仍在执行（多域名订单的 CA 逐授权轮询还可能更久），不是签发失败，
+    // 调用方须把“仍在进行中”和真实失败区分开。日志弹窗仍可回看。
     for (let i = 0; i < 300; i++) {
       await new Promise((r) => setTimeout(r, 2000))
       if (disposed) return null
@@ -62,7 +64,7 @@ export function useCertIssuance() {
         // 网络抖动：继续下一轮
       }
     }
-    return null
+    return 'timeout'
   }
 
   // 把域名批量签发为一张证书。日志弹窗复用证书中心的任务日志（实时轮询）。
@@ -88,6 +90,9 @@ export function useCertIssuance() {
     logDomains.value = domains
     logShow.value = true
     const task = await pollTask(taskId)
+    if (task === 'timeout') {
+      return { ok: false, error: '证书签发仍在进行中（已等待 10 分钟，后台继续执行），可到证书中心查看日志；签发完成后请重新绑定' }
+    }
     if (task?.status === 'success') return { ok: true, certId: task.cert_id }
     return { ok: false, error: task?.error || '证书签发未完成，可到证书中心查看日志' }
   }

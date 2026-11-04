@@ -1894,7 +1894,13 @@ function scanRowMatchText(r: ScanRow): string {
     if (reason === 'single_candidate') return '已识别（唯一可用卷）'
     return '已识别'
   }
-  if (r.match === 'ambiguous') return '识别到多个候选，请选择'
+  if (r.match === 'ambiguous') {
+    // A lone weak hit (below the unique bar) lands here too: there is only
+    // one candidate, but it is unconfirmed, so the copy must not claim
+    // "multiple candidates".
+    if (r.matched.length === 1) return '识别到 1 个弱匹配候选，请确认选择'
+    return '识别到多个候选，请选择'
+  }
   return '未能识别，请选择目标卷'
 }
 

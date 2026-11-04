@@ -27,7 +27,7 @@ import (
 var sharedHTTP01 struct {
 	mu     sync.Mutex
 	values map[string]string // challenge token -> key authorization
-	probe  func() bool        // reports whether an external stack serves :80
+	probe  func() bool       // reports whether an external stack serves :80
 }
 
 // SetSharedHTTP01Probe installs the availability probe buildSolvers consults:

@@ -690,12 +690,12 @@ func TestRunRestoreUploadedBatchOffline(t *testing.T) {
 			t.Fatalf("staged upload %s must be removed after the run", it.Arch.ID)
 		}
 	}
-		for _, tok := range tokens {
-			if _, _, _, _, ok := us.peekToken(tok); ok {
-				t.Fatalf("token %s must be dropped after the run", tok)
-			}
+	for _, tok := range tokens {
+		if _, _, _, _, ok := us.peekToken(tok); ok {
+			t.Fatalf("token %s must be dropped after the run", tok)
 		}
 	}
+}
 
 func TestCleanArchiveStem(t *testing.T) {
 	cases := []struct {
@@ -784,4 +784,3 @@ services:
 		t.Fatalf("commit code=%d body=%s, want 202", commitW.Code, commitW.Body.String())
 	}
 }
-

@@ -598,8 +598,14 @@ func (r certMatchRank) betterThan(o certMatchRank) bool {
 func (h *Hub) Delete(id string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if _, ok := h.certs[id]; !ok {
+	c, ok := h.certs[id]
+	if !ok {
 		return fmt.Errorf("certificate %s not found", id)
+	}
+	// Backstop for the handler's pending guard: a pending row has a live
+	// issuance task whose storeResult would resurrect it on success.
+	if c.Status == CertStatusPending {
+		return fmt.Errorf("certificate %s is being issued and cannot be deleted yet", id)
 	}
 	delete(h.certs, id)
 	_ = os.Remove(h.certFile(id))
@@ -1014,6 +1020,13 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 	if !ok {
 		return nil, fmt.Errorf("certificate %s not found", id)
 	}
+	// A pending row already has an issuance task running (StartIssueTask
+	// holds acmeMu for it); renewing here would queue a second full
+	// issuance for the same domains. Failed rows stay renewable: that is
+	// how an operator retries a failed issuance via the「申请」button.
+	if c.Status == CertStatusPending {
+		return nil, fmt.Errorf("该证书正在签发中，请等待签发完成后再申请")
+	}
 	h.mu.Lock()
 	if c.Renewing {
 		h.mu.Unlock()
@@ -1095,6 +1108,16 @@ func (h *Hub) renewExpiring() {
 	renewBefore := time.Duration(h.renewBeforeDaysOrDefault()) * 24 * time.Hour
 	for _, c := range h.List() {
 		if !c.AutoRenew || c.Renewing {
+			continue
+		}
+		// Only genuinely issued certificates are renewal candidates. A
+		// pending placeholder has no validity window (zero NotAfter) and a
+		// failed placeholder never gains one, so without this guard both
+		// would qualify forever: the pending row would double-issue once
+		// the in-flight task finishes, and the failed row would retry
+		// every 6h indefinitely. Empty status is a legacy issued record
+		// (predates the Status field) and stays renewable.
+		if c.Status == CertStatusPending || c.Status == CertStatusFailed {
 			continue
 		}
 		// Renewal threshold scales with validity: renewBefore days for classic

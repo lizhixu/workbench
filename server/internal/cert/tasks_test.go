@@ -260,12 +260,12 @@ func TestCertLogPersistenceAndEndpoints(t *testing.T) {
 		t.Errorf("unexpected task response: %v", taskResp.Data)
 	}
 
-		// Delete cert log
-		hub.DeleteCertLog(certID)
-		if _, err := os.Stat(expectedPath); !os.IsNotExist(err) {
-			t.Errorf("expected log file deleted, err = %v", err)
-		}
+	// Delete cert log
+	hub.DeleteCertLog(certID)
+	if _, err := os.Stat(expectedPath); !os.IsNotExist(err) {
+		t.Errorf("expected log file deleted, err = %v", err)
 	}
+}
 
 func TestPendingCertLifecycleAndDomainExclusion(t *testing.T) {
 	dataDir := t.TempDir()
@@ -344,4 +344,3 @@ func TestPendingCertLifecycleAndDomainExclusion(t *testing.T) {
 		t.Errorf("reloaded orphan last_error = %q, want restart explanation", orphanReloaded.LastError)
 	}
 }
-

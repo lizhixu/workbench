@@ -324,10 +324,10 @@ func TestLookupAuthoritativeTXTDeadNS(t *testing.T) {
 	if found {
 		t.Fatal("expected miss against a dead NS")
 	}
-		if !strings.Contains(detail, "权威 NS 查询失败") {
-			t.Errorf("detail = %q, want authoritative query failure explanation", detail)
-		}
+	if !strings.Contains(detail, "权威 NS 查询失败") {
+		t.Errorf("detail = %q, want authoritative query failure explanation", detail)
 	}
+}
 
 func TestDNS01PollSchedule(t *testing.T) {
 	cases := []struct {
@@ -352,3 +352,30 @@ func TestDNS01PollSchedule(t *testing.T) {
 	}
 }
 
+func TestDetectReplacement(t *testing.T) {
+	fqdn := "_acme-challenge.example.com"
+	stub := func(vals []string, err error) func(context.Context, string) ([]string, error) {
+		return func(context.Context, string) ([]string, error) { return vals, err }
+	}
+	called := false
+	neverProbe := func(context.Context, string) ([]string, error) {
+		called = true
+		return nil, nil
+	}
+
+	if hint := detectReplacement(fqdn, "missing-val", []string{"sib-val"}, stub([]string{"sib-val"}, nil)); !strings.Contains(hint, "覆盖") || !strings.Contains(hint, "追加") {
+		t.Errorf("sibling visible, missing absent: hint = %q, want replacement hint", hint)
+	}
+	if hint := detectReplacement(fqdn, "missing-val", []string{"sib-val"}, stub([]string{"missing-val", "sib-val"}, nil)); hint != "" {
+		t.Errorf("missing record present: hint = %q, want empty", hint)
+	}
+	if hint := detectReplacement(fqdn, "missing-val", []string{"sib-val"}, stub(nil, nil)); hint != "" {
+		t.Errorf("neither visible: hint = %q, want empty", hint)
+	}
+	if hint := detectReplacement(fqdn, "missing-val", []string{"sib-val"}, stub(nil, errors.New("boom"))); hint != "" {
+		t.Errorf("probe failed: hint = %q, want empty", hint)
+	}
+	if hint := detectReplacement(fqdn, "missing-val", nil, neverProbe); hint != "" || called {
+		t.Errorf("no siblings: hint = %q called = %v, want empty and no probe", hint, called)
+	}
+}

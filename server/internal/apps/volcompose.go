@@ -105,6 +105,42 @@ type staticComposeService struct {
 	Volumes []any `yaml:"volumes"`
 }
 
+// parseParentRelativeSpec parses a short-form volume spec whose source is a
+// parent-relative path ("../shared:/data[:ro]", "..\\shared:/data"). It mirrors
+// parseVolumeSpec's splitting but without its ".." traversal guard, which the
+// static parser must not apply: the source is resolved with path.Join against
+// the compose file's directory, so leading ".." segments are cleaned there.
+// Mid-path ".." ("a/../b") and ".." in the container path stay rejected.
+func parseParentRelativeSpec(spec string) (src, dst, mode string, ok bool) {
+	s := strings.TrimSpace(spec)
+	parts := strings.Split(s, ":")
+	if n := len(parts); n >= 3 && (parts[n-1] == "ro" || parts[n-1] == "rw") {
+		mode = parts[n-1]
+		parts = parts[:n-1]
+	}
+	if len(parts) < 2 {
+		return "", "", "", false
+	}
+	dst = strings.TrimSpace(parts[len(parts)-1])
+	src = strings.TrimSpace(strings.Join(parts[:len(parts)-1], ":"))
+	if src == "" || dst == "" || !strings.HasPrefix(dst, "/") || strings.Contains(dst, "..") {
+		return "", "", "", false
+	}
+	norm := strings.ReplaceAll(src, "\\", "/")
+	if norm != ".." && !strings.HasPrefix(norm, "../") {
+		return "", "", "", false
+	}
+	for _, seg := range strings.Split(norm, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			continue
+		}
+		if strings.Contains(seg, ":") {
+			return "", "", "", false
+		}
+	}
+	return src, dst, mode, true
+}
+
 // staticComposeVolumes parses app.ComposeContent statically when dynamic container
 // inspection on the host is unavailable (containers stopped, not yet deployed, or agent offline).
 func staticComposeVolumes(app *Application) []DiscoveredVolume {
@@ -148,7 +184,16 @@ func staticComposeVolumes(app *Application) []DiscoveredVolume {
 				}
 				src, d, mode, ok := parseVolumeSpec(v)
 				if !ok {
-					continue
+					// parseVolumeSpec rejects any ".." as a traversal guard
+					// shared with the backup/migrate paths. The static
+					// parser resolves parent-relative binds against the
+					// compose file's directory itself, so leading ".."
+					// segments are legitimate here and get their own
+					// strict parse instead of being dropped.
+					src, d, mode, ok = parseParentRelativeSpec(v)
+					if !ok {
+						continue
+					}
 				}
 				if isIgnoredInternalMount(d) {
 					continue
@@ -161,10 +206,14 @@ func staticComposeVolumes(app *Application) []DiscoveredVolume {
 					if strings.HasPrefix(src, "/") || (len(src) >= 3 && src[1] == ':' && (src[2] == '/' || src[2] == '\\')) {
 						hostPath = src
 					} else {
-						// Relative bind mount path like "./data"
-						cleanRel := strings.TrimPrefix(strings.TrimPrefix(src, "."), "/")
-						cleanRel = strings.TrimPrefix(cleanRel, "\\")
-						hostPath = path.Join("/var/lib/watchman/apps", app.ID, cleanRel)
+						// Relative bind mount ("./data", "../shared", "."):
+						// resolve against the raw_compose file's directory
+						// (/var/lib/watchman/apps/<id>/). ComposeContent is
+						// only stored for raw_compose apps, so this base is
+						// exact; path.Join cleans "." and ".." segments,
+						// so "../shared" lands on the parent directory
+						// instead of being mangled into <id>/shared.
+						hostPath = path.Join("/var/lib/watchman/apps", app.ID, strings.ReplaceAll(src, "\\", "/"))
 					}
 				} else {
 					volType = "volume"
@@ -181,6 +230,17 @@ func staticComposeVolumes(app *Application) []DiscoveredVolume {
 				if tgt == "" || !strings.HasPrefix(tgt, "/") {
 					continue
 				}
+				// Only bind mounts and named volumes carry host data worth
+				// backing up. tmpfs/cluster/npipe and friends do not, and a
+				// sourceless entry (anonymous volume, tmpfs without source)
+				// is not addressable — previously it produced a malformed
+				// ":/data" candidate spec.
+				if t != "" && t != "bind" && t != "volume" {
+					continue
+				}
+				if src == "" {
+					continue
+				}
 				if isIgnoredInternalMount(tgt) {
 					continue
 				}
@@ -195,9 +255,7 @@ func staticComposeVolumes(app *Application) []DiscoveredVolume {
 					if strings.HasPrefix(src, "/") || (len(src) >= 3 && src[1] == ':' && (src[2] == '/' || src[2] == '\\')) {
 						hostPath = src
 					} else {
-						cleanRel := strings.TrimPrefix(strings.TrimPrefix(src, "."), "/")
-						cleanRel = strings.TrimPrefix(cleanRel, "\\")
-						hostPath = path.Join("/var/lib/watchman/apps", app.ID, cleanRel)
+						hostPath = path.Join("/var/lib/watchman/apps", app.ID, strings.ReplaceAll(src, "\\", "/"))
 					}
 				} else {
 					volType = "volume"
@@ -333,18 +391,34 @@ func (e *Engine) DiscoverAppVolumes(app *Application) ([]DiscoveredVolume, error
 	hub := e.volumeHub(app)
 	if isComposeApp(app) {
 		var disc []DiscoveredVolume
+		var dynErr error
 		if hub != nil {
 			proj := composeProjectName(app.ID)
 			res, err := execOnAgent(hub, "voldisc-"+randomToken(4), composeDiscoverScript(proj), 30)
 			if err == nil && res.GetExitCode() == 0 {
 				disc = parseComposeDiscoverOutput(res.GetStdout())
+			} else if err != nil {
+				dynErr = err
+			} else {
+				dynErr = fmt.Errorf("挂载发现脚本退出码 %d", res.GetExitCode())
 			}
 		}
 		if len(disc) == 0 {
 			disc = staticComposeVolumes(app)
 		}
-		if len(disc) == 0 && hub == nil && strings.TrimSpace(app.ComposeContent) == "" {
-			return nil, fmt.Errorf("目标主机 Agent 不在线，无法动态发现 Compose 挂载卷")
+		if len(disc) == 0 {
+			// A failed dynamic discovery with no static fallback is a
+			// failure, not an empty volume list: returning nil here made
+			// the volumes endpoint render "no mounts" and the backup
+			// path report "未配置任何挂载卷", hiding the real error.
+			// Genuinely empty results (successful discovery, or a compose
+			// file that declares no volumes) still return empty, nil.
+			if dynErr != nil {
+				return nil, fmt.Errorf("Compose 挂载卷动态发现失败且静态解析无结果: %v", dynErr)
+			}
+			if hub == nil && strings.TrimSpace(app.ComposeContent) == "" {
+				return nil, fmt.Errorf("目标主机 Agent 不在线，无法动态发现 Compose 挂载卷")
+			}
 		}
 		return disc, nil
 	}

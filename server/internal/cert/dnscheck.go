@@ -358,6 +358,55 @@ func lookupAuthoritativeTXT(ctx context.Context, nsAddrs []string, fqdn, want st
 	}
 }
 
+// lookupAuthoritativeTXTValues returns every TXT string currently published
+// at fqdn, asking the first authoritative server that answers (system
+// resolver as fallback for CNAME-delegated names). Used only on the failure
+// path to tell "record not propagated yet" apart from "the DNS backend
+// replaced our record set".
+func lookupAuthoritativeTXTValues(ctx context.Context, fqdn string) ([]string, error) {
+	if addrs, err := discoverAuthoritativeAddrs(ctx, 10*time.Second, fqdn); err == nil {
+		for _, addr := range addrs {
+			if txts, qErr := queryAuthoritativeServer(ctx, addr, fqdn); qErr == nil {
+				return txts, nil
+			}
+		}
+	}
+	return net.DefaultResolver.LookupTXT(ctx, fqdn)
+}
+
+// detectReplacement checks, after a propagation failure, whether a sibling
+// batch record for the same FQDN is already visible while the missing one
+// is not. Batch present only works if the DNS backend appends values for a
+// shared FQDN; if it replaces them, the earlier record vanishes while the
+// later one shows up, which is exactly this signature. It returns a
+// human-readable hint, or "" when there is no such evidence (no siblings,
+// probe failure, or the missing record showing up after all). probe is a
+// seam so tests can stub the DNS lookup.
+func detectReplacement(fqdn, missing string, siblingTXTs []string, probe func(context.Context, string) ([]string, error)) string {
+	if len(siblingTXTs) == 0 {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	vals, err := probe(ctx, fqdn)
+	if err != nil {
+		return ""
+	}
+	present := make(map[string]bool, len(vals))
+	for _, v := range vals {
+		present[v] = true
+	}
+	if present[missing] {
+		return ""
+	}
+	for _, sib := range siblingTXTs {
+		if present[sib] {
+			return fmt.Sprintf("同一域名 %s 下已有其他待验证记录生效、唯独本条缺失，DNS 服务端可能以覆盖而非追加方式写入 TXT（请检查 dns-mng 的 present 是否为追加语义）", fqdn)
+		}
+	}
+	return ""
+}
+
 // dns01PollSchedule returns the polling interval for the given elapsed time since
 // the start of propagation checks.
 //   - 0 to 60s: every 3s (dense polling for fast-converging DNS providers);
@@ -431,7 +480,16 @@ func verifyDNSTXTPropagation(ctx context.Context, logf func(format string, args 
 		}
 		attempt++
 		attemptCtx, cancel := context.WithTimeout(ctx, budget)
-		found, d := lookupAuthoritativeTXT(attemptCtx, nsAddrs, fqdn, want)
+		// Rotate the NS order each attempt: the per-attempt budget is
+		// shared across the list, so a fixed order would starve trailing
+		// nameservers whenever the head ones are slow or filtered.
+		// Rotation spreads the budget across all of them over attempts.
+		addrs := nsAddrs
+		if n := len(nsAddrs); n > 1 {
+			r := (attempt - 1) % n
+			addrs = append(append([]string{}, nsAddrs[r:]...), nsAddrs[:r]...)
+		}
+		found, d := lookupAuthoritativeTXT(attemptCtx, addrs, fqdn, want)
 		cancel()
 		if found {
 			logf("第 %d 次探测命中，TXT 记录已生效", attempt)

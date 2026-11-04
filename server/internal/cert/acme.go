@@ -842,7 +842,7 @@ func (a *acmeClient) satisfyAuthorizations(authzURLs []string, accountKey crypto
 		// One extra interval of margin beyond the propagation budget lets the
 		// polling loop always end on its diagnostic timeout message instead of
 		// racing a raw context.DeadlineExceeded at the last instant.
-			ctx, cancel := context.WithTimeout(context.Background(), dns01PropagationCheckTimeout+30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), dns01PropagationCheckTimeout+30*time.Second)
 		defer cancel()
 		for _, pc := range dnsChecks {
 			a.logStagef("挑战呈现", "正在校验权威 NS 解析: %s TXT %s", pc.dnsFQDN, pc.dnsTXT)
@@ -851,6 +851,21 @@ func (a *acmeClient) satisfyAuthorizations(authzURLs []string, accountKey crypto
 			}, pc.dnsFQDN, pc.dnsTXT)
 			if err != nil {
 				a.warnStagef("挑战呈现", "权威 NS 传播校验失败: %v", err)
+				// Batch present depends on the DNS backend appending values
+				// for a shared FQDN. If it replaces them instead, this
+				// record vanishes while a sibling batch record shows up;
+				// surface that as a diagnosable hint instead of a bare
+				// propagation failure.
+				var siblings []string
+				for _, other := range dnsChecks {
+					if other != pc && other.dnsFQDN == pc.dnsFQDN && other.dnsTXT != pc.dnsTXT {
+						siblings = append(siblings, other.dnsTXT)
+					}
+				}
+				if hint := detectReplacement(pc.dnsFQDN, pc.dnsTXT, siblings, lookupAuthoritativeTXTValues); hint != "" {
+					a.warnStagef("挑战呈现", "%s", hint)
+					return cleanups, fmt.Errorf("DNS 权威服务器传播校验失败: %w；%s", err, hint)
+				}
 				return cleanups, fmt.Errorf("DNS 权威服务器传播校验失败: %w", err)
 			}
 		}
@@ -959,4 +974,3 @@ func (a *acmeClient) pollAuthorizationWithTimeout(authzURL string, accountKey cr
 		}
 	}
 }
-

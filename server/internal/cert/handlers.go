@@ -602,6 +602,13 @@ func (h *Handlers) deleteCert(c *gin.Context) {
 			}
 		}
 	}
+	// A pending row has a live issuance task. Deleting it now would only
+	// look deleted: the task's storeResult recreates it as issued on
+	// success. Refuse until the issuance reaches a terminal state.
+	if crt, ok := h.hub.Get(id); ok && crt.Status == CertStatusPending {
+		c.JSON(http.StatusConflict, gin.H{"error": "该证书正在签发中，删除后签发完成仍会重新出现。请等待签发完成（或失败）后再删除"})
+		return
+	}
 	if err := h.hub.Delete(c.Param("id")); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return

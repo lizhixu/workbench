@@ -524,6 +524,11 @@ async function issueMissingAndBind(missing: string[]) {
   proxyActionLabel.value = '签发证书中…'
   try {
     const issued = await issueDomains(missing)
+    if (issued.state === 'in_progress') {
+      // 后台仍在签发：只提示进度，不诱导「重试」重复下单（AGENTS.md §3.7）
+      message.info(`${issued.error}。请勿重复发起签发`)
+      return
+    }
     if (!issued.ok) {
       message.error(`证书签发失败：${issued.error || '未知原因'}；可稍后重试或在证书中心手动签发`)
       return
@@ -1130,6 +1135,8 @@ const volumeBackupTotal = ref(0)
 const volumePage = ref(1)
 const volumePageSize = ref(10)
 const discoveredVolumes = ref<DiscoveredVolume[]>([])
+// 归档列表接口附带：运行时挂载卷发现失败的原因（不影响归档列表本身）
+const volumeDiscoveryError = ref('')
 // 备份位置选项（NSelect 空值约定 §8.3.1：未选 = null，不用 ''）。
 const s3Targets = ref<S3Target[]>([])
 const selectedBackupTargetId = ref<string | null>('local')
@@ -1591,6 +1598,9 @@ async function loadVolumeBackups(silent = false) {
     if (res.volumes) {
       discoveredVolumes.value = res.volumes
     }
+    // 发现失败不能静默退化成「无挂载卷」：就地展示原因，避免用户误以为
+    // 候选卷为空或卷不在白名单（AGENTS.md §3.7 离线导入）。
+    volumeDiscoveryError.value = res.volumes_error || ''
     if (res.total > 0 && res.data.length === 0 && volumePage.value > 1) {
       volumePage.value = Math.max(1, Math.ceil(res.total / volumePageSize.value))
       return loadVolumeBackups(silent)
@@ -1814,10 +1824,17 @@ function closeUploadRestoreModal() {
   showUploadRestoreModal.value = false
 }
 
-// 弹窗被关闭（右上角 ×、遮罩点击）或重新打开时，确认态一律回退到核对步骤
+// 弹窗被关闭（右上角 ×、遮罩点击）时确认态回退；重新打开由 openUploadRestoreModal 显式复位
 watch(showUploadRestoreModal, (open) => {
   if (!open) restoreConfirming.value = false
 })
+
+// 确认态期间任何配对数据变化（勾选、改选目标卷、移除文件、重新识别）都必须
+// 退回核对步骤：否则「确认的对象」与实际提交给后端的 specs 会不一致，
+// 而恢复是清空式覆盖，不能让用户确认 A 却执行 B（DESIGN.md §9.17）。
+watch(scanRows, () => {
+  restoreConfirming.value = false
+}, { deep: true })
 
 function handleScanFileSelect({ onFinish }: UploadCustomRequestOptions) {
   // 只暂存选择，不上传：文件在「上传并识别」时整批发给面板。
@@ -1879,25 +1896,30 @@ async function doScanUpload() {
 
 function removeScanRow(idx: number) {
   scanRows.value.splice(idx, 1)
-  // 配对结果变化后必须重新核对，确认态回退
-  if (!scanRows.value.length) restoreConfirming.value = false
+  // 无论是否删空，配对结果都已变化，确认态一律回退（DESIGN.md §9.17）
+  restoreConfirming.value = false
 }
 
 const scanRowsTotalSize = computed(() => scanRows.value.reduce((sum, r) => sum + (r.size || 0), 0))
 
-// 每份文件至少选了一个目标卷，且同一卷未被两份文件同时占用。
-// 未配对与卷冲突是两种不同的问题，分别给出可读提示，避免只有一句「未就绪」。
+// 每份文件至少选了一个有效目标卷，且同一卷未被两份文件同时占用。
+// 未配对与卷冲突是两种不同的问题，分别给出可读提示，避免只有一句「未就绪」；
+// 卷冲突优先级更高，不能因前面有未配对行就被掩盖。
 const scanRowsIssue = computed<'none' | 'unpaired' | 'conflict'>(() => {
   if (!scanRows.value.length) return 'none'
   const seen = new Set<string>()
+  let unpaired = false
   for (const r of scanRows.value) {
-    if (!r.specs.length) return 'unpaired'
+    if (!r.specs.length || r.specs.some((s) => !s)) {
+      unpaired = true
+      continue
+    }
     for (const s of r.specs) {
       if (seen.has(s)) return 'conflict'
       seen.add(s)
     }
   }
-  return 'none'
+  return unpaired ? 'unpaired' : 'none'
 })
 
 const scanRowsReady = computed(() => scanRows.value.length > 0 && scanRowsIssue.value === 'none')
@@ -1905,6 +1927,14 @@ const scanRowsReady = computed(() => scanRows.value.length > 0 && scanRowsIssue.
 const scanRowsIssueText = computed(() => {
   if (scanRowsIssue.value === 'conflict') return '同一挂载卷被多份文件同时占用，请调整配对后再恢复'
   if (scanRowsIssue.value === 'unpaired') return '仍有文件未选择目标挂载卷，配对完整后才能开始恢复'
+  return ''
+})
+
+// 置灰原因必须就地可见（DESIGN.md §9.17）：配对问题优先，其次是部署/卷任务占用。
+const restoreBlockedReason = computed(() => {
+  if (scanRowsIssueText.value) return scanRowsIssueText.value
+  if (deploying.value) return '应用正在部署中，请等待部署完成后再恢复'
+  if (volumeBusy.value) return '有备份/恢复任务正在进行，请等待完成后再恢复'
   return ''
 })
 
@@ -1933,8 +1963,19 @@ function scanRowMatchText(r: ScanRow): string {
 }
 
 async function doCommitRestore() {
-  if (!canWrite.value || volumeBusy.value || deploying.value) return
-  if (!scanRowsReady.value) return
+  // 守卫不能静默 return：按钮看似可点却毫无反应会让用户误以为恢复已发起。
+  if (!canWrite.value) {
+    message.warning('当前账号无权执行恢复操作')
+    return
+  }
+  if (volumeBusy.value || deploying.value) {
+    message.warning('有备份/恢复或部署任务正在进行，请等待完成后再恢复')
+    return
+  }
+  if (!scanRowsReady.value) {
+    message.warning(scanRowsIssueText.value || '请先完成文件与目标挂载卷的配对')
+    return
+  }
   uploadingRestore.value = true
   try {
     const res = await commitVolumeUploadRestore(
@@ -2841,6 +2882,9 @@ onUnmounted(() => {
 
         <NTabPane name="volumes" tab="数据卷备份">
           <div class="overview-scroll vol-tab-pane">
+            <NAlert v-if="volumeDiscoveryError" type="warning" :show-icon="true" style="margin-bottom: 8px">
+              运行时挂载卷发现失败：{{ volumeDiscoveryError }}。当前展示的是应用声明/静态解析结果，离线导入恢复可能因此无法识别目标卷。
+            </NAlert>
             <NAlert v-if="parsedVolumes.length === 0" type="default" :show-icon="false" style="margin-bottom: 4px">
               <template v-if="isCompose">
                 尚未发现挂载卷，服务启动后自动发现。
@@ -3211,8 +3255,9 @@ onUnmounted(() => {
                       accept=".tar,.tar.gz,.tgz,application/x-tar,application/gzip"
                       :custom-request="handleScanFileSelect"
                       :show-upload-button="false"
+                      :disabled="restoreConfirming"
                     >
-                      <NButton size="small">
+                      <NButton size="small" :disabled="restoreConfirming">
                         <template #icon><NIcon><FolderOutline /></NIcon></template>
                         选择备份文件
                       </NButton>
@@ -3221,7 +3266,7 @@ onUnmounted(() => {
                       type="primary"
                       size="small"
                       :loading="scanning"
-                      :disabled="scanFileList.length === 0"
+                      :disabled="scanFileList.length === 0 || restoreConfirming"
                       @click="doScanUpload"
                     >
                       <template #icon><NIcon><CloudUploadOutline /></NIcon></template>
@@ -3241,11 +3286,12 @@ onUnmounted(() => {
                       {{ scanRowsReady ? '配对完成' : scanRowsIssue === 'conflict' ? '目标卷重复' : '存在未配对文件' }}
                     </NTag>
                   </div>
-                  <div v-if="scanRowsIssueText" class="vol-restore-issue-hint">
-                    {{ scanRowsIssueText }}
+                  <div v-if="scanRows.length > 0 && restoreBlockedReason" class="vol-restore-issue-hint">
+                    {{ restoreBlockedReason }}
                   </div>
 
-                  <!-- 行数上限 10 份，超长时在弹窗内滚动，避免把弹窗撑出屏幕 -->
+                  <!-- DESIGN.md §9.4 例外：弹窗内辅助性小列表，行数硬上限 10 份
+                       （VOLUME_UPLOAD_PAIR_CAP），允许固定 max-height 限高且不分页。 -->
                   <div v-if="scanRows.length > 0" class="vol-restore-list">
                     <div
                       v-for="(row, idx) in scanRows"
@@ -3261,7 +3307,7 @@ onUnmounted(() => {
                       </div>
                       <div v-if="row.snapshot" class="vol-scan-targets">
                         <span class="vol-scan-targets-label">恢复到</span>
-                        <NCheckboxGroup v-model:value="row.specs">
+                        <NCheckboxGroup v-model:value="row.specs" :disabled="restoreConfirming">
                           <NCheckbox
                             v-for="m in row.matched"
                             :key="m.volume_spec"
@@ -3279,11 +3325,12 @@ onUnmounted(() => {
                           v-model:value="row.specs[0]"
                           class="vol-pair-spec"
                           size="small"
+                          :disabled="restoreConfirming"
                           :options="volumeOptions()"
                           :placeholder="row.match === 'none' ? '未能自动识别，请选择目标挂载卷' : '选择要恢复到的目标挂载卷'"
                         />
                       </div>
-                      <NButton quaternary size="small" @click="removeScanRow(idx)">
+                      <NButton quaternary size="small" :disabled="restoreConfirming" @click="removeScanRow(idx)">
                         移除
                       </NButton>
                     </div>
@@ -3302,6 +3349,9 @@ onUnmounted(() => {
                         确认恢复这 {{ scanRows.length }} 份文件？
                       </template>
                       将停止容器，用备份内容覆盖目标挂载卷的现有数据，完成后自动重启；任一文件校验或解包失败则整批取消，不产生部分导入。
+                      <div v-if="restoreBlockedReason" class="vol-restore-confirm-issue">
+                        {{ restoreBlockedReason }}
+                      </div>
                     </NAlert>
                     <NSpace justify="end" :size="10">
                       <template v-if="!restoreConfirming">
@@ -3321,7 +3371,12 @@ onUnmounted(() => {
                         <NButton :disabled="uploadingRestore" @click="restoreConfirming = false">
                           返回核对
                         </NButton>
-                        <NButton type="error" :loading="uploadingRestore" @click="doCommitRestore">
+                        <NButton
+                          type="error"
+                          :loading="uploadingRestore"
+                          :disabled="!scanRowsReady || volumeBusy || deploying"
+                          @click="doCommitRestore"
+                        >
                           确认恢复
                         </NButton>
                       </template>
@@ -3417,8 +3472,10 @@ onUnmounted(() => {
           </div>
         </NTabPane>
 
-        <NTabPane name="logs" tab="运行日志">
-          <div class="overview-scroll">
+        <!-- show:lazy：页签切走后组件常驻，保住选中容器 / 筛选 / 滚动位置（AGENTS.md §8.4）；
+             外层只负责撑高，滚动交给组件内唯一的 .log-box（DESIGN.md §9.7 单一滚动源）。 -->
+        <NTabPane name="logs" tab="运行日志" display-directive="show:lazy">
+          <div class="overview-scroll logs-pane-scroll">
             <AppRuntimeLogs :app="app" :active="activeTab === 'logs'" :can-write="canWrite" />
           </div>
         </NTabPane>
@@ -4130,6 +4187,12 @@ onUnmounted(() => {
   padding: 10px 2px 0 0;
 }
 
+/* 运行日志页签：滚动只由 AppRuntimeLogs 内部的 .log-box 承担，
+   外层不产生第二条滚动条（DESIGN.md §9.7 单一滚动源）。 */
+.logs-pane-scroll {
+  overflow: hidden;
+}
+
 .proxy-domain-status {
   font-size: 11px;
   line-height: 1.5;
@@ -4299,13 +4362,15 @@ onUnmounted(() => {
   }
 }
 
-/* 配对问题提示：仅在不满足恢复条件时出现，说明为什么按钮不可点 */
+/* 配对问题提示：仅在不满足恢复条件时出现，说明为什么按钮不可点；
+   颜色走主题变量，避免亮/暗主题下固定色造成对比度断层（DESIGN.md §9.1） */
 .vol-restore-issue-hint {
   font-size: 12px;
-  color: #e0a020;
+  color: var(--text-warning);
 }
 
-/* 文件行上限 10 份，超出时弹窗内滚动，避免撑破弹窗高度 */
+/* DESIGN.md §9.4 例外：辅助性小列表、行数硬上限 10 份，
+   显式声明本例外后允许固定 max-height 限高且不分页。 */
 .vol-restore-list {
   display: flex;
   flex-direction: column;
@@ -4408,6 +4473,12 @@ onUnmounted(() => {
 
   > .vol-restore-confirm {
     text-align: left;
+
+    .vol-restore-confirm-issue {
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--text-warning);
+    }
   }
 }
 

@@ -116,6 +116,10 @@ func scanUploadTar(file string) (*tarScanResult, error) {
 	deadline := time.Now().Add(volumeScanTimeBudget)
 	tr := tar.NewReader(src)
 	manifestSeen := false
+	manifestUnusable := false
+	// 护栏只截断「识别用的元数据采集」，不阻断导入本身：目录形态信号在
+	// 远未到上限时就已经稳定，大归档不该因为条目多而被拒。快照清单由
+	// 备份脚本写在归档首部，正常产物必然在截断之前读到。
 	for i := 0; ; i++ {
 		if i >= volumeScanEntryCap {
 			break
@@ -140,9 +144,17 @@ func scanUploadTar(file string) (*tarScanResult, error) {
 		}
 		if !manifestSeen && name == "manifest.json" && hd.Typeflag != tar.TypeDir {
 			raw, _ := io.ReadAll(io.LimitReader(tr, volumeScanManifestCap))
+			// 被 cap 截断的 manifest 不能当作「没有 manifest」：恢复脚本在
+			// 主机端会独立用 tar -tf 判定快照并按 volumes/vol_<i> 解包，
+			// 一旦两侧判定分叉，非快照归档会被按 vol_0 灌进错误的目标卷。
+			if len(raw) >= volumeScanManifestCap {
+				manifestUnusable = true
+			}
 			var mf SnapshotManifest
-			if json.Unmarshal(raw, &mf) == nil && len(mf.Volumes) > 0 {
+			if err := json.Unmarshal(raw, &mf); err == nil && len(mf.Volumes) > 0 {
 				res.manifest = &mf
+			} else {
+				manifestUnusable = true
 			}
 			manifestSeen = true
 		}
@@ -173,6 +185,18 @@ func scanUploadTar(file string) (*tarScanResult, error) {
 			}
 		}
 	}
+	// Fail-closed：只要「扫描侧的 Snapshot 判定」可能不等于「恢复端重新
+	// 看到的快照标志」，就拒绝这份归档，宁可整批 400 也不能错卷覆盖。
+	// handler 已把 scanUploadTar 的 error 映射为整批 400 并回滚暂存文件。
+	if manifestUnusable {
+		return nil, errors.New("归档内 manifest.json 损坏、过大或缺少卷清单，无法安全识别（请改用系统导出的快照或拆分后重试）")
+	}
+	// 恢复端只看「根级有没有 manifest.json」来决定按 volumes/vol_<i> 解包。
+	// 清单合法但归档里根本没有 volumes/ 目录时，若仍判为快照，清空目标卷后
+	// 解包必然失败（甚至解到空），因此同样按不可用处理。
+	if res.manifest != nil && !res.topSet["volumes"] {
+		return nil, errors.New("归档含 manifest.json 但缺少 volumes/ 卷目录，与快照结构不符，无法安全恢复")
+	}
 	return res, nil
 }
 
@@ -202,12 +226,20 @@ func cleanArchiveStem(filename string) string {
 // volumeScanCandidates collects the app's live target volumes: declared
 // volumes for single-container apps (parseable offline), discovered mounts for
 // Compose apps (dynamically inspected on the agent, falling back to static
-// ComposeContent parsing when offline or stopped).
-func volumeScanCandidates(h *AppHandlers, app *Application) []volumeScanCandidate {
+// ComposeContent parsing when offline or stopped). A discovery failure with no
+// static fallback is returned as an error rather than an empty candidate list,
+// so an offline import cannot masquerade as "no candidate volumes".
+func volumeScanCandidates(h *AppHandlers, app *Application) ([]volumeScanCandidate, error) {
 	if isComposeApp(app) {
-		disc, _ := h.engine.DiscoverAppVolumes(app)
+		disc, err := h.engine.DiscoverAppVolumes(app)
 		if len(disc) == 0 {
+			// Static ComposeContent parsing is the offline fallback: keep the
+			// existing degrade-to-static behaviour, but do not let it hide a
+			// discovery failure when it also finds nothing.
 			disc = staticComposeVolumes(app)
+		}
+		if len(disc) == 0 && err != nil {
+			return nil, fmt.Errorf("应用 %s 的挂载卷发现失败且静态解析无结果: %v", app.ID, err)
 		}
 		cands := make([]volumeScanCandidate, 0, len(disc))
 		for _, d := range disc {
@@ -219,7 +251,7 @@ func volumeScanCandidates(h *AppHandlers, app *Application) []volumeScanCandidat
 				HostPath: d.HostPath, Service: d.Service, VolumeType: d.VolumeType,
 			})
 		}
-		return cands
+		return cands, nil
 	}
 	cands := make([]volumeScanCandidate, 0, len(app.Volumes))
 	for _, v := range app.Volumes {
@@ -238,7 +270,7 @@ func volumeScanCandidates(h *AppHandlers, app *Application) []volumeScanCandidat
 		}
 		cands = append(cands, volumeScanCandidate{Spec: spec, ContainerPath: dst, HostPath: host, VolumeType: vType})
 	}
-	return cands
+	return cands, nil
 }
 
 // matchScanVolumes proposes which live volumes one uploaded file belongs to.

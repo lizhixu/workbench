@@ -1,6 +1,7 @@
 package cert
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -609,7 +610,11 @@ func (h *Handlers) deleteCert(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "该证书正在签发中，删除后签发完成仍会重新出现。请等待签发完成（或失败）后再删除"})
 		return
 	}
-	if err := h.hub.Delete(c.Param("id")); err != nil {
+	if err := h.hub.Delete(id); err != nil {
+		if errors.Is(err, ErrCertificateBeingIssued) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}

@@ -307,6 +307,23 @@ func discoverAuthoritativeAddrs(ctx context.Context, budget time.Duration, fqdn 
 	return addrs, nil
 }
 
+// rotateNSAddrs rotates the authoritative NS order once per attempt. The
+// per-attempt budget is shared across the list, so a fixed order would let a
+// slow or filtered head server starve every trailing nameserver. Extracted as
+// a pure helper so the rotation can be pinned by unit tests without spinning
+// up UDP servers.
+func rotateNSAddrs(nsAddrs []string, attempt int) []string {
+	n := len(nsAddrs)
+	if n <= 1 {
+		return nsAddrs
+	}
+	r := (attempt - 1) % n
+	if r < 0 {
+		r += n
+	}
+	return append(append([]string{}, nsAddrs[r:]...), nsAddrs[:r]...)
+}
+
 // lookupAuthoritativeTXT queries the pre-resolved authoritative nameserver
 // addresses for fqdn and checks whether want is present in the returned TXT
 // records. When no addresses were discovered, or authoritative queries fail,
@@ -484,11 +501,7 @@ func verifyDNSTXTPropagation(ctx context.Context, logf func(format string, args 
 		// shared across the list, so a fixed order would starve trailing
 		// nameservers whenever the head ones are slow or filtered.
 		// Rotation spreads the budget across all of them over attempts.
-		addrs := nsAddrs
-		if n := len(nsAddrs); n > 1 {
-			r := (attempt - 1) % n
-			addrs = append(append([]string{}, nsAddrs[r:]...), nsAddrs[:r]...)
-		}
+		addrs := rotateNSAddrs(nsAddrs, attempt)
 		found, d := lookupAuthoritativeTXT(attemptCtx, addrs, fqdn, want)
 		cancel()
 		if found {

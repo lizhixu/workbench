@@ -105,6 +105,26 @@ type staticComposeService struct {
 	Volumes []any `yaml:"volumes"`
 }
 
+// composeAppsRoot is the directory all raw_compose app data lives under.
+// Relative bind sources are resolved within it; see resolveComposeBindHostPath.
+const composeAppsRoot = "/var/lib/watchman/apps"
+
+// resolveComposeBindHostPath resolves a relative bind source against the
+// raw_compose app directory and checks containment. One leading ".." is
+// legitimate ("../shared" -> /var/lib/watchman/apps/shared for shared volumes),
+// but any number of ".." segments can escape appsRoot entirely (e.g.
+// "../../../../etc" -> /etc). That host path later becomes the clean-restore
+// rm -rf / untar target, so an escaping volume must be dropped here instead
+// of being offered as a restore target. Absolute bind sources and named
+// volumes never go through this resolver.
+func resolveComposeBindHostPath(appID, src string) (hostPath string, ok bool) {
+	hostPath = path.Join(composeAppsRoot, appID, strings.ReplaceAll(src, "\\", "/"))
+	if !strings.HasPrefix(hostPath, composeAppsRoot+"/") {
+		return "", false
+	}
+	return hostPath, true
+}
+
 // parseParentRelativeSpec parses a short-form volume spec whose source is a
 // parent-relative path ("../shared:/data[:ro]", "..\\shared:/data"). It mirrors
 // parseVolumeSpec's splitting but without its ".." traversal guard, which the
@@ -212,8 +232,14 @@ func staticComposeVolumes(app *Application) []DiscoveredVolume {
 						// only stored for raw_compose apps, so this base is
 						// exact; path.Join cleans "." and ".." segments,
 						// so "../shared" lands on the parent directory
-						// instead of being mangled into <id>/shared.
-						hostPath = path.Join("/var/lib/watchman/apps", app.ID, strings.ReplaceAll(src, "\\", "/"))
+						// instead of being mangled into <id>/shared. The
+						// containment check drops sources that escape the
+						// apps root (see resolveComposeBindHostPath).
+						hp, contained := resolveComposeBindHostPath(app.ID, src)
+						if !contained {
+							continue
+						}
+						hostPath = hp
 					}
 				} else {
 					volType = "volume"
@@ -255,7 +281,11 @@ func staticComposeVolumes(app *Application) []DiscoveredVolume {
 					if strings.HasPrefix(src, "/") || (len(src) >= 3 && src[1] == ':' && (src[2] == '/' || src[2] == '\\')) {
 						hostPath = src
 					} else {
-						hostPath = path.Join("/var/lib/watchman/apps", app.ID, strings.ReplaceAll(src, "\\", "/"))
+						hp, contained := resolveComposeBindHostPath(app.ID, src)
+						if !contained {
+							continue
+						}
+						hostPath = hp
 					}
 				} else {
 					volType = "volume"

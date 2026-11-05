@@ -201,6 +201,8 @@ async function loadContainers() {
     containersError.value = msg.includes('offline') ? '主机 Agent 离线，无法拉取容器列表' : msg
     containers.value = []
     selected.value = null
+    // 容器清单失效：此前在途的日志响应不能再回填到空列表上
+    invalidateInFlight()
   } finally {
     loadingContainers.value = false
   }
@@ -212,6 +214,17 @@ async function loadContainers() {
 // 否则一次轮询超车会把手动刷新的 loading 永久钉住。
 let logSeq = 0
 let loadingSeq = 0
+// 在途日志请求数：静默轮询遇到慢响应时不叠加请求，避免 Agent 侧并发拉起
+// 一堆 docker logs 进程；手动刷新仍可发起并用 logSeq 作废旧响应。
+let inFlightCount = 0
+
+// 停止轮询 / 切换应用 / 容器清空时统一作废在途响应：只清 timer 会让
+// 迟到的响应把旧应用的日志回填到新界面（幽灵请求）。
+function invalidateInFlight() {
+  logSeq++
+  loadingSeq = -1
+  loadingLogs.value = false
+}
 
 function localizeLogError(msg: string) {
   if (msg.includes('offline')) return '主机 Agent 离线，无法拉取日志'
@@ -220,8 +233,13 @@ function localizeLogError(msg: string) {
 }
 
 async function fetchLogs(silent: boolean) {
-  if (!selected.value) return
+  if (!selected.value) {
+    invalidateInFlight()
+    return
+  }
+  if (silent && inFlightCount > 0) return
   const seq = ++logSeq
+  inFlightCount++
   if (!silent) {
     loadingSeq = seq
     loadingLogs.value = true
@@ -250,16 +268,18 @@ async function fetchLogs(silent: boolean) {
       logsError.value = localizeLogError(msg)
     }
   } finally {
+    inFlightCount--
     if (!silent && seq === loadingSeq) loadingLogs.value = false
   }
 }
 
 let timer: number | undefined
-function stopPolling() {
+function stopPolling(invalidate = false) {
   if (timer !== undefined) {
     clearInterval(timer)
     timer = undefined
   }
+  if (invalidate) invalidateInFlight()
 }
 function startPolling() {
   stopPolling()
@@ -283,13 +303,14 @@ watch(
   () => props.active,
   (v) => {
     if (v) initOrRefresh()
-    else stopPolling()
+    else stopPolling(true)
   },
   { immediate: true },
 )
 watch(
   () => props.app.id,
   () => {
+    stopPolling(true)
     containers.value = []
     selected.value = null
     rawText.value = ''
@@ -315,8 +336,8 @@ watch(autoRefresh, () => startPolling())
 onActivated(() => {
   if (props.active) initOrRefresh()
 })
-onDeactivated(() => stopPolling())
-onUnmounted(() => stopPolling())
+onDeactivated(() => stopPolling(true))
+onUnmounted(() => stopPolling(true))
 
 const tsRe = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))\s?(.*)$/
 const errorRe = /error|fatal|panic|exception|failed/i
@@ -382,9 +403,14 @@ function downloadLogs() {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
-  a.download = `${name}-logs.txt`
+  a.download = `${name}-logs.log`
+  // 挂在 DOM 上并延迟释放，避免 Firefox / Safari 在 blob 被读取前就失效
+  document.body.appendChild(a)
   a.click()
-  URL.revokeObjectURL(url)
+  window.setTimeout(() => {
+    a.remove()
+    URL.revokeObjectURL(url)
+  }, 0)
 }
 </script>
 
@@ -402,6 +428,9 @@ function downloadLogs() {
   color: var(--text-secondary);
   font-size: 12px;
 }
+/* 页签内滚动容器（DESIGN.md §9.7）：父级 .runtime-logs 已 height:100%，
+   这里用 flex:1 + min-height:0 吃掉剩余高度，等价于显式 height:100%，
+   保证只有 .log-box 一个可滚动区域。 */
 .log-box {
   flex: 1;
   min-height: 0;
@@ -434,5 +463,13 @@ function downloadLogs() {
 .log-empty {
   color: var(--text-secondary);
   font-size: 12px;
+}
+/* DESIGN.md §9.16：说明文字必须自带 12px / 次要色 / 行高，不能只挂
+   全局开关用的 .tip-hint 类名却没有任何样式规则。 */
+.tip-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
 }
 </style>

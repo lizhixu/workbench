@@ -379,3 +379,34 @@ func TestDetectReplacement(t *testing.T) {
 		t.Errorf("no siblings: hint = %q called = %v, want empty and no probe", hint, called)
 	}
 }
+
+// The per-attempt budget is shared across the whole NS list. Rotation must
+// give every address a turn at the head, otherwise one slow/filtered server
+// can starve the rest forever (AGENTS.md §3.7 NS 轮转).
+func TestRotateNSAddrs(t *testing.T) {
+	ns := []string{"1.1.1.1:53", "2.2.2.2:53", "3.3.3.3:53"}
+	seen := map[string]bool{}
+	for attempt := 1; attempt <= len(ns); attempt++ {
+		got := rotateNSAddrs(ns, attempt)
+		want := append(append([]string{}, ns[attempt-1:]...), ns[:attempt-1]...)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("attempt %d: got %v, want %v", attempt, got, want)
+		}
+		seen[got[0]] = true
+	}
+	if len(seen) != len(ns) {
+		t.Errorf("rotation never gave all %d nameservers a turn at the head: %v", len(ns), seen)
+	}
+	if got := rotateNSAddrs(ns, len(ns)+1); strings.Join(got, ",") != strings.Join(ns, ",") {
+		t.Errorf("rotation must wrap back to the original order: %v", got)
+	}
+	if strings.Join(ns, ",") != "1.1.1.1:53,2.2.2.2:53,3.3.3.3:53" {
+		t.Errorf("rotation mutated the caller's slice: %v", ns)
+	}
+	if got := rotateNSAddrs([]string{"only:53"}, 3); len(got) != 1 || got[0] != "only:53" {
+		t.Errorf("single NS must stay untouched: %v", got)
+	}
+	if got := rotateNSAddrs(nil, 2); len(got) != 0 {
+		t.Errorf("empty NS list must stay empty: %v", got)
+	}
+}

@@ -145,3 +145,87 @@ func TestLogsArgs(t *testing.T) {
 		}
 	}
 }
+
+func TestLogsArgsBoundaries(t *testing.T) {
+	cases := []struct {
+		name        string
+		container   string
+		args        string
+		want        string
+		wantErr     bool
+		errContains string
+	}{
+		{"默认无 args：200 行且不加 --timestamps（老 Agent 兼容）", "web", "", "logs --tail 200 web", false, ""},
+		{"tail 下边界 1", "web", `{"tail":1}`, "logs --tail 1 web", false, ""},
+		{"tail 上边界 10000", "web", `{"tail":10000}`, "logs --tail 10000 web", false, ""},
+		{"since 合法单位 s", "web", `{"since":"30s"}`, "logs --tail 200 --since 30s web", false, ""},
+		{"since 合法单位 m", "web", `{"since":"5m"}`, "logs --tail 200 --since 5m web", false, ""},
+		{"since 合法单位 h", "web", `{"since":"1h"}`, "logs --tail 200 --since 1h web", false, ""},
+		{"since 合法单位 d", "web", `{"since":"7d"}`, "logs --tail 200 --since 7d web", false, ""},
+		{"未知字段被忽略", "web", `{"tail":10,"unknown_field":"ignored"}`, "logs --tail 10 web", false, ""},
+		{"args_json 为 null 回落默认 200 行", "web", `null`, "logs --tail 200 web", false, ""},
+		{"空对象", "web", `{}`, "logs --tail 200 web", false, ""},
+
+		{"tail 为 0", "web", `{"tail":0}`, "", true, "tail out of range"},
+		{"tail 为负数", "web", `{"tail":-5}`, "", true, "tail out of range"},
+		{"tail 10001 超上限", "web", `{"tail":10001}`, "", true, "tail out of range"},
+		{"tail 非整数 1.5", "web", `{"tail":1.5}`, "", true, "invalid args_json"},
+		{"tail 溢出 int64", "web", `{"tail":99999999999999999999}`, "", true, "invalid args_json"},
+
+		{"since 复合时长 1h30m", "web", `{"since":"1h30m"}`, "", true, "invalid since"},
+		{"since RFC3339 时间戳", "web", `{"since":"2024-01-01T00:00:00Z"}`, "", true, "invalid since"},
+		{"since 带前导 -", "web", `{"since":"-1h"}`, "", true, "invalid since"},
+		{"since 非法单位 1x", "web", `{"since":"1x"}`, "", true, "invalid since"},
+		{"since 纯数字", "web", `{"since":"123"}`, "", true, "invalid since"},
+
+		{"timestamps 为字符串", "web", `{"timestamps":"true"}`, "", true, "invalid args_json"},
+		{"timestamps 为数字", "web", `{"timestamps":1}`, "", true, "invalid args_json"},
+
+		{"args_json 为数组", "web", `[1,2,3]`, "", true, "invalid args_json"},
+		{"args_json 为字符串", "web", `"hello"`, "", true, "invalid args_json"},
+		{"args_json 非法 JSON", "web", `{bad`, "", true, "invalid args_json"},
+
+		{"容器名为空", "", "", "", true, "container is required"},
+		{"容器名以 - 开头（flag 注入）", "-x", "", "", true, "invalid container name"},
+	}
+	for _, tc := range cases {
+		got, err := logsArgs(tc.container, []byte(tc.args))
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("%s: 应 fail-closed 报错，实际通过并得到 %q", tc.name, strings.Join(got, " "))
+				continue
+			}
+			if tc.errContains != "" && !strings.Contains(err.Error(), tc.errContains) {
+				t.Errorf("%s: 错误信息 %q 不含 %q", tc.name, err.Error(), tc.errContains)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: 不应报错: %v", tc.name, err)
+			continue
+		}
+		if strings.Join(got, " ") != tc.want {
+			t.Errorf("%s: 得到 %q, 想要 %q", tc.name, strings.Join(got, " "), tc.want)
+		}
+	}
+}
+
+// dockerArgs has no "logs" case: Manager.run dispatches op "logs" to logsArgs
+// before ever calling dockerArgs, so dockerArgs("logs", ...) must fail closed
+// as an unknown op. This locks that the two dispatch paths do not overlap.
+func TestDockerArgsRejectsUnknownOps(t *testing.T) {
+	cases := []struct {
+		name string
+		op   string
+	}{
+		{"logs 由 logsArgs 单独处理", "logs"},
+		{"未知 op", "bogus"},
+		{"空 op", ""},
+	}
+	for _, tc := range cases {
+		args, ok := dockerArgs(tc.op, "web", "img")
+		if ok || args != nil {
+			t.Errorf("%s: dockerArgs(%q) 应返回 (nil,false)，实际 (%v,%v)", tc.name, tc.op, args, ok)
+		}
+	}
+}

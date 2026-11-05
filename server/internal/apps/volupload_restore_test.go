@@ -321,6 +321,16 @@ func TestScanVolumeUploadsValidation(t *testing.T) {
 	}{
 		{"空请求体", nil, "请上传备份文件"},
 		{"非 tar 内容", []uploadPart{filePart("file", "x.tar", []byte("not a tar at all"))}, "无法识别"},
+		{"清单损坏", []uploadPart{
+			filePart("file", "bad-manifest.tar.gz", writeTestTarGz(t, map[string]string{"manifest.json": `{"volumes":`})),
+		}, "manifest.json 损坏"},
+		{"清单合法但缺卷目录", []uploadPart{
+			// 恢复端只看根级 manifest.json 就按 volumes/vol_<i> 解包；清单合法
+			// 但归档里没有 volumes/ 时若仍判为快照，清空目标卷后必然解包失败。
+			filePart("file", "no-volumes.tar.gz", writeTestTarGz(t, map[string]string{
+				"manifest.json": `{"version":"1.0","app_id":"app1","volumes":[{"volume_spec":"/opt/a:/a","container_path":"/a"}]}`,
+			})),
+		}, "缺少 volumes/"},
 		{"超上限", []uploadPart{
 			filePart("file", "a.tar", writeTestTar(t, map[string]string{"data/x": "1"})),
 			filePart("file", "b.tar", writeTestTar(t, map[string]string{"data/x": "2"})),

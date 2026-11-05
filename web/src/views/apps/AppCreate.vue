@@ -1329,6 +1329,9 @@ async function bindDomainsWithCert(appId: string) {
       } catch (e: any) {
         failureNotes.push(`证书已签发但重新绑定失败：${e?.message || e}`)
       }
+    } else if (issued.state === 'in_progress') {
+      // 观察窗口结束 ≠ 签发失败：后台任务会自己入库，重复点「重试」会再下一单
+      failureNotes.push(`证书仍在签发中（后台继续执行，请勿重复发起签发），可到证书中心查看日志；签发完成后请重新绑定`)
     } else {
       failureNotes.push(`证书签发失败：${issued.error || '未知原因'}`)
     }

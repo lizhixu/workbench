@@ -100,6 +100,16 @@ const config = reactive<CertHubConfig>({
 })
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
+// 签发观察窗口的局部轮询提升为组件级，组件切走/卸载时必须清掉，
+// 否则签发后立刻离开页面会留下一个最多跑 10 分钟的孤儿 timer。
+let issuePollTimer: ReturnType<typeof setInterval> | null = null
+
+function clearIssuePoll() {
+  if (issuePollTimer) {
+    clearInterval(issuePollTimer)
+    issuePollTimer = null
+  }
+}
 
 const configReady = computed(() => config.enabled && config.base_url !== '')
 
@@ -848,7 +858,8 @@ async function doIssue() {
     // 最多轮询 120 次（共 10 分钟），直到新证书完成签发（issued 或 failed）。
     const targetCertId = res.cert_id
     let tries = 0
-    const timer = setInterval(async () => {
+    clearIssuePoll()
+    issuePollTimer = setInterval(async () => {
       tries++
       try {
         await loadCerts()
@@ -858,7 +869,7 @@ async function doIssue() {
       if (targetCertId) {
         const found = certs.value.find((c) => c.id === targetCertId)
         if (found && found.status !== 'pending') {
-          clearInterval(timer)
+          clearIssuePoll()
           if (found.status === 'issued') {
             message.success('证书签发成功')
           } else if (found.status === 'failed') {
@@ -868,7 +879,7 @@ async function doIssue() {
         }
       }
       if (tries >= 120) {
-        clearInterval(timer)
+        clearIssuePoll()
         // 10 分钟观察窗口只覆盖传播等待：多域名订单的 CA 逐授权轮询还
         // 可能更久。窗口结束不是失败——后台仍在执行，列表 30 秒刷新会
         // 自动带回终态；静默停表会让用户误以为签发卡死了。
@@ -1034,11 +1045,13 @@ onActivated(() => {
 onDeactivated(() => {
   stopPolling()
   stopManualPolling()
+  clearIssuePoll()
 })
 
 onUnmounted(() => {
   stopPolling()
   stopManualPolling()
+  clearIssuePoll()
 })
 </script>
 

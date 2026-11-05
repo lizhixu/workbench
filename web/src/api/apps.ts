@@ -293,6 +293,7 @@ export interface VolumeBackupListResp {
   page_size: number
   s3: VolumeS3Status
   volumes?: DiscoveredVolume[]
+  volumes_error?: string
 }
 
 export function listVolumeBackups(id: string, params?: { volume?: string; offset?: number; page_size?: number }) {

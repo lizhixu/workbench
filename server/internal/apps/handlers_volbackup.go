@@ -96,12 +96,22 @@ func (h *AppHandlers) listVolumeBackups(c *gin.Context) {
 	// The s3 block reports the default target for display; the backup
 	// button itself is gated by the destination the user picks on the page
 	// (an unknown target or no target at all -> 400 on POST).
-	disc, _ := h.engine.DiscoverAppVolumes(app)
-	c.JSON(http.StatusOK, gin.H{
+	// Discovery is advisory here: the archive list must stay readable even
+	// when the host is offline. Surface a failure in a separate field so the
+	// UI can warn, and always return a concrete (possibly empty) array.
+	disc, discErr := h.engine.DiscoverAppVolumes(app)
+	if disc == nil {
+		disc = []DiscoveredVolume{}
+	}
+	resp := gin.H{
 		"data": page, "total": total, "offset": offset, "page_size": pageSize,
 		"s3":      h.engine.S3Status(),
 		"volumes": disc,
-	})
+	}
+	if discErr != nil {
+		resp["volumes_error"] = "挂载卷发现失败：" + discErr.Error()
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (h *AppHandlers) getAppVolumes(c *gin.Context) {
@@ -512,10 +522,11 @@ func scanUploadFilename(name string) string {
 // scanVolumeUploads is phase 1 of the two-phase import: it stages the files on
 // the panel and returns, per file, which target volume(s) the content was
 // auto-recognized as. No slot is taken and no agent is strictly required — a
-// scan only reads app metadata plus the staged bytes, so Compose volume
-// discovery degrades to "no candidates" when the host is offline and the UI
-// falls back to manual selection. Anything staged here is inert until the
-// operator confirms phase 2.
+// scan only reads app metadata plus the staged bytes. Compose volume discovery
+// falls back to static ComposeContent parsing when the host is offline; if that
+// also fails it is reported as 503 instead of silently pretending there are no
+// candidate volumes. Anything staged here is inert until the operator confirms
+// phase 2.
 func (h *AppHandlers) scanVolumeUploads(c *gin.Context) {
 	app, ok := h.store.GetApp(c.Param("id"))
 	if !ok {
@@ -534,7 +545,11 @@ func (h *AppHandlers) scanVolumeUploads(c *gin.Context) {
 	// Expired scans are dropped here instead of on a timer: the only thing
 	// that creates staged scan files is this endpoint itself.
 	us.SweepScans()
-	candidates := volumeScanCandidates(h, app)
+	candidates, cerr := volumeScanCandidates(h, app)
+	if cerr != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": cerr.Error()})
+		return
+	}
 
 	mr, err := c.Request.MultipartReader()
 	if err != nil {
@@ -710,9 +725,15 @@ func (h *AppHandlers) commitVolumeUploadRestore(c *gin.Context) {
 		scan   *stagedScan
 		chosen []volumeScanCandidate
 	}
-	candidates := volumeScanCandidates(h, app)
+	candidates, cerr := volumeScanCandidates(h, app)
+	if cerr != nil {
+		h.engine.releaseVolumeSlot(app.ID)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": cerr.Error()})
+		return
+	}
 	pairs := make([]commitPair, 0, len(req.Pairs))
 	seenSpecs := make(map[string]bool, len(req.Pairs))
+	seenArchiveIDs := make(map[string]bool, len(req.Pairs))
 	for i, rp := range req.Pairs {
 		id := strings.TrimSpace(rp.ArchiveID)
 		if id == "" {
@@ -720,6 +741,14 @@ func (h *AppHandlers) commitVolumeUploadRestore(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("第 %d 份文件缺少上传标识", i+1)})
 			return
 		}
+		// 同一个 archive_id 被引用两次会在 Phase B 第二次 TakeScan 时 410，
+		// 白白作废这批上传；前置校验给出准确原因且不破坏暂存文件。
+		if seenArchiveIDs[id] {
+			h.engine.releaseVolumeSlot(app.ID)
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("第 %d 份文件重复引用了同一份上传（%s）", i+1, id)})
+			return
+		}
+		seenArchiveIDs[id] = true
 		sc, ok := h.engine.volUploads.PeekScan(app.ID, id)
 		if !ok {
 			h.engine.releaseVolumeSlot(app.ID)

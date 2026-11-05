@@ -105,3 +105,103 @@ func TestMatchScanVolumesSingleWeakHitIsAmbiguous(t *testing.T) {
 		t.Fatalf("strong single hit: match=%q matched=%v, want unique with 1 candidate", match, matched)
 	}
 }
+
+func TestStaticComposeVolumesContainmentAndEdgeCases(t *testing.T) {
+	app := &Application{
+		ID: "app1",
+		ComposeContent: `
+services:
+  web:
+    image: nginx
+    volumes:
+      - .\data:/winrel
+      - .:/appdir
+      - ../..:/escape1
+      - ../../../../etc:/escape2
+      - ../shared:/shared
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - type: tmpfs
+        target: /cache
+      - type: volume
+        target: /anon
+      - type: bind
+        source: ../../../../etc
+        target: /longescape
+      - type: volume
+        source: namedvol
+        target: /named
+`,
+	}
+	got := staticComposeVolumes(app)
+	byContainer := map[string]DiscoveredVolume{}
+	for _, v := range got {
+		if v.VolumeSpec == "" || v.VolumeSpec[0] == ':' {
+			t.Errorf("malformed VolumeSpec %q for %s", v.VolumeSpec, v.ContainerPath)
+		}
+		byContainer[v.ContainerPath] = v
+	}
+	// Sources whose resolved host path escapes the apps root must never
+	// become a clean-restore (rm -rf / untar) target.
+	for _, cp := range []string{"/escape1", "/escape2", "/longescape"} {
+		if v, ok := byContainer[cp]; ok {
+			t.Errorf("%s must be dropped (escapes apps root), got %+v", cp, v)
+		}
+	}
+	// Legitimate parent-relative and current-dir binds stay.
+	if v := byContainer["/shared"]; v.VolumeType != "bind" || v.HostPath != "/var/lib/watchman/apps/shared" || v.VolumeSpec != "../shared:/shared" {
+		t.Errorf("/shared = %+v, want bind ../shared:/shared -> /var/lib/watchman/apps/shared", v)
+	}
+	if v := byContainer["/appdir"]; v.VolumeType != "bind" || v.HostPath != "/var/lib/watchman/apps/app1" {
+		t.Errorf("/appdir = %+v, want bind /var/lib/watchman/apps/app1", v)
+	}
+	if v := byContainer["/winrel"]; v.VolumeType != "bind" || v.HostPath != "/var/lib/watchman/apps/app1/data" {
+		t.Errorf("/winrel = %+v, want bind /var/lib/watchman/apps/app1/data", v)
+	}
+	// System mounts, tmpfs and sourceless anonymous volumes are filtered.
+	for _, cp := range []string{"/etc/localtime", "/var/run/docker.sock", "/cache", "/anon"} {
+		if v, ok := byContainer[cp]; ok {
+			t.Errorf("%s must be filtered, got %+v", cp, v)
+		}
+	}
+	// A named volume stays, with a well-formed spec and empty host path.
+	if v := byContainer["/named"]; v.VolumeType != "volume" || v.HostPath != "" || v.VolumeSpec != "namedvol:/named" {
+		t.Errorf("/named = %+v, want named volume namedvol:/named", v)
+	}
+}
+
+// TestVolumeScanCandidatesSurfacesDiscoveryError covers the same dynamic
+// discovery failure as TestDiscoverAppVolumesDynamicFailureIsError, but keeps
+// the engine registry nil so discovery fails fast offline instead of waiting
+// on the 60s execOnAgent timeout of a registered-but-unconnected agent.
+func TestVolumeScanCandidatesSurfacesDiscoveryError(t *testing.T) {
+	store, err := NewStore(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	e := NewEngine(nil, store, nil, nil)
+	h := NewAppHandlers(nil, store, e)
+
+	// No ComposeContent: discovery fails and static parsing finds nothing —
+	// the error must not be swallowed into "no candidates".
+	app := &Application{ID: "app1", HostID: "h1", SourceType: "raw_compose"}
+	cands, err := volumeScanCandidates(h, app)
+	if err == nil {
+		t.Fatalf("expected discovery error, got candidates %v", cands)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("candidates must be empty on error, got %v", cands)
+	}
+
+	// Static ComposeContent still wins over a failed discovery (offline
+	// fallback semantics stay intact).
+	app2 := &Application{ID: "app2", HostID: "h1", SourceType: "raw_compose",
+		ComposeContent: "services:\n  web:\n    image: nginx\n    volumes:\n      - ./data:/data\n"}
+	cands, err = volumeScanCandidates(h, app2)
+	if err != nil {
+		t.Fatalf("static fallback should succeed, got error: %v", err)
+	}
+	if len(cands) != 1 || cands[0].ContainerPath != "/data" {
+		t.Fatalf("static fallback candidates = %v, want one /data volume", cands)
+	}
+}

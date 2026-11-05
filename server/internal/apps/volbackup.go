@@ -580,8 +580,12 @@ func volumeMultiRestoreScript(archivePath, safetyDir string, cleanRestore bool, 
 	sb.WriteString(fmt.Sprintf("[ -f %s ] || { echo %s >&2; exit 1; }\n",
 		shellQuote(archivePath), shellQuote("归档文件不存在: "+archivePath)))
 	sb.WriteString(fmt.Sprintf("mkdir -p %s\n", shellQuote(safetyDir)))
+	// 快照判定必须与面板扫描侧一致：扫描侧把 "./manifest.json" 规范化为
+	// 根级 manifest.json，这里也同时接受两种成员名。否则一份扫描时被判为
+	// 裸 tar 的归档会在主机端被重新判为快照，按 volumes/vol_0 解到错误卷。
+	// GNU tar 用 -tf 自动识别压缩，不写死 gzip 参数。
 	sb.WriteString(fmt.Sprintf(`IS_SNAPSHOT=0
-if tar -tf %s manifest.json >/dev/null 2>&1; then
+if tar -tf %s 2>/dev/null | grep -qE '^(\./)?manifest\.json$'; then
   IS_SNAPSHOT=1
 fi
 `, shellQuote(archivePath)))

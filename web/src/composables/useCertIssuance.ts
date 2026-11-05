@@ -11,6 +11,17 @@ import { useAuthStore } from '../stores/auth'
 // 证书的域名由后端以 missing_domains 一次列出，前端把它们合并成一张多 SAN
 // 证书提交给证书中心，签发完成后重试绑定（空 cert_id 会自动命中新证书）。
 // 证书中心签发是 adminOnly，非管理员只能拿到可操作提示。
+//
+// 观察窗口（10 分钟）结束而后台任务仍在跑时返回 in_progress，不是失败：
+// 调用方必须据此提示「仍在签发中」，绝不能显示「签发失败」并诱导重试，
+// 否则会重复创建 pending 占位与 CA 订单（AGENTS.md §3.7）。
+export interface IssueOutcome {
+  ok: boolean
+  state: 'success' | 'failed' | 'in_progress'
+  certId?: string
+  error?: string
+}
+
 export function useCertIssuance() {
   const auth = useAuthStore()
   const canIssue = computed(() => auth.role === 'admin')
@@ -68,33 +79,38 @@ export function useCertIssuance() {
   }
 
   // 把域名批量签发为一张证书。日志弹窗复用证书中心的任务日志（实时轮询）。
-  async function issueDomains(domains: string[]): Promise<{ ok: boolean; certId?: string; error?: string }> {
-    if (domains.length === 0) return { ok: true }
+  async function issueDomains(domains: string[]): Promise<IssueOutcome> {
+    if (domains.length === 0) return { ok: true, state: 'success' }
     if (!canIssue.value) {
-      return { ok: false, error: '当前账号无证书签发权限，请联系管理员签发覆盖证书后重试' }
+      return { ok: false, state: 'failed', error: '当前账号无证书签发权限，请联系管理员签发覆盖证书后重试' }
     }
     if (accounts.value.length === 0) {
-      return { ok: false, error: '尚未配置 ACME 账户，无法自动签发证书' }
+      return { ok: false, state: 'failed', error: '尚未配置 ACME 账户，无法自动签发证书' }
     }
     let taskId = ''
     try {
       const res = await issueCert(domains, accountId.value || undefined, challenge.value || undefined)
       if (!res.ok || !res.task_id) {
-        return { ok: false, error: res.message || '证书签发受理失败' }
+        return { ok: false, state: 'failed', error: res.message || '证书签发受理失败' }
       }
       taskId = res.task_id
     } catch (e: any) {
-      return { ok: false, error: e?.message || '证书签发受理失败' }
+      return { ok: false, state: 'failed', error: e?.message || '证书签发受理失败' }
     }
     logTaskId.value = taskId
     logDomains.value = domains
     logShow.value = true
     const task = await pollTask(taskId)
-    if (task === 'timeout') {
-      return { ok: false, error: '证书签发仍在进行中（已等待 10 分钟，后台继续执行），可到证书中心查看日志；签发完成后请重新绑定' }
+    if (task === 'timeout' || task === null) {
+      // timeout：观察窗口结束但后台任务仍在执行；null：组件已卸载，同样不能断言失败。
+      return {
+        ok: false,
+        state: 'in_progress',
+        error: '证书签发仍在进行中（已等待 10 分钟，后台继续执行），可到证书中心查看日志；签发完成后请重新绑定',
+      }
     }
-    if (task?.status === 'success') return { ok: true, certId: task.cert_id }
-    return { ok: false, error: task?.error || '证书签发未完成，可到证书中心查看日志' }
+    if (task.status === 'success') return { ok: true, state: 'success', certId: task.cert_id }
+    return { ok: false, state: 'failed', error: task.error || '证书签发未完成，可到证书中心查看日志' }
   }
 
   return {

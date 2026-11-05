@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -41,6 +42,11 @@ const (
 	CertStatusIssued  = "issued"  // 已签发
 	CertStatusFailed  = "failed"  // 签发失败
 )
+
+// ErrCertificateBeingIssued is returned by Hub.Delete when the target is a
+// pending issuance placeholder. Refusing the delete is a temporary conflict
+// (HTTP 409), not a missing record (HTTP 404); handlers map it with errors.Is.
+var ErrCertificateBeingIssued = errors.New("certificate is being issued and cannot be deleted yet")
 
 // Certificate is one issued certificate with its PEM material.
 type Certificate struct {
@@ -78,6 +84,12 @@ type Hub struct {
 	certs    map[string]*Certificate
 	tasks    map[string]*IssueTask
 	liveLogs sync.Map // id (string) -> *certLogger
+	// deletedCerts records ids removed through Delete. Issue/Import and the
+	// manual flow call storeResult with a brand-new id, so a missing certs[id]
+	// alone cannot distinguish "new certificate" from "deleted while a renewal
+	// was in flight"; this tombstone lets a late storeResult discard (and clean
+	// up) a result for a row the operator already deleted.
+	deletedCerts map[string]struct{}
 	// renewBeforeDays supplies the configured "days before expiry" for
 	// automatic renewal (settings: certs.auto_renew_days). Nil means the
 	// built-in default (30 days). Injected by the server entrypoint so the
@@ -167,6 +179,7 @@ func NewHub(dataDir string, log *slog.Logger) (*Hub, error) {
 		certs:    make(map[string]*Certificate),
 		tasks:    make(map[string]*IssueTask),
 	}
+	h.deletedCerts = make(map[string]struct{})
 	if err := os.MkdirAll(h.dir, 0700); err != nil {
 		return nil, err
 	}
@@ -605,9 +618,13 @@ func (h *Hub) Delete(id string) error {
 	// Backstop for the handler's pending guard: a pending row has a live
 	// issuance task whose storeResult would resurrect it on success.
 	if c.Status == CertStatusPending {
-		return fmt.Errorf("certificate %s is being issued and cannot be deleted yet", id)
+		return fmt.Errorf("%w: %s", ErrCertificateBeingIssued, id)
 	}
 	delete(h.certs, id)
+	// Mark the id as terminally deleted so a late storeResult (e.g. a renewal
+	// that was in flight when the operator deleted this issued certificate)
+	// discards its result instead of resurrecting the row.
+	h.deletedCerts[id] = struct{}{}
 	_ = os.Remove(h.certFile(id))
 	_ = os.Remove(h.keyFile(id))
 	_ = os.Remove(h.certLogFile(id))
@@ -647,6 +664,19 @@ func (h *Hub) storeResult(id string, accountID string, domains []string, certPEM
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// Only a still-registered record may be rebuilt. If the operator deleted
+	// this id while an issuance/renewal was in flight, storeResult must not
+	// resurrect the row, and must not leave the PEM files it just wrote as
+	// orphans. Brand-new ids from Issue/Import/manual/test injection are
+	// absent from certs but also absent from deletedCerts, so they still
+	// create a fresh record as before.
+	if _, exists := h.certs[id]; !exists {
+		if _, deleted := h.deletedCerts[id]; deleted {
+			_ = os.Remove(h.certFile(id))
+			_ = os.Remove(h.keyFile(id))
+			return fmt.Errorf("证书 %s 已被删除，丢弃本次签发结果", id)
+		}
+	}
 	// A renewal rebuilds the record in place (same ID); the admin-managed
 	// remark predates it and must survive the re-issue.
 	var remark string
@@ -711,7 +741,10 @@ func (h *Hub) createPendingCert(id, accountID string, domains []string) error {
 func (h *Hub) markIssueFailed(id, msg string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if c, ok := h.certs[id]; ok {
+	// Only a pending placeholder may become failed. A late failure callback
+	// must never downgrade a record that already reached CertStatusIssued
+	// (an empty status is a legacy issued record, not a placeholder).
+	if c, ok := h.certs[id]; ok && c.Status == CertStatusPending {
 		c.Status = CertStatusFailed
 		c.LastError = msg
 		c.Renewing = false
@@ -1020,23 +1053,29 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 	if !ok {
 		return nil, fmt.Errorf("certificate %s not found", id)
 	}
-	// A pending row already has an issuance task running (StartIssueTask
-	// holds acmeMu for it); renewing here would queue a second full
-	// issuance for the same domains. Failed rows stay renewable: that is
-	// how an operator retries a failed issuance via the「申请」button.
-	if c.Status == CertStatusPending {
+	// Decide both guards inside one h.mu critical section, against the
+	// current h.certs[id] rather than the stale value copy above. Two
+	// concurrent Renews otherwise both read Renewing=false from their
+	// copies and pass; acmeMu only serializes the ACME work and never
+	// re-checks, so the same domain would be issued twice and storeResult
+	// would overwrite the row twice. Failed rows still pass (retry path).
+	h.mu.Lock()
+	cur, ok := h.certs[id]
+	if !ok {
+		h.mu.Unlock()
+		return nil, fmt.Errorf("certificate %s not found", id)
+	}
+	if cur.Status == CertStatusPending {
+		h.mu.Unlock()
 		return nil, fmt.Errorf("该证书正在签发中，请等待签发完成后再申请")
 	}
-	h.mu.Lock()
-	if c.Renewing {
+	if cur.Renewing {
 		h.mu.Unlock()
 		return nil, fmt.Errorf("该证书正在续期中")
 	}
-	if cur, ok := h.certs[id]; ok {
-		cur.Renewing = true
-		cur.LastError = ""
-		_ = h.saveCertsLocked()
-	}
+	cur.Renewing = true
+	cur.LastError = ""
+	_ = h.saveCertsLocked()
 	h.mu.Unlock()
 
 	clog := newCertLogger(id, h.log)

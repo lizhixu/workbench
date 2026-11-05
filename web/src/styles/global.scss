@@ -13,6 +13,8 @@ html.light {
   --text-primary: #1e293b;
   --text-secondary: #64748b;
   --text-muted: #94a3b8;
+  /* 警告类短提示文字（非 Naive 组件自带文案），亮色底需深琥珀保证对比度 */
+  --text-warning: #b45309;
   --tab-bg: #e2e8f0;
   --tab-hover: #cbd5e1;
   --cmd-box-bg: #1e293b;
@@ -37,6 +39,7 @@ html.dark {
   --text-primary: #f3f4f6;
   --text-secondary: #9ca3af;
   --text-muted: #6b7280;
+  --text-warning: #fbbf24;
   --tab-bg: rgba(255, 255, 255, 0.06);
   --tab-hover: rgba(255, 255, 255, 0.12);
   --cmd-box-bg: #111827;

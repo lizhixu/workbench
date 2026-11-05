@@ -95,14 +95,18 @@ func TestVolumeResolveMountpointScript(t *testing.T) {
 // The restore core must lean on GNU tar's compression auto-detection: an
 // operator-uploaded archive may be a plain uncompressed .tar (piped straight
 // out of `docker cp`), so the manifest probe and both extraction branches
-// must use -tf/-xf, never the gzip-only -tzf/-xzf.
+// must use -tf/-xf, never the gzip-only -tzf/-xzf. The probe must also accept
+// "./manifest.json" (the panel scanner normalises that prefix), otherwise a
+// file scanned as a plain tar would be re-classified as a snapshot on the
+// host and unpacked from volumes/vol_0 into the wrong volume.
 func TestVolumeMultiRestoreScript(t *testing.T) {
 	script := volumeMultiRestoreScript("/var/backups/watchman/apps/app1/vbk_x.tar.gz",
 		"/var/backups/watchman/apps/app1/safety", true,
 		[]RestoreTarget{{Index: 0, DestDir: "/opt/data", Spec: "/opt/data:/data"}})
 
-	if !strings.Contains(script, `tar -tf '/var/backups/watchman/apps/app1/vbk_x.tar.gz' manifest.json`) {
-		t.Errorf("manifest probe must use auto-detect -tf:\n%s", script)
+	if !strings.Contains(script, `tar -tf '/var/backups/watchman/apps/app1/vbk_x.tar.gz'`) ||
+		!strings.Contains(script, `grep -qE '^(\./)?manifest\.json$'`) {
+		t.Errorf("manifest probe must auto-detect compression and accept ./ prefix:\n%s", script)
 	}
 	if strings.Contains(script, "-tzf") || strings.Contains(script, "-xzf") {
 		t.Errorf("restore must not hardcode gzip flags:\n%s", script)

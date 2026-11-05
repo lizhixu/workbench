@@ -1677,6 +1677,14 @@ func (h *handlers) dockerCall(c *gin.Context, op, container, image string, argsJ
 			c.JSON(http.StatusOK, gin.H{"ok": true, "data": rows})
 			return
 		}
+		// logs is plain text (one log line per row). Structured wrapping makes
+		// the frontend re-stringify it with indentation/brackets/commas and
+		// break line semantics (colouring, timestamp parsing, search, copy).
+		// Return raw text; ps/images above still need array normalisation.
+		if op == "logs" {
+			c.JSON(http.StatusOK, gin.H{"ok": true, "raw": string(payload)})
+			return
+		}
 		var parsed any
 		if json.Unmarshal(payload, &parsed) == nil {
 			c.JSON(http.StatusOK, gin.H{"ok": true, "data": parsed})

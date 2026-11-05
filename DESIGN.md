@@ -556,6 +556,7 @@ web/
 - **杜绝原生 `<NTable>` 承载不定长数据**：`NTable` 仅为静态 HTML 表格包装，无 `flex-height`、无固定表头与分页。数据表格必须使用 `NDataTable` + `columns` render 函数；单元格样式在 render 中生成时，scoped 样式必须使用 `:deep()` 穿透。
 - **`flex-height` 高度生效验收**：`.table-flex-fill` 已配置 `flex: 1; min-height: 0`。若另行手写 flex 容器，必须确保 `NDataTable` 自身获得 `flex: 1`，验收口径为：**表格数据区 `clientHeight` 必须明显大于表头高度**（避免数据区 clientHeight 为 0 导致表格空白）。
 - **固定列（fixed: left/right）纯色防透**：横向滚动表格中，固定列（如首列、操作列）背景色必须硬绑定不透明的 `var(--bg-card)`，行悬停时同步切换为不透明的 `tdColorHover`（`#18223a` / `#f8fafc`），杜绝半透明导致底层单元格文字穿透重叠。
+- **单元格内容必须自带截断**：`NDataTable` 的 `td` 默认 `overflow: visible`，固定宽度列里的文本与 `NTag` 都**不会**自动截断——`NTag` 是 `inline-flex + nowrap`，长中文标签会直接画出单元格、盖住右侧相邻列（如操作审计页「操作」列的长 action 文案压住「目标」列）。固定宽度列必须二选一：纯文本走 `ellipsis: { tooltip: true }`；必须保留标签外观时，给标签根节点 `max-width: 100%`，并对内部 `.n-tag__content` 设 `min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap`（render 生成节点时用 `:deep()` 穿透，参考 `AuditList.vue` 的 `.audit-action-tag`），完整文案由 `title` 或 tooltip 承载。新增或调整固定宽度列后必须实测「内容右边界 ≤ 单元格右边界」，并确认行高不被超长用户名等字段撑成多行。
 - **例外规范**：卡片内部的辅助性小表格（常用命令库、备份列表、执行主机勾选框、告警规则清单等），因数据量天然有限且非页面主体，允许使用固定 `:max-height` 限高且不分页，但**必须在代码注释中显式声明本例外**。
 
 ### 9.5 多页签与表格布局规范：Tab 与表格卡片分层架构

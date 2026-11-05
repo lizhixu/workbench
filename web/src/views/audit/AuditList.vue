@@ -142,13 +142,23 @@ const columns: DataTableColumns<AuditEntry> = [
     width: 170,
     render: (row) => h('span', { class: 'mono-font' }, fmtTime(row.timestamp)),
   },
-  { title: '用户', key: 'username', width: 110 },
+  { title: '用户', key: 'username', width: 110, ellipsis: { tooltip: true } },
   {
     title: '操作',
     key: 'action',
-    width: 140,
-    render: (row) =>
-      h(NTag, { size: 'small', bordered: false, type: 'info' }, { default: () => actionLabel(row.action, row.target_type) }),
+    width: 160,
+    render: (row) => {
+      const label = actionLabel(row.action, row.target_type)
+      // NTag 是 inline-flex + nowrap，标签本身不会截断；Naive 的 td 默认
+      // overflow: visible，超长中文 action（如「切换应用到 GitHub App 触发」）
+      // 会画出单元格直接盖住「目标」列。这里让标签吃满列宽上限、在标签内部
+      // 省略，完整文案走 title 悬停（单元格样式由 render 生成，需 :deep 穿透）。
+      return h(
+        NTag,
+        { size: 'small', bordered: false, type: 'info', class: 'audit-action-tag', title: label },
+        { default: () => label },
+      )
+    },
   },
   {
     title: '目标',
@@ -334,7 +344,7 @@ onMounted(load)
         :bordered="false"
         size="small"
         :row-props="(row: AuditEntry) => ({ style: 'cursor: pointer', onClick: () => showDetail(row) })"
-        :scroll-x="1100"
+        :scroll-x="1130"
       />
       <div class="table-pagination-bar">
         <NPagination
@@ -447,6 +457,20 @@ onMounted(load)
 .target-text {
   font-weight: 500;
   color: var(--text-primary);
+}
+
+/* 操作列标签：外层限制在列宽内，内层文本省略，长 action 绝不溢出到「目标」列
+   （NDataTable 的 td 默认 overflow: visible，不做约束就会画出单元格）。 */
+:deep(.audit-action-tag) {
+  max-width: 100%;
+  vertical-align: middle;
+
+  .n-tag__content {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 }
 
 .detail-grid {

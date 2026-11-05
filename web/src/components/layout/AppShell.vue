@@ -840,6 +840,19 @@ function handleUser(key: string) {
       justify-content: center;
       padding: 0;
     }
+
+    // 有新版本时设置项的 NBadge 没有子节点，Naive 会给它加
+    // n-badge--as-is，角标变成静态盒子参与 flex 布局：8px 圆点 +
+    // 10px gap 会把图标向左顶 9px，与其余项对不齐。折叠态把它抽出
+    // 文档流、贴到图标右上角（图标 18px 居中于 52px 宽的项内，右上
+    // 角为 x=35、y=9；圆点 8px，top: 5px、right: 13px 时圆心正好
+    // 落在该角上），图标恢复与其他项一致的居中。
+    .side-nav-badge {
+      position: absolute;
+      top: 5px;
+      right: 13px;
+      margin-left: 0;
+    }
   }
 
   .side-nav-list {
@@ -855,6 +868,7 @@ function handleUser(key: string) {
   }
 
   .side-nav-item {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 10px;

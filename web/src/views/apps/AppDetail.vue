@@ -13,7 +13,7 @@ import {
   ArrowBackOutline, BuildOutline, CloudUploadOutline, CopyOutline,
   DownloadOutline, FolderOutline,
   GitCommitOutline, MoveOutline, PlayOutline, RefreshOutline, SparklesOutline, StopOutline,
-  SwapHorizontalOutline, TrashOutline,
+  SwapHorizontalOutline, TerminalOutline, TrashOutline,
 } from '@vicons/ionicons5'
 import {
   cancelDeployment, deployApp, diagnoseDeployment, getApp, getAppStatus, getDeployment, listDeployments, restartApp,
@@ -32,7 +32,7 @@ import {
   bindProxy, getCertCover, listCerts, unbindProxy,
   type CertCover, type Certificate, type ProxyBindDomain,
 } from '../../api/certs'
-import { installDocker, listHosts } from '../../api/hosts'
+import { dockerAll, installDocker, listHosts } from '../../api/hosts'
 import { listNetworkNodes } from '../../api/network'
 import {
   getGitHubAppStatus, switchAppToGitHubApp, type GitHubAppStatus,
@@ -44,6 +44,7 @@ import { useAuthStore } from '../../stores/auth'
 import OpsTunnelModal from '../../components/tunnels/OpsTunnelModal.vue'
 import AppMigrateModal from '../../components/apps/AppMigrateModal.vue'
 import AppRuntimeLogs from '../../components/apps/AppRuntimeLogs.vue'
+import TerminalPane from '../../components/host/TerminalPane.vue'
 import CertLogModal from '../../components/cert/CertLogModal.vue'
 import { useCertIssuance } from '../../composables/useCertIssuance'
 
@@ -68,6 +69,110 @@ const activeTab = ref('overview')
 // Deployment log viewer.
 const showLog = ref(false)
 const logDeployment = ref<Deployment | null>(null)
+
+// ---- App container terminal (overview "终端" entry) ----
+// Reuses the Docker page's TerminalPane-in-modal pattern; the container list
+// is discovered the same way as the runtime-logs tab (docker ps filtered by
+// watchman.app=<id> / com.docker.compose.project=watchman-<id>).
+interface AppTerminalContainer {
+  name: string
+  status: string
+  service: string
+}
+const showAppTerminal = ref(false)
+const termContainers = ref<AppTerminalContainer[]>([])
+const termContainerLoading = ref(true)
+const termContainerError = ref('')
+const selectedTermContainer = ref<string | null>(null)
+
+const termContainerOptions = computed(() =>
+  termContainers.value.map((c) => ({
+    label: c.service ? `${c.service}（${c.name}）` : c.name,
+    value: c.name,
+  })),
+)
+const termButtonTitle = computed(() => {
+  if (termContainerLoading.value) return '正在加载容器列表…'
+  if (termContainerError.value) return termContainerError.value
+  if (!termContainers.value.length) return '暂无运行中的容器'
+  return '打开容器终端'
+})
+
+// docker ps --format {{json .}} 把 Labels 渲染成逗号分隔的 key=value 字符串，
+// 与主机 Docker 页 watchmanAppLabel 同款兼容（对象形态同样接受）。
+function parseTermContainerLabels(labels: unknown): Record<string, string> {
+  if (!labels) return {}
+  if (typeof labels === 'object') return labels as Record<string, string>
+  if (typeof labels !== 'string') return {}
+  const out: Record<string, string> = {}
+  for (const part of labels.split(',')) {
+    const eq = part.indexOf('=')
+    if (eq > 0) out[part.slice(0, eq)] = part.slice(eq + 1)
+  }
+  return out
+}
+
+async function loadAppTerminalContainers() {
+  if (!canWrite.value || !app.value) {
+    termContainers.value = []
+    selectedTermContainer.value = null
+    termContainerLoading.value = false
+    return
+  }
+  termContainerLoading.value = true
+  termContainerError.value = ''
+  try {
+    const res = await dockerAll(app.value.host_id)
+    const rows = (res.containers || []) as any[]
+    const found: AppTerminalContainer[] = []
+    for (const c of rows) {
+      const labels = parseTermContainerLabels(c.Labels)
+      if (labels['watchman.app'] !== app.value.id && labels['com.docker.compose.project'] !== `watchman-${app.value.id}`) {
+        continue
+      }
+      found.push({
+        name: (c.Names || c.ID || '').replace(/^\//, ''),
+        status: c.Status || '',
+        service: labels['com.docker.compose.service'] || '',
+      })
+    }
+    found.sort((a, b) => {
+      const aUp = a.status.startsWith('Up') ? 0 : 1
+      const bUp = b.status.startsWith('Up') ? 0 : 1
+      if (aUp !== bUp) return aUp - bUp
+      return (a.service || a.name).localeCompare(b.service || b.name)
+    })
+    if (!found.length && app.value.container_name) {
+      found.push({ name: app.value.container_name, status: '', service: '' })
+    }
+    termContainers.value = found
+    if (!found.some((c) => c.name === selectedTermContainer.value)) {
+      selectedTermContainer.value = found.length ? found[0].name : null
+    }
+  } catch (e: any) {
+    const msg = e.message || '加载容器列表失败'
+    termContainerError.value = msg.includes('offline') ? '主机 Agent 离线，无法拉取容器列表' : msg
+    termContainers.value = []
+    selectedTermContainer.value = null
+  } finally {
+    termContainerLoading.value = false
+  }
+}
+
+async function openAppTerminal() {
+  if (!canWrite.value) return
+  // 点开时刷新一次：容器启停后清单可能已变，缓存可能过期。
+  await loadAppTerminalContainers()
+  if (!termContainers.value.length) {
+    message.warning(termContainerError.value || '暂无运行中的容器')
+    return
+  }
+  // 多容器不预连任意一个：先让用户选容器再连接，切换容器即重连新会话。
+  selectedTermContainer.value = termContainers.value.length === 1
+    ? termContainers.value[0].name
+    : null
+  showAppTerminal.value = true
+}
 
 // Service migration (cross-host move): the modal drives precheck + submit,
 // and a successful start switches to the deployment tab to follow progress.
@@ -700,6 +805,7 @@ async function loadApp() {
   } catch (e: any) {
     message.error(e.message || '获取应用信息失败')
   }
+  await loadAppTerminalContainers()
 }
 
 async function saveAndRedeployCompose() {
@@ -2772,6 +2878,19 @@ onUnmounted(() => {
               <NButton v-if="canWrite" size="small" @click="openEdit">
                 编辑配置
               </NButton>
+              <NButton
+                v-if="canWrite"
+                size="small"
+                :loading="termContainerLoading"
+                :disabled="!termContainerLoading && termContainers.length === 0"
+                :title="termButtonTitle"
+                @click="openAppTerminal"
+              >
+                <template #icon>
+                  <NIcon><TerminalOutline /></NIcon>
+                </template>
+                终端
+              </NButton>
             </NSpace>
             <NDescriptions :column="2" bordered size="small" label-placement="left">
               <NDescriptionsItem label="部署来源">
@@ -3983,6 +4102,45 @@ onUnmounted(() => {
         <NAlert v-if="logDeployment?.error" type="error" style="margin-top: 10px">
           {{ logDeployment.error }}
         </NAlert>
+      </div>
+    </NModal>
+
+    <!-- 应用容器终端：复用 Docker 页的 TerminalPane 弹窗模式。多容器时
+      先在弹窗内选容器再连接，不预连任意一个；切换容器即重连新会话。 -->
+    <NModal
+      v-model:show="showAppTerminal"
+      preset="card"
+      :title="selectedTermContainer ? `容器终端直连: ${selectedTermContainer}` : '容器终端'"
+      style="width: 80vw; max-width: 1000px; height: 600px"
+    >
+      <div v-if="termContainers.length > 1" style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px">
+        <span>容器</span>
+        <NSelect
+          v-model:value="selectedTermContainer"
+          :options="termContainerOptions"
+          size="small"
+          placeholder="请选择容器"
+          style="width: 260px"
+        />
+        <NButton size="small" :loading="termContainerLoading" @click="loadAppTerminalContainers">
+          <template #icon>
+            <NIcon><RefreshOutline /></NIcon>
+          </template>
+          刷新
+        </NButton>
+      </div>
+      <div :style="{ height: termContainers.length > 1 ? '460px' : '500px' }">
+        <TerminalPane
+          v-if="showAppTerminal && selectedTermContainer"
+          :key="selectedTermContainer"
+          :host-id="app?.host_id || ''"
+          :shell="`docker exec -it ${selectedTermContainer} /bin/sh`"
+        />
+        <NEmpty
+          v-else-if="showAppTerminal"
+          description="请先选择容器"
+          style="height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center"
+        />
       </div>
     </NModal>
 

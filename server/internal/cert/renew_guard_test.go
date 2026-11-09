@@ -21,7 +21,7 @@ func TestRenewRefusesPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHub: %v", err)
 	}
-	if err := hub.createPendingCert("crt_pending1", "acc_test1", []string{"test.example.com"}); err != nil {
+	if err := hub.createPendingCert("crt_pending1", "acc_test1", []string{"test.example.com"}, ""); err != nil {
 		t.Fatalf("createPendingCert: %v", err)
 	}
 	if _, err := hub.Renew("crt_pending1"); err == nil || !strings.Contains(err.Error(), "正在签发中") {
@@ -46,7 +46,7 @@ func TestRenewAllowsFailedRetry(t *testing.T) {
 	if err := hub.DeleteAccount("acc_letsencrypt"); err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
-	if err := hub.createPendingCert("crt_failed1", "acc_test1", []string{"retry.example.com"}); err != nil {
+	if err := hub.createPendingCert("crt_failed1", "acc_test1", []string{"retry.example.com"}, ""); err != nil {
 		t.Fatalf("createPendingCert: %v", err)
 	}
 	hub.markIssueFailed("crt_failed1", "DNS-01 验证超时")
@@ -84,10 +84,10 @@ func TestRenewExpiringSkipsPlaceholders(t *testing.T) {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
 	now := time.Now()
-	if err := hub.createPendingCert("crt_pending1", "acc_test1", []string{"pending.example.com"}); err != nil {
+	if err := hub.createPendingCert("crt_pending1", "acc_test1", []string{"pending.example.com"}, ""); err != nil {
 		t.Fatalf("createPendingCert: %v", err)
 	}
-	if err := hub.createPendingCert("crt_failed1", "acc_test1", []string{"failed.example.com"}); err != nil {
+	if err := hub.createPendingCert("crt_failed1", "acc_test1", []string{"failed.example.com"}, ""); err != nil {
 		t.Fatalf("createPendingCert: %v", err)
 	}
 	hub.markIssueFailed("crt_failed1", "DNS-01 验证超时")
@@ -127,7 +127,7 @@ func TestDeleteRefusesPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHub: %v", err)
 	}
-	if err := hub.createPendingCert("crt_pending1", "acc_test1", []string{"pending.example.com"}); err != nil {
+	if err := hub.createPendingCert("crt_pending1", "acc_test1", []string{"pending.example.com"}, ""); err != nil {
 		t.Fatalf("createPendingCert: %v", err)
 	}
 	if err := hub.Delete("crt_pending1"); !errors.Is(err, ErrCertificateBeingIssued) {
@@ -154,7 +154,7 @@ func TestDeleteCertPendingReturnsConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.createPendingCert("crt_pending1", "acc_test1", []string{"pending.example.com"}); err != nil {
+	if err := h.createPendingCert("crt_pending1", "acc_test1", []string{"pending.example.com"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	gin.SetMode(gin.TestMode)

@@ -35,6 +35,8 @@ export interface Certificate {
   id: string
   status?: 'pending' | 'issued' | 'failed' | string
   account_id?: string
+  // 签发/续期首选验证方式（auto/http-01/dns-01；手动 DNS-01 仅当次有效，不存）
+  challenge?: ChallengeMode
   domains: string[]
   not_before: string
   not_after: string
@@ -249,6 +251,20 @@ export function renewCert(id: string) {
   return unwrap<{ ok: boolean; message: string }>(http.post(`/certs/${id}/renew`))
 }
 
+// 按新配置重新签发已有证书（同一条记录、同一批绑定）：账户、域名、
+// 验证方式任一改动都走这里。手动 DNS-01 时返回 order（两阶段）；
+// 其他验证方式返回 task_id（异步签发，轮询证书 renewing 状态看终态）。
+export function reissueCert(
+  id: string,
+  domains: string[],
+  accountId?: string,
+  challenge?: ChallengeMode,
+) {
+  return unwrap<{ ok: boolean; task_id?: string; cert_id?: string; order?: ManualDNSOrder; message: string }>(
+    http.post(`/certs/${id}/reissue`, { domains, account_id: accountId, challenge: challenge || undefined }),
+  )
+}
+
 // 编辑证书管理员备注（≤200 字，仅元信息，不影响证书本身；adminOnly + 审计）。
 export function updateCertRemark(id: string, remark: string) {
   return unwrap<{ data: Certificate }>(http.put(`/certs/${id}/remark`, { remark })).then(
@@ -273,6 +289,8 @@ export function deleteCert(id: string, force = false) {
 export interface ProxyBindDomain {
   domain: string
   cert_id?: string
+  // true = 该域名 80 端口 301 跳转 https；缺省/false = 80 直接提供明文访问。
+  force_https?: boolean
 }
 
 export interface ProxyBindRequest {

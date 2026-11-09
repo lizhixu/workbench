@@ -50,21 +50,22 @@ var ErrCertificateBeingIssued = errors.New("certificate is being issued and cann
 
 // Certificate is one issued certificate with its PEM material.
 type Certificate struct {
-	ID        string    `json:"id"`
-	AccountID string    `json:"account_id,omitempty"` // ID of the ACMEAccount that issued this cert
-	Domains   []string  `json:"domains"`              // SANs, e.g. ["*.example.com", "example.com"]
-	Status    string    `json:"status,omitempty"`     // pending | issued | failed；空值按 issued 兼容存量
-	CertPEM   string    `json:"-"`
-	KeyPEM    string    `json:"-"`
-	NotBefore time.Time `json:"not_before"`
-	NotAfter  time.Time `json:"not_after"`
-	Issuer    string    `json:"issuer,omitempty"`
-	AutoRenew bool      `json:"auto_renew"`
-	CreatedAt time.Time `json:"created_at"`
-	Renewing  bool      `json:"renewing,omitempty"`
-	LastError string    `json:"last_error,omitempty"`
-	Remark    string    `json:"remark,omitempty"` // admin-managed note (≤200 runes), edited via PUT /certs/:id/remark
-	LastLogAt time.Time `json:"last_log_at,omitempty"`
+	ID        string              `json:"id"`
+	AccountID string              `json:"account_id,omitempty"` // ID of the ACMEAccount that issued this cert
+	Challenge ChallengePreference `json:"challenge,omitempty"`  // preferred ACME challenge for issuance/renewal (auto/http-01/dns-01); manual DNS-01 is per-issuance only and is never stored
+	Domains   []string            `json:"domains"`              // SANs, e.g. ["*.example.com", "example.com"]
+	Status    string              `json:"status,omitempty"`     // pending | issued | failed；空值按 issued 兼容存量
+	CertPEM   string              `json:"-"`
+	KeyPEM    string              `json:"-"`
+	NotBefore time.Time           `json:"not_before"`
+	NotAfter  time.Time           `json:"not_after"`
+	Issuer    string              `json:"issuer,omitempty"`
+	AutoRenew bool                `json:"auto_renew"`
+	CreatedAt time.Time           `json:"created_at"`
+	Renewing  bool                `json:"renewing,omitempty"`
+	LastError string              `json:"last_error,omitempty"`
+	Remark    string              `json:"remark,omitempty"` // admin-managed note (≤200 runes), edited via PUT /certs/:id/remark
+	LastLogAt time.Time           `json:"last_log_at,omitempty"`
 }
 
 // DefaultDirectoryURL is the Let's Encrypt production ACME directory.
@@ -655,6 +656,22 @@ func (h *Hub) UpdateRemark(id, remark string) (*Certificate, error) {
 	return &cp, nil
 }
 
+// effectiveChallenge returns the challenge mechanism a renewal should
+// use: the preference stored on the record, falling back to auto when
+// unset, invalid, or manual (manual TXT provisioning cannot run
+// unattended in the renewal loop).
+func (c *Certificate) effectiveChallenge() ChallengePreference {
+	if c == nil {
+		return ChallengeAuto
+	}
+	switch c.Challenge {
+	case ChallengeAuto, ChallengeHTTP01, ChallengeDNS01:
+		return c.Challenge
+	default:
+		return ChallengeAuto
+	}
+}
+
 func (h *Hub) storeResult(id string, accountID string, domains []string, certPEM, keyPEM []byte, notBefore, notAfter time.Time, issuer string, autoRenew bool) error {
 	if err := os.WriteFile(h.certFile(id), certPEM, 0600); err != nil {
 		return err
@@ -678,14 +695,18 @@ func (h *Hub) storeResult(id string, accountID string, domains []string, certPEM
 		}
 	}
 	// A renewal rebuilds the record in place (same ID); the admin-managed
-	// remark predates it and must survive the re-issue.
+	// remark and the stored challenge preference predate it and must
+	// survive the re-issue.
 	var remark string
+	var challenge ChallengePreference
 	if prev, ok := h.certs[id]; ok {
 		remark = prev.Remark
+		challenge = prev.Challenge
 	}
 	h.certs[id] = &Certificate{
 		ID:        id,
 		AccountID: accountID,
+		Challenge: challenge,
 		Domains:   domains,
 		Status:    CertStatusIssued,
 		CertPEM:   string(certPEM),
@@ -722,12 +743,18 @@ func (h *Hub) markError(id, msg string) {
 // only after the ACME flow succeeds. The record carries no key material and a
 // zero validity window, so it is never usable for serving traffic; the issuing
 // goroutine later fills it in place (storeResult) or marks it failed.
-func (h *Hub) createPendingCert(id, accountID string, domains []string) error {
+func (h *Hub) createPendingCert(id, accountID string, domains []string, ch ChallengePreference) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// Manual DNS-01 is per-issuance only and can never run unattended;
+	// never persist it as the record's challenge preference.
+	if ch == ChallengeDNS01Manual {
+		ch = ChallengeAuto
+	}
 	h.certs[id] = &Certificate{
 		ID:        id,
 		AccountID: accountID,
+		Challenge: ch,
 		Domains:   append([]string(nil), domains...),
 		Status:    CertStatusPending,
 		AutoRenew: true,
@@ -890,6 +917,16 @@ func (h *Hub) IssueWithChallenge(identifiers []string, accountID string, ch Chal
 	if err := h.storeResult(id, acc.ID, clean, certPEM, keyPEM, notBefore, notAfter, issuer, true); err != nil {
 		return nil, err
 	}
+	// Persist the challenge preference on the new record (storeResult only
+	// preserves it from a previous record, and there is none here).
+	if ch != ChallengeAuto && ch != ChallengeDNS01Manual {
+		h.mu.Lock()
+		if c, ok := h.certs[id]; ok {
+			c.Challenge = ch
+			_ = h.saveCertsLocked()
+		}
+		h.mu.Unlock()
+	}
 	clog.Logf("完成入库", "证书入库成功: ID=%s, 包含域名: %s", id, strings.Join(clean, ", "))
 	h.notifyRenewed(id)
 	_ = h.SaveCertLog(id, clog.String())
@@ -928,7 +965,7 @@ func (h *Hub) StartIssueTask(identifiers []string, accountID string, ch Challeng
 	// 提前预生成证书 ID 与任务 ID，并在协程启动前立即落一条「签发中」占位
 	// 记录，让用户点击申请后列表立刻可见。
 	certID := "crt_" + randomHex(8)
-	if err := h.createPendingCert(certID, acc.ID, clean); err != nil {
+	if err := h.createPendingCert(certID, acc.ID, clean, ch); err != nil {
 		return nil, nil, fmt.Errorf("创建证书占位记录失败: %w", err)
 	}
 
@@ -998,6 +1035,144 @@ func (h *Hub) StartIssueTask(identifiers []string, accountID string, ch Challeng
 	}()
 
 	certCopy, _ := h.Get(certID)
+	return task, certCopy, nil
+}
+
+// StartReissueTask re-issues an existing certificate under a new
+// configuration (ACME account, domains, challenge preference) and stores
+// the result back into the same record (same ID, same bindings). The old
+// material keeps serving until the new issuance lands: a failed reissue
+// leaves the record untouched apart from LastError (markError) — the
+// domains on the record always describe the stored material, never an
+// issuance that did not happen, so a failed reissue can never make
+// FindByDomain/SNI match a domain the stored certificate does not cover.
+// The account and challenge changes are saved on the record up front
+// (they describe how the record is managed, not the material); a manual
+// challenge is never persisted — it cannot run unattended.
+func (h *Hub) StartReissueTask(id string, identifiers []string, accountID string, ch ChallengePreference) (*IssueTask, *Certificate, error) {
+	clean := make([]string, 0, len(identifiers))
+	for _, d := range identifiers {
+		d = strings.TrimSpace(strings.ToLower(d))
+		if d != "" {
+			clean = append(clean, d)
+		}
+	}
+	if len(clean) == 0 {
+		return nil, nil, fmt.Errorf("至少需要一个域名或 IP")
+	}
+
+	var acc *ACMEAccount
+	if accountID != "" {
+		got, ok := h.GetAccount(accountID)
+		if !ok {
+			return nil, nil, fmt.Errorf("ACME 机构账户 %s 不存在", accountID)
+		}
+		acc = got
+	} else {
+		got, err := h.GetDefaultAccount()
+		if err != nil {
+			return nil, nil, err
+		}
+		acc = got
+	}
+
+	h.mu.Lock()
+	cur, ok := h.certs[id]
+	if !ok {
+		h.mu.Unlock()
+		return nil, nil, fmt.Errorf("certificate %s not found", id)
+	}
+	if cur.Status == CertStatusPending {
+		h.mu.Unlock()
+		return nil, nil, fmt.Errorf("%w: %s", ErrCertificateBeingIssued, id)
+	}
+	if cur.Renewing {
+		h.mu.Unlock()
+		return nil, nil, fmt.Errorf("该证书正在续期中，请等待续期完成后再重新签发")
+	}
+	// The edit does not touch auto-renew: preserve the record's setting.
+	autoRenew := cur.AutoRenew
+	cur.Renewing = true
+	cur.LastError = ""
+	cur.AccountID = acc.ID
+	if ch != ChallengeDNS01Manual {
+		cur.Challenge = ch
+	}
+	_ = h.saveCertsLocked()
+	h.mu.Unlock()
+
+	task, err := h.CreateIssueTaskWithError(clean, acc.ID, string(ch))
+	if err != nil {
+		// Roll the in-flight marker back so the record is not stuck.
+		h.mu.Lock()
+		if c, ok := h.certs[id]; ok {
+			c.Renewing = false
+			_ = h.saveCertsLocked()
+		}
+		h.mu.Unlock()
+		return nil, nil, fmt.Errorf("保存签发任务失败: %w", err)
+	}
+
+	// Bind the task to the existing record (not a fresh id).
+	_ = h.UpdateIssueTaskWithError(task.ID, func(t *IssueTask) {
+		t.CertID = id
+	})
+	task.CertID = id
+
+	clog := newCertLogger(task.ID, h.log)
+	h.RegisterLiveLog(task.ID, clog)
+	h.RegisterLiveLog(id, clog)
+
+	go func() {
+		defer h.UnregisterLiveLog(task.ID)
+		defer h.UnregisterLiveLog(id)
+		h.acmeMu.Lock()
+		defer h.acmeMu.Unlock()
+		clog.Logf("准备账户", "启动证书重新签发任务 [%s], 域名/IP: %s, 挑战机制: %s", task.ID, strings.Join(clean, ", "), string(ch))
+		certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, clean, ch, clog)
+		if err != nil {
+			clog.Warnf("完成入库", "证书重新签发失败: %v", err)
+			h.markError(id, err.Error())
+			_ = h.SaveCertLog(id, clog.String())
+			if updateErr := h.UpdateIssueTaskWithError(task.ID, func(t *IssueTask) {
+				t.Status = TaskFailed
+				t.Error = err.Error()
+				t.Log = clog.String()
+			}); updateErr != nil {
+				h.log.Error("persist failed cert reissue task state", "id", task.ID, "err", updateErr)
+			}
+			return
+		}
+		clog.Logf("完成入库", "证书获取完成，正在入库: ID=%s", id)
+		if err := h.storeResult(id, acc.ID, clean, certPEM, keyPEM, notBefore, notAfter, issuer, autoRenew); err != nil {
+			clog.Warnf("完成入库", "证书存储失败: %v", err)
+			h.markError(id, err.Error())
+			_ = h.SaveCertLog(id, clog.String())
+			if updateErr := h.UpdateIssueTaskWithError(task.ID, func(t *IssueTask) {
+				t.Status = TaskFailed
+				t.CertID = id
+				t.Error = err.Error()
+				t.Log = clog.String()
+			}); updateErr != nil {
+				h.log.Error("persist failed cert reissue task state", "id", task.ID, "err", updateErr)
+			}
+			return
+		}
+		clog.Logf("完成入库", "证书已成功入库: %s", id)
+		h.notifyRenewed(id)
+		if err := h.SaveCertLog(id, clog.String()); err != nil {
+			h.log.Warn("persist cert reissue log failed", "id", id, "err", err)
+		}
+		if updateErr := h.UpdateIssueTaskWithError(task.ID, func(t *IssueTask) {
+			t.Status = TaskSuccess
+			t.CertID = id
+			t.Log = clog.String()
+		}); updateErr != nil {
+			h.log.Error("persist successful cert reissue task state failed", "id", task.ID, "err", updateErr)
+		}
+	}()
+
+	certCopy, _ := h.Get(id)
 	return task, certCopy, nil
 }
 
@@ -1103,7 +1278,7 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 		acc = got
 	}
 
-	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, c.Domains, ChallengeAuto, clog)
+	certPEM, keyPEM, notBefore, notAfter, issuer, err := h.issueACME(acc, c.Domains, c.effectiveChallenge(), clog)
 	if err != nil {
 		clog.Warnf("完成入库", "证书续期失败: %v", err)
 		_ = h.SaveCertLog(id, clog.String())

@@ -17,7 +17,11 @@ import (
 // the record reaches the provider's API in seconds (their default TTL of
 // 600 only governs caching resolvers, but their NS clusters keep syncing
 // across nodes for minutes, and the queried NS IP set can include late or
-// filtered nodes — hitting i/o timeouts one poll at a time).
+// filtered nodes — hitting i/o timeouts one poll at a time). The check
+// therefore requires a strict majority of the discovered NS addresses to
+// serve the value, and then cross-checks it through the system resolver
+// (the external recursive view the CA sees), before the CA is notified; a
+// single synced node no longer passes.
 var dns01PropagationCheckTimeout = 600 * time.Second
 
 // dns01PropagationCheckInterval is the polling interval between propagation checks.
@@ -44,6 +48,27 @@ var dns01QueryTimeout = 3 * time.Second
 // It is a package-level variable so tests can stub it without spinning up
 // real DNS nameservers.
 var dns01AuthoritativeCheck = verifyDNSTXTPropagation
+
+// systemTXTLookup is the system-resolver TXT lookup behind both the
+// authoritative check's fallback and the public-resolver cross-check. It
+// reads net.DefaultResolver at call time (not a bound method value) so
+// tests that replace the resolver still take effect, and so tests can stub
+// it outright.
+var systemTXTLookup = func(ctx context.Context, fqdn string) ([]string, error) {
+	return net.DefaultResolver.LookupTXT(ctx, fqdn)
+}
+
+// dns01PublicCheckTimeout bounds the public-resolver cross-check that runs
+// after the authoritative quorum passes. The CA validates through its own
+// recursive resolvers; three minutes is enough for a converged record to
+// show up in the public view, and a longer wait would only burn the shared
+// propagation budget on a broken host resolver.
+var dns01PublicCheckTimeout = 3 * time.Minute
+
+// discoverAuthoritativeNS resolves the authoritative nameserver addresses
+// for a zone. It is a package-level variable so tests can point the
+// propagation check at fake nameservers without real DNS.
+var discoverAuthoritativeNS = discoverAuthoritativeAddrs
 
 // buildDNSQuery builds an RFC 1035 UDP DNS query packet for TXT records of the given FQDN.
 func buildDNSQuery(fqdn string, recursionDesired bool) ([]byte, uint16, error) {
@@ -324,55 +349,100 @@ func rotateNSAddrs(nsAddrs []string, attempt int) []string {
 	return append(append([]string{}, nsAddrs[r:]...), nsAddrs[:r]...)
 }
 
+// queryAuthoritativeTXTServer queries one authoritative nameserver for the
+// TXT records of fqdn. It is a package-level variable so tests can stub the
+// transport and pin the quorum logic without real UDP sockets (loopback UDP
+// replies are not deliverable in some sandboxes).
+var queryAuthoritativeTXTServer = queryAuthoritativeServer
+
 // lookupAuthoritativeTXT queries the pre-resolved authoritative nameserver
 // addresses for fqdn and checks whether want is present in the returned TXT
-// records. When no addresses were discovered, or authoritative queries fail,
-// it falls back to the system resolver. detail explains the miss so the
-// polling log (and the final timeout error) can distinguish "DNS answered,
-// record not propagated yet" from "NS unreachable".
-func lookupAuthoritativeTXT(ctx context.Context, nsAddrs []string, fqdn, want string) (found bool, detail string) {
-	var answered bool
+// records. It passes only when a strict majority of the nameservers already
+// serve the value (quorum = len(nsAddrs)/2+1; e.g. 9 of 16) — a single
+// synced node is not enough, because the CA may query any node, and a
+// first-hit pass let an issuance notify the CA while most of the
+// provider's cluster had not converged yet (ZeroSSL, 2026-11-05).
+//
+// It returns the number of nameservers that served the value and the total
+// discovered, so the caller can log the quorum and diagnose a partial sync.
+// When no addresses were discovered, or no authoritative query answered at
+// all, it falls back to the system resolver — the path the no-NS case
+// relies on. The fallback is also consulted when every answering
+// nameserver returned no TXT records at all (a CNAME-delegated
+// _acme-challenge, where the zone NS answers with a CNAME instead of TXT);
+// when nameservers do return TXT records, the system resolver never
+// overrides them. detail explains the miss (or a resolver-side pass) so
+// the polling log and the final timeout error can distinguish "DNS
+// answered, record not propagated yet" from "NS unreachable".
+func lookupAuthoritativeTXT(ctx context.Context, nsAddrs []string, fqdn, want string) (found bool, hits, total int, detail string) {
+	total = len(nsAddrs)
+	quorum := total/2 + 1
+	var answered, anyTXT bool
+	var failures int
 	var lastErr error
 	for _, addr := range nsAddrs {
-		txts, qErr := queryAuthoritativeServer(ctx, addr, fqdn)
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		txts, qErr := queryAuthoritativeTXTServer(ctx, addr, fqdn)
 		if qErr != nil {
+			failures++
 			lastErr = qErr
 			continue
 		}
 		answered = true
+		if len(txts) > 0 {
+			anyTXT = true
+		}
 		for _, t := range txts {
 			if t == want {
-				return true, ""
+				hits++
+				break
 			}
+		}
+		if hits >= quorum {
+			return true, hits, total, ""
 		}
 	}
 
-	var sysErr error
-	if sysTxts, err := net.DefaultResolver.LookupTXT(ctx, fqdn); err == nil {
-		answered = true
-		for _, t := range sysTxts {
-			if t == want {
-				return true, ""
+	// The system resolver is the source of truth only when the
+	// authoritative path yielded nothing usable: no nameserver answered,
+	// or every answer carried no TXT records at all (CNAME delegation).
+	if !answered || !anyTXT {
+		if sysTxts, err := systemTXTLookup(ctx, fqdn); err == nil {
+			for _, t := range sysTxts {
+				if t == want {
+					if len(nsAddrs) == 0 {
+						return true, 0, total, "系统解析器已见记录"
+					}
+					return true, 0, total, "系统解析器已见记录（权威 NS 未返回 TXT 记录）"
+				}
 			}
+		} else if !answered {
+			// Both paths failed and nothing answered: surface both errors.
+			if lastErr != nil {
+				return false, hits, total, fmt.Sprintf("权威 NS 查询失败: %v；系统解析器失败: %v", lastErr, err)
+			}
+			return false, hits, total, fmt.Sprintf("未定位到权威 NS，系统解析器失败: %v", err)
 		}
-	} else {
-		sysErr = err
 	}
 
-	switch {
-	case answered:
+	failSuffix := ""
+	if failures > 0 {
+		failSuffix = fmt.Sprintf("；另有 %d 个 NS 查询失败（最后一次: %v）", failures, lastErr)
+	}
+	if hits > 0 {
+		return false, hits, total, fmt.Sprintf("仅 %d/%d 个权威 NS 见到该 TXT 记录（需至少 %d 个）%s", hits, total, quorum, failSuffix)
+	}
+	if answered {
 		// Reachable and answering — the record simply has not shown up yet,
 		// which is the normal state while propagation is in flight.
-		return false, "DNS 已应答但尚未返回该 TXT 记录"
-	case lastErr != nil && sysErr != nil:
-		return false, fmt.Sprintf("权威 NS 查询失败: %v；系统解析器失败: %v", lastErr, sysErr)
-	case lastErr != nil:
-		return false, fmt.Sprintf("权威 NS 查询失败: %v；系统解析器未见记录", lastErr)
-	case sysErr != nil:
-		return false, fmt.Sprintf("未定位到权威 NS，系统解析器失败: %v", sysErr)
-	default:
-		return false, "未定位到权威 NS，系统解析器未见记录"
+		return false, hits, total, "DNS 已应答但尚未返回该 TXT 记录" + failSuffix
 	}
+	if lastErr != nil {
+		return false, hits, total, fmt.Sprintf("权威 NS 查询失败: %v；系统解析器未见记录%s", lastErr, failSuffix)
+	}
+	return false, hits, total, "未定位到权威 NS，系统解析器未见记录"
 }
 
 // lookupAuthoritativeTXTValues returns every TXT string currently published
@@ -381,9 +451,9 @@ func lookupAuthoritativeTXT(ctx context.Context, nsAddrs []string, fqdn, want st
 // path to tell "record not propagated yet" apart from "the DNS backend
 // replaced our record set".
 func lookupAuthoritativeTXTValues(ctx context.Context, fqdn string) ([]string, error) {
-	if addrs, err := discoverAuthoritativeAddrs(ctx, 10*time.Second, fqdn); err == nil {
+	if addrs, err := discoverAuthoritativeNS(ctx, 10*time.Second, fqdn); err == nil {
 		for _, addr := range addrs {
-			if txts, qErr := queryAuthoritativeServer(ctx, addr, fqdn); qErr == nil {
+			if txts, qErr := queryAuthoritativeTXTServer(ctx, addr, fqdn); qErr == nil {
 				return txts, nil
 			}
 		}
@@ -441,9 +511,11 @@ var dns01PollSchedule = func(elapsed time.Duration) time.Duration {
 }
 
 // verifyDNSTXTPropagation polls authoritative nameservers until the expected
-// TXT value is visible, or the timeout is exceeded. Every attempt is reported
-// through logf, and the timeout error always carries the attempt count and the
-// last attempt's reason — never a bare context deadline.
+// TXT value is visible on a strict majority of them, then cross-checks it
+// through the system resolver (the external, recursive view the CA sees)
+// before reporting success. Every attempt is reported through logf, and the
+// timeout error always carries the attempt count and the last attempt's
+// reason — never a bare context deadline.
 func verifyDNSTXTPropagation(ctx context.Context, logf func(format string, args ...any), fqdn, want string) error {
 	if logf == nil {
 		logf = func(string, ...any) {}
@@ -467,7 +539,7 @@ func verifyDNSTXTPropagation(ctx context.Context, logf func(format string, args 
 		deadline = ctxDeadline
 	}
 
-	nsAddrs, nsErr := discoverAuthoritativeAddrs(ctx, time.Until(deadline), fqdn)
+	nsAddrs, nsErr := discoverAuthoritativeNS(ctx, time.Until(deadline), fqdn)
 	if len(nsAddrs) == 0 {
 		if nsErr != nil {
 			logf("未定位到权威 NS（%v），改用系统解析器轮询 TXT 生效", nsErr)
@@ -481,10 +553,16 @@ func verifyDNSTXTPropagation(ctx context.Context, logf func(format string, args 
 
 	attempt := 0
 	detail := "尚未探测"
+	bestHits, bestTotal := 0, 0
 	timeoutErr := func() error {
-		return fmt.Errorf("DNS 传播校验超时（已等待 %s）: %s 的 TXT 记录 %q 未能在权威 NS 生效（共探测 %d 次，最后一次: %s）",
+		msg := fmt.Sprintf("DNS 传播校验超时（已等待 %s）: %s 的 TXT 记录 %q 未能在权威 NS 生效（共探测 %d 次，最后一次: %s）",
 			time.Since(start).Round(time.Second), fqdn, want, attempt, detail)
+		if bestTotal > 0 {
+			msg += fmt.Sprintf("；最多 %d/%d 个权威 NS 见到记录", bestHits, bestTotal)
+		}
+		return errors.New(msg)
 	}
+	quorumHits, quorumTotal := 0, 0
 	for {
 		elapsed := time.Since(start)
 		remaining := time.Until(deadline)
@@ -502,11 +580,23 @@ func verifyDNSTXTPropagation(ctx context.Context, logf func(format string, args 
 		// nameservers whenever the head ones are slow or filtered.
 		// Rotation spreads the budget across all of them over attempts.
 		addrs := rotateNSAddrs(nsAddrs, attempt)
-		found, d := lookupAuthoritativeTXT(attemptCtx, addrs, fqdn, want)
+		found, hits, total, d := lookupAuthoritativeTXT(attemptCtx, addrs, fqdn, want)
 		cancel()
+		if hits > bestHits {
+			bestHits, bestTotal = hits, total
+		}
 		if found {
-			logf("第 %d 次探测命中，TXT 记录已生效", attempt)
-			return nil
+			quorumHits, quorumTotal = hits, total
+			if hits > 0 {
+				logf("第 %d 次探测命中（%d/%d 个权威 NS 已见记录），TXT 记录已生效", attempt, hits, total)
+			} else {
+				// Passed via the system resolver (no NS discovered, or the
+				// zone NS returned no TXT at all): the external view is
+				// already proven by the same resolver, so stage 2 is moot.
+				logf("第 %d 次探测命中（%s），TXT 记录已生效", attempt, d)
+				return nil
+			}
+			break
 		}
 		if attempt == 1 || !errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
 			detail = d
@@ -525,5 +615,75 @@ func verifyDNSTXTPropagation(ctx context.Context, logf func(format string, args 
 			return ctx.Err()
 		case <-time.After(wait):
 		}
+	}
+
+	// Stage 2: public-resolver cross-check. The authoritative quorum proves
+	// the provider's cluster converged, but the CA validates through its
+	// own recursive resolvers — a second, external view must see the value
+	// before the CA is notified.
+	return verifyPublicTXTPropagation(ctx, logf, fqdn, want, deadline, quorumHits, quorumTotal)
+}
+
+// verifyPublicTXTPropagation is the second stage of the propagation check:
+// after the authoritative quorum passes, the TXT value must also be visible
+// through the system resolver (the external, recursive view the CA sees)
+// before the CA is notified. It polls within the shared propagation
+// deadline, capped by dns01PublicCheckTimeout, and returns a diagnostic
+// that names the public view explicitly so it is never confused with an
+// authoritative-NS timeout.
+func verifyPublicTXTPropagation(ctx context.Context, logf func(format string, args ...any), fqdn, want string, deadline time.Time, quorumHits, quorumTotal int) error {
+	start := time.Now()
+	stageDeadline := deadline
+	if cap := start.Add(dns01PublicCheckTimeout); cap.Before(stageDeadline) {
+		stageDeadline = cap
+	}
+	detail := "尚未探测"
+	timeoutErr := func() error {
+		quorumClause := "已在系统解析器生效"
+		if quorumTotal > 0 {
+			quorumClause = fmt.Sprintf("已在多数权威 NS 生效（%d/%d）", quorumHits, quorumTotal)
+		}
+		return fmt.Errorf("DNS 公共解析器校验超时（已等待 %s）: %s 的 TXT 记录 %q %s，但公共解析器未见记录（最后一次: %s）；CA 可能同样查不到，请等待 DNS 传播完成后再试",
+			time.Since(start).Round(time.Second), fqdn, want, quorumClause, detail)
+	}
+	elapsed := time.Duration(0)
+	for {
+		if !time.Now().Before(stageDeadline) {
+			return timeoutErr()
+		}
+		lookupCtx, cancel := context.WithTimeout(ctx, dns01AttemptTimeout)
+		txts, err := systemTXTLookup(lookupCtx, fqdn)
+		cancel()
+		if err == nil {
+			seen := false
+			for _, t := range txts {
+				if t == want {
+					seen = true
+					break
+				}
+			}
+			if seen {
+				logf("公共解析器已见 TXT 记录，外部视角确认")
+				return nil
+			}
+			detail = "公共解析器已应答但尚未返回该 TXT 记录"
+		} else {
+			detail = fmt.Sprintf("公共解析器查询失败: %v", err)
+		}
+		logf("公共解析器未见记录（%s），继续等待...", detail)
+
+		wait := dns01PollSchedule(elapsed)
+		if remaining := time.Until(stageDeadline); remaining < wait {
+			wait = remaining
+		}
+		select {
+		case <-ctx.Done():
+			if !time.Now().Before(stageDeadline) {
+				return timeoutErr()
+			}
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+		elapsed = time.Since(start)
 	}
 }

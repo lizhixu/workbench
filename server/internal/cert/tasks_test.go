@@ -279,7 +279,7 @@ func TestPendingCertLifecycleAndDomainExclusion(t *testing.T) {
 	accountID := "acc_test1"
 
 	// 1. createPendingCert
-	if err := hub.createPendingCert(certID, accountID, domains); err != nil {
+	if err := hub.createPendingCert(certID, accountID, domains, ""); err != nil {
 		t.Fatalf("createPendingCert: %v", err)
 	}
 
@@ -324,7 +324,7 @@ func TestPendingCertLifecycleAndDomainExclusion(t *testing.T) {
 
 	// 4. Restart reconciliation: pending -> failed
 	certPendingOrphan := "crt_orphan1"
-	if err := hub.createPendingCert(certPendingOrphan, accountID, []string{"orphan.example.com"}); err != nil {
+	if err := hub.createPendingCert(certPendingOrphan, accountID, []string{"orphan.example.com"}, ""); err != nil {
 		t.Fatalf("create orphan pending: %v", err)
 	}
 

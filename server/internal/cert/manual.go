@@ -276,6 +276,28 @@ func validPendingID(id string) bool {
 // Network I/O (account setup, order creation, authorization fetch) runs
 // without holding the hub lock; only the final persist takes it briefly.
 func (h *Hub) StartManualDNSOrder(identifiers []string, accountID string) (*PendingOrder, error) {
+	return h.startManualDNSOrder(identifiers, accountID, "")
+}
+
+// StartManualReissueOrder creates a manual DNS-01 order that, once
+// confirmed, stores the issued certificate back into the existing record
+// id instead of a fresh one. The record is only guarded at creation
+// (not pending/renewing); no Renewing flag is held while the order waits
+// for the administrator to provision TXT records — that wait is
+// unbounded, and a stuck flag would brick renewals. Confirm re-checks
+// the guard and holds Renewing only for the finalize itself.
+func (h *Hub) StartManualReissueOrder(id string, identifiers []string, accountID string) (*PendingOrder, error) {
+	if c, ok := h.Get(id); !ok {
+		return nil, fmt.Errorf("certificate %s not found", id)
+	} else if c.Status == CertStatusPending {
+		return nil, fmt.Errorf("%w: %s", ErrCertificateBeingIssued, id)
+	} else if c.Renewing {
+		return nil, fmt.Errorf("该证书正在续期中，请等待续期完成后再重新签发")
+	}
+	return h.startManualDNSOrder(identifiers, accountID, id)
+}
+
+func (h *Hub) startManualDNSOrder(identifiers []string, accountID string, targetCertID string) (*PendingOrder, error) {
 	clean := make([]string, 0, len(identifiers))
 	for _, d := range identifiers {
 		d = strings.TrimSpace(strings.ToLower(d))
@@ -320,6 +342,7 @@ func (h *Hub) StartManualDNSOrder(identifiers []string, accountID string) (*Pend
 		OrderURL:    orderURL,
 		FinalizeURL: order.Finalize,
 		Status:      ManualOrderAwaitingDNS,
+		CertID:      targetCertID,
 		CreatedAt:   time.Now(),
 		ExpiresAt:   time.Now().Add(manualOrderTTL),
 	}
@@ -473,7 +496,11 @@ func (h *Hub) ConfirmManualDNSOrder(id string) (*Certificate, error) {
 	// fail records the error on the pending order. terminal=false means the
 	// same order may be confirmed again (nothing was sent to the CA, or the
 	// failure was transient); terminal=true means the CA already reached a
-	// final verdict on this order and it must not be retried.
+	// final verdict on this order and it must not be retried. A failed
+	// reissue confirm also releases the target record's in-flight marker,
+	// but only when this confirm set it (heldRenewing) — never clobber a
+	// renewal that was already running when confirm was refused.
+	heldRenewing := false
 	fail := func(msg string, err error, terminal bool) (*Certificate, error) {
 		full := msg
 		if err != nil {
@@ -488,9 +515,37 @@ func (h *Hub) ConfirmManualDNSOrder(id string) (*Certificate, error) {
 			cur.Terminal = terminal
 			_ = h.savePendingLocked(cur)
 		}
+		if heldRenewing && p.CertID != "" {
+			if c, ok := h.certs[p.CertID]; ok {
+				c.Renewing = false
+				_ = h.saveCertsLocked()
+			}
+		}
 		h.mu.Unlock()
 		h.log.Warn("manual dns-01 order failed", "id", id, "err", full, "terminal", terminal)
 		return nil, fmt.Errorf("%s", full)
+	}
+
+	// A reissue order stores into an existing record: hold Renewing for
+	// the finalize so a concurrent renewal cannot land after this one
+	// and silently undo it. The flag is released by fail() on every error
+	// path below and by storeResult's rebuild on success, so it can never
+	// stick if the order is abandoned or the target deleted.
+	if p.CertID != "" {
+		h.mu.Lock()
+		target, ok := h.certs[p.CertID]
+		if !ok {
+			h.mu.Unlock()
+			return fail("目标证书已被删除，请重新发起签发", nil, true)
+		}
+		if target.Renewing {
+			h.mu.Unlock()
+			return fail("该证书正在续期中，请等待续期完成后再确认验证", nil, false)
+		}
+		target.Renewing = true
+		heldRenewing = true
+		_ = h.saveCertsLocked()
+		h.mu.Unlock()
 	}
 
 	// Sanity check first: every expected TXT value must be visible before
@@ -522,7 +577,7 @@ func (h *Hub) ConfirmManualDNSOrder(id string) (*Certificate, error) {
 		if err := client.triggerChallenge(az.ChallengeURL, accountKey); err != nil {
 			return fail(fmt.Sprintf("通知 CA 验证 %q 失败", az.IdentifierValue), err, false)
 		}
-		if err := client.pollAuthorizationWithTimeout(az.URL, accountKey, 10*time.Minute); err != nil {
+		if err := client.pollAuthorizationWithTimeout(az.URL, accountKey, caAuthzPollTimeout); err != nil {
 			// An invalid/expired authorization is a terminal CA verdict: the
 			// order is dead and must be recreated. A timeout is transient —
 			// the authorization may still flip to valid, so retrying is safe.
@@ -562,12 +617,26 @@ func (h *Hub) ConfirmManualDNSOrder(id string) (*Certificate, error) {
 	if issuer == "" {
 		issuer = acc.Name
 	}
-	certID := "crt_" + randomHex(8)
-	// Manually issued: the renewal loop uses automatic challenges (HTTP-01 /
-	// dns-mng DNS-01), which is exactly what the administrator bypassed by
+	// A reissue order stores back into its target record, preserving the
+	// record's auto-renew setting (the edit never touches it). A fresh
+	// manual issuance stays non-auto-renewing: the renewal loop's
+	// automatic challenges are exactly what the administrator bypassed by
 	// choosing the manual two-phase flow — auto-renew would only fail
 	// repeatedly. Leave AutoRenew off; the alert monitor reminds before expiry.
-	if err := h.storeResult(certID, acc.ID, p.Identifiers, certPEM, keyPEM, notBefore, notAfter, issuer, false); err != nil {
+	certID := p.CertID
+	autoRenew := false
+	if certID != "" {
+		if c, ok := h.Get(certID); ok {
+			autoRenew = c.AutoRenew
+		} else {
+			// The target was deleted while the order waited: never
+			// resurrect it under a fresh id.
+			return fail("目标证书已被删除，请重新发起签发", nil, true)
+		}
+	} else {
+		certID = "crt_" + randomHex(8)
+	}
+	if err := h.storeResult(certID, acc.ID, p.Identifiers, certPEM, keyPEM, notBefore, notAfter, issuer, autoRenew); err != nil {
 		// The certificate was issued but could not be stored locally; the
 		// order is consumed, so a fresh order is required.
 		return fail("保存证书失败", err, true)

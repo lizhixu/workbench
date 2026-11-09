@@ -850,7 +850,7 @@ func (a *acmeClient) satisfyAuthorizations(authzURLs []string, accountKey crypto
 				a.logStagef("挑战呈现", format, args...)
 			}, pc.dnsFQDN, pc.dnsTXT)
 			if err != nil {
-				a.warnStagef("挑战呈现", "权威 NS 传播校验失败: %v", err)
+				a.warnStagef("挑战呈现", "DNS 传播校验失败: %v", err)
 				// Batch present depends on the DNS backend appending values
 				// for a shared FQDN. If it replaces them instead, this
 				// record vanishes while a sibling batch record shows up;
@@ -864,12 +864,12 @@ func (a *acmeClient) satisfyAuthorizations(authzURLs []string, accountKey crypto
 				}
 				if hint := detectReplacement(pc.dnsFQDN, pc.dnsTXT, siblings, lookupAuthoritativeTXTValues); hint != "" {
 					a.warnStagef("挑战呈现", "%s", hint)
-					return cleanups, fmt.Errorf("DNS 权威服务器传播校验失败: %w；%s", err, hint)
+					return cleanups, fmt.Errorf("DNS 传播校验失败: %w；%s", err, hint)
 				}
-				return cleanups, fmt.Errorf("DNS 权威服务器传播校验失败: %w", err)
+				return cleanups, fmt.Errorf("DNS 传播校验失败: %w", err)
 			}
 		}
-		a.logStagef("挑战呈现", "DNS-01 全部 TXT 记录已在权威 NS 生效，准备通知 CA 验证")
+		a.logStagef("挑战呈现", "DNS-01 全部 TXT 记录已生效（权威 NS 多数命中、公共解析器可见），准备通知 CA 验证")
 	}
 
 	// Phase 4: Unified trigger.
@@ -921,14 +921,22 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
+// caAuthzPollTimeout is the deadline for waiting on one CA authorization
+// to become valid, shared by the automatic flow and the manual DNS-01
+// flow. 10 minutes: the CA validates through its own resolvers, which
+// may take minutes to see a fresh TXT record even after the panel's
+// authoritative-NS propagation check confirms it (ZeroSSL took longer
+// than the old 3-minute deadline on 2026-11-05 while the record was live
+// on all authoritative NS — the authorization stayed pending, never
+// invalid, until the poll gave up).
+const caAuthzPollTimeout = 10 * time.Minute
+
 // pollAuthorization waits until the authorization becomes valid.
 func (a *acmeClient) pollAuthorization(authzURL string, accountKey crypto.Signer) error {
-	return a.pollAuthorizationWithTimeout(authzURL, accountKey, 3*time.Minute)
+	return a.pollAuthorizationWithTimeout(authzURL, accountKey, caAuthzPollTimeout)
 }
 
 // pollAuthorizationWithTimeout is pollAuthorization with a custom deadline.
-// The manual DNS-01 flow uses a longer deadline because the administrator
-// adds the TXT records by hand and CA-side DNS propagation takes longer.
 func (a *acmeClient) pollAuthorizationWithTimeout(authzURL string, accountKey crypto.Signer, timeout time.Duration) error {
 	a.logStagef("CA验证", "轮询 CA 授权状态 (URL=%s, 最长等待=%s)...", authzURL, timeout)
 	deadline := time.Now().Add(timeout)

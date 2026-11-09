@@ -133,6 +133,7 @@ export const actionLabels: Record<string, string> = {
   cert_issue: '签发证书',
   cert_import: '导入已有证书',
   cert_renew: '续期证书',
+  cert_reissue: '按新配置重新签发证书',
   cert_delete: '删除证书',
   cert_config_update: '更新证书 DNS 验证配置',
   cert_account_create: '添加 ACME 账户',

@@ -280,16 +280,13 @@ func TestQueryAuthoritativeServerQueryBounded(t *testing.T) {
 // answering-but-not-yet-propagated NS: the normal state while propagation is
 // in flight, not a reachability failure.
 func TestLookupAuthoritativeTXTDetails(t *testing.T) {
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("ListenPacket: %v", err)
-	}
-	defer pc.Close()
-	go serveTXT(pc, "some-other-token")
+	stubNSTransport(t, func(context.Context, string, string) ([]string, error) {
+		return []string{"some-other-token"}, nil
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	found, detail := lookupAuthoritativeTXT(ctx, []string{pc.LocalAddr().String()}, "_acme-challenge.example.com", "want-val")
+	found, _, _, detail := lookupAuthoritativeTXT(ctx, []string{"ns1:53"}, "_acme-challenge.example.com", "want-val")
 	if found {
 		t.Fatal("expected miss for a different TXT value")
 	}
@@ -302,25 +299,11 @@ func TestLookupAuthoritativeTXTDetails(t *testing.T) {
 // failures must be surfaced, not silently swallowed into a bare "not found".
 func TestLookupAuthoritativeTXTDeadNS(t *testing.T) {
 	stubTestResolver(t) // system-resolver fallback fails instantly, deterministically
-	oldQuery := dns01QueryTimeout
-	dns01QueryTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { dns01QueryTimeout = oldQuery })
+	stubNSTransport(t, func(context.Context, string, string) ([]string, error) {
+		return nil, errors.New("i/o timeout")
+	})
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("ListenPacket: %v", err)
-	}
-	defer pc.Close()
-	go func() { // read and never reply
-		buf := make([]byte, 512)
-		for {
-			if _, _, err := pc.ReadFrom(buf); err != nil {
-				return
-			}
-		}
-	}()
-
-	found, detail := lookupAuthoritativeTXT(context.Background(), []string{pc.LocalAddr().String()}, "_acme-challenge.example.com", "want-val")
+	found, _, _, detail := lookupAuthoritativeTXT(context.Background(), []string{"ns1:53"}, "_acme-challenge.example.com", "want-val")
 	if found {
 		t.Fatal("expected miss against a dead NS")
 	}
@@ -408,5 +391,203 @@ func TestRotateNSAddrs(t *testing.T) {
 	}
 	if got := rotateNSAddrs(nil, 2); len(got) != 0 {
 		t.Errorf("empty NS list must stay empty: %v", got)
+	}
+}
+
+// stubNSTransport replaces the authoritative-NS UDP transport with canned
+// per-address answers, so quorum counting is pinned without real sockets
+// (loopback UDP replies are not deliverable in some sandboxes).
+func stubNSTransport(t *testing.T, fn func(context.Context, string, string) ([]string, error)) {
+	t.Helper()
+	old := queryAuthoritativeTXTServer
+	queryAuthoritativeTXTServer = fn
+	t.Cleanup(func() { queryAuthoritativeTXTServer = old })
+}
+
+// stubSystemTXTLookup replaces the system-resolver TXT lookup seam.
+func stubSystemTXTLookup(t *testing.T, fn func(context.Context, string) ([]string, error)) {
+	t.Helper()
+	old := systemTXTLookup
+	systemTXTLookup = fn
+	t.Cleanup(func() { systemTXTLookup = old })
+}
+
+// TestLookupAuthoritativeTXTQuorum pins the majority rule: a single synced
+// node must not pass the check (the ZeroSSL failure — one of 16 NS had the
+// value after 3 seconds while the rest of the cluster had not converged),
+// a strict majority must.
+func TestLookupAuthoritativeTXTQuorum(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fqdn := "_acme-challenge.example.com"
+	want := "want-val"
+
+	twoOfThree := map[string][]string{
+		"ns1:53": {want},
+		"ns2:53": {want},
+		"ns3:53": {"other-val"},
+	}
+	stubNSTransport(t, func(_ context.Context, addr, _ string) ([]string, error) {
+		return twoOfThree[addr], nil
+	})
+	found, hits, total, _ := lookupAuthoritativeTXT(ctx, []string{"ns1:53", "ns2:53", "ns3:53"}, fqdn, want)
+	if !found || hits != 2 || total != 3 {
+		t.Fatalf("2 of 3 synced: found=%v hits=%d total=%d, want true/2/3", found, hits, total)
+	}
+
+	oneOfThree := map[string][]string{
+		"ns1:53": {want},
+		"ns2:53": {"other-val"},
+		"ns3:53": {"other-val"},
+	}
+	stubNSTransport(t, func(_ context.Context, addr, _ string) ([]string, error) {
+		return oneOfThree[addr], nil
+	})
+	found, hits, total, detail := lookupAuthoritativeTXT(ctx, []string{"ns1:53", "ns2:53", "ns3:53"}, fqdn, want)
+	if found {
+		t.Fatal("1 of 3 synced must not pass the quorum")
+	}
+	if hits != 1 || total != 3 {
+		t.Fatalf("1 of 3 synced: hits=%d total=%d, want 1/3", hits, total)
+	}
+	if !strings.Contains(detail, "仅 1/3") || !strings.Contains(detail, "需至少 2 个") {
+		t.Errorf("detail = %q, want partial-quorum explanation", detail)
+	}
+
+	// A single nameserver keeps the old behavior: quorum of one is one.
+	stubNSTransport(t, func(context.Context, string, string) ([]string, error) {
+		return []string{want}, nil
+	})
+	found, hits, total, _ = lookupAuthoritativeTXT(ctx, []string{"ns1:53"}, fqdn, want)
+	if !found || hits != 1 || total != 1 {
+		t.Fatalf("single NS: found=%v hits=%d total=%d, want true/1/1", found, hits, total)
+	}
+}
+
+// TestLookupAuthoritativeTXTResolverFallback pins when the system resolver
+// may speak: no nameservers at all, or every answer carrying no TXT records
+// (CNAME delegation). It must never override nameservers that do return TXT
+// records — that is the quorum's job.
+func TestLookupAuthoritativeTXTResolverFallback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fqdn := "_acme-challenge.example.com"
+	want := "want-val"
+
+	stubSystemTXTLookup(t, func(context.Context, string) ([]string, error) {
+		return []string{want}, nil
+	})
+	found, _, _, detail := lookupAuthoritativeTXT(ctx, nil, fqdn, want)
+	if !found || !strings.Contains(detail, "系统解析器已见记录") {
+		t.Fatalf("no NS + resolver hit: found=%v detail=%q, want pass via resolver", found, detail)
+	}
+
+	stubSystemTXTLookup(t, func(context.Context, string) ([]string, error) {
+		return nil, errors.New("resolver down")
+	})
+	found, _, _, detail = lookupAuthoritativeTXT(ctx, nil, fqdn, want)
+	if found || !strings.Contains(detail, "未定位到权威 NS，系统解析器失败") {
+		t.Fatalf("no NS + resolver down: found=%v detail=%q, want miss with both errors", found, detail)
+	}
+
+	// Nameserver answers with no TXT at all: resolver may still pass it.
+	stubNSTransport(t, func(context.Context, string, string) ([]string, error) {
+		return nil, nil
+	})
+	stubSystemTXTLookup(t, func(context.Context, string) ([]string, error) {
+		return []string{want}, nil
+	})
+	found, _, _, detail = lookupAuthoritativeTXT(ctx, []string{"ns1:53"}, fqdn, want)
+	if !found || !strings.Contains(detail, "权威 NS 未返回 TXT 记录") {
+		t.Fatalf("empty answer + resolver hit: found=%v detail=%q, want pass via resolver", found, detail)
+	}
+	stubSystemTXTLookup(t, func(context.Context, string) ([]string, error) {
+		return nil, errors.New("resolver down")
+	})
+	found, _, _, detail = lookupAuthoritativeTXT(ctx, []string{"ns1:53"}, fqdn, want)
+	if found || !strings.Contains(detail, "DNS 已应答但尚未返回该 TXT 记录") {
+		t.Fatalf("empty answer + resolver down: found=%v detail=%q, want plain in-flight miss", found, detail)
+	}
+}
+
+// TestVerifyDNSTXTPropagationPublicCheck pins stage 2: after the
+// authoritative quorum passes, the value must also be visible through the
+// system resolver before success is reported; and when stage 1 already
+// passed via the system resolver, stage 2 is skipped as redundant.
+func TestVerifyDNSTXTPropagationPublicCheck(t *testing.T) {
+	fqdn := "_acme-challenge.example.com"
+	want := "want-val"
+	oldMinWait := dns01PropagationMinWait
+	oldSchedule := dns01PollSchedule
+	oldCheckTimeout := dns01PropagationCheckTimeout
+	oldPublicTimeout := dns01PublicCheckTimeout
+	oldDiscover := discoverAuthoritativeNS
+	dns01PropagationMinWait = 0
+	dns01PollSchedule = func(time.Duration) time.Duration { return 10 * time.Millisecond }
+	dns01PropagationCheckTimeout = 30 * time.Second
+	dns01PublicCheckTimeout = 200 * time.Millisecond
+	t.Cleanup(func() {
+		dns01PropagationMinWait = oldMinWait
+		dns01PollSchedule = oldSchedule
+		dns01PropagationCheckTimeout = oldCheckTimeout
+		dns01PublicCheckTimeout = oldPublicTimeout
+		discoverAuthoritativeNS = oldDiscover
+	})
+
+	collectLogs := func() (*[]string, func(string, ...any)) {
+		lines := &[]string{}
+		return lines, func(format string, args ...any) {
+			*lines = append(*lines, fmt.Sprintf(format, args...))
+		}
+	}
+	joinLines := func(lines *[]string) string { return strings.Join(*lines, "\n") }
+
+	// Quorum passes (one stubbed NS) and the public view sees it: success,
+	// with the cross-check logged.
+	discoverAuthoritativeNS = func(context.Context, time.Duration, string) ([]string, error) {
+		return []string{"ns1:53"}, nil
+	}
+	stubNSTransport(t, func(context.Context, string, string) ([]string, error) {
+		return []string{want}, nil
+	})
+	stubSystemTXTLookup(t, func(context.Context, string) ([]string, error) {
+		return []string{want}, nil
+	})
+	lines, logf := collectLogs()
+	if err := verifyDNSTXTPropagation(context.Background(), logf, fqdn, want); err != nil {
+		t.Fatalf("quorum + public view: unexpected error: %v", err)
+	}
+	if !strings.Contains(joinLines(lines), "公共解析器已见") {
+		t.Errorf("logs = %v, want the public cross-check line", *lines)
+	}
+
+	// Quorum passes but the public view never sees it: a timeout naming
+	// the public view, not the authoritative NS.
+	stubSystemTXTLookup(t, func(context.Context, string) ([]string, error) {
+		return nil, errors.New("resolver down")
+	})
+	lines, logf = collectLogs()
+	err := verifyDNSTXTPropagation(context.Background(), logf, fqdn, want)
+	if err == nil {
+		t.Fatal("public view missing: expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "公共解析器") || !strings.Contains(err.Error(), "多数权威 NS") {
+		t.Errorf("error = %q, want the public-view timeout naming the quorum", err.Error())
+	}
+
+	// Stage 1 passed via the system resolver itself (no NS discovered):
+	// stage 2 is the same view, so it is skipped.
+	discoverAuthoritativeNS = func(context.Context, time.Duration, string) ([]string, error) {
+		return nil, errors.New("no NS discovered")
+	}
+	stubSystemTXTLookup(t, func(context.Context, string) ([]string, error) {
+		return []string{want}, nil
+	})
+	lines, logf = collectLogs()
+	if err := verifyDNSTXTPropagation(context.Background(), logf, fqdn, want); err != nil {
+		t.Fatalf("resolver-pass: unexpected error: %v", err)
+	}
+	if strings.Contains(joinLines(lines), "公共解析器") {
+		t.Errorf("logs = %v, want no public cross-check when stage 1 already passed via the resolver", *lines)
 	}
 }

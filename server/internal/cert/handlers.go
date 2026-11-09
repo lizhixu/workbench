@@ -80,6 +80,7 @@ func (h *Handlers) Register(readRG, writeRG *gin.RouterGroup) {
 	writeRG.DELETE("/certs/manual/:id", h.cancelManualOrder)
 	writeRG.POST("/certs/import", h.importCert)
 	writeRG.POST("/certs/:id/renew", h.renewCert)
+	writeRG.POST("/certs/:id/reissue", h.reissueCert)
 	writeRG.PUT("/certs/:id/remark", h.putCertRemark)
 	writeRG.POST("/certs/:id/key", h.revealCertKey)
 	writeRG.DELETE("/certs/:id", h.deleteCert)
@@ -551,6 +552,81 @@ func (h *Handlers) renewCert(c *gin.Context) {
 		}
 	}()
 	c.JSON(http.StatusAccepted, gin.H{"ok": true, "message": "续期请求已受理，请稍后刷新列表"})
+}
+
+// reissueCert re-issues an existing certificate under a new configuration
+// (ACME account, domains, challenge preference) — the "real edit" behind
+// the cert list's 编辑 button. The new material lands back into the same
+// record (same ID, same bindings); the old material keeps serving until
+// it does, and a failed reissue leaves it in place.
+//
+//   - Manual DNS-01 is two-phase like a fresh issuance: the order is
+//     created now and the TXT records are returned; the administrator
+//     confirms via POST /certs/manual/:id/confirm, which stores into the
+//     same record.
+//   - Any other challenge starts a background task (202, like renew);
+//     the record's Renewing flag tracks it and the log is readable under
+//     the task id and the cert id alike.
+//
+// Guards: pending / renewing rows refuse (409) — an in-flight issuance
+// would land after this one and silently undo it. Runs under the audited
+// admin write group, risk high.
+func (h *Handlers) reissueCert(c *gin.Context) {
+	id := c.Param("id")
+	var req struct {
+		Domains   []string `json:"domains"`
+		AccountID string   `json:"account_id"`
+		Challenge string   `json:"challenge"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	cur, ok := h.hub.Get(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "certificate not found"})
+		return
+	}
+	if cur.Status == CertStatusPending {
+		c.JSON(http.StatusConflict, gin.H{"error": "该证书正在签发中，请等待签发完成后再重新签发"})
+		return
+	}
+	if cur.Renewing {
+		c.JSON(http.StatusConflict, gin.H{"error": "该证书正在续期中，请等待续期完成后再重新签发"})
+		return
+	}
+	if len(req.Domains) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "至少需要一个域名或 IP"})
+		return
+	}
+	ch := ChallengePreference(strings.TrimSpace(req.Challenge))
+	if !ch.Valid() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("未知的验证方式: %q", req.Challenge)})
+		return
+	}
+	if ch == ChallengeDNS01Manual {
+		order, err := h.hub.StartManualReissueOrder(id, req.Domains, req.AccountID)
+		if err != nil {
+			if errors.Is(err, ErrCertificateBeingIssued) {
+				c.JSON(http.StatusConflict, gin.H{"error": "该证书正在签发中，请等待签发完成后再重新签发"})
+				return
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true, "order": order, "message": "手动 DNS-01 订单已创建，请按指引添加 TXT 解析"})
+		return
+	}
+	task, _, err := h.hub.StartReissueTask(id, req.Domains, req.AccountID, ch)
+	if err != nil {
+		if errors.Is(err, ErrCertificateBeingIssued) {
+			c.JSON(http.StatusConflict, gin.H{"error": "该证书正在签发中，请等待签发完成后再重新签发"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"ok": true, "task_id": task.ID, "cert_id": id, "message": "重新签发请求已受理，请稍后刷新列表"})
 }
 
 // deleteCert removes a certificate.

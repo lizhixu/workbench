@@ -2177,6 +2177,7 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodDelete, "/api/v1/certs/manual/:id", "cert_manual_dns_cancel", "cert", "id", audit.RiskHigh, "取消手动 DNS-01 签发订单"},
 		{http.MethodPost, "/api/v1/certs/import", "cert_import", "cert", "", audit.RiskHigh, "导入已有证书"},
 		{http.MethodPost, "/api/v1/certs/:id/renew", "cert_renew", "cert", "id", audit.RiskHigh, "续期证书"},
+		{http.MethodPost, "/api/v1/certs/:id/reissue", "cert_reissue", "cert", "id", audit.RiskHigh, "按新配置重新签发证书"},
 		// Remark edits are metadata-only, so the empty risk normalizes to
 		// medium in the middleware (same convention as cert_config_update).
 		{http.MethodPut, "/api/v1/certs/:id/remark", "cert_remark", "cert", "id", "", "编辑证书备注"},

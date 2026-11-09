@@ -2,7 +2,7 @@
 import { computed, h, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
   NAlert, NButton, NCard, NCollapse, NCollapseItem, NDataTable,
-  NDescriptions, NDescriptionsItem, NForm, NFormItem, NIcon, NInput,
+  NDescriptions, NDescriptionsItem, NDivider, NForm, NFormItem, NIcon, NInput,
   NModal, NPopconfirm, NPopover, NRadio, NRadioGroup, NSelect, NSpace, NSpin,
   NSwitch, NTabPane, NTabs, NTag, NTooltip, useDialog, useMessage,
 } from 'naive-ui'
@@ -18,7 +18,7 @@ import {
   certDownloadUrl, createACMEAccount, deleteACMEAccount, deleteCert, getACMEAccountKey,
   getCertConfig,
   getCertDetail, getCertKey, importCert, issueCert, listACMEAccounts, listCerts, listPresets,
-  renewCert, updateACMEAccount, updateCertConfig, updateCertRemark,
+  renewCert, reissueCert, updateACMEAccount, updateCertConfig, updateCertRemark,
   startManualDNSIssue, getManualDNSOrder, confirmManualDNSOrder, cancelManualDNSOrder,
   type ACMEAccount, type ACMEPreset, type Certificate, type CertDetail,
   type CertHubConfig, type ChallengeMode, type ManualDNSOrder,
@@ -108,6 +108,15 @@ function clearIssuePoll() {
   if (issuePollTimer) {
     clearInterval(issuePollTimer)
     issuePollTimer = null
+  }
+}
+
+let reissuePollTimer: ReturnType<typeof setInterval> | null = null
+
+function clearReissuePoll() {
+  if (reissuePollTimer) {
+    clearInterval(reissuePollTimer)
+    reissuePollTimer = null
   }
 }
 
@@ -359,30 +368,146 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
   },
 ])
 
-// ---- 证书备注编辑（PUT /certs/:id/remark，仅元信息，adminOnly + 审计） ----
+// ---- 编辑证书（PUT /certs/:id/remark 改备注 + POST /certs/:id/reissue
+// 按新配置重新签发；配置改动触发签发、备注单独改只保存备注） ----
 const showRemarkModal = ref(false)
 const editingRemarkCert = ref<Certificate | null>(null)
 const remarkDraft = ref('')
+const editAccountID = ref('')
+const editDomains = ref('')
+const editChallenge = ref<ChallengeMode>('')
 const remarkSaving = ref(false)
+
+function parseDomainList(text: string): string[] {
+  return text
+    .split(/[\n,]/)
+    .map((d) => d.trim().toLowerCase())
+    .filter((d) => d.length > 0)
+}
+
+const editConfigChanged = computed(() => {
+  const cert = editingRemarkCert.value
+  if (!cert) return false
+  return (
+    editAccountID.value !== (cert.account_id || '') ||
+    parseDomainList(editDomains.value).join('\n') !== (cert.domains || []).map((d) => d.toLowerCase()).join('\n') ||
+    editChallenge.value !== (cert.challenge || '')
+  )
+})
+
+const editRemarkChanged = computed(() => {
+  const cert = editingRemarkCert.value
+  if (!cert) return false
+  return remarkDraft.value.trim() !== (cert.remark || '')
+})
+
+// 泛域名只能 DNS 验证：与申请弹窗同一条判据。
+const editWildcardDetected = computed(() =>
+  parseDomainList(editDomains.value).some((d) => d.startsWith('*.')),
+)
+
+watch(editWildcardDetected, (has) => {
+  if (has && editChallenge.value === 'http-01') {
+    editChallenge.value = ''
+    message.info('检测到泛域名，已切换为自动（泛域名强制 DNS-01）')
+  }
+})
 
 function openEditRemark(r: Certificate) {
   editingRemarkCert.value = r
   remarkDraft.value = r.remark || ''
+  editAccountID.value = r.account_id || ''
+  editDomains.value = (r.domains || []).join('\n')
+  editChallenge.value = (r.challenge || '') as ChallengeMode
   showRemarkModal.value = true
+}
+
+function startReissuePoll(certId: string) {
+  // 重签是异步的：轮询证书 renewing 标志看终态（签发成功后
+  // storeResult 重建记录、Renewing 清零；失败则 markError 置 LastError）。
+  let tries = 0
+  clearReissuePoll()
+  reissuePollTimer = setInterval(async () => {
+    tries++
+    try {
+      await loadCerts()
+    } catch {
+      /* 忽略单次刷新失败 */
+    }
+    const found = certs.value.find((c) => c.id === certId)
+    if (found && !found.renewing) {
+      clearReissuePoll()
+      if (found.last_error) {
+        message.error(found.last_error)
+      } else {
+        message.success('证书已按新配置重新签发')
+      }
+      return
+    }
+    if (tries >= 120) {
+      clearReissuePoll()
+      if (found && found.renewing) {
+        message.info('证书仍在签发中（已等待 10 分钟，后台继续执行），列表每 30 秒刷新，完成后状态会自动更新')
+      }
+    }
+  }, 5000)
 }
 
 async function saveRemarkModal() {
   if (!editingRemarkCert.value || remarkSaving.value) return
+  const cert = editingRemarkCert.value
+  const configChanged = editConfigChanged.value
+  const remarkChanged = editRemarkChanged.value
+  if (!configChanged && !remarkChanged) {
+    message.info('没有需要保存的改动')
+    showRemarkModal.value = false
+    return
+  }
+  if (configChanged) {
+    const domains = parseDomainList(editDomains.value)
+    if (domains.length === 0) {
+      message.warning('请填写至少一个域名')
+      return
+    }
+    if (editWildcardDetected.value && editChallenge.value === 'http-01') {
+      message.warning('检测到泛域名（*.），只能使用 DNS-01 验证')
+      return
+    }
+    if (editChallenge.value === 'dns-01' && !configReady.value) {
+      message.warning('已选择 DNS-01 验证，请先配置并启用 dns-mng 集成')
+      showConfig.value = true
+      return
+    }
+  }
   remarkSaving.value = true
   try {
-    const updated = await updateCertRemark(editingRemarkCert.value.id, remarkDraft.value.trim())
-    editingRemarkCert.value.remark = updated.remark
-    const found = certs.value.find((c) => c.id === editingRemarkCert.value?.id)
-    if (found) found.remark = updated.remark
-    message.success('备注已保存')
+    // 备注先保存：重签失败也不丢备注改动。
+    if (remarkChanged) {
+      const updated = await updateCertRemark(cert.id, remarkDraft.value.trim())
+      const found = certs.value.find((c) => c.id === cert.id)
+      if (found) found.remark = updated.remark
+      if (!configChanged) message.success('备注已保存')
+    }
+    if (configChanged) {
+      const domains = parseDomainList(editDomains.value)
+      const res = await reissueCert(cert.id, domains, editAccountID.value || undefined, editChallenge.value || undefined)
+      showRemarkModal.value = false
+      if (res.order) {
+        // 手动 DNS-01：打开解析指引弹窗，确认后落到同一条记录。
+        openManualModal(res.order)
+        return
+      }
+      message.success(res.message || '重新签发请求已受理')
+      if (res.task_id) {
+        openTaskLog(res.task_id, domains)
+      }
+      await loadCerts()
+      startReissuePoll(cert.id)
+      return
+    }
     showRemarkModal.value = false
   } catch (e: any) {
-    message.error(e?.message || '备注保存失败')
+    message.error(e?.message || '保存失败')
   } finally {
     remarkSaving.value = false
   }
@@ -1046,12 +1171,14 @@ onDeactivated(() => {
   stopPolling()
   stopManualPolling()
   clearIssuePoll()
+  clearReissuePoll()
 })
 
 onUnmounted(() => {
   stopPolling()
   stopManualPolling()
   clearIssuePoll()
+  clearReissuePoll()
 })
 </script>
 
@@ -1601,12 +1728,12 @@ onUnmounted(() => {
 	      </NSpin>
 	    </NModal>
 
-	    <!-- 编辑证书备注弹窗 -->
+	    <!-- 编辑证书弹窗：备注 + 签发配置（账户/域名/验证方式） -->
 	    <NModal
 	      v-model:show="showRemarkModal"
 	      preset="card"
-	      title="编辑证书备注"
-	      style="width: 440px; max-width: 94vw"
+	      title="编辑证书"
+	      style="width: 560px; max-width: 94vw"
 	    >
 	      <NForm label-placement="top">
 	        <NFormItem :label="`备注 · ${editingRemarkCert?.domains?.[0] || editingRemarkCert?.id || ''}`">
@@ -1619,11 +1746,66 @@ onUnmounted(() => {
 	            placeholder="记录证书用途、申请人等（最多 200 字）"
 	          />
 	        </NFormItem>
+	        <template v-if="editingRemarkCert?.status === 'pending' || editingRemarkCert?.renewing">
+	          <NAlert type="info" :show-icon="true" class="tip-hint" style="margin-bottom: 12px">
+	            该证书{{ editingRemarkCert?.status === 'pending' ? '正在签发中' : '正在续期中' }}，完成后可编辑签发配置；现在只能改备注。
+	          </NAlert>
+	        </template>
+	        <template v-else>
+	          <NDivider title-placement="left" style="margin: 4px 0 12px">签发配置</NDivider>
+	          <NAlert type="info" :show-icon="true" class="tip-hint" style="margin-bottom: 12px">
+	            保存后按新配置重新签发，老证书继续服务，成功后原地覆盖到同一条记录；签发失败老证书不动。验证方式会记下来，以后续期也按它走。
+	          </NAlert>
+	          <NFormItem label="CA 机构账户">
+	            <NSelect
+	              v-model:value="editAccountID"
+	              :options="accountSelectOptions"
+	              placeholder="选择 ACME 机构账户（留空用默认账户）"
+	            />
+	          </NFormItem>
+	          <NFormItem label="域名列表" required>
+	            <NInput
+	              v-model:value="editDomains"
+	              type="textarea"
+	              :rows="3"
+	              placeholder="*.example.com&#10;example.com（每行一个）"
+	            />
+	          </NFormItem>
+	          <NFormItem label="验证方式">
+	            <NRadioGroup v-model:value="editChallenge">
+	              <NSpace>
+	                <NRadio value="">自动（推荐）</NRadio>
+	                <NRadio value="http-01" :disabled="editWildcardDetected">HTTP-01</NRadio>
+	                <NRadio value="dns-01">DNS-01（自动）</NRadio>
+	                <NRadio value="dns-01-manual">DNS-01（手动解析）</NRadio>
+	              </NSpace>
+	            </NRadioGroup>
+	            <template #feedback>
+	              <span v-if="editWildcardDetected" class="field-hint text-amber tip-hint">
+	                包含泛域名，仅支持 DNS 验证
+	              </span>
+	              <span v-else-if="editChallenge === 'http-01'" class="field-hint tip-hint">
+	                需服务器 80 端口可被 CA 访问（不支持泛域名）
+	              </span>
+	              <span v-else-if="editChallenge === 'dns-01'" class="field-hint tip-hint">
+	                依赖证书中心 dns-mng 自动添加/清理 TXT 解析
+	              </span>
+	              <span v-else-if="editChallenge === 'dns-01-manual'" class="field-hint tip-hint">
+	                提交后需手动前往 DNS 服务商添加 TXT 解析记录
+	              </span>
+	              <span v-else class="field-hint tip-hint">
+	                普通域名优先 HTTP-01，不可用时自动回退 DNS 验证
+	              </span>
+	            </template>
+	          </NFormItem>
+	        </template>
 	      </NForm>
 	      <template #footer>
 	        <NSpace justify="end">
 	          <NButton @click="showRemarkModal = false">取消</NButton>
-	          <NButton type="primary" :loading="remarkSaving" @click="saveRemarkModal">保存</NButton>
+	          <NButton type="primary" :loading="remarkSaving" @click="saveRemarkModal">
+	            {{ editConfigChanged ? '保存并重新签发' : '保存' }}
+	          </NButton>
 	        </NSpace>
 	      </template>
 	    </NModal>

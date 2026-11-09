@@ -785,7 +785,7 @@ func TestIssueBatchPresentPropagationFailNoTrigger(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on propagation failure")
 	}
-	if !strings.Contains(err.Error(), "权威服务器传播校验失败") {
+	if !strings.Contains(err.Error(), "DNS 传播校验失败") {
 		t.Fatalf("expected propagation error, got: %v", err)
 	}
 

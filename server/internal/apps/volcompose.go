@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -103,6 +104,7 @@ type staticComposeYAML struct {
 
 type staticComposeService struct {
 	Volumes []any `yaml:"volumes"`
+	Ports   []any `yaml:"ports"`
 }
 
 // composeAppsRoot is the directory all raw_compose app data lives under.
@@ -317,6 +319,102 @@ func staticComposeVolumes(app *Application) []DiscoveredVolume {
 		}
 	}
 	return out
+}
+
+// firstComposePublishedPort returns the first published host port declared
+// in a raw_compose app's compose file (services in name order — the same
+// determinism as staticComposeVolumes — first valid entry wins), or 0 when
+// the app has no compose content or publishes nothing. It is the fallback
+// port source for proxy upstream resolution: compose files are authoritative
+// for compose apps, whose Application.Ports list is normally empty (the
+// form ports do not apply to compose deploys). Git-backed compose apps have
+// no ComposeContent on the server, so they keep the 8080 fallback.
+func firstComposePublishedPort(app *Application) int {
+	if app == nil || strings.TrimSpace(app.ComposeContent) == "" {
+		return 0
+	}
+	var cf staticComposeYAML
+	if err := yaml.Unmarshal([]byte(app.ComposeContent), &cf); err != nil {
+		return 0
+	}
+	svcNames := make([]string, 0, len(cf.Services))
+	for name := range cf.Services {
+		svcNames = append(svcNames, name)
+	}
+	sort.Strings(svcNames)
+	for _, svcName := range svcNames {
+		for _, raw := range cf.Services[svcName].Ports {
+			if p := parseComposePublishedPort(raw); p != 0 {
+				return p
+			}
+		}
+	}
+	return 0
+}
+
+// parseComposePublishedPort extracts the host port from one compose `ports`
+// entry, or 0 when the entry publishes nothing usable:
+//   - short syntax: "host:container", "ip:host:container" (a trailing
+//     "/tcp" or "/udp" suffix is stripped); a bare "container" has no host
+//     port; ranges ("80-81:80-81") and IPv6 forms are skipped rather than
+//     guessed.
+//   - long syntax: {published: <port>, target: <port>} — published may be
+//     a number or a numeric string; absent means an ephemeral host port.
+func parseComposePublishedPort(raw any) int {
+	switch v := raw.(type) {
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return 0
+		}
+		if i := strings.Index(s, "/"); i >= 0 {
+			s = s[:i]
+		}
+		parts := strings.Split(s, ":")
+		var hostPart string
+		switch len(parts) {
+		case 2:
+			hostPart = parts[0]
+		case 3:
+			hostPart = parts[1]
+		default:
+			return 0
+		}
+		return parsePortNumber(hostPart)
+	case map[string]any:
+		switch p := v["published"].(type) {
+		case int:
+			return validPort(p)
+		case int64:
+			return validPort(int(p))
+		case float64:
+			return validPort(int(p))
+		case string:
+			return parsePortNumber(strings.TrimSpace(p))
+		default:
+			return 0
+		}
+	default:
+		return 0
+	}
+}
+
+// parsePortNumber parses a plain decimal port, or 0 for anything else
+// (ranges, empty, out of range).
+func parsePortNumber(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return validPort(n)
+}
+
+// validPort returns p when it is a usable TCP port, else 0.
+func validPort(p int) int {
+	if p < 1 || p > 65535 {
+		return 0
+	}
+	return p
 }
 
 // parseComposeDiscoverOutput parses stdout from composeDiscoverScript into structured DiscoveredVolumes.

@@ -2,6 +2,7 @@ package apps
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -408,24 +409,24 @@ func TestBindProxyRejectsWindowsHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-		if err := store.PutApp(&Application{
-			ID: "app_win", Name: "demo", HostID: regResp.GetAgentId(),
-			Ports: []PortMapping{{Host: 8080, Container: 80}},
-		}); err != nil {
-			t.Fatalf("PutApp: %v", err)
-		}
+	if err := store.PutApp(&Application{
+		ID: "app_win", Name: "demo", HostID: regResp.GetAgentId(),
+		Ports: []PortMapping{{Host: 8080, Container: 80}},
+	}); err != nil {
+		t.Fatalf("PutApp: %v", err)
+	}
 
-		hub, err := cert.NewHub(t.TempDir(), nil)
-		if err != nil {
-			t.Fatalf("NewHub: %v", err)
-		}
-		_ = hub.StoreCertForTest("c1", []string{"x.example.com"}, "mock-cert", "mock-key")
+	hub, err := cert.NewHub(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewHub: %v", err)
+	}
+	_ = hub.StoreCertForTest("c1", []string{"x.example.com"}, "mock-cert", "mock-key")
 
-		gin.SetMode(gin.TestMode)
-		r := gin.New()
-		NewProxyHandler(reg, store, hub).Register(r.Group(""))
-		req := httptest.NewRequest(http.MethodPut, "/apps/app_win/proxy",
-			strings.NewReader(`{"domains":[{"domain":"x.example.com","cert_id":"c1"}],"mode":"local"}`))
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	NewProxyHandler(reg, store, hub).Register(r.Group(""))
+	req := httptest.NewRequest(http.MethodPut, "/apps/app_win/proxy",
+		strings.NewReader(`{"domains":[{"domain":"x.example.com","cert_id":"c1"}],"mode":"local"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -582,11 +583,11 @@ func TestBindProxyCrossAppConflict(t *testing.T) {
 }
 
 // TestRenderVhosts: renderVhosts generates an 80 redirect and 443 proxy server
-// block for each domain.
+// block for each domain when ForceHTTPS is on.
 func TestRenderVhosts(t *testing.T) {
 	bindings := []DomainBinding{
-		{Domain: "a.example.com", CertID: "c1"},
-		{Domain: "b.example.com", CertID: "c2"},
+		{Domain: "a.example.com", CertID: "c1", ForceHTTPS: true},
+		{Domain: "b.example.com", CertID: "c2", ForceHTTPS: true},
 	}
 	conf := renderVhosts(bindings, "127.0.0.1:8080", true)
 	for _, d := range []string{"a.example.com", "b.example.com"} {
@@ -605,6 +606,53 @@ func TestRenderVhosts(t *testing.T) {
 	}
 	if !strings.Contains(conf, "Upgrade $http_upgrade;") {
 		t.Errorf("websocket enabled must include Upgrade header:\n%s", conf)
+	}
+	if got := strings.Count(conf, "return 301 https://$host$request_uri;"); got != 2 {
+		t.Errorf("forced domains must render one 301 each, got %d:\n%s", got, conf)
+	}
+}
+
+// TestRenderVhostsForceHTTPS: a domain with ForceHTTPS off serves the app
+// directly over plain HTTP on :80 instead of redirecting, and the two
+// bindings in one file stay independent.
+func TestRenderVhostsForceHTTPS(t *testing.T) {
+	bindings := []DomainBinding{
+		{Domain: "a.example.com", CertID: "c1", ForceHTTPS: true},
+		{Domain: "b.example.com", CertID: "c2", ForceHTTPS: false},
+	}
+	conf := renderVhosts(bindings, "127.0.0.1:8080", true)
+	if got := strings.Count(conf, "return 301 https://$host$request_uri;"); got != 1 {
+		t.Errorf("exactly one forced domain must render a 301, got %d:\n%s", got, conf)
+	}
+	// Three proxy locations: a's :443, b's :80 and b's :443.
+	if got := strings.Count(conf, "proxy_pass http://127.0.0.1:8080;"); got != 3 {
+		t.Errorf("proxy_pass count = %d, want 3:\n%s", got, conf)
+	}
+	if !strings.Contains(conf, "proxy_set_header X-Forwarded-Proto http;") {
+		t.Errorf("plain :80 vhost must advertise proto http:\n%s", conf)
+	}
+	if !strings.Contains(conf, "proxy_set_header X-Forwarded-Proto https;") {
+		t.Errorf(":443 vhost must advertise proto https:\n%s", conf)
+	}
+	// The plain :80 vhost gets the same upload body limit as :443.
+	if got := strings.Count(conf, "client_max_body_size 64m;"); got != 3 {
+		t.Errorf("client_max_body_size count = %d, want 3:\n%s", got, conf)
+	}
+	// The 301 must sit in a's :80 block, not b's: the conf order is a's :80,
+	// a's :443, b's :80, b's :443, so the first server block is a's.
+	first := strings.Index(conf, "server {")
+	second := strings.Index(conf[first+1:], "server {")
+	if first < 0 || second < 0 || !strings.Contains(conf[first:first+second], "return 301") {
+		t.Errorf("first :80 block must carry the 301:\n%s", conf)
+	}
+
+	// Websocket off: neither the plain :80 nor the :443 block upgrades.
+	plain := renderVhosts([]DomainBinding{{Domain: "c.example.com", CertID: "c3"}}, "127.0.0.1:8080", false)
+	if strings.Contains(plain, "Upgrade $http_upgrade;") {
+		t.Errorf("websocket off must not emit Upgrade headers:\n%s", plain)
+	}
+	if !strings.Contains(plain, "proxy_pass http://127.0.0.1:8080;") {
+		t.Errorf("unforced domain must still proxy on :80:\n%s", plain)
 	}
 }
 
@@ -730,6 +778,92 @@ func TestSyncUpstreamManualFlag(t *testing.T) {
 	}
 }
 
+// TestFirstComposePublishedPort: the proxy upstream for a raw_compose app
+// comes from the compose file itself (the app's Ports list is normally
+// empty — the form ports do not apply to compose deploys). Services are
+// scanned in name order; the first usable published host port wins.
+func TestFirstComposePublishedPort(t *testing.T) {
+	compose := func(body string) *Application {
+		return &Application{ID: "a1", SourceType: "raw_compose", ComposeContent: body}
+	}
+	cases := []struct {
+		name string
+		app  *Application
+		want int
+	}{
+		{"short host:container", compose("services:\n  certimate:\n    image: certimate/certimate:latest\n    ports:\n      - 8090:8090\n"), 8090},
+		{"short ip:host:container", compose("services:\n  web:\n    image: nginx\n    ports:\n      - 127.0.0.1:9000:80\n"), 9000},
+		{"short with protocol suffix", compose("services:\n  web:\n    image: nginx\n    ports:\n      - 8090:8090/tcp\n"), 8090},
+		{"bare container port skipped", compose("services:\n  web:\n    image: nginx\n    ports:\n      - 8090\n"), 0},
+		{"range skipped", compose("services:\n  web:\n    image: nginx\n    ports:\n      - 8090-8091:8090-8091\n"), 0},
+		{"long syntax published", compose("services:\n  web:\n    image: nginx\n    ports:\n      - target: 80\n        published: 8081\n        protocol: tcp\n"), 8081},
+		{"long syntax without published", compose("services:\n  web:\n    image: nginx\n    ports:\n      - target: 80\n"), 0},
+		{"services in name order", compose("services:\n  zsvc:\n    image: a\n    ports:\n      - 9000:90\n  asvc:\n    image: b\n    ports:\n      - 7000:70\n"), 7000},
+		{"first usable wins within service", compose("services:\n  web:\n    image: nginx\n    ports:\n      - 8090\n      - 8081:81\n"), 8081},
+		{"invalid yaml", compose("services: [unclosed"), 0},
+		{"empty compose", compose(""), 0},
+		{"nil app", nil, 0},
+	}
+	for _, tc := range cases {
+		if got := firstComposePublishedPort(tc.app); got != tc.want {
+			t.Errorf("%s: got %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	// Ports list still wins over the compose file when present.
+	withPorts := compose("services:\n  web:\n    image: nginx\n    ports:\n      - 8090:8090\n")
+	withPorts.Ports = []PortMapping{{Host: 3000, Container: 80}}
+	if got := firstPublishedPort(withPorts); got != 3000 {
+		t.Errorf("form ports win over compose: got %d, want 3000", got)
+	}
+}
+
+// TestDefaultUpstreamComposePort: a raw_compose app with no Ports list gets
+// its local upstream from the compose file instead of the 8080 fallback.
+func TestDefaultUpstreamComposePort(t *testing.T) {
+	ph := NewProxyHandler(nil, nil, nil)
+	app := &Application{
+		ID: "app_c1641ea6306f1a92", HostID: "h1", SourceType: "raw_compose",
+		ComposeContent: "services:\n  certimate:\n    image: certimate/certimate:latest\n    ports:\n      - 8090:8090\n",
+	}
+	got, err := ph.defaultUpstream(app, "local", "")
+	if err != nil || got != "127.0.0.1:8090" {
+		t.Errorf("local compose upstream: got %q, err %v, want 127.0.0.1:8090", got, err)
+	}
+	plain := &Application{ID: "a2", HostID: "h1"}
+	got, err = ph.defaultUpstream(plain, "local", "")
+	if err != nil || got != "127.0.0.1:8080" {
+		t.Errorf("no-port fallback: got %q, err %v, want 127.0.0.1:8080", got, err)
+	}
+}
+
+// TestSyncUpstreamRepairsFallbackSentinel: a stored non-manual
+// 127.0.0.1:8080 is the "no port was known" sentinel, not a choice — the
+// next local sync recomputes it once the compose file yields a real port.
+// Manual values, genuinely-8080 apps and non-sentinel stored values are
+// untouched.
+func TestSyncUpstreamRepairsFallbackSentinel(t *testing.T) {
+	ph := NewProxyHandler(nil, nil, nil)
+	compose8090 := "services:\n  certimate:\n    image: certimate/certimate:latest\n    ports:\n      - 8090:8090\n"
+	compose8080 := "services:\n  web:\n    image: nginx\n    ports:\n      - 8080:80\n"
+	cases := []struct {
+		name string
+		app  *Application
+		want string
+	}{
+		{"sentinel repaired from compose", &Application{ID: "a1", HostID: "h1", SourceType: "raw_compose", ComposeContent: compose8090, ProxyUpstream: "127.0.0.1:8080"}, "127.0.0.1:8090"},
+		{"manual sentinel kept", &Application{ID: "a2", HostID: "h1", SourceType: "raw_compose", ComposeContent: compose8090, ProxyUpstream: "127.0.0.1:8080", ProxyUpstreamManual: true}, "127.0.0.1:8080"},
+		{"genuine 8080 unchanged", &Application{ID: "a3", HostID: "h1", SourceType: "raw_compose", ComposeContent: compose8080, ProxyUpstream: "127.0.0.1:8080"}, "127.0.0.1:8080"},
+		{"non-sentinel stored kept", &Application{ID: "a4", HostID: "h1", SourceType: "raw_compose", ComposeContent: compose8090, ProxyUpstream: "127.0.0.1:9000"}, "127.0.0.1:9000"},
+		{"no port anywhere keeps sentinel", &Application{ID: "a5", HostID: "h1", ProxyUpstream: "127.0.0.1:8080"}, "127.0.0.1:8080"},
+	}
+	for _, tc := range cases {
+		got, err := ph.syncUpstream(tc.app, "local", "", "")
+		if err != nil || got != tc.want {
+			t.Errorf("%s: got %q, err %v, want %q", tc.name, got, err, tc.want)
+		}
+	}
+}
+
 // TestReloadFailureImplicatesApp: compensation after a failed nginx -t must
 // only fire when the output names this app's conf or cert files — another
 // app's broken conf must not delete this app's good binding.
@@ -835,6 +969,21 @@ func TestResolveProxyCerts(t *testing.T) {
 		t.Fatalf("explicit override: pairs=%v missing=%v err=%v", pairs, missing, rerr)
 	}
 
+	// The force-HTTPS choice is orthogonal to certificate resolution: it
+	// survives both auto matching and an explicit override.
+	pairs, missing, rerr = resolveProxyCerts(hub, []DomainBinding{
+		{Domain: "a.example.com", ForceHTTPS: true},
+		{Domain: "sub.example.com", CertID: "crt_wild", ForceHTTPS: true},
+	})
+	if rerr != nil || len(missing) != 0 || len(pairs) != 2 {
+		t.Fatalf("force_https resolve: pairs=%v missing=%v err=%v", pairs, missing, rerr)
+	}
+	for _, p := range pairs {
+		if !p.binding.ForceHTTPS {
+			t.Errorf("resolveProxyCerts dropped force_https for %s: %+v", p.binding.Domain, p.binding)
+		}
+	}
+
 	// Explicit failures keep their old classification.
 	cases := []struct {
 		name       string
@@ -856,5 +1005,58 @@ func TestResolveProxyCerts(t *testing.T) {
 				t.Errorf("got status=%d msg=%q, want status=%d containing %q", rerr.status, rerr.msg, tc.wantStatus, tc.wantSubstr)
 			}
 		})
+	}
+}
+
+// TestResolveBindingCertsPreservesForceHTTPS: the legacy freeze path (a stored
+// binding with an empty cert_id resolved via FindByDomain) builds a fresh
+// binding for the render — it must carry the stored force_https choice, or
+// the next sync would silently drop the redirect for one render.
+func TestResolveBindingCertsPreservesForceHTTPS(t *testing.T) {
+	store := newTestStore(t)
+	hub, err := cert.NewHub(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewHub: %v", err)
+	}
+	_ = hub.StoreCertForTest("crt_a", []string{"a.example.com"}, "cert", "key")
+	app := &Application{
+		ID:           "app1",
+		Name:         "app-one",
+		HostID:       "h1",
+		ProxyDomains: []DomainBinding{{Domain: "a.example.com", CertID: "", ForceHTTPS: true}},
+	}
+	if err := store.PutApp(app); err != nil {
+		t.Fatalf("PutApp: %v", err)
+	}
+	reg := rpc.NewRegistry(t.TempDir(), nil)
+	ph := NewProxyHandler(reg, store, hub)
+	pairs, err := ph.resolveBindingCerts(app)
+	if err != nil {
+		t.Fatalf("resolveBindingCerts: %v", err)
+	}
+	if len(pairs) != 1 || !pairs[0].binding.ForceHTTPS {
+		t.Fatalf("freeze path dropped force_https: pairs=%+v", pairs)
+	}
+	// The freeze only materializes CertID/Auto on the stored record; the
+	// operator's force_https choice stays untouched.
+	got, ok := store.GetApp("app1")
+	if !ok {
+		t.Fatalf("GetApp: app not found")
+	}
+	b := got.ProxyDomains[0]
+	if b.CertID != "crt_a" || !b.Auto || !b.ForceHTTPS {
+		t.Errorf("stored binding after freeze = %+v, want cert crt_a, auto, force_https", b)
+	}
+}
+
+// TestProxyBindReqForceHTTPS: the bind request carries the per-domain
+// force_https flag (absent = false = serve plain HTTP on :80).
+func TestProxyBindReqForceHTTPS(t *testing.T) {
+	var req proxyBindReq
+	if err := json.Unmarshal([]byte(`{"domains":[{"domain":"a.example.com","cert_id":"crt_a","force_https":true},{"domain":"b.example.com"}]}`), &req); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(req.Domains) != 2 || !req.Domains[0].ForceHTTPS || req.Domains[1].ForceHTTPS {
+		t.Errorf("force_https decode = %+v", req.Domains)
 	}
 }

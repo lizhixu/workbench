@@ -119,6 +119,10 @@ type DomainBinding struct {
 	Domain string `json:"domain"`
 	CertID string `json:"cert_id"`
 	Auto   bool   `json:"auto,omitempty"`
+	// ForceHTTPS, when true, makes the port-80 vhost 301-redirect to
+	// HTTPS. False (the default) serves the app directly over plain
+	// HTTP on :80 — the redirect is opt-in, never assumed.
+	ForceHTTPS bool `json:"force_https,omitempty"`
 }
 
 // Deployment statuses.

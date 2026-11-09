@@ -147,6 +147,7 @@ interface ProxyDomainRow {
   id: number
   domain: string
   cert_id: string
+  force_https: boolean
   cover: CertCover | null
   loading: boolean
   error: string
@@ -155,11 +156,12 @@ interface ProxyDomainRow {
 }
 
 let nextProxyRowId = 1
-function newProxyRow(domain = '', certId = ''): ProxyDomainRow {
+function newProxyRow(domain = '', certId = '', forceHttps = false): ProxyDomainRow {
   return {
     id: nextProxyRowId++,
     domain,
     cert_id: certId,
+    force_https: forceHttps,
     cover: null,
     loading: false,
     error: '',
@@ -203,7 +205,7 @@ function syncProxyForm() {
     if (app.value.proxy_domains && app.value.proxy_domains.length > 0) {
       // auto=true 的绑定在下次保存时由服务端重新匹配（不把已物化的旧 ID
       // 当成用户显式选择，否则证书过期后会绑回一张旧证）。
-      rows = app.value.proxy_domains.map((d) => newProxyRow(d.domain, d.auto ? '' : d.cert_id))
+      rows = app.value.proxy_domains.map((d) => newProxyRow(d.domain, d.auto ? '' : d.cert_id, d.force_https ?? false))
     } else if (app.value.domain) {
       rows = [newProxyRow(app.value.domain)]
     }
@@ -211,7 +213,10 @@ function syncProxyForm() {
       if (r.timer) clearTimeout(r.timer)
     }
     proxyForm.value.domains = rows
-    rows.forEach(probeProxyDomain)
+    // 进页不再自动探测证书覆盖：只查看时探测结果没有意义（查看不是编辑），
+    // 探测只在域名输入改动时触发（onProxyDomainInput → probeProxyDomain）。
+    // 注意：未探测行的 cover 为 null，提示与自动签发区须按“未知”处理，
+    // 绝不能当成“无覆盖证书”误报（见 proxyDomainHint / proxyAutoDomains）。
     proxyForm.value.mode = (app.value.proxy_mode as 'local' | 'gateway') ?? 'local'
     proxyForm.value.gateway_host_id = app.value.proxy_gateway_host_id ?? null
     proxyForm.value.upstream = app.value.proxy_upstream ?? ''
@@ -225,21 +230,25 @@ function syncProxyForm() {
 function probeProxyDomain(row: ProxyDomainRow) {
   if (row.timer) clearTimeout(row.timer)
   const d = row.domain.trim().toLowerCase()
+  // 新探测一排期就作废旧结果与在途请求（seq++ 让迟到的旧响应无法写回）：
+  // 旧 cover 若留到新探测返回，防抖 + 请求期间会按旧结论渲染提示与
+  // 自动签发区而闪烁一次（如删掉末字又补回时，中间态“无覆盖”的旧结果
+  // 会让“部分域名暂无可用证书”提醒短暂闪现）。清掉后该行回到“未知”态，
+  // 探测期间不参与 proxyAutoDomains、不渲染提示。
+  row.seq++
+  row.cover = null
+  row.error = ''
   if (!d) {
-    row.seq++ // 作废在途探测，否则它会把结果写回已被清空的行
-    row.cover = null
     row.loading = false
-    row.error = ''
     return
   }
   row.loading = true
   row.timer = setTimeout(async () => {
-    const seq = ++row.seq
+    const seq = row.seq
     try {
       const cover = await getCertCover(d)
       if (seq !== row.seq) return
       row.cover = cover
-      row.error = ''
     } catch {
       if (seq !== row.seq) return
       row.cover = null
@@ -317,7 +326,9 @@ const proxyActiveDomains = computed(() =>
 )
 
 const proxyAutoDomains = computed(() =>
-  proxyActiveDomains.value.filter((r) => !r.cert_id && !proxyDomainHasUsableCert(r)),
+  // cover 为 null = 尚未探测过（进页不再自动探测）：按“未知”排除，
+  // 否则已绑定域名每次进页都会被误算进“暂无可用证书”区。
+  proxyActiveDomains.value.filter((r) => !r.cert_id && r.cover !== null && !proxyDomainHasUsableCert(r)),
 )
 
 function proxyDomainHint(row: ProxyDomainRow): { tone: 'ok' | 'warn'; text: string } {
@@ -337,6 +348,11 @@ function proxyDomainHint(row: ProxyDomainRow): { tone: 'ok' | 'warn'; text: stri
       }
     }
     return { tone: 'ok', text: `已手动指定证书：${c ? c.domains.join(', ') : row.cert_id}` }
+  }
+  // 尚未探测过（进页不再自动探测）：不下结论、不显示提示；
+  // 否则已绑定域名每次进页都会误报“暂无覆盖证书”。改域名时探测后才出提示。
+  if (!row.cover) {
+    return { tone: 'ok', text: '' }
   }
   if (row.cover?.covered) {
     if (row.cover.usable !== false && row.cover.cert) {
@@ -504,6 +520,7 @@ function proxyBindList(): ProxyBindDomain[] {
     .map((r) => ({
       domain: r.domain.trim().toLowerCase(),
       cert_id: r.cert_id || undefined,
+      force_https: r.force_https || undefined,
     }))
 }
 
@@ -2215,11 +2232,11 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
             trigger: () => h(
               NButton,
               {
-                size: 'tiny', secondary: true, type: 'error',
+                size: 'tiny', quaternary: true, type: 'error',
+                title: '删除',
                 disabled: r.status === 'running' || volumeBusy.value,
               },
               {
-                default: () => '删除',
                 icon: () => h(NIcon, null, { default: () => h(TrashOutline) }),
               },
             ),
@@ -3568,11 +3585,16 @@ onUnmounted(() => {
                         <div v-if="row.loading" class="proxy-domain-status">探测证书覆盖中…</div>
                         <div v-else-if="row.error" class="proxy-domain-status is-error">{{ row.error }}</div>
                         <div
-                          v-else-if="row.domain.trim()"
+                          v-else-if="row.domain.trim() && proxyDomainHint(row).text"
                           class="proxy-domain-status"
                           :class="`is-${proxyDomainHint(row).tone}`"
                         >
                           {{ proxyDomainHint(row).text }}
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 8px; margin-top: 6px">
+                          <NSwitch v-model:value="row.force_https" size="small" />
+                          <span style="font-size: 13px">强制 HTTPS</span>
+                          <span v-if="!row.force_https" class="field-hint tip-hint">关闭后 http:// 直接访问，不跳转 https</span>
                         </div>
                       </div>
                       <NButton quaternary type="error" @click="removeProxyDomain(idx)">

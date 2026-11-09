@@ -15,6 +15,8 @@ export interface DomainBinding {
   // true = 证书由服务端按域名自动匹配（保存时物化具体 ID）；前端展示为
   // 「自动匹配」并在下次保存时重新解析，不把旧证书钉死成显式选择。
   auto?: boolean
+  // true = 该域名 80 端口 301 跳转 https；缺省/false = 80 直接提供明文访问。
+  force_https?: boolean
 }
 
 export interface AppEntity {

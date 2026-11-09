@@ -36,6 +36,10 @@ const (
 	nginxContainer   = "watchman-proxy-nginx"
 	writeChunkSize   = 64 * 1024
 	fileWriteTimeout = 60 * time.Second
+	// defaultProxyUpstreamPort is the loopback port used when an app
+	// publishes no port at all. It marks "no port information", not a
+	// real choice — see syncUpstream's sentinel repair.
+	defaultProxyUpstreamPort = 8080
 )
 
 // ProxyHandler wires application domain bindings to the certificate hub and
@@ -89,6 +93,9 @@ func (h *ProxyHandler) Register(writeRG *gin.RouterGroup) {
 type proxyDomainReq struct {
 	Domain string `json:"domain"`
 	CertID string `json:"cert_id"`
+	// ForceHTTPS opts this domain into the port-80 → HTTPS 301. Absent
+	// or false means :80 serves the app directly over plain HTTP.
+	ForceHTTPS bool `json:"force_https,omitempty"`
 }
 
 type proxyBindReq struct {
@@ -212,7 +219,7 @@ func (h *ProxyHandler) bindProxy(c *gin.Context) {
 		}
 		seen[domain] = true
 		certID := strings.TrimSpace(req.Domains[i].CertID)
-		domains = append(domains, DomainBinding{Domain: domain, CertID: certID})
+		domains = append(domains, DomainBinding{Domain: domain, CertID: certID, ForceHTTPS: req.Domains[i].ForceHTTPS})
 	}
 
 	// One domain maps to exactly one app: two vhosts with the same
@@ -628,8 +635,11 @@ func (h *ProxyHandler) SyncProxyForHost(app *Application, oldHostID string) erro
 // and keeping it would point the gateway at the host the app just left —
 // unless ProxyUpstreamManual says the operator chose it, in which case the
 // collision is intentional and the value is kept verbatim. Legacy records
-// (manual flag false) keep the heuristic. Empty or malformed stored values
-// fall back to defaultUpstream.
+// (manual flag false) keep the heuristic. A second exception is the
+// local-mode 8080 sentinel: a stored 127.0.0.1:8080 on a non-manual record
+// only ever meant "no port was known", and is recomputed once a real port
+// can be resolved. Empty or malformed stored values fall back to
+// defaultUpstream.
 func (h *ProxyHandler) syncUpstream(app *Application, mode, gatewayHostID, oldHostID string) (string, error) {
 	stored := strings.TrimSpace(app.ProxyUpstream)
 	if stored == "" || !validProxyUpstream(stored) {
@@ -637,7 +647,18 @@ func (h *ProxyHandler) syncUpstream(app *Application, mode, gatewayHostID, oldHo
 	}
 	if mode == "local" {
 		// Loopback upstreams are host-independent: the stored value stays
-		// valid on the new host, manual or computed.
+		// valid on the new host, manual or computed — except the 8080
+		// sentinel. A stored 127.0.0.1:8080 on a non-manual record only
+		// ever meant "no port was known when this was computed" (compose
+		// apps publish no Ports list); once a real port is known, keeping
+		// the sentinel would proxy into the void. A manual 8080 is never
+		// repaired, and an app that genuinely publishes 8080 recomputes
+		// to the same value, so neither case changes.
+		if !app.ProxyUpstreamManual && stored == fmt.Sprintf("127.0.0.1:%d", defaultProxyUpstreamPort) {
+			if def, err := h.defaultUpstream(app, mode, gatewayHostID); err == nil && def != stored {
+				return def, nil
+			}
+		}
 		return stored, nil
 	}
 	if app.ProxyUpstreamManual {
@@ -684,10 +705,25 @@ func gatewayStoredUpstreamWasComputed(stored, oldMesh, oldPublic, oldInternal st
 // syncFirstPort mirrors defaultUpstream's port choice: the first published
 // host port, or 8080 when the app publishes nothing.
 func syncFirstPort(app *Application) int {
+	if port := firstPublishedPort(app); port != 0 {
+		return port
+	}
+	return defaultProxyUpstreamPort
+}
+
+// firstPublishedPort resolves the port defaultUpstream and syncFirstPort
+// use: the form/template port list first, then the first published port
+// parsed from a raw_compose file, else 0 (callers fall back to
+// defaultProxyUpstreamPort). Compose files are authoritative for compose
+// apps, whose Ports list is normally empty.
+func firstPublishedPort(app *Application) int {
+	if app == nil {
+		return 0
+	}
 	if len(app.Ports) > 0 && app.Ports[0].Host != 0 {
 		return app.Ports[0].Host
 	}
-	return 8080
+	return firstComposePublishedPort(app)
 }
 
 // pushVhost pushes every binding's cert + key, writes the vhost conf and
@@ -996,7 +1032,7 @@ func (h *ProxyHandler) resolveBindingCerts(app *Application) ([]domainCertPair, 
 			return nil, fmt.Errorf("域名 %s 的存量绑定未记录证书，且证书中心没有覆盖它的证书，请先在应用详情绑定证书", domain)
 		}
 		freeze[domain] = crt.ID
-		pairs = append(pairs, domainCertPair{binding: DomainBinding{Domain: domain, CertID: crt.ID, Auto: true}, crt: crt})
+		pairs = append(pairs, domainCertPair{binding: DomainBinding{Domain: domain, CertID: crt.ID, Auto: true, ForceHTTPS: b.ForceHTTPS}, crt: crt})
 	}
 	if len(freeze) > 0 {
 		if err := h.store.UpdateApp(app.ID, func(a *Application) error {
@@ -1324,12 +1360,9 @@ func (h *ProxyHandler) RepushAppCerts(crt *cert.Certificate) {
 // 127.0.0.1 is never used as a gateway upstream: it would point at the gateway
 // itself and blackhole traffic.
 func (h *ProxyHandler) defaultUpstream(app *Application, mode, gatewayHostID string) (string, error) {
-	var port int
-	if len(app.Ports) > 0 {
-		port = app.Ports[0].Host
-	}
+	port := firstPublishedPort(app)
 	if port == 0 {
-		port = 8080
+		port = defaultProxyUpstreamPort
 	}
 	if mode == "local" {
 		return fmt.Sprintf("127.0.0.1:%d", port), nil
@@ -1407,7 +1440,16 @@ func renderVhosts(bindings []DomainBinding, upstream string, websocket bool) str
 		fmt.Fprintf(&b, "server {\n")
 		fmt.Fprintf(&b, "    listen 80;\n")
 		fmt.Fprintf(&b, "    server_name %s;\n", domain)
-		fmt.Fprintf(&b, "    return 301 https://$host$request_uri;\n")
+		if bd.ForceHTTPS {
+			fmt.Fprintf(&b, "    return 301 https://$host$request_uri;\n")
+		} else {
+			// No forced redirect: :80 serves the app directly over plain
+			// HTTP. The 1m nginx default body limit applies here too, same
+			// as on :443 — proxied uploads would otherwise be truncated
+			// with a confusing 413.
+			fmt.Fprintf(&b, "    client_max_body_size 64m;\n\n")
+			renderProxyLocation(&b, upstream, websocket, "http")
+		}
 		fmt.Fprintf(&b, "}\n\n")
 		fmt.Fprintf(&b, "server {\n")
 		fmt.Fprintf(&b, "    listen 443 ssl;\n")
@@ -1419,21 +1461,28 @@ func renderVhosts(bindings []DomainBinding, upstream string, websocket bool) str
 		// nginx defaults to a 1m body limit; proxied uploads would be silently
 		// truncated with a confusing 413 for the app behind the vhost.
 		fmt.Fprintf(&b, "    client_max_body_size 64m;\n\n")
-		fmt.Fprintf(&b, "    location / {\n")
-		fmt.Fprintf(&b, "        proxy_pass http://%s;\n", upstream)
-		fmt.Fprintf(&b, "        proxy_set_header Host $host;\n")
-		fmt.Fprintf(&b, "        proxy_set_header X-Real-IP $remote_addr;\n")
-		fmt.Fprintf(&b, "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
-		fmt.Fprintf(&b, "        proxy_set_header X-Forwarded-Proto https;\n")
-		if websocket {
-			fmt.Fprintf(&b, "        proxy_set_header Upgrade $http_upgrade;\n")
-			fmt.Fprintf(&b, "        proxy_set_header Connection \"upgrade\";\n")
-			fmt.Fprintf(&b, "        proxy_read_timeout 300s;\n")
-		}
-		fmt.Fprintf(&b, "    }\n")
+		renderProxyLocation(&b, upstream, websocket, "https")
 		fmt.Fprintf(&b, "}\n\n")
 	}
 	return strings.TrimRight(b.String(), "\n") + "\n"
+}
+
+// renderProxyLocation writes the shared proxy location block. proto is the
+// scheme the client used — https on :443, http on a plain :80 vhost — so the
+// app behind the proxy sees the real client-facing scheme.
+func renderProxyLocation(b *strings.Builder, upstream string, websocket bool, proto string) {
+	fmt.Fprintf(b, "    location / {\n")
+	fmt.Fprintf(b, "        proxy_pass http://%s;\n", upstream)
+	fmt.Fprintf(b, "        proxy_set_header Host $host;\n")
+	fmt.Fprintf(b, "        proxy_set_header X-Real-IP $remote_addr;\n")
+	fmt.Fprintf(b, "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
+	fmt.Fprintf(b, "        proxy_set_header X-Forwarded-Proto %s;\n", proto)
+	if websocket {
+		fmt.Fprintf(b, "        proxy_set_header Upgrade $http_upgrade;\n")
+		fmt.Fprintf(b, "        proxy_set_header Connection \"upgrade\";\n")
+		fmt.Fprintf(b, "        proxy_read_timeout 300s;\n")
+	}
+	fmt.Fprintf(b, "    }\n")
 }
 
 // writeFileOnAgent streams one small file (cert/conf) through the existing

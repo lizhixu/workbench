@@ -201,6 +201,7 @@ export interface CreateDomainItem {
   id: number
   domain: string
   cert_id: string
+  force_https: boolean
   certCover: CertCover | null
   loading: boolean
   error: string
@@ -214,6 +215,7 @@ const domainRows = ref<CreateDomainItem[]>([
     id: nextRowId++,
     domain: '',
     cert_id: '',
+    force_https: false,
     certCover: null,
     loading: false,
     error: '',
@@ -275,6 +277,7 @@ function addDomainRow() {
     id: nextRowId++,
     domain: '',
     cert_id: '',
+    force_https: false,
     certCover: null,
     loading: false,
     error: '',
@@ -298,21 +301,24 @@ function onDomainRowChange(row: CreateDomainItem) {
   if (domainRows.value[0]?.id === row.id) {
     form.domain = row.domain
   }
+  // 新探测一排期就作废旧结果与在途请求（seq++ 让迟到的旧响应无法写回）：
+  // 旧 certCover 若留到新探测返回，防抖 + 请求期间会按旧结论渲染自动签发区
+  // 而闪烁一次。清掉后该行回到“未知”态，探测期间不参与 autoIssueDomains。
+  row.seq++
+  row.certCover = null
+  row.error = ''
   if (!d) {
     row.cert_id = ''
-    row.certCover = null
     row.loading = false
-    row.error = ''
     return
   }
   row.loading = true
   row.timer = setTimeout(async () => {
-    const seq = ++row.seq
+    const seq = row.seq
     try {
       const cover = await getCertCover(d)
       if (seq !== row.seq) return
       row.certCover = cover
-      row.error = ''
     } catch {
       if (seq !== row.seq) return
       row.certCover = null
@@ -346,8 +352,11 @@ function domainHasUsableCert(row: CreateDomainItem): boolean {
 
 // 未显式指定证书、且当前也没有可用证书覆盖的域名：保存时由服务端自动匹配，
 // 匹配不到再对这些域名批量签发一张多 SAN 证书后重试绑定。
+// 探测进行中的行按“未知”排除，否则新探测在防抖 + 请求期间会按旧结论
+// 让“部分域名暂无可用证书”提醒闪烁一次；探测失败落回 cover=null 的行
+// 仍算未覆盖（提交时服务端说了算）。
 const autoIssueDomains = computed(() => {
-  return activeDomains.value.filter((r) => !r.cert_id && !domainHasUsableCert(r))
+  return activeDomains.value.filter((r) => !r.cert_id && !r.loading && !domainHasUsableCert(r))
 })
 
 const hasUncoveredDomains = computed(() => autoIssueDomains.value.length > 0)
@@ -1288,6 +1297,7 @@ async function bindDomainsWithCert(appId: string) {
   const domains = rows.map((r) => ({
     domain: r.domain.trim().toLowerCase(),
     cert_id: r.cert_id || undefined,
+    force_https: r.force_https || undefined,
   }))
   const doBind = (list: ProxyBindDomain[]) =>
     bindProxy(appId, {
@@ -1950,6 +1960,11 @@ onMounted(loadData)
                     :class="`is-${domainCertHint(item).tone}`"
                   >
                     {{ domainCertHint(item).text }}
+                  </div>
+                  <div style="display: flex; align-items: center; gap: 8px; margin-top: 6px">
+                    <NSwitch v-model:value="item.force_https" size="small" />
+                    <span style="font-size: 13px">强制 HTTPS</span>
+                    <span v-if="!item.force_https" class="hint">关闭后 http:// 直接访问，不跳转 https</span>
                   </div>
                 </div>
                 <NButton quaternary type="error" @click="removeDomainRow(idx)" :disabled="domainRows.length <= 1">

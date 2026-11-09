@@ -79,6 +79,14 @@ type tarScanResult struct {
 	prefixes map[string]bool // distinct path prefixes up to depth 3 + top-level file names
 	topDirs  []string        // ordered distinct top-level entry names, display-capped
 	topSet   map[string]bool
+	// complete is false when the read stopped early (entry cap, time budget,
+	// or the prefix set hit its cap): the layout signals below are then only
+	// a prefix of the archive, and restoreStripComponents must not act on
+	// them — stripping on a partial view could silently drop entries.
+	complete bool
+	// topHasChild records, per top-level entry name, whether any entry sits
+	// below it (i.e. it is a directory, explicit header or implied).
+	topHasChild map[string]bool
 }
 
 // scanUploadTar reads a staged archive's structure: gzip is auto-detected by
@@ -112,7 +120,7 @@ func scanUploadTar(file string) (*tarScanResult, error) {
 		src = zr
 	}
 
-	res := &tarScanResult{prefixes: make(map[string]bool), topSet: make(map[string]bool)}
+	res := &tarScanResult{prefixes: make(map[string]bool), topSet: make(map[string]bool), topHasChild: make(map[string]bool), complete: true}
 	deadline := time.Now().Add(volumeScanTimeBudget)
 	tr := tar.NewReader(src)
 	manifestSeen := false
@@ -122,9 +130,11 @@ func scanUploadTar(file string) (*tarScanResult, error) {
 	// 备份脚本写在归档首部，正常产物必然在截断之前读到。
 	for i := 0; ; i++ {
 		if i >= volumeScanEntryCap {
+			res.complete = false
 			break
 		}
 		if time.Now().After(deadline) {
+			res.complete = false
 			break
 		}
 		hd, herr := tr.Next()
@@ -160,6 +170,9 @@ func scanUploadTar(file string) (*tarScanResult, error) {
 		}
 		segments := strings.Split(name, "/")
 		top := segments[0]
+		if len(segments) >= 2 {
+			res.topHasChild[top] = true
+		}
 		if !res.topSet[top] {
 			res.topSet[top] = true
 			if len(res.topDirs) < 20 {
@@ -183,6 +196,10 @@ func scanUploadTar(file string) (*tarScanResult, error) {
 			if len(segments) >= 3 {
 				res.prefixes[segments[0]+"/"+segments[1]+"/"+segments[2]] = true
 			}
+		} else {
+			// Prefix set full: the layout signals are incomplete, so the
+			// strip decision below must stay conservative (strip 0).
+			res.complete = false
 		}
 	}
 	// Fail-closed：只要「扫描侧的 Snapshot 判定」可能不等于「恢复端重新
@@ -402,6 +419,78 @@ func matchScanVolumes(res *tarScanResult, cands []volumeScanCandidate, filename 
 		return scanMatchUnique, []volumeScanMatch{hits[0].m}
 	}
 	return scanMatchAmbiguous, matched
+}
+
+// restoreStripComponents decides how many leading path components a bare-tar
+// restore must strip so the archive's contents land at the volume root. It
+// is the restore-side half of the scan's matching: the scan says which volume
+// a file belongs to, this says how the file's layout maps onto it. It only
+// ever strips on an unambiguous layout — a complete scan, exactly one
+// distinct top-level entry, and that entry a directory — because GNU tar
+// silently drops members with fewer components than --strip-components
+// (exit 0, no error): stripping a flat or mixed tar would delete the
+// top-level files it was supposed to restore.
+//   - every entry under the full container path (tarred from the parent
+//     directory, e.g. app/pb_data/...) → strip the path depth;
+//   - the single top directory is the volume's container or host basename
+//     (docker cp / host-dir tar) → strip 1.
+//
+// Anything else strips nothing and the archive unpacks as-is.
+func restoreStripComponents(res *tarScanResult, cand volumeScanCandidate) int {
+	if res == nil || res.manifest != nil || !res.complete || len(res.topDirs) != 1 {
+		return 0
+	}
+	top := res.topDirs[0]
+	if !res.topHasChild[top] {
+		return 0
+	}
+	container := strings.TrimPrefix(cand.ContainerPath, "/")
+	if container != "" {
+		if depth := len(strings.Split(container, "/")); depth >= 2 && depthPrefixesMatch(res.prefixes, container, depth) {
+			return depth
+		}
+	}
+	base := path.Base(cand.ContainerPath)
+	hostBase := path.Base(cand.HostPath)
+	if hostBase == "" || hostBase == "." || hostBase == "/" {
+		if src, _, _, ok := parseVolumeSpec(cand.Spec); ok {
+			hostBase = path.Base(src)
+		}
+	}
+	// The top directory may carry a leading dot (e.g. ".data" for the host
+	// basename "data"): the scan normalizes that away for matching, and the
+	// strip verdict follows the same normalization.
+	cleanTop := strings.TrimLeft(top, "._")
+	for _, name := range []string{top, cleanTop} {
+		if name == "" {
+			continue
+		}
+		if (base != "" && base != "/" && base != "." && name == base) ||
+			(hostBase != "" && hostBase != "/" && hostBase != "." && name == hostBase) {
+			return 1
+		}
+	}
+	return 0
+}
+
+// depthPrefixesMatch reports whether the distinct depth-d path prefixes in
+// the scanned archive are exactly the one given prefix: every multi-segment
+// entry sits below it, so stripping d components loses nothing.
+func depthPrefixesMatch(prefixes map[string]bool, want string, depth int) bool {
+	if depth < 1 {
+		return false
+	}
+	seen := 0
+	for k := range prefixes {
+		if strings.Count(k, "/") != depth-1 {
+			continue
+		}
+		if k != want {
+			return false
+		}
+		seen++
+	}
+	return seen == 1
 }
 
 // resolveScanCandidates maps one commit pair's requested specs onto live

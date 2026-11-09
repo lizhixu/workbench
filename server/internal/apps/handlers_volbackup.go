@@ -607,12 +607,20 @@ func (h *AppHandlers) scanVolumeUploads(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("第 %d 个文件「%s」无法识别：%v", len(done)+1, scanUploadFilename(part.FileName()), terr)})
 			return
 		}
+		// The strip verdict is part of the scan: the layout is known here,
+		// and the commit only has to look the chosen volume up by spec.
+		stripBySpec := make(map[string]int, len(candidates))
+		for _, cand := range candidates {
+			if n := restoreStripComponents(res, cand); n > 0 {
+				stripBySpec[cand.Spec] = n
+			}
+		}
 		sc := &stagedScan{
 			ArchiveID: id, AppID: app.ID,
 			Filename: scanUploadFilename(part.FileName()),
 			Size:     size, SHA256: hr.hex(),
 			Snapshot: res.manifest != nil, Manifest: res.manifest,
-			StagedAt: time.Now(),
+			StagedAt: time.Now(), StripBySpec: stripBySpec,
 		}
 		us.PutScan(sc)
 		done = append(done, scanned{scan: sc, res: res})
@@ -908,6 +916,9 @@ func (h *AppHandlers) commitVolumeUploadRestore(c *gin.Context) {
 			arch.VolumeSpec = p.chosen[0].Spec
 			arch.HostPath = p.chosen[0].HostPath
 			arch.ContainerPath = p.chosen[0].ContainerPath
+			// Carry the scan's bare-tar layout verdict onto the record so
+			// the restore unpacks the wrapper instead of nesting it.
+			arch.StripComponents = sc.StripBySpec[p.chosen[0].Spec]
 		}
 		for _, ch := range p.chosen {
 			specs = append(specs, ch.Spec)

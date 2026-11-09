@@ -1149,8 +1149,10 @@ func (e *Engine) removeContainer(hub *rpc.Hub, name string) {
 
 // ---- helpers ----------------------------------------------------------
 
-// execOnAgent runs one command on the agent and waits for the result.
-func execOnAgent(hub *rpc.Hub, execID string, command string, timeoutSec int32) (*agentpb.ExecResult, error) {
+// execOnAgent runs one command on the agent and waits for the result. It is
+// a variable (not a plain func) so tests can stub the agent round-trip;
+// production code always uses the default implementation below.
+var execOnAgent = func(hub *rpc.Hub, execID string, command string, timeoutSec int32) (*agentpb.ExecResult, error) {
 	resultCh := make(chan *agentpb.ExecResult, 1)
 	hub.SetRespHandler(execID, func(msg *agentpb.AgentMessage) {
 		hub.SetRespHandler(execID, nil)

@@ -126,6 +126,19 @@ func TestVolumeMultiRestoreScript(t *testing.T) {
 	if !strings.Contains(script, "[ -f ") || !strings.Contains(script, "归档文件不存在") {
 		t.Errorf("restore script must check the archive exists:\n%s", script)
 	}
+
+	// A bare tar whose layout the upload scan already attributed to this
+	// volume strips its wrapper directory; a bare tar with no strip verdict
+	// keeps the direct extract. The snapshot branch always strips 2.
+	stripped := volumeMultiRestoreScript("/var/backups/watchman/apps/app1/vbk_x.tar.gz",
+		"/var/backups/watchman/apps/app1/safety", true,
+		[]RestoreTarget{{Index: 0, DestDir: "/opt/data", Spec: "/opt/data:/data", Strip: 1}})
+	if !strings.Contains(stripped, `tar -C '/opt/data' -xf '/var/backups/watchman/apps/app1/vbk_x.tar.gz' --strip-components=1`) {
+		t.Errorf("bare-tar branch with Strip=1 must strip the wrapper:\n%s", stripped)
+	}
+	if strings.Contains(script, "--strip-components=1") {
+		t.Errorf("bare-tar branch with Strip=0 must not strip anything:\n%s", script)
+	}
 }
 
 // The upload preflight probe must auto-detect compression too: a plain .tar

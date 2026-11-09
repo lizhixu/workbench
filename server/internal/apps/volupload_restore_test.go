@@ -444,6 +444,16 @@ func TestCommitVolumeUploadRestore(t *testing.T) {
 		if arch.HostPath != want[0] || arch.ContainerPath != want[1] {
 			t.Fatalf("record %s host=%q container=%q, want %v", id, arch.HostPath, arch.ContainerPath, want)
 		}
+		// The scan's bare-tar layout verdict rides along onto the record:
+		// file 1 ("a/keep") wraps volume /a, file 2 ("whatever/keep") was
+		// hand-picked onto /b, so only the first strips.
+		wantStrip := 0
+		if i == 0 {
+			wantStrip = 1
+		}
+		if arch.StripComponents != wantStrip {
+			t.Fatalf("record %s strip_components=%d, want %d", id, arch.StripComponents, wantStrip)
+		}
 		if arch.Source != VolumeArchiveSourceUpload || arch.Status != VolumeBackupUploaded {
 			t.Fatalf("record %s source=%q status=%q", id, arch.Source, arch.Status)
 		}

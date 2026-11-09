@@ -148,6 +148,11 @@ type VolumeArchive struct {
 	ConsistencyMode string `json:"consistency_mode,omitempty"`
 	// CleanRestore records whether this archive defaults or was restored with clean wipe.
 	CleanRestore bool `json:"clean_restore,omitempty"`
+	// StripComponents records, for an uploaded bare tar, how many leading
+	// path components the restore must strip so the archive lands at the
+	// volume root (decided at upload-scan time from the tar layout, see
+	// restoreStripComponents). Snapshots ignore it: they unpack by manifest.
+	StripComponents int `json:"strip_components,omitempty"`
 	// StorageTarget/StorageTargetName are frozen at backup time: switching the
 	// default target later must not orphan older archives.
 	// Can be "local" (host-local storage) or an S3 target ID.
@@ -566,6 +571,9 @@ type RestoreTarget struct {
 	Index   int    `json:"index"`
 	DestDir string `json:"dest_dir"`
 	Spec    string `json:"spec"`
+	// Strip is how many leading path components a bare-tar unpack removes
+	// (0 = direct extract). Snapshots ignore it.
+	Strip int `json:"strip,omitempty"`
 }
 
 // volumeMultiRestoreScript generates the agent shell script to unpack one or more volumes
@@ -603,12 +611,22 @@ fi
 				destDirQ, destDirQ, destDirQ))
 		}
 		volPattern := fmt.Sprintf("volumes/vol_%d", t.Index)
+		bareExtract := fmt.Sprintf("tar -C %s -xf %s", destDirQ, shellQuote(archivePath))
+		if t.Strip > 0 {
+			// Bare tar whose layout the upload scan already attributed to
+			// this volume (docker cp / host-dir / parent-tar wrapper):
+			// strip the wrapper so the contents land at the volume root
+			// instead of one level down. Strip is only ever set when the
+			// layout is unambiguous (see restoreStripComponents); a flat
+			// or mixed tar keeps the direct extract below.
+			bareExtract = fmt.Sprintf("tar -C %s -xf %s --strip-components=%d", destDirQ, shellQuote(archivePath), t.Strip)
+		}
 		sb.WriteString(fmt.Sprintf(`if [ "$IS_SNAPSHOT" -eq 1 ]; then
   tar -C %s -xf %s --strip-components=2 %s
 else
-  tar -C %s -xf %s
+  %s
 fi
-`, destDirQ, shellQuote(archivePath), shellQuote(volPattern), destDirQ, shellQuote(archivePath)))
+`, destDirQ, shellQuote(archivePath), shellQuote(volPattern), bareExtract))
 	}
 	return sb.String()
 }
@@ -1525,6 +1543,7 @@ func (e *Engine) resolveRestoreDestinations(hub *rpc.Hub, app *Application, arch
 			Index:   idx,
 			DestDir: destDir,
 			Spec:    item.VolumeSpec,
+			Strip:   arch.StripComponents,
 		})
 	}
 
@@ -1682,7 +1701,12 @@ func (e *Engine) runRestoreUploadedBatch(app *Application, items []*uploadedRest
 		ready = append(ready, &stagedItem{idx: i, item: it, staging: staging, targets: targets})
 	}
 
-	// Phase 2 — one stop for the whole batch, one restart after all unpacks.
+	// Phase 2 — one stop for the whole batch, one (re)start after all
+	// unpacks. An app that was stopped before the restore is started too:
+	// a restore that leaves the app down while reporting success is a false
+	// success. The start only runs when the unpack succeeded — on a failed
+	// unpack the stopped app stays stopped (its safety copy still holds the
+	// pre-restore data).
 	wasRunning, _ := e.IsAppRunning(hub, app)
 	if wasRunning {
 		if serr := e.StopApp(hub, app); serr != nil {
@@ -1692,41 +1716,49 @@ func (e *Engine) runRestoreUploadedBatch(app *Application, items []*uploadedRest
 			}
 			return false, serr
 		}
-		defer func() {
-			if startErr := e.StartApp(hub, app); startErr != nil {
-				restartErr := fmt.Errorf("恢复后重启应用失败: %v", startErr)
-				e.log.Error("volume restore: restart failed", "app", app.ID, "err", restartErr)
-				if err == nil {
-					err = restartErr
-				} else {
-					err = fmt.Errorf("%v；%w", err, restartErr)
-				}
-				for j := range pairErrs {
-					if pairErrs[j] == nil {
-						pairErrs[j] = restartErr
-					}
-				}
-				return
-			}
-			running, _ := e.IsAppRunning(hub, app)
-			if !running {
-				restartErr := fmt.Errorf("恢复后应用未保持运行")
-				e.log.Error("volume restore: app not running after restart", "app", app.ID)
-				if err == nil {
-					err = restartErr
-				} else {
-					err = fmt.Errorf("%v；%w", err, restartErr)
-				}
-				for j := range pairErrs {
-					if pairErrs[j] == nil {
-						pairErrs[j] = restartErr
-					}
-				}
-				return
-			}
-			restarted = true
-		}()
 	}
+	defer func() {
+		if !wasRunning && err != nil {
+			return
+		}
+		verb := "重启"
+		if !wasRunning {
+			verb = "启动"
+		}
+		if startErr := e.StartApp(hub, app); startErr != nil {
+			restartErr := fmt.Errorf("恢复后%s应用失败: %v", verb, startErr)
+			e.log.Error("volume restore: restart failed", "app", app.ID, "err", restartErr)
+			if err == nil {
+				err = restartErr
+			} else {
+				err = fmt.Errorf("%v；%w", err, restartErr)
+			}
+			for j := range pairErrs {
+				if pairErrs[j] == nil {
+					pairErrs[j] = restartErr
+				}
+			}
+			return
+		}
+		running, _ := e.IsAppRunning(hub, app)
+		if !running {
+			restartErr := fmt.Errorf("恢复后应用未保持运行")
+			e.log.Error("volume restore: app not running after restart", "app", app.ID)
+			if err == nil {
+				err = restartErr
+			} else {
+				err = fmt.Errorf("%v；%w", err, restartErr)
+			}
+			for j := range pairErrs {
+				if pairErrs[j] == nil {
+					pairErrs[j] = restartErr
+				}
+			}
+			return
+		}
+		restarted = true
+		e.log.Info("volume restore: app (re)started after restore", "app", app.ID, "was_running", wasRunning)
+	}()
 
 	// Phase 3 — per-pair unpack. The container is already stopped and every
 	// other pair's data is staged and verified, so one failure marks only its
@@ -1742,7 +1774,7 @@ func (e *Engine) runRestoreUploadedBatch(app *Application, items []*uploadedRest
 		err = errors.Join(unpackErrs...)
 		return restarted, err
 	}
-	e.log.Info("volume batch restored", "app", app.ID, "targets", len(ready), "restarted", restarted)
+	e.log.Info("volume batch restored", "app", app.ID, "targets", len(ready))
 	return restarted, nil
 }
 
@@ -1845,41 +1877,54 @@ func (e *Engine) runRestoreCore(app *Application, arch *VolumeArchive, downloadU
 		defer e.cleanupHostPaths(hub, staging)
 	}
 
+	// An app that was stopped before the restore is started too: a restore
+	// that leaves the app down while reporting success is a false success.
+	// The start only runs when the unpack succeeded — on a failed unpack
+	// the stopped app stays stopped (its safety copy still holds the
+	// pre-restore data).
 	wasRunning, _ := e.IsAppRunning(hub, app)
 	if wasRunning {
 		if err := e.StopApp(hub, app); err != nil {
 			return false, fmt.Errorf("停止应用失败: %v", err)
 		}
-		defer func() {
-			if startErr := e.StartApp(hub, app); startErr != nil {
-				restartErr := fmt.Errorf("恢复后重启应用失败: %v", startErr)
-				e.log.Error("volume restore: restart failed", "app", app.ID, "err", restartErr)
-				if err == nil {
-					err = restartErr
-				} else {
-					err = fmt.Errorf("%v；%w", err, restartErr)
-				}
-				return
-			}
-			running, _ := e.IsAppRunning(hub, app)
-			if !running {
-				restartErr := fmt.Errorf("恢复后应用未保持运行")
-				e.log.Error("volume restore: app not running after restart", "app", app.ID)
-				if err == nil {
-					err = restartErr
-				} else {
-					err = fmt.Errorf("%v；%w", err, restartErr)
-				}
-				return
-			}
-			restarted = true
-		}()
 	}
+	defer func() {
+		if !wasRunning && err != nil {
+			return
+		}
+		verb := "重启"
+		if !wasRunning {
+			verb = "启动"
+		}
+		if startErr := e.StartApp(hub, app); startErr != nil {
+			restartErr := fmt.Errorf("恢复后%s应用失败: %v", verb, startErr)
+			e.log.Error("volume restore: restart failed", "app", app.ID, "err", restartErr)
+			if err == nil {
+				err = restartErr
+			} else {
+				err = fmt.Errorf("%v；%w", err, restartErr)
+			}
+			return
+		}
+		running, _ := e.IsAppRunning(hub, app)
+		if !running {
+			restartErr := fmt.Errorf("恢复后应用未保持运行")
+			e.log.Error("volume restore: app not running after restart", "app", app.ID)
+			if err == nil {
+				err = restartErr
+			} else {
+				err = fmt.Errorf("%v；%w", err, restartErr)
+			}
+			return
+		}
+		restarted = true
+		e.log.Info("volume restore: app (re)started after restore", "app", app.ID, "was_running", wasRunning)
+	}()
 
 	if uerr := e.execRestoreTargets(hub, app, arch, staging, opts.CleanRestore, targets); uerr != nil {
 		return restarted, uerr
 	}
-	e.log.Info("volume restored", "app", app.ID, "archive", arch.ID, "targets", len(targets), "restarted", restarted)
+	e.log.Info("volume restored", "app", app.ID, "archive", arch.ID, "targets", len(targets))
 	return restarted, nil
 }
 

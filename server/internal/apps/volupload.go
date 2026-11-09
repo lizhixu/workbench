@@ -57,6 +57,11 @@ type stagedScan struct {
 	Snapshot  bool
 	Manifest  *SnapshotManifest
 	StagedAt  time.Time
+	// StripBySpec is the upload-scan verdict, per candidate volume spec, of
+	// how many leading path components a bare-tar restore must strip
+	// (restoreStripComponents). Snapshots carry no entry: they unpack by
+	// manifest. A spec absent here strips nothing.
+	StripBySpec map[string]int
 }
 
 var errVolumeUploadTooLarge = errors.New("上传文件不能超过 2GB")

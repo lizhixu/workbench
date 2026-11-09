@@ -86,7 +86,34 @@ func (m *Manager) Open(req *agentpb.TerminalOpen) error {
 		Account: req.GetAccount(),
 	})
 	if err != nil {
-		return fmt.Errorf("open pty: %w", err)
+		openErr := fmt.Errorf("open pty: %w", err)
+		// Surface the failure in the terminal instead of leaving a hung
+		// session: the server already created the session and routes this
+		// output to the browser; the empty output that follows marks the
+		// session ended, so no further input is forwarded to a session
+		// that was never created.
+		m.mu.Lock()
+		sender := m.sender
+		m.mu.Unlock()
+		if sender != nil {
+			sender.Send(&agentpb.AgentMessage{
+				Payload: &agentpb.AgentMessage_TermOut{
+					TermOut: &agentpb.TerminalOutput{
+						SessionId: req.GetSessionId(),
+						Data:      []byte("无法启动终端：" + openErr.Error() + "\r\n"),
+					},
+				},
+			})
+			sender.Send(&agentpb.AgentMessage{
+				Payload: &agentpb.AgentMessage_TermOut{
+					TermOut: &agentpb.TerminalOutput{
+						SessionId: req.GetSessionId(),
+						Data:      nil, // empty data signals EOF
+					},
+				},
+			})
+		}
+		return openErr
 	}
 
 	s := &session{id: req.GetSessionId(), pty: p, stop: make(chan struct{})}

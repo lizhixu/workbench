@@ -1050,7 +1050,7 @@ func (x *HeartbeatAck) GetTs() int64 {
 type TerminalOpen struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
-	Shell         string                 `protobuf:"bytes,2,opt,name=shell,proto3" json:"shell,omitempty"`     // bash / sh / powershell / cmd
+	Shell         string                 `protobuf:"bytes,2,opt,name=shell,proto3" json:"shell,omitempty"`     // bash / sh / powershell / cmd, or a full command line with arguments (e.g. "docker exec -it <container> /bin/sh"); the agent splits it into argv
 	Account       string                 `protobuf:"bytes,3,opt,name=account,proto3" json:"account,omitempty"` // optional login account; empty = default
 	Cwd           string                 `protobuf:"bytes,4,opt,name=cwd,proto3" json:"cwd,omitempty"`
 	Cols          uint32                 `protobuf:"varint,5,opt,name=cols,proto3" json:"cols,omitempty"`
@@ -2247,7 +2247,9 @@ type DockerOp struct {
 	// - For op "logs": {"tail":200,"since":"24h","timestamps":true} — tail
 	//   1..10000 (default 200), since "" or "all" means no --since flag,
 	//   otherwise a docker duration like 1h/24h/168h; old agents ignore
-	//   args_json for logs and keep returning --tail 200.
+	//   args_json for logs and keep returning --tail 200. The logs payload
+	//   merges the container's stdout and stderr (the docker CLI splits
+	//   them across its own streams; old agents capture stdout only).
 	// all fields optional; empty dynamic rows are skipped.
 	ArgsJson      []byte `protobuf:"bytes,5,opt,name=args_json,json=argsJson,proto3" json:"args_json,omitempty"`
 	unknownFields protoimpl.UnknownFields

@@ -19,7 +19,7 @@ type PTY interface {
 
 // Config describes how to start a terminal session.
 type Config struct {
-	Shell   string // command to run (e.g. "bash", "powershell.exe")
+	Shell   string // command to run, optionally with arguments (e.g. "bash", "docker exec -it <container> /bin/sh")
 	Cwd     string // working directory (empty = inherit)
 	Cols    uint16
 	Rows    uint16

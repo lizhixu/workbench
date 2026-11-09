@@ -4,6 +4,7 @@
 package pty
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
@@ -23,7 +24,17 @@ func Open(cfg Config) (PTY, error) {
 		shell = "bash"
 	}
 
-	cmd := exec.Command(shell)
+	// The shell value may carry arguments (the container terminal sends the
+	// whole `docker exec -it <container> /bin/sh` line). Split it into argv
+	// instead of handing the entire string to exec.Command as one file name.
+	argv, err := splitShellCommand(shell)
+	if err != nil {
+		return nil, err
+	}
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("empty shell command")
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	if cfg.Cwd != "" {
 		cmd.Dir = cfg.Cwd
 	}

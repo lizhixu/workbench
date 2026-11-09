@@ -2,10 +2,14 @@ package docker
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"watchman/proto/agentpb"
 )
 
 // The console can install Docker on a running host, so a cached "missing"
@@ -227,5 +231,80 @@ func TestDockerArgsRejectsUnknownOps(t *testing.T) {
 		if ok || args != nil {
 			t.Errorf("%s: dockerArgs(%q) 应返回 (nil,false)，实际 (%v,%v)", tc.name, tc.op, args, ok)
 		}
+	}
+}
+
+// captureSender records the single DockerEvent a Manager run sends.
+type captureSender struct {
+	msg *agentpb.AgentMessage
+}
+
+func (s *captureSender) Send(msg *agentpb.AgentMessage) bool {
+	s.msg = msg
+	return true
+}
+
+// logs 必须合并 stdout 与 stderr：docker CLI 把容器 stderr 分流到自身
+// stderr，`Output()` 只抓 stdout 时写 stderr 的应用（如 Go 默认 log 的
+// certimate）日志会全丢、面板恒显示空。ps 等结构化 op 保持只抓 stdout，
+// stderr 混入会污染 NDJSON 解析。
+func TestRunLogsMergesStderr(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"logs\" ]; then\n" +
+		"  if [ \"$4\" = \"missing\" ]; then echo 'Error: No such container: missing' >&2; exit 1; fi\n" +
+		"  echo stdout-line\n" +
+		"  echo stderr-line >&2\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"ps\" ]; then\n" +
+		"  echo '{\"ID\":\"abc\"}'\n" +
+		"  echo ps-stderr-noise >&2\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"echo unexpected >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	runOp := func(op *agentpb.DockerOp) *agentpb.DockerEvent {
+		m := NewManager(nil)
+		m.lookPath = func(string) (string, error) { return filepath.Join(dir, "docker"), nil }
+		s := &captureSender{}
+		m.SetSender(s)
+		m.run(op)
+		if s.msg == nil {
+			t.Fatal("Manager.run 未发送 DockerEvent")
+		}
+		return s.msg.GetDocker()
+	}
+
+	// logs：stdout 与 stderr 都要进 payload。
+	ev := runOp(&agentpb.DockerOp{Op: "logs", Container: "web"})
+	if !ev.GetOk() {
+		t.Fatalf("logs 应成功，实际失败：%s", ev.GetError())
+	}
+	payload := string(ev.GetPayloadJson())
+	if !strings.Contains(payload, "stdout-line") || !strings.Contains(payload, "stderr-line") {
+		t.Errorf("logs payload 应同时含 stdout 与 stderr 行，实际 %q", payload)
+	}
+
+	// logs 失败时 CombinedOutput 的报错仍要带回（ExitError.Stderr 为空）。
+	ev = runOp(&agentpb.DockerOp{Op: "logs", Container: "missing"})
+	if ev.GetOk() {
+		t.Error("logs 不存在的容器应失败")
+	} else if !strings.Contains(ev.GetError(), "No such container") {
+		t.Errorf("logs 失败信息应含 CLI 报错，实际 %q", ev.GetError())
+	}
+
+	// ps：保持只抓 stdout，stderr 噪声不得混入 NDJSON。
+	ev = runOp(&agentpb.DockerOp{Op: "ps"})
+	if !ev.GetOk() {
+		t.Fatalf("ps 应成功，实际失败：%s", ev.GetError())
+	}
+	if strings.Contains(string(ev.GetPayloadJson()), "ps-stderr-noise") {
+		t.Errorf("ps payload 不应含 stderr 内容，实际 %q", string(ev.GetPayloadJson()))
 	}
 }

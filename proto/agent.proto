@@ -136,7 +136,7 @@ message HeartbeatAck {
 
 message TerminalOpen {
   string session_id = 1;
-  string shell = 2; // bash / sh / powershell / cmd
+  string shell = 2; // bash / sh / powershell / cmd, or a full command line with arguments (e.g. "docker exec -it <container> /bin/sh"); the agent splits it into argv
   string account = 3; // optional login account; empty = default
   string cwd = 4;
   uint32 cols = 5;
@@ -299,7 +299,9 @@ message DockerOp {
   // - For op "logs": {"tail":200,"since":"24h","timestamps":true} — tail
   //   1..10000 (default 200), since "" or "all" means no --since flag,
   //   otherwise a docker duration like 1h/24h/168h; old agents ignore
-  //   args_json for logs and keep returning --tail 200.
+  //   args_json for logs and keep returning --tail 200. The logs payload
+  //   merges the container's stdout and stderr (the docker CLI splits
+  //   them across its own streams; old agents capture stdout only).
   // all fields optional; empty dynamic rows are skipped.
   bytes args_json = 5;
 }

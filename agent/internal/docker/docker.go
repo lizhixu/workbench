@@ -139,13 +139,28 @@ func (m *Manager) run(op *agentpb.DockerOp) {
 		}
 	}
 
-	out, err := exec.CommandContext(ctx, "docker", args...).Output()
+	// `docker logs` 的容器输出分流：CLI 把容器 stdout 写到自身 stdout、
+	// 容器 stderr 写到自身 stderr；只抓 stdout 会丢掉写 stderr 的应用日志
+	// （如 Go 默认 log，certimate 即全量 stderr），故 logs 单独走
+	// CombinedOutput 合并两流。ps/images 的输出是结构化 NDJSON，stderr
+	// 混入会污染解析，保持只抓 stdout。
+	var out []byte
+	var err error
+	if op.GetOp() == "logs" {
+		out, err = exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	} else {
+		out, err = exec.CommandContext(ctx, "docker", args...).Output()
+	}
 	if err != nil {
-		// `Output()` only captures stdout; pull the stderr separately for the
-		// error message so the user sees what the CLI complained about.
+		// `Output()` 只抓 stdout 时用 ExitError.Stderr 补 CLI 报错；
+		// CombinedOutput 下 stderr 已在 out 里，Stderr 为空则回落用 out，
+		// 否则「容器不存在」这类报错会被吞成空字符串。
 		errOut := ""
 		if ee, ok := err.(*exec.ExitError); ok {
 			errOut = string(ee.Stderr)
+		}
+		if errOut == "" {
+			errOut = string(out)
 		}
 		result.Ok = false
 		result.Error = err.Error() + ": " + errOut

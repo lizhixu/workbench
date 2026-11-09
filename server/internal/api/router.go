@@ -2025,7 +2025,12 @@ loop:
 				return
 			}
 			lastProgress = p
-			if p.GetError() != "" {
+			// Failure is decided by stage, not by a non-empty Error: the
+			// agent reuses Error as a status-message field on in-progress
+			// stages (e.g. "verifying format and architecture"), so
+			// treating any non-empty Error as fatal aborts every upgrade
+			// at the verification step. Only stage "error" means failure.
+			if p.GetStage() == "error" {
 				c.JSON(http.StatusInternalServerError, gin.H{
 					"error": p.GetError(),
 					"stage": p.GetStage(),

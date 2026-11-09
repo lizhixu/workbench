@@ -2180,9 +2180,9 @@ const volumeColumns = computed<DataTableColumns<ParsedVolume>>(() => {
 })
 
 const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
-  { title: '创建时间', key: 'created_at', width: 166, render: (r) => h('span', { class: 'mono-font' }, formatTime(r.created_at)) },
+  { title: '创建时间', key: 'created_at', width: 180, render: (r) => h('span', { class: 'mono-font' }, formatTime(r.created_at)) },
   {
-    title: '快照内容 / 挂载卷', key: 'volume_spec', minWidth: 180, ellipsis: { tooltip: true },
+    title: '快照内容 / 挂载卷', key: 'volume_spec', minWidth: 210, ellipsis: { tooltip: true },
     render: (r) => {
       if (r.volumes && r.volumes.length > 1) {
         return h(NSpace, { size: 6, align: 'center' }, () => [
@@ -2212,7 +2212,7 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
     },
   },
   {
-    title: '模式', key: 'consistency_mode', width: 88,
+    title: '模式', key: 'consistency_mode', width: 80,
     render: (r) => {
       const mode = r.consistency_mode || 'online'
       if (mode === 'stop') return h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => '停机冷备' })
@@ -2238,18 +2238,18 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
     },
   },
   {
-    title: '大小', key: 'size', width: 88,
+    title: '大小', key: 'size', width: 84,
     render: (r) => h('span', { class: 'mono-font', style: 'font-size: 12px' }, r.size > 0 ? formatBytes(r.size) : '—'),
   },
   {
-    title: '状态', key: 'status', width: 84,
+    title: '状态', key: 'status', width: 80,
     // 上传记录无 S3 对象、状态恒为 uploaded，不走备份成功/失败的标签。
     render: (r) => r.source === 'upload'
       ? h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '上传' })
       : volArchiveStatusTag(r.status),
   },
   {
-    title: '最近恢复', key: 'last_restore', width: 190,
+    title: '最近恢复', key: 'last_restore', width: 200,
     render: (r) => {
       if (!r.last_restore_at) return renderVolDash()
       const failed = r.last_restore_status === 'failed'
@@ -2303,7 +2303,7 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
     },
   },
   {
-    title: '操作', key: 'actions', width: 208, fixed: 'right',
+    title: '操作', key: 'actions', width: 200, fixed: 'right',
     render: (r) => h(NSpace, { size: 6, wrap: false }, () => [
       canWrite.value && r.status === 'success'
         ? h(
@@ -2338,11 +2338,11 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
             trigger: () => h(
               NButton,
               {
-                size: 'tiny', quaternary: true, type: 'error',
-                title: '删除',
+                size: 'tiny', secondary: true, type: 'error',
                 disabled: r.status === 'running' || volumeBusy.value,
               },
               {
+                default: () => '删除',
                 icon: () => h(NIcon, null, { default: () => h(TrashOutline) }),
               },
             ),
@@ -3116,7 +3116,7 @@ onUnmounted(() => {
                     size="small"
                     :bordered="false"
                     :loading="volumeListLoading"
-                    :scroll-x="1440"
+                    :scroll-x="1496"
                     :row-key="(r: VolumeArchive) => r.id"
                   >
                     <template #empty>

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -94,11 +95,25 @@ func mustScanSnapshot(t *testing.T) *tarScanResult {
 
 // ---- 缺陷 1：恢复脚本真实解包落点 ----
 
+// skipUnlessPOSIXPaths skips tests that unpack real archives through the
+// local sh: the generated restore script feeds tar paths straight from
+// t.TempDir(), and on Windows those carry a drive letter ("C:\...") which
+// tar parses as a remote host ("Cannot connect to C"), so the run can never
+// succeed there. LookPath("sh")/LookPath("tar") do not catch this — Git Bash
+// ships both. CI and production both run on Linux.
+func skipUnlessPOSIXPaths(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX-only: tar treats Windows drive-letter temp paths as a remote host")
+	}
+}
+
 // TestVolumeMultiRestoreScriptRealUnpack runs the generated restore script
 // through a real sh instead of only asserting its text: the bare-tar branch
 // used to unpack docker-cp-shaped archives one level too deep, and a string
 // assertion cannot catch a wrong --strip-components value.
 func TestVolumeMultiRestoreScriptRealUnpack(t *testing.T) {
+	skipUnlessPOSIXPaths(t)
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("no sh in this environment")
 	}
@@ -240,6 +255,7 @@ func runLocalScript(command string) (*agentpb.ExecResult, error) {
 // scratch space is not writable and removes its own app dir afterwards.
 func newRestoreTestEnv(t *testing.T, appID string) (*Engine, *Store, *VolumeStore, *fakeRestoreAgent) {
 	t.Helper()
+	skipUnlessPOSIXPaths(t)
 	if err := os.MkdirAll(volumeStagingDir(appID), 0o755); err != nil {
 		t.Skipf("volume staging scratch space not writable: %v", err)
 	}

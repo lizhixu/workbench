@@ -271,7 +271,9 @@ onMounted(() => {
       </NFormItem>
 
       <NFormItem label="模型名称 (Model)" required>
-        <NSpace :wrap="false" style="width: 100%">
+        <!-- 不用 NSpace：它会给每个子项包一层 wrapper div，写在 NSelect 上的
+             flex:1 落不到 flex 轴上，选择框无法撑满剩余行宽 -->
+        <div class="model-row">
           <NSelect
             v-model:value="modelValue"
             :options="modelOptions"
@@ -284,7 +286,7 @@ onMounted(() => {
           <NButton secondary :loading="probingModels" @click="handleProbeModels">
             探测模型
           </NButton>
-        </NSpace>
+        </div>
         <template #feedback>
           <span class="muted tip-hint">
             点「探测模型」从当前端点拉取可用模型列表；列表中没有时可直接输入，输入后按回车确认。
@@ -371,4 +373,12 @@ onMounted(() => {
 
 <style scoped lang="scss">
 .muted { color: var(--text-secondary); font-size: 13px; }
+
+// 「选择框 + 按钮」同行：NSelect 撑满剩余宽度，按钮保持自然宽度
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
 </style>

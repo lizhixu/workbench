@@ -387,6 +387,7 @@ web/
 - **常用命令库**：增删改查常用运维 Shell 脚本。
 - **在线终端与文件配置**：默认登录账号、默认文件打开路径。
 - **AI 适配层设置 (Admin 专享)**：配置 AI Provider (Ollama/vLLM/DeepSeek/GLM/OpenAI)、BaseURL、API Key、降级链 (Fallbacks)、频率限制与数据脱敏开关 (`mask_on_external`)。
+- **模型选择行布局**：`AiConfig.vue` 的模型选择框与「探测模型」按钮使用 `.model-row` 直接 flex 排列（宽度 100%、垂直居中、间距 8px）；`NSelect` 以 `flex: 1; min-width: 0` 占满剩余宽度，按钮保持自然宽度。该行不使用会增加子项包装层的 `NSpace`，避免选择框上的 flex 属性失效；字段说明仍放在 `NFormItem` 的 `#feedback` 插槽内。
 
 ---
 

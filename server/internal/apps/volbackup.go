@@ -2106,8 +2106,34 @@ func (e *Engine) GetVolumeArchive(appID, archiveID string) (*VolumeArchive, bool
 // ---- snapshot job bridge (snapshots.AppVolumeHost) ----
 //
 // 快照备份的 app_volume 任务把「定义 / 定时 / 保留份数 / 统一归档历史」交给快照
-// 模块，执行语义仍在本引擎：声明卷白名单、S3 唯一存储、SHA 校验与安全停机恢复。
+// 模块，执行语义仍在本引擎：应用挂载清单白名单、S3 存储、SHA 校验与安全停机恢复。
 // 同一条归档记录（VolumeStore）同时出现在应用详情页与快照任务历史里。
+
+// appVolumeSpecs is the shared job allowlist for validation and history.
+// Compose mounts live in the project, not Application.Volumes; use the same
+// discovery (and static fallback) as the app detail page and snapshot runner.
+func (e *Engine) appVolumeSpecs(app *Application) ([]string, error) {
+	volumes := app.Volumes
+	if isComposeApp(app) {
+		discovered, err := e.DiscoverAppVolumes(app)
+		if err != nil {
+			return nil, err
+		}
+		volumes = make([]string, 0, len(discovered))
+		for _, v := range discovered {
+			volumes = append(volumes, v.VolumeSpec)
+		}
+	}
+	seen := make(map[string]bool, len(volumes))
+	specs := make([]string, 0, len(volumes))
+	for _, v := range volumes {
+		if v = strings.TrimSpace(v); v != "" && !seen[v] {
+			seen[v] = true
+			specs = append(specs, v)
+		}
+	}
+	return specs, nil
+}
 
 // ResolveAppVolume returns the application's backupable volumes for snapshot
 // job create/update validation.
@@ -2116,17 +2142,12 @@ func (e *Engine) ResolveAppVolume(appID string) (*snapshots.AppVolumeTarget, err
 	if !ok {
 		return nil, fmt.Errorf("应用不存在")
 	}
-	if !volumeBackupSupported(app) {
-		return nil, fmt.Errorf("Compose 应用的挂载卷在编排文件中声明，暂不支持应用级备份")
-	}
 	if e.hostIsWindows(app.HostID) {
 		return nil, fmt.Errorf("数据卷备份暂仅支持 Linux 主机")
 	}
-	vols := make([]string, 0, len(app.Volumes))
-	for _, v := range app.Volumes {
-		if v = strings.TrimSpace(v); v != "" {
-			vols = append(vols, v)
-		}
+	vols, err := e.appVolumeSpecs(app)
+	if err != nil {
+		return nil, err
 	}
 	if len(vols) == 0 {
 		return nil, fmt.Errorf("应用未配置任何挂载卷")
@@ -2136,15 +2157,12 @@ func (e *Engine) ResolveAppVolume(appID string) (*snapshots.AppVolumeTarget, err
 
 // RunAppVolumeBackup executes one snapshot job run. Preflight order mirrors the
 // HTTP front door: volume slot (synchronous) → deploy check → agent online.
-// The spec is the job target: "ALL" runs against every declared volume, any
+// The spec is the job target: "ALL" runs against every current mount, any
 // other value is the comma-joined selection (a bare spec = single volume).
 func (e *Engine) RunAppVolumeBackup(appID, spec, note, storageTarget string, retention int) error {
 	app, ok := e.store.GetApp(appID)
 	if !ok {
 		return fmt.Errorf("应用不存在")
-	}
-	if !volumeBackupSupported(app) {
-		return fmt.Errorf("Compose 应用的挂载卷在编排文件中声明，暂不支持应用级备份")
 	}
 	if e.hostIsWindows(app.HostID) {
 		return fmt.Errorf("数据卷备份暂仅支持 Linux 主机")
@@ -2154,10 +2172,14 @@ func (e *Engine) RunAppVolumeBackup(appID, spec, note, storageTarget string, ret
 		if len(specs) == 0 {
 			return fmt.Errorf("应用数据卷备份必须选择挂载卷")
 		}
+		volumes, err := e.appVolumeSpecs(app)
+		if err != nil {
+			return err
+		}
 		for _, s := range specs {
 			declared := false
-			for _, v := range app.Volumes {
-				if strings.TrimSpace(v) == s {
+			for _, v := range volumes {
+				if v == s {
 					declared = true
 					break
 				}
@@ -2167,7 +2189,7 @@ func (e *Engine) RunAppVolumeBackup(appID, spec, note, storageTarget string, ret
 			}
 		}
 	} else {
-		// "ALL" follows the declared set at run time — volumes added after the
+		// "ALL" follows the discovered set at run time — volumes added after the
 		// job was created are picked up automatically.
 		specs = nil
 	}
@@ -2194,7 +2216,7 @@ func (e *Engine) RunAppVolumeBackup(appID, spec, note, storageTarget string, ret
 
 // ListAppVolumeArchives exposes one app's archive records to the snapshot job
 // history. The filter is the job's volume selection: "ALL" matches snapshots
-// of the whole declared set, a comma list matches snapshots of exactly that
+// of the whole current mount set, a comma list matches snapshots of exactly that
 // selection — so each job's history keeps its own runs even when other jobs
 // (or manual backups) cover different volumes of the same app.
 func (e *Engine) ListAppVolumeArchives(appID, spec string) []*snapshots.AppVolumeArchive {
@@ -2206,18 +2228,18 @@ func (e *Engine) ListAppVolumeArchives(appID, spec string) []*snapshots.AppVolum
 	if spec != "" {
 		specs, all := snapshots.ParseAppVolumeSpecList(spec)
 		if all {
-			// "ALL" resolves against the declared set at query time: snapshots
+			// "ALL" resolves against the current mounts at query time: snapshots
 			// taken before a volume was added simply age out of this job's
 			// history (they stay visible in the app detail tab).
 			app, ok := e.store.GetApp(appID)
 			if !ok {
 				return []*snapshots.AppVolumeArchive{}
 			}
-			specs = make([]string, 0, len(app.Volumes))
-			for _, v := range app.Volumes {
-				if v = strings.TrimSpace(v); v != "" {
-					specs = append(specs, v)
-				}
+			var err error
+			specs, err = e.appVolumeSpecs(app)
+			if err != nil {
+				e.log.Warn("resolve job archive volume selection failed", "app", appID, "err", err)
+				return []*snapshots.AppVolumeArchive{}
 			}
 		}
 		want = make(map[string]bool, len(specs))
@@ -2272,17 +2294,16 @@ func appVolumeArchiveMatchesSelection(a *VolumeArchive, want map[string]bool) bo
 			specs = []string{s}
 		}
 	}
-	if len(specs) != len(want) {
-		return false
-	}
 	seen := make(map[string]bool, len(specs))
 	for _, s := range specs {
-		if !want[s] || seen[s] {
+		if !want[s] {
 			return false
 		}
+		// Compose services may share the same mount. The job selects volume
+		// specs, so repeated service entries still represent one selected spec.
 		seen[s] = true
 	}
-	return true
+	return len(seen) == len(want)
 }
 
 // recordVolumeRestoreFailure stamps a failed outcome onto the archive and

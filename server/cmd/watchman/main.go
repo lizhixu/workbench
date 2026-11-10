@@ -577,6 +577,13 @@ func main() {
 	// (certs.expiry_reminder_days). Read live on every evaluation so changes
 	// apply without a restart.
 	certHub.SetRenewBeforeDaysProvider(func() int { return settingsStore.CertAutoRenewDays() })
+	// Panel-domain source for the certificate hub: a bound domain means every
+	// IP-only certificate is orphaned (strict domain restriction 403s direct
+	// IP access), so its auto-renew must stop. The renewal loop reconciles
+	// every scan; the hook below makes the pause land the instant the domain
+	// binds instead of waiting up to 6 hours.
+	certHub.SetPanelDomainProvider(func() string { return settingsStore.PanelSecurity().PanelDomain })
+	settingsStore.SetOnPanelDomainChange(func(oldDomain, newDomain string) { certHub.PauseOrphanedIPCerts() })
 	alertMonitor.SetCertExpiryReminderDays(func() int { return settingsStore.CertExpiryReminderDays() })
 	go alertMonitor.Start(ctx, 30*time.Second)
 

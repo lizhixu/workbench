@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, h, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import {
   NAlert,
   NButton,
@@ -55,6 +56,7 @@ defineOptions({ name: 'CertDomain' })
 
 const dialog = useDialog()
 const message = useMessage()
+const router = useRouter()
 const loading = ref(false)
 const certStatus = ref<PanelCertStatus | null>(null)
 
@@ -180,7 +182,7 @@ function preferredPanelURL(): string {
 // 绑定/解绑后当前地址立即失效（严格域名限制，旧地址的接口请求会被 403，
 // 无法再回读状态）或 TLS 已关闭，必须直接引导管理员到新地址，而不是留在
 // 旧页面里对着 403 / 连接失败发呆。
-function showMoveDialog(domain: string, opts: { title: string; sslReset?: boolean }) {
+function showMoveDialog(domain: string, opts: { title: string; sslReset?: boolean; ipCertPaused?: boolean }) {
   const primary = portlessURL(domain)
   const fallback = fallbackURL(domain)
   const children = [
@@ -202,6 +204,15 @@ function showMoveDialog(domain: string, opts: { title: string; sslReset?: boolea
         'p',
         { style: 'margin-top:8px;color:#d03050;font-size:12px' },
         '原域名证书绑定、面板 SSL 与强制 HTTPS 已自动清除，避免旧证书与新域名不匹配导致无法访问。请在新地址下重新签发或绑定证书，再按需开启 HTTPS。',
+      ),
+    )
+  }
+  if (opts.ipCertPaused) {
+    children.push(
+      h(
+        'p',
+        { style: 'margin-top:8px;font-size:12px;color:var(--text-secondary)' },
+        '若此前为公网 IP 签发过证书，其自动续期已自动关闭；面板不再经 IP 提供访问，该证书已无用途，建议到证书中心删除（暂停原因已写入其日志；解绑面板域名后可重新申请）。',
       ),
     )
   }
@@ -227,7 +238,7 @@ async function doBind(v: string, sslWasReset: boolean) {
   const current = window.location.hostname.toLowerCase()
   if (current !== v.toLowerCase()) {
     // 旧地址的后续请求会被严格域名限制拦截，这里不再回读状态。
-    showMoveDialog(v, { title: '面板域名已绑定', sslReset: sslWasReset })
+    showMoveDialog(v, { title: '面板域名已绑定', sslReset: sslWasReset, ipCertPaused: true })
     return
   }
   await refreshStatus()
@@ -251,6 +262,25 @@ function bindDomain() {
       'p',
       `绑定后面板只能通过 ${v} 访问，通过 IP 或其他域名发起的请求将被 403 拦截。请确认 DNS 已解析到本服务器。`,
     ),
+    // 严格域名限制在任何绑定下都会让 IP 证书失去唯一入口（面板 403 IP 访问），
+    // 因此该提示不挂在 SSL 开关分支下，恒以条件句展示；绑定后 IP 证书已无用途，
+    // 主动建议删除而非仅告知「可随时删除」。
+    h('p', { style: 'margin-top:8px' }, [
+      '若此前为公网 IP 签发过证书，绑定后其自动续期将自动关闭；面板不再经 IP 提供访问，该证书已无用途，建议到',
+      h(
+        'a',
+        {
+          style: 'color:var(--primary-color);cursor:pointer',
+          onClick: () => {
+            // 先关闭确认弹窗再跳转，避免弹窗滞留在证书中心页面上。
+            dialog.destroyAll()
+            router.push('/certs')
+          },
+        },
+        '证书中心',
+      ),
+      '删除（暂停原因已写入其日志；解绑面板域名后可重新申请）。',
+    ]),
   ]
   if (changing) {
     children.push(h('p', { style: 'margin-top:8px' }, `当前绑定域名为 ${current}，绑定后将切换为 ${v}。`))

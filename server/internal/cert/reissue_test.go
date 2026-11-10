@@ -397,4 +397,23 @@ func TestReissueCertHandlerGuards(t *testing.T) {
 	if res.TaskID == "" || res.CertID != "crt_h" {
 		t.Fatalf("response = %+v, want task_id + cert_id crt_h", res)
 	}
+
+	// Wait for the background task to reach a terminal state before the test
+	// returns: after the 202 it keeps persisting the failure (cert log, task
+	// state) into the temp dir, which races t.TempDir's cleanup on Windows
+	// ("directory is not empty"). The unreachable directory makes it fail.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		task, ok := h.GetTask(res.TaskID)
+		if ok && task.Status != TaskRunning {
+			if task.Status != TaskFailed {
+				t.Fatalf("task status = %s, want failed (directory is unreachable)", task.Status)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reissue task did not reach a terminal state in time")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -317,6 +318,25 @@ func (h *Hub) SaveCertLog(certID, content string) error {
 		}
 	}
 	return nil
+}
+
+// appendCertLogNote appends a timestamped note to a certificate's persisted
+// log (best effort) so one-off lifecycle decisions — e.g. the auto-renew
+// pause for an orphaned IP certificate — stay discoverable from the cert log
+// modal. SaveCertLog replaces the whole file, so the existing content is read
+// back and re-persisted with the note appended.
+func (h *Hub) appendCertLogNote(certID, note string) {
+	var content string
+	if existing, err := os.ReadFile(h.certLogFile(certID)); err == nil {
+		content = string(existing)
+		if content != "" && !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+	}
+	content += fmt.Sprintf("[%s] [自动续期] %s\n", time.Now().Format("2006-01-02 15:04:05"), note)
+	if err := h.SaveCertLog(certID, content); err != nil {
+		h.log.Warn("failed appending note to certificate log", "cert", certID, "err", err)
+	}
 }
 
 // GetCertLog returns the log text, updated time, and whether it exists.

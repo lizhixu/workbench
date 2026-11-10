@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -68,6 +69,27 @@ type Certificate struct {
 	LastLogAt time.Time           `json:"last_log_at,omitempty"`
 }
 
+// isIPIdentifiers reports whether the list is non-empty and every entry is a
+// bare IP address.
+func isIPIdentifiers(domains []string) bool {
+	if len(domains) == 0 {
+		return false
+	}
+	for _, d := range domains {
+		if net.ParseIP(strings.TrimSpace(d)) == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// IsIPOnly reports whether every SAN on the record is a bare IP address.
+// IP certificates exist solely for the panel itself — app proxy domains and
+// ACME issuance flows both require hostnames — so once the panel binds a
+// domain (strict domain restriction then 403s direct IP access) an
+// IP-only certificate has no possible consumer left and must stop renewing.
+func (c *Certificate) IsIPOnly() bool { return isIPIdentifiers(c.Domains) }
+
 // DefaultDirectoryURL is the Let's Encrypt production ACME directory.
 const DefaultDirectoryURL = "https://acme-v02.api.letsencrypt.org/directory"
 
@@ -96,6 +118,11 @@ type Hub struct {
 	// built-in default (30 days). Injected by the server entrypoint so the
 	// cert package stays decoupled from the settings store.
 	renewBeforeDays func() int
+	// panelDomain supplies the currently bound panel domain (settings:
+	// security.panel_domain, "" = panel reachable by IP). Injected by the
+	// server entrypoint so the cert package stays decoupled from the
+	// settings store, mirroring renewBeforeDays.
+	panelDomain func() string
 	// onRenewed, when set, is invoked after a certificate lands in the store
 	// — new ACME issuance, renewal, manual DNS-01 confirmation and import
 	// all funnel there. Injected by the wiring layer (router) so a re-issued
@@ -110,6 +137,26 @@ func (h *Hub) SetRenewBeforeDaysProvider(fn func() int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.renewBeforeDays = fn
+}
+
+// SetPanelDomainProvider injects the bound panel-domain source. A nil
+// provider (or an empty domain) keeps IP-only certificates renewable.
+func (h *Hub) SetPanelDomainProvider(fn func() string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.panelDomain = fn
+}
+
+// panelDomainOrDefault must never be called while holding h.mu — it takes
+// the same lock to snapshot the provider.
+func (h *Hub) panelDomainOrDefault() string {
+	h.mu.RLock()
+	fn := h.panelDomain
+	h.mu.RUnlock()
+	if fn == nil {
+		return ""
+	}
+	return strings.TrimSpace(fn())
 }
 
 // SetOnRenewed injects the post-store callback fired whenever a certificate
@@ -1060,6 +1107,14 @@ func (h *Hub) StartReissueTask(id string, identifiers []string, accountID string
 	if len(clean) == 0 {
 		return nil, nil, fmt.Errorf("至少需要一个域名或 IP")
 	}
+	// Reissuing for bare IPs while the panel is bound to a domain would mint
+	// material nobody can serve (strict domain restriction 403s direct IP
+	// access). Records whose identifiers are edited to hostnames stay
+	// re-issuable — the guard matches the requested identifiers, not the
+	// stored record.
+	if isIPIdentifiers(clean) && h.panelDomainOrDefault() != "" {
+		return nil, nil, fmt.Errorf("面板已绑定域名，IP 证书不再适用；如不再需要可在证书中心删除该证书，或解绑面板域名后重新申请")
+	}
 
 	var acc *ACMEAccount
 	if accountID != "" {
@@ -1234,6 +1289,10 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 	// copies and pass; acmeMu only serializes the ACME work and never
 	// re-checks, so the same domain would be issued twice and storeResult
 	// would overwrite the row twice. Failed rows still pass (retry path).
+	// Read the provider outside the lock: panelDomainOrDefault takes h.mu
+	// itself, and the value here is advisory — the renewal loop re-checks
+	// every scan.
+	panelDomain := h.panelDomainOrDefault()
 	h.mu.Lock()
 	cur, ok := h.certs[id]
 	if !ok {
@@ -1247,6 +1306,15 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 	if cur.Renewing {
 		h.mu.Unlock()
 		return nil, fmt.Errorf("该证书正在续期中")
+	}
+	// A bound panel domain makes an IP-only certificate unusable (strict
+	// domain restriction 403s direct IP access), so renewing it would burn
+	// CA quota for material nobody can ever serve. The panel issuer refuses
+	// to create new IP certificates while a domain is bound; reissue carries
+	// the same guard on the requested identifiers.
+	if cur.IsIPOnly() && panelDomain != "" {
+		h.mu.Unlock()
+		return nil, fmt.Errorf("面板已绑定域名，IP 证书不再适用；如不再需要可在证书中心删除该证书，或解绑面板域名后重新申请")
 	}
 	cur.Renewing = true
 	cur.LastError = ""
@@ -1298,6 +1366,64 @@ func (h *Hub) Renew(id string) (*Certificate, error) {
 	return updated, nil
 }
 
+// orphanedIPCert reports whether an IP-only certificate's only possible
+// consumer — the panel — has moved to a bound domain: strict domain
+// restriction then 403s direct IP access, so the record can no longer be
+// served to anyone. The provider is re-read on purpose so a domain bound
+// mid-scan is honored immediately for the remaining candidates.
+func (h *Hub) orphanedIPCert(c *Certificate) bool {
+	return c.IsIPOnly() && h.panelDomainOrDefault() != ""
+}
+
+// PauseOrphanedIPCerts turns off auto-renew on every orphaned IP-only
+// certificate. Binding a panel domain clears security.panel_ssl_cert_id but
+// leaves the cert-center record untouched — and each successful Renew resets
+// auto_renew back to true — so without this reconciliation the loop would
+// keep re-issuing the dead certificate roughly every other day (IP
+// certificates live ~6 days, so the 1/3-validity threshold fires early)
+// forever. The record itself is kept: the operator can delete it at any
+// time (the panel delete guard no longer references it), and issuing a
+// fresh IP certificate after unbinding the domain restores auto-renew.
+// Unbinding does not resume a paused record on purpose — by then it has long
+// expired; re-issuing is the documented path. Idempotent: nothing is
+// written when no certificate qualifies.
+func (h *Hub) PauseOrphanedIPCerts() {
+	domain := h.panelDomainOrDefault()
+	if domain == "" {
+		return
+	}
+	for _, c := range h.List() {
+		// Placeholders carry no material and are never renewal candidates.
+		if !c.AutoRenew || c.Status == CertStatusPending || c.Status == CertStatusFailed {
+			continue
+		}
+		if !c.IsIPOnly() {
+			continue
+		}
+		paused := false
+		h.mu.Lock()
+		if cur, ok := h.certs[c.ID]; ok && cur.AutoRenew && cur.IsIPOnly() {
+			cur.AutoRenew = false
+			paused = true
+			if err := h.saveCertsLocked(); err != nil {
+				// Persist failure is not fatal: the renewal filter below
+				// independently skips orphaned IP certs, and the next scan
+				// retries the flip.
+				h.log.Warn("failed persisting auto-renew pause for orphaned IP certificate", "cert", c.ID, "err", err)
+			} else {
+				h.log.Warn("panel domain bound; orphaned IP certificate auto-renew paused",
+					"cert", c.ID, "domains", c.Domains, "panel_domain", domain)
+			}
+		}
+		h.mu.Unlock()
+		if paused {
+			// appendCertLogNote takes h.mu (via SaveCertLog), so it must stay
+			// outside the critical section above.
+			h.appendCertLogNote(c.ID, "面板已绑定域名，IP 证书不再有可用入口，自动续期已自动暂停；如不再需要可删除该证书，解绑面板域名后可重新申请")
+		}
+	}
+}
+
 // RunRenewalLoop periodically renews expiring certificates.
 func (h *Hub) RunRenewalLoop(stop <-chan struct{}) {
 	go func() {
@@ -1319,6 +1445,11 @@ func (h *Hub) RunRenewalLoop(stop <-chan struct{}) {
 const defaultRenewBeforeDays = 30
 
 func (h *Hub) renewExpiring() {
+	// Reconcile first: renewals only ever happen inside this loop, so pausing
+	// orphans before the filter guarantees that binding a domain stops every
+	// IP certificate from ever renewing again, starting with the very next
+	// scan after the change.
+	h.PauseOrphanedIPCerts()
 	renewBefore := time.Duration(h.renewBeforeDaysOrDefault()) * 24 * time.Hour
 	for _, c := range h.List() {
 		if !c.AutoRenew || c.Renewing {
@@ -1332,6 +1463,12 @@ func (h *Hub) renewExpiring() {
 		// every 6h indefinitely. Empty status is a legacy issued record
 		// (predates the Status field) and stays renewable.
 		if c.Status == CertStatusPending || c.Status == CertStatusFailed {
+			continue
+		}
+		// Defense in depth against a domain binding landing mid-scan: the
+		// reconciliation above already flipped the orphans it saw, but this
+		// snapshot may race a concurrent SetMany.
+		if h.orphanedIPCert(c) {
 			continue
 		}
 		// Renewal threshold scales with validity: renewBefore days for classic

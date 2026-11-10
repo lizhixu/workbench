@@ -91,6 +91,14 @@ func (p *PanelCertIssuer) StartIssue(mode, ip, challenge string) (*IssueJob, err
 			return nil, fmt.Errorf("尚未绑定面板域名，请先绑定域名")
 		}
 	case "ip":
+		// A bound panel domain 403s every direct IP request, so a new IP
+		// certificate could never be served — refuse instead of minting an
+		// orphan the renewal loop would then have to keep pausing. Mirrors
+		// bindPanelCertificate, which already refuses to bind an IP
+		// certificate while a domain is bound.
+		if strings.TrimSpace(p.settings.PanelSecurity().PanelDomain) != "" {
+			return nil, fmt.Errorf("面板已绑定域名，IP 证书不再适用；请改用为绑定域名申请证书，或先解绑面板域名")
+		}
 		target = strings.TrimSpace(ip)
 		if target == "" {
 			detected, err := cert.DetectPublicIP()

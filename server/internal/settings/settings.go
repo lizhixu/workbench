@@ -411,6 +411,12 @@ type Store struct {
 	system   map[string]json.RawMessage
 	users    map[string]map[string]json.RawMessage
 	onChange func()
+	// onPanelDomainChange, when set, is fired after a committed system-scope
+	// write actually changes security.panel_domain (bind, change or unbind),
+	// outside the store lock, with the previous and next values. The cert
+	// wiring uses it to pause auto-renew on orphaned panel IP certificates
+	// the moment the domain binds, instead of waiting for the renewal scan.
+	onPanelDomainChange func(oldDomain, newDomain string)
 	// servingProvider reports what the panel actually serves right now
 	// (standard-port listeners + primary port), supplied by the panel
 	// security layer. Nil when not wired (tests, reset tools); BaseURL
@@ -735,6 +741,18 @@ func (s *Store) SetOnChange(fn func()) {
 	s.mu.Unlock()
 }
 
+// SetOnPanelDomainChange registers a callback fired after a committed
+// system-scope write changes security.panel_domain (bind, change or unbind),
+// outside the store lock, with the previous and next values. It exists so
+// the certificate hub can react to the binding the same instant it commits
+// (the renewal loop's reconciliation scan is the slow backstop); settings
+// itself stays decoupled from the cert package.
+func (s *Store) SetOnPanelDomainChange(fn func(oldDomain, newDomain string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onPanelDomainChange = fn
+}
+
 // SetServingStateProvider registers the callback BaseURL uses to learn what
 // the panel actually serves (standard-port listeners + primary port). It is
 // a callback, not a direct call, because settings cannot import the panel
@@ -791,8 +809,12 @@ func (s *Store) setManyLocked(scope Scope, username string, items map[string]jso
 	// locks the admin out of the panel. Clear the binding and HTTPS in the same
 	// atomic write as the domain itself, so a stale certificate can never
 	// outlive the domain it was issued for.
+	domainChanged := false
+	var prevDomain, nextDomain string
 	if scope == ScopeSystem {
-		if s.resetPanelCertOnDomainChange(normed) {
+		if changed, oldDomain, newDomain := s.resetPanelCertOnDomainChange(normed); changed {
+			domainChanged = true
+			prevDomain, nextDomain = oldDomain, newDomain
 			s.log.Info("panel domain changed; panel certificate binding cleared and HTTPS disabled",
 				"domain", string(normed["security.panel_domain"]))
 		}
@@ -829,29 +851,42 @@ func (s *Store) setManyLocked(scope Scope, username string, items map[string]jso
 	}
 	s.system = newSystem
 	s.users = newUsers
-	return s.onChange, nil
+	if !domainChanged || s.onPanelDomainChange == nil {
+		return s.onChange, nil
+	}
+	// Compose the post-commit callback: the standard-port reconciliation
+	// keeps its head start, then the domain-change hook observes the already
+	// committed state (both run outside the store lock via SetMany).
+	onChange := s.onChange
+	onDomainChange := s.onPanelDomainChange
+	return func() {
+		if onChange != nil {
+			onChange()
+		}
+		onDomainChange(prevDomain, nextDomain)
+	}, nil
 }
 
 // resetPanelCertOnDomainChange inspects a system-scope write: if it changes
 // security.panel_domain (including unbinding), it overwrites the SSL keys in
 // place so the same atomic write also clears the certificate binding, disables
 // panel SSL and force-HTTPS, and drops custom PEMs. Returns whether the reset
-// fired.
-func (s *Store) resetPanelCertOnDomainChange(normed map[string]json.RawMessage) bool {
+// fired, plus the previous and next domain values for the post-commit hook.
+func (s *Store) resetPanelCertOnDomainChange(normed map[string]json.RawMessage) (bool, string, string) {
 	rawNew, ok := normed["security.panel_domain"]
 	if !ok {
-		return false
+		return false, "", ""
 	}
 	var next string
 	if json.Unmarshal(rawNew, &next) != nil {
-		return false
+		return false, "", ""
 	}
 	var prev string
 	if oldRaw, ok := s.system["security.panel_domain"]; ok {
 		_ = json.Unmarshal(oldRaw, &prev)
 	}
 	if strings.EqualFold(strings.TrimSpace(next), strings.TrimSpace(prev)) {
-		return false
+		return false, "", ""
 	}
 	normed["security.panel_ssl_enabled"] = json.RawMessage("false")
 	normed["security.panel_force_https"] = json.RawMessage("false")
@@ -859,7 +894,7 @@ func (s *Store) resetPanelCertOnDomainChange(normed map[string]json.RawMessage) 
 	normed["security.panel_ssl_cert_id"] = json.RawMessage(`""`)
 	normed["security.panel_ssl_cert_pem"] = json.RawMessage(`""`)
 	normed["security.panel_ssl_key_pem"] = json.RawMessage(`""`)
-	return true
+	return true, prev, next
 }
 
 // DeleteUser drops every user-scope setting of a username, so a recreated

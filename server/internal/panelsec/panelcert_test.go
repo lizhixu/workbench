@@ -35,6 +35,17 @@ func TestStartIssueValidation(t *testing.T) {
 		t.Errorf("domain mode without bound domain: got %v, want 尚未绑定面板域名", err)
 	}
 
+	for _, ip := range []string{"not-an-ip", "192.168.1.1", "10.0.0.5", "127.0.0.1", "::1", "224.0.0.1"} {
+		if _, err := issuer.StartIssue("ip", ip, ""); err == nil {
+			t.Errorf("expected error for IP %q", ip)
+		}
+	}
+	// Public IP passes validation while no domain is bound; nil hub is the
+	// next failure.
+	if _, err := issuer.StartIssue("ip", "8.8.8.8", ""); err == nil || !strings.Contains(err.Error(), "证书中心不可用") {
+		t.Errorf("public IP: got %v, want 证书中心不可用", err)
+	}
+
 	if err := st.SetMany(settings.ScopeSystem, "", map[string]json.RawMessage{
 		"security.panel_domain": rawStr("panel.example.com"),
 	}); err != nil {
@@ -44,14 +55,13 @@ func TestStartIssueValidation(t *testing.T) {
 	if _, err := issuer.StartIssue("domain", "", ""); err == nil || !strings.Contains(err.Error(), "证书中心不可用") {
 		t.Errorf("domain mode with bound domain: got %v, want 证书中心不可用", err)
 	}
-
-	for _, ip := range []string{"not-an-ip", "192.168.1.1", "10.0.0.5", "127.0.0.1", "::1", "224.0.0.1"} {
-		if _, err := issuer.StartIssue("ip", ip, ""); err == nil {
-			t.Errorf("expected error for IP %q", ip)
+	// With a domain bound every IP issuance is refused up front, before IP
+	// validation or public-IP detection: the panel 403s direct IP access,
+	// so the certificate could never be served — issuing it would only mint
+	// an orphan for the renewal loop to keep pausing.
+	for _, ip := range []string{"8.8.8.8", "192.168.1.1", "not-an-ip", ""} {
+		if _, err := issuer.StartIssue("ip", ip, ""); err == nil || !strings.Contains(err.Error(), "IP 证书不再适用") {
+			t.Errorf("ip %q with bound domain: got %v, want IP 证书不再适用", ip, err)
 		}
-	}
-	// Public IP passes validation; nil hub is the next failure.
-	if _, err := issuer.StartIssue("ip", "8.8.8.8", ""); err == nil || !strings.Contains(err.Error(), "证书中心不可用") {
-		t.Errorf("public IP: got %v, want 证书中心不可用", err)
 	}
 }

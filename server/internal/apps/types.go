@@ -138,13 +138,19 @@ const (
 	DeployCancelled = "cancelled"
 )
 
+// TriggerUpgrade marks a deployment started by POST /apps/:id/upgrade: the
+// pipeline pulls the latest images before the normal rollout (see
+// runWithPin). Git apps carry no pull step — fetch+build already refreshes
+// them — so for git an upgrade run is a redeploy with this trigger.
+const TriggerUpgrade = "upgrade"
+
 // Deployment records one build+rollout attempt of an application.
 type Deployment struct {
 	ID            string    `json:"id"`
 	AppID         string    `json:"app_id"`
 	CommitHash    string    `json:"commit_hash,omitempty"`
 	CommitMessage string    `json:"commit_message,omitempty"`
-	Trigger       string    `json:"trigger"` // "create" | "webhook" | "manual" | "rollback" | "migrate"
+	Trigger       string    `json:"trigger"` // "create" | "webhook" | "github-app" | "manual" | "rollback" | "migrate" | "upgrade"
 	Status        string    `json:"status"`
 	StartedBy     string    `json:"started_by,omitempty"`
 	StartedAt     time.Time `json:"started_at"`

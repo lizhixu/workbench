@@ -120,6 +120,30 @@ func NewEngine(reg *rpc.Registry, store *Store, vs *vault.Store, log *slog.Logge
 // polls the deployment status. Returns the created record or nil when a
 // build is already running for this application.
 func (e *Engine) StartDeployment(app *Application, trigger, startedBy string) (*Deployment, error) {
+	return e.enqueueDeployment(app, trigger, startedBy, "")
+}
+
+// StartRollback re-runs the pipeline pinned to a historical commit. The
+// recorded commit's image is still referenced by the recorded deployment, so
+// rollback rebuilds from the checked-out commit for full auditability.
+func (e *Engine) StartRollback(app *Application, commit, startedBy string) (*Deployment, error) {
+	return e.enqueueDeployment(app, "rollback", startedBy, commit)
+}
+
+// StartUpgrade enqueues a deployment that first pulls the latest images
+// (see runWithPin) and then runs the normal rollout. It reuses the same
+// single-slot queue and deployment record as a manual redeploy, so an
+// upgrade in flight blocks a concurrent deploy/upgrade with the usual
+// already-running error and the pull step is visible in the build log.
+func (e *Engine) StartUpgrade(app *Application, startedBy string) (*Deployment, error) {
+	return e.enqueueDeployment(app, TriggerUpgrade, startedBy, "")
+}
+
+// enqueueDeployment creates the deployment record, claims the single-slot
+// build queue and starts the pipeline goroutine. StartDeployment,
+// StartRollback and StartUpgrade share it so the volume-slot and
+// already-running guards cannot drift between entry points.
+func (e *Engine) enqueueDeployment(app *Application, trigger, startedBy, pin string) (*Deployment, error) {
 	dep := &Deployment{
 		ID:        "dep_" + randomToken(8),
 		AppID:     app.ID,
@@ -151,42 +175,7 @@ func (e *Engine) StartDeployment(app *Application, trigger, startedBy string) (*
 		return nil, err
 	}
 
-	go e.runWithPin(ctx, app, dep, "")
-	return dep, nil
-}
-
-// StartRollback re-runs the pipeline pinned to a historical commit. The
-// recorded commit's image is still referenced by the recorded deployment, so
-// rollback rebuilds from the checked-out commit for full auditability.
-func (e *Engine) StartRollback(app *Application, commit, startedBy string) (*Deployment, error) {
-	dep := &Deployment{
-		ID:        "dep_" + randomToken(8),
-		AppID:     app.ID,
-		Trigger:   "rollback",
-		Status:    DeployQueued,
-		StartedBy: startedBy,
-		StartedAt: time.Now(),
-	}
-	if e.VolumeBusy(app.ID) {
-		return nil, errVolumeOpInProgress
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	if err := e.registerRunning(app.ID, &activeDeployment{depID: dep.ID, cancel: cancel}); err != nil {
-		cancel()
-		return nil, err
-	}
-	if e.VolumeBusy(app.ID) {
-		e.finishRunning(app.ID, dep.ID)
-		cancel()
-		return nil, errVolumeOpInProgress
-	}
-	if err := e.store.AddDeployment(dep); err != nil {
-		e.finishRunning(app.ID, dep.ID)
-		cancel()
-		return nil, err
-	}
-
-	go e.runWithPin(ctx, app, dep, commit)
+	go e.runWithPin(ctx, app, dep, pin)
 	return dep, nil
 }
 
@@ -495,6 +484,28 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 			return
 		}
 
+		// Upgrade step: refresh every image the stack references before
+		// bringing it up, so a floating tag actually moves. A failed pull
+		// fails the run before `up` touches any container.
+		if dep.Trigger == TriggerUpgrade {
+			pullCmd := fmt.Sprintf("docker compose -f %s -p %s pull",
+				shellQuote(composePath), shellQuote("watchman-"+app.ID))
+			logBuf.WriteString("$ " + pullCmd + "\n")
+			if cancelled() {
+				return
+			}
+			res, err := execOnAgent(hub, "compose-pull-"+randomToken(4), pullCmd, 300)
+			if err != nil {
+				fail("拉取 Compose 镜像失败: %v", err)
+				return
+			}
+			logBuf.WriteResult(res, nil, res.GetStderr())
+			if res.GetExitCode() != 0 {
+				fail("拉取 Compose 镜像失败 (exit %d)", res.GetExitCode())
+				return
+			}
+		}
+
 		composeCmd := fmt.Sprintf("docker compose -f %s -p %s up -d --remove-orphans",
 			shellQuote(composePath), shellQuote("watchman-"+app.ID))
 		logBuf.WriteString("$ " + composeCmd + "\n")
@@ -543,17 +554,22 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 		return
 	}
 
-		// Branch for single pre-built image deployment (app store / quick run):
-		if app.SourceType == "image" {
-			if !e.setDeploymentStatus(app.ID, dep.ID, DeployDeploying) {
-				return
-			}
-			logBuf.WriteString("$ deploy pre-built image\n")
-			e.deploySingleContainer(ctx, hub, app, dep, logBuf, app.Image)
+	// Branch for single pre-built image deployment (app store / quick run):
+	if app.SourceType == "image" {
+		if !e.setDeploymentStatus(app.ID, dep.ID, DeployDeploying) {
 			return
 		}
+		logBuf.WriteString("$ deploy pre-built image\n")
+		if dep.Trigger == TriggerUpgrade && app.Image != "" {
+			if !e.pullImage(hub, app.Image, logBuf, cancelled, fail) {
+				return
+			}
+		}
+		e.deploySingleContainer(ctx, hub, app, dep, logBuf, app.Image)
+		return
+	}
 
-		// Branch for built-in template deployment:
+	// Branch for built-in template deployment:
 	if app.SourceType == "template" {
 		if !e.setDeploymentStatus(app.ID, dep.ID, DeployDeploying) {
 			return
@@ -562,6 +578,11 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 		if err := ResolveTemplate(app); err != nil {
 			fail("解析应用模板失败: %v", err)
 			return
+		}
+		if dep.Trigger == TriggerUpgrade && app.Image != "" {
+			if !e.pullImage(hub, app.Image, logBuf, cancelled, fail) {
+				return
+			}
 		}
 		e.deploySingleContainer(ctx, hub, app, dep, logBuf, app.Image)
 		return
@@ -1216,6 +1237,30 @@ func classifyDockerPreflight(exitCode int32) error {
 	default:
 		return fmt.Errorf("目标主机 Docker 不可用 (exit %d)：请检查 Docker 安装与服务状态后重试", exitCode)
 	}
+}
+
+// pullImage pulls one image reference on the target host. It is the upgrade
+// step for image/template apps: the pull runs before any container is
+// touched, so a failed pull fails the deployment with the old container
+// still serving. Returns false when the caller must stop the pipeline
+// (fail() already recorded the reason).
+func (e *Engine) pullImage(hub *rpc.Hub, imageRef string, logBuf *logBuffer, cancelled func() bool, fail func(string, ...any)) bool {
+	if cancelled() {
+		return false
+	}
+	pullCmd := fmt.Sprintf("docker pull %s", shellQuote(imageRef))
+	logBuf.WriteString("$ " + pullCmd + "\n")
+	res, err := execOnAgent(hub, "docker-pull-"+randomToken(4), pullCmd, 300)
+	if err != nil {
+		fail("拉取镜像失败: %v", err)
+		return false
+	}
+	logBuf.WriteResult(res, nil, res.GetStderr())
+	if res.GetExitCode() != 0 {
+		fail("拉取镜像失败 (exit %d)", res.GetExitCode())
+		return false
+	}
+	return true
 }
 
 // checkDockerReady runs the preflight on the target host. A transport

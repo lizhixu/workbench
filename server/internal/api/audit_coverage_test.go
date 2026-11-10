@@ -24,6 +24,7 @@ func TestDeriveMutationActionCoverage(t *testing.T) {
 		// Apps.
 		{http.MethodPost, "/api/v1/apps", "app_create", "app", ""},
 		{http.MethodPost, "/api/v1/apps/:id/deploy", "app_deploy", "app", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/apps/:id/upgrade", "app_upgrade", "app", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/apps/:id/deployments/cancel", "app_deploy_cancel", "app", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/apps/:id/migrate", "app_migrate", "app", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/apps/:id/volume-backups", "app_volume_backup", "app", ""},

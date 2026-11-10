@@ -210,6 +210,7 @@
     - **部署历史页签（重做）**：独立工具栏（共 N 次部署 / N 个进行中 / 最近一次时间，右侧「刷新」与「重新部署」，空态给「立即部署」CTA）+ 标准表格布局（`NCard.table-flex-fill` + `flex-height` NDataTable + 独立 `.table-pagination-bar` NPagination，符合 §8.2）。状态列对非终态记录带转圈；触发列第二行显示发起人；耗时列对进行中记录按当前时间滚动累加；开始时间统一走 `fmtDateTime`（面板时区，零值时间显示 `-`）；操作列 `fixed: 'right'`。**自动刷新**以「列表/最新记录里是否存在 queued/building/deploying」为依据每 2 秒静默拉一次（`loadDeployments(true)` 不点亮 loading、失败不弹错），全部落终态即停表，并有 30 分钟有界窗口防止脏记录永久轮询；不再依赖 `status.deploying`——前置检查类失败 1 秒内落终态，5 秒状态轮询可能一次都没看到“部署中”，新记录会永远停在“排队”。换页/改每页条数显式重新请求：改条数会把页码重置为 1，若只 `watch(page)`，用户本来就在第 1 页时不会触发任何请求。**布局根因**：此前 `NDataTable flex-height` 直接放进自建 flex 列，表格自身没有 `flex: 1`，`flex-height` 拿到的可用高度是 0，页签里只剩表头和分页条、所有记录都渲染在 0 高滚动区里——这是「部署历史完全没法用」的直接原因。
     - **部署日志弹窗**：列表接口不返回日志正文（`build_log` 单条上限 64KB，20 条 × 2 秒轮询会变成兆级流量），打开弹窗时按 depID 单独取全文；运行中的记录随上述 2 秒轮询刷新（`GET /apps/:id/deployments/:depID` 在记录尚未落终态时叠加引擎内存中的实时构建缓冲 `Engine.LiveLog`，任务结束移除缓冲，以记录里的终态 `build_log` 为准；`logBuffer` 读写加锁，API 读取与管线写入不再有数据竞争）。弹窗头部展示状态 Tag、触发方式与发起人、耗时、开始时间；提供「自动跟随」（新内容贴底，可关闭）、刷新、复制；构建中尚无输出时提示「等待构建输出…」。
     - **取消与终态加固**：Compose 部署取消时自动 `compose down` 清理已上线栈（raw_compose 与 git-compose 两分支；清理失败时记录 Error 明确标注栈仍在运行，请手动 down，禁止静默记干净取消）；部署记录终态守卫——success/failed/cancelled 一旦写入，任何后续阶段/取消/成功路径不得重写（此前探活取消可被 fail 覆盖丢 `CancelledBy`、swap 后取消可翻 success）；`-next` 容器名带 depID 后缀（`watchman-app-<id>-next-dep_<8字符>`，新旧两 run 容器名必然不同，旧管线清理删不掉新容器，purge 与迁移清理同步覆盖新旧两种命名）；swap 前与 `finishDeploySuccess` 入口查应用存活，已删则删 `-next` 并 fail（不建中继）；`deployApp` 补 engine nil 守卫（503）。
+  - **应用升级（`POST /api/v1/apps/:id/upgrade`）**：详情页「升级」按钮的后端入口，与重新部署共用同一条单槽位部署队列与部署记录（`trigger=upgrade`，审计 `app_upgrade`/high），拉取步骤写进部署日志。按来源分：`image`/`template` 先 `docker pull` 解析后的镜像再走正常滚动替换；`raw_compose` 在写好 `compose.yaml` 后先 `docker compose pull` 再 `up -d`；`git` 无额外拉取步骤——`fetch` + 构建本身就是刷新（构建不带 `--pull`，基础镜像仍用缓存）。**`git` 来源应用详情页不显示「升级」按钮**：对这类应用升级与重新部署完全等价（push 自动部署或点重新部署即刷新），摆两个按钮会误导；按钮仅 `image`/`template`/`raw_compose` 显示。拉取失败即本次部署失败、旧容器原样保留；部署进行中再点升级返回 409（按钮在部署中禁用，无 force 语义）。v1 不做镜像 digest 前后比对：固定 tag 拉取无变化时仍会走一次完整重新部署。
   - **部署 Docker 前置检查**：管线在 Agent 在线校验通过后、拉取代码/构建之前，先对目标主机执行 Docker 可用性检查（`command -v docker` 与 `docker info` 两段、退出码区分，复用反代保障的分类口径）：未安装 → 快速失败「目标主机未安装 Docker：请先在主机详情 Docker 页一键安装 Docker 后重试」；daemon 未起 → 「目标主机 Docker 服务未运行：请先启动 Docker 服务后重试」；检查本身传输失败（Agent 断连/exec 超时）不归类为 Docker 问题。覆盖全部来源（git/镜像/模板/Compose 终点都是 docker），此前缺失该检查时，无 Docker 主机会一路跑到起容器才以裸 `docker: command not found`（exit 127）失败。创建即部署同样走该检查，失败时经 `deploy_warning` 带出同一文案。不覆盖：`docker compose` 插件缺失（`docker info` 通过但 compose 子命令不存在）仍在 Compose 步骤以原错误失败，属后续缺口。**前端安装提醒**：光给文字提示不够便捷，`AppDetail.vue` 在最新一次部署死于“未安装 Docker”时给两条路——详情页眉与正文之间的常驻警告横幅（一键安装 Docker 按钮）与本页会话内发起的部署刚失败时的自动弹窗（问是否安装，安装中禁关、装完给「立即重新部署」）；安装走现有 `POST /hosts/:id/docker/install-script`（服务端内置官方脚本，前端 330 秒超时）。识别靠部署记录 `error` 含固定文案“未安装 Docker”（记录无 error_code 字段，改后端文案须同步前端）；提醒状态取最新一条记录（单独拉第 1 页第 1 条，不依赖历史页签当前页码）；部署结束（部署中→非部署中）时补刷一次历史与最新记录，否则 1 秒内落终态的快速失败永远刷不出来。
   - **创建即部署**：`POST /apps` 持久化成功后立即 `engine.StartDeployment(app, "create", …)` 入队首轮部署（`Deployment.trigger` 新增 `create`，详情页展示为「创建」），响应附 `deployment`；引擎忙/启动失败不失败创建本身，仅附 `deploy_warning`（应用记录合法，可手动重试）。前端创建页提示「已创建，正在部署…」，详情页既有轮询自然展示 排队→构建→发布→成功/失败 与日志。
   - **应用列表**：列为 应用名称 / 服务器 / 来源 / 当前版本 / 状态 / 最近部署 / 最近更新 / 操作。「服务器」由前端并行 `listHosts()` 按 `host_id → hostname` 映射（`/apps` 不 join 主机，主机接口失败不阻断应用列表）；「来源」替代原只对 Git 有意义的 `repo_url @ branch` 列（git → 仓库+自动部署标记、image → 镜像、template → 模板、raw_compose → Docker Compose）；「最近更新」取 `Application.updated_at`。右上角入口文案「创建应用」（原「链接 Git 应用」）。
@@ -894,6 +895,7 @@ GET    /api/v1/apps/:id
 PUT    /api/v1/apps/:id                   # 部分更新配置
 DELETE /api/v1/apps/:id?purge=            # 删除应用（可选清除容器与镜像）
 POST   /api/v1/apps/:id/deploy?force=     # 触发部署（force=true 支持终止在途任务并重新部署）
+POST   /api/v1/apps/:id/upgrade         # 升级应用：先拉取最新镜像再重新部署（单条部署记录，trigger=upgrade；见 §3.7「应用升级」）
 POST   /api/v1/apps/:id/deployments/cancel # 终止当前正在进行的部署任务
 POST   /api/v1/apps/:id/rollback          # 版本回滚
 POST   /api/v1/apps/:id/stop
@@ -1340,7 +1342,7 @@ POST   /api/v1/apps                        # 创建应用 {source_type, host_id,
 GET    /api/v1/apps/:id                    # 应用详情
 PUT    /api/v1/apps/:id                    # 部分更新（PATCH 语义）：未提交的键保持原值，显式 false/""/{} 才清空；可改 name/image(仅 image 来源)/healthcheck_url/env_vars/ports/volumes/compose_content/mesh_forward_*/auto_deploy/auth_vault_id 等；host_id/source_type/container_name 不可改
 DELETE /api/v1/apps/:id                    # 删除
-POST   /api/v1/apps/:id/deploy|rollback    # 部署 / 回滚
+POST   /api/v1/apps/:id/deploy|rollback|upgrade    # 部署 / 回滚 / 升级（upgrade 先拉镜像再部署，见 §3.7「应用升级」）
 POST   /api/v1/apps/:id/migrate            # 跨主机迁移 {target_host_id, migrate_volumes?, clean_source?}；同步校验后 202 返回 Deployment（trigger=migrate），失败自动回滚源主机（见 §3.7「服务迁移」）
 POST   /api/v1/apps/:id/migrate/precheck   # 只读预检 {target_host_id} → {agent_online, docker_running, s3_ready, s3_bucket, volume_count, port_conflicts, warnings}；读组、免审计，问题只以 warnings 上报
 POST   /api/v1/apps/:id/stop|start|restart

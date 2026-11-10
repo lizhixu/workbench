@@ -69,7 +69,7 @@ export interface Deployment {
   app_id: string
   commit_hash?: string
   commit_message?: string
-  trigger: 'create' | 'webhook' | 'manual' | 'rollback' | 'migrate'
+  trigger: 'create' | 'webhook' | 'github-app' | 'manual' | 'rollback' | 'migrate' | 'upgrade'
   status: 'queued' | 'building' | 'deploying' | 'success' | 'failed' | 'cancelled'
   started_by?: string
   cancelled_by?: string
@@ -179,6 +179,12 @@ export function deleteApp(id: string, purge = false) {
 export function deployApp(id: string, force = false) {
   return unwrap<{ data: Deployment }>(
     http.post(`/apps/${id}/deploy`, { force }),
+  ).then((r) => r.data)
+}
+
+export function upgradeApp(id: string) {
+  return unwrap<{ data: Deployment }>(
+    http.post(`/apps/${id}/upgrade`, {}),
   ).then((r) => r.data)
 }
 

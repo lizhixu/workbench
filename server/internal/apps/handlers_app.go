@@ -94,6 +94,7 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	writeRG.PUT("/apps/:id", h.updateApp)
 	writeRG.DELETE("/apps/:id", h.deleteApp)
 	writeRG.POST("/apps/:id/deploy", h.deployApp)
+	writeRG.POST("/apps/:id/upgrade", h.upgradeApp)
 	writeRG.POST("/apps/:id/deployments/cancel", h.cancelDeployment)
 	writeRG.POST("/apps/:id/rollback", h.rollbackApp)
 	writeRG.POST("/apps/:id/stop", h.stopApp)
@@ -913,6 +914,31 @@ func (h *AppHandlers) deployApp(c *gin.Context) {
 	}
 
 	dep, err := h.engine.StartDeployment(app, "manual", usernameOf(c))
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": dep})
+}
+
+// upgradeApp starts an upgrade deployment: the pipeline first pulls the
+// latest images for the app's source (image/template: docker pull;
+// raw_compose: docker compose pull; git: fetch+build already refreshes)
+// and then runs the normal rollout, so a floating tag actually moves.
+// Like deployApp it returns the deployment record immediately; progress is
+// polled through the deployments list. No force flag: the button is
+// disabled while a deployment is in flight.
+func (h *AppHandlers) upgradeApp(c *gin.Context) {
+	app, ok := h.store.GetApp(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
+		return
+	}
+	if h.engine == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deployment engine unavailable"})
+		return
+	}
+	dep, err := h.engine.StartUpgrade(app, usernameOf(c))
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return

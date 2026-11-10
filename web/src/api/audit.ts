@@ -110,6 +110,7 @@ export const actionLabels: Record<string, string> = {
   app_update: '更新应用配置',
   app_delete: '删除应用',
   app_deploy: '部署应用',
+  app_upgrade: '升级应用',
   app_deploy_cancel: '终止进行中的部署任务',
   app_rollback: '回滚应用到上一版本',
   app_stop: '停止应用',

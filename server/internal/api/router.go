@@ -2141,6 +2141,7 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodPut, "/api/v1/apps/:id", "app_update", "app", "id", "", "更新应用配置"},
 		{http.MethodDelete, "/api/v1/apps/:id", "app_delete", "app", "id", audit.RiskHigh, "删除应用"},
 		{http.MethodPost, "/api/v1/apps/:id/deploy", "app_deploy", "app", "id", audit.RiskHigh, "部署应用"},
+		{http.MethodPost, "/api/v1/apps/:id/upgrade", "app_upgrade", "app", "id", audit.RiskHigh, "升级应用"},
 		{http.MethodPost, "/api/v1/apps/:id/deployments/cancel", "app_deploy_cancel", "app", "id", audit.RiskHigh, "终止进行中的部署任务"},
 		{http.MethodPost, "/api/v1/apps/:id/rollback", "app_rollback", "app", "id", audit.RiskHigh, "回滚应用到上一版本"},
 		{http.MethodPost, "/api/v1/apps/:id/stop", "app_stop", "app", "id", audit.RiskHigh, "停止应用"},

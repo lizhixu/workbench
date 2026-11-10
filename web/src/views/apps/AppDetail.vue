@@ -10,14 +10,14 @@ import {
 import type { DataTableColumns, UploadCustomRequestOptions, UploadFileInfo } from 'naive-ui'
 import {
   AddOutline,
-  ArrowBackOutline, BuildOutline, CloudUploadOutline, CopyOutline,
+  ArrowBackOutline, ArrowUpCircleOutline, BuildOutline, CloudUploadOutline, CopyOutline,
   DownloadOutline, FolderOutline,
   GitCommitOutline, MoveOutline, PlayOutline, RefreshOutline, SparklesOutline, StopOutline,
   SwapHorizontalOutline, TerminalOutline, TrashOutline,
 } from '@vicons/ionicons5'
 import {
   cancelDeployment, deployApp, diagnoseDeployment, getApp, getAppStatus, getDeployment, listDeployments, restartApp,
-  rollbackApp, startApp, stopApp, updateApp, syncAppWebhook, type AppEntity, type AppStatus, type Deployment,
+  rollbackApp, startApp, stopApp, updateApp, syncAppWebhook, upgradeApp, type AppEntity, type AppStatus, type Deployment,
   type AIDiagnosis,
   backupAppVolumes, listVolumeBackups, restoreVolumeArchive, deleteVolumeArchive,
   scanVolumeUploads, commitVolumeUploadRestore,
@@ -1075,6 +1075,38 @@ async function doDeploy(force = false) {
       alreadyRunning
         ? '当前已有部署任务正在执行，请稍候刷新状态，或再次点击「重新部署」强制替换'
         : e.message || '触发部署失败',
+    )
+    if (alreadyRunning) loadStatus()
+  } finally {
+    acting.value = false
+  }
+}
+
+// 升级：与 doDeploy 同一套受理/轮询/插队流程，区别是后端先拉取最新镜像
+// 再走正常部署。部署进行中时按钮禁用（无 force 语义），在途冲突只报 409。
+async function doUpgrade() {
+  acting.value = true
+  try {
+    const dep = await upgradeApp(appId.value)
+    if (dep?.id) seenActiveDepIds.add(dep.id)
+    message.success('已开始升级：先拉取最新镜像，再重新部署')
+    if (dep?.id) startDeployPolling()
+    if (page.value !== 1) {
+      page.value = 1
+      await Promise.all([loadStatus(), loadDeployments(), refreshNewestDeployment()])
+    } else {
+      if (dep?.id && !deployments.value.some((d) => d.id === dep.id)) {
+        deployments.value = [dep, ...deployments.value]
+        total.value += 1
+      }
+      await Promise.all([loadStatus(), loadDeployments(), refreshNewestDeployment()])
+    }
+  } catch (e: any) {
+    const alreadyRunning = e?.status === 409 && /already running/i.test(String(e?.message ?? ''))
+    message.error(
+      alreadyRunning
+        ? '当前已有部署任务正在执行，请稍候再试'
+        : e.message || '触发升级失败',
     )
     if (alreadyRunning) loadStatus()
   } finally {
@@ -2533,7 +2565,8 @@ const triggerLabel = (t: string) =>
     : t === 'webhook' ? 'Git 推送'
       : t === 'rollback' ? '回滚'
         : t === 'migrate' ? '迁移'
-          : '手动'
+          : t === 'upgrade' ? '升级'
+            : '手动'
 
 const columns = computed<DataTableColumns<Deployment>>(() => [
   { title: '状态', key: 'status', width: 100, render: (r) => depStatusTag(r.status) },
@@ -2800,6 +2833,12 @@ onUnmounted(() => {
             <NIcon><CloudUploadOutline /></NIcon>
           </template>
           {{ status?.state === 'undeployed' ? '部署' : '重新部署' }}
+        </NButton>
+        <NButton v-if="app.source_type !== 'git'" size="small" :loading="acting" :disabled="deploying" @click="doUpgrade">
+          <template #icon>
+            <NIcon><ArrowUpCircleOutline /></NIcon>
+          </template>
+          升级
         </NButton>
         <NPopconfirm v-if="deploying" @positive-click="doCancelDeploy">
           <template #trigger>

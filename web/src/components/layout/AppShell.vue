@@ -400,9 +400,9 @@ function handleUser(key: string) {
     <!-- 顶部 Header 导航与多 Workspace 页签栏 -->
     <NLayoutHeader class="app-top-header">
       <div class="header-left">
-        <div class="brand-logo" @click="router.push('/hosts')">
+        <div class="brand-logo" :class="{ collapsed: navCollapsed }" @click="router.push('/hosts')">
           <img src="/k-works.png" class="logo-img" alt="Logo" />
-          <span class="brand-title">Watchman 云堡垒机</span>
+          <span v-if="!navCollapsed" class="brand-title">Watchman 云堡垒机</span>
         </div>
 
         <!-- 顶部 Workspace 多页签栏 -->
@@ -642,6 +642,18 @@ function handleUser(key: string) {
     user-select: none;
     // 品牌区固定不收缩，页签再多也不被挤变形
     flex-shrink: 0;
+    // 侧栏折叠时品牌区跟随收纳：标题由模板 v-if 即时隐藏（与
+    // side-nav-label 同款语义），logo 左移对齐折叠后的图标列——折叠
+    // 侧栏 52px、内边距 8px、右边框 1px，18px 图标居中列中心 x≈25.5；
+    // header 左内边距 16px + 30px logo 中心在 x=31，左移 5.5px 后两中
+    // 心落在同一竖线。窄屏（≤768px）标题恒隐藏、侧栏另有几何，不平移。
+    transition: margin-left 0.18s ease;
+
+    @media (min-width: 769px) {
+      &.collapsed {
+        margin-left: -5.5px;
+      }
+    }
 
     .logo-img {
       width: 30px;

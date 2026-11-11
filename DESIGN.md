@@ -559,6 +559,7 @@ web/
 - **`flex-height` 高度生效验收**：`.table-flex-fill` 已配置 `flex: 1; min-height: 0`。若另行手写 flex 容器，必须确保 `NDataTable` 自身获得 `flex: 1`，验收口径为：**表格数据区 `clientHeight` 必须明显大于表头高度**（避免数据区 clientHeight 为 0 导致表格空白）。
 - **固定列（fixed: left/right）纯色防透**：横向滚动表格中，固定列（如首列、操作列）背景色必须硬绑定不透明的 `var(--bg-card)`，行悬停时同步切换为不透明的 `tdColorHover`（`#18223a` / `#f8fafc`），杜绝半透明导致底层单元格文字穿透重叠。
 - **单元格内容必须自带截断**：`NDataTable` 的 `td` 默认 `overflow: visible`，固定宽度列里的文本与 `NTag` 都**不会**自动截断——`NTag` 是 `inline-flex + nowrap`，长中文标签会直接画出单元格、盖住右侧相邻列（如操作审计页「操作」列的长 action 文案压住「目标」列）。固定宽度列必须二选一：纯文本走 `ellipsis: { tooltip: true }`；必须保留标签外观时，给标签根节点 `max-width: 100%`，并对内部 `.n-tag__content` 设 `min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap`（render 生成节点时用 `:deep()` 穿透，参考 `AuditList.vue` 的 `.audit-action-tag`），完整文案由 `title` 或 tooltip 承载。新增或调整固定宽度列后必须实测「内容右边界 ≤ 单元格右边界」，并确认行高不被超长用户名等字段撑成多行。
+- **长内容列的省略 tooltip 必须限宽断行**：`ellipsis: { tooltip: true }` 的内置弹层默认单行铺开、无宽度上限，承载命令、长路径等超长单元格内容时会宽到被视口裁掉（遮挡不可读）。凡列内容可能超出可视宽度的（如命令拦截审计的「命令」列），必须给 `tooltip` 传约束（选项原样透传给 `NTooltip`）：`style: { maxWidth: '480px' }` 限宽 + `contentStyle: { wordBreak: 'break-all' }` 任意断行（长无空格 token 依赖此断行）+ `scrollable: true` 与 `contentStyle: { maxHeight: '320px' }` 限高滚动（超长内容在弹层内滚动，箭头由 Naive 滚动条承载不受影响），杜绝弹层在任一方向超出视口。
 - **例外规范**：卡片内部的辅助性小表格（常用命令库、备份列表、执行主机勾选框、告警规则清单等），因数据量天然有限且非页面主体，允许使用固定 `:max-height` 限高且不分页，但**必须在代码注释中显式声明本例外**。
 
 ### 9.5 多页签与表格布局规范：Tab 与表格卡片分层架构

@@ -157,7 +157,17 @@ const auditColumns = [
   {
     title: '命令',
     key: 'command',
-    ellipsis: { tooltip: true },
+    // 命令常是长且无空格的单行文本（长路径/编码串）：内置 ellipsis tooltip
+    // 默认一行铺开且无宽度上限，弹层会宽到被视口裁掉。限宽 + 任意断行 +
+    // 限高滚动（scrollable 让 Naive 自带滚动条承载，箭头不受影响），
+    // 保证整条命令在弹层内完整可读（tooltip 选项原样透传给 NTooltip）。
+    ellipsis: {
+      tooltip: {
+        scrollable: true,
+        style: { maxWidth: '480px' },
+        contentStyle: { maxHeight: '320px', wordBreak: 'break-all' as const },
+      },
+    },
     render: (r: CommandAuditEntry) => h('code', { style: 'font-size:12px' }, r.command),
   },
   {

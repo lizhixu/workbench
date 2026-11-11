@@ -3,11 +3,9 @@
 //
 // A backup is a gzipped tar of the data directory: user accounts, host
 // registry, terminal recordings, metrics history, audit trail and settings.
-// Restore unpacks an archive back over that directory. Because the running
-// process keeps these files in memory and rewrites them on its next save, a
-// restore only becomes authoritative after the server is restarted -- callers
-// are told so explicitly, and the current state is always archived first so a
-// mistaken restore is recoverable.
+// Restore validates into an isolated staging directory. Startup applies the
+// prepared transaction before opening business stores, with a safety archive
+// and a recoverable rollback journal. No live process data is overwritten.
 package backup
 
 import (
@@ -31,19 +29,22 @@ import (
 )
 
 const (
-	archivePrefix = "watchman-backup-"
-	archiveSuffix = ".tar.gz"
+	archivePrefix  = "watchman-backup-"
+	archiveSuffix  = ".tar.gz"
 	backupsDirName = "backups"
 	indexFileName  = "index.json"
 
 	// Caps on what a restore will unpack, so a malformed or hostile archive
 	// cannot exhaust the disk or the inode table.
-	MaxRestoreBytes   int64 = 4 << 30
+	MaxRestoreBytes   int64 = 64 << 30
 	MaxRestoreEntries       = 200000
+	MaxArchiveBytes   int64 = MaxRestoreBytes + (1 << 30)
 )
 
 // ErrDisabled is returned when the store has no data directory to work with.
 var ErrDisabled = errors.New("backup disabled: no data directory configured")
+var ErrBusy = errors.New("已有备份或恢复任务正在执行")
+var ErrPending = errors.New("已有待应用的恢复，请重启控制端或取消待恢复任务")
 
 // Meta describes one archive on disk.
 type Meta struct {
@@ -54,9 +55,14 @@ type Meta struct {
 	Note      string    `json:"note"`
 	CreatedBy string    `json:"created_by"`
 	CreatedAt time.Time `json:"created_at"`
-	// Auto marks archives the server took on its own (currently the safety
-	// copy written just before a restore).
-	Auto bool `json:"auto"`
+	// Auto marks archives the server took on its own (scheduled runs and the
+	// safety copy written just before a restore).
+	Auto         bool   `json:"auto"`
+	Kind         string `json:"kind,omitempty"` // manual | scheduled | safety
+	RemoteTarget string `json:"remote_target,omitempty"`
+	RemoteName   string `json:"remote_name,omitempty"`
+	RemoteKey    string `json:"remote_key,omitempty"`
+	RemoteError  string `json:"remote_error,omitempty"`
 }
 
 // RestoreResult reports what a restore unpacked.
@@ -65,15 +71,22 @@ type RestoreResult struct {
 	Bytes           int64  `json:"bytes"`
 	SafetyCopy      string `json:"safety_copy"`
 	RestartRequired bool   `json:"restart_required"`
+	Pending         bool   `json:"pending"`
+	Legacy          bool   `json:"legacy"`
 }
 
 // Store manages backup archives under <dataDir>/backups.
 type Store struct {
 	mu        sync.Mutex
+	opMu      sync.Mutex
 	dataDir   string
 	backupDir string
 	log       *slog.Logger
 	index     []Meta
+	task      Task
+	policy    Policy
+	s3        S3Targets
+	rename    func(string, string) error // test seam for transaction failures
 }
 
 // NewStore prepares the backup directory and reconciles the archive index with
@@ -83,7 +96,7 @@ func NewStore(dataDir string, log *slog.Logger) (*Store, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Store{dataDir: dataDir, log: log}
+	s := &Store{dataDir: dataDir, log: log, rename: os.Rename}
 	if dataDir == "" {
 		return s, nil
 	}
@@ -92,6 +105,9 @@ func NewStore(dataDir string, log *slog.Logger) (*Store, error) {
 		return nil, fmt.Errorf("create backup dir: %w", err)
 	}
 	if err := s.load(); err != nil {
+		return nil, err
+	}
+	if err := s.loadOperations(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -121,8 +137,11 @@ func (s *Store) load() error {
 	known := make(map[string]bool, len(idx))
 	kept := make([]Meta, 0, len(idx))
 	for _, m := range idx {
+		if !validArchiveName(m.Name) {
+			continue
+		}
 		st, err := os.Stat(filepath.Join(s.backupDir, m.Name))
-		if err != nil {
+		if err != nil || !st.Mode().IsRegular() {
 			continue
 		}
 		m.Size = st.Size()
@@ -135,7 +154,7 @@ func (s *Store) load() error {
 		return fmt.Errorf("scan backup dir: %w", err)
 	}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), archiveSuffix) || known[e.Name()] {
+		if !e.Type().IsRegular() || !validArchiveName(e.Name()) || known[e.Name()] {
 			continue
 		}
 		info, err := e.Info()
@@ -158,11 +177,7 @@ func (s *Store) save() error {
 	if s.dataDir == "" {
 		return nil
 	}
-	data, err := json.MarshalIndent(s.index, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(s.indexPath(), data, 0o600)
+	return atomicJSON(s.indexPath(), s.index)
 }
 
 // List returns archive metadata, newest first.
@@ -182,27 +197,43 @@ func (s *Store) Path(name string) (string, error) {
 	if s.dataDir == "" {
 		return "", ErrDisabled
 	}
-	if name == "" || name != filepath.Base(name) || strings.ContainsAny(name, `/\`) {
-		return "", errors.New("invalid backup name")
-	}
-	if !strings.HasPrefix(name, archivePrefix) || !strings.HasSuffix(name, archiveSuffix) {
+	if !validArchiveName(name) {
 		return "", errors.New("invalid backup name")
 	}
 	p := filepath.Join(s.backupDir, name)
-	if _, err := os.Stat(p); err != nil {
+	if st, err := os.Lstat(p); err != nil || !st.Mode().IsRegular() {
 		return "", errors.New("backup not found")
 	}
 	return p, nil
 }
 
-// Delete removes an archive and its index entry.
-func (s *Store) Delete(name string) error {
+func validArchiveName(name string) bool {
+	return name != "" && name == filepath.Base(name) && !strings.ContainsAny(name, `/\`) && strings.HasPrefix(name, archivePrefix) && strings.HasSuffix(name, archiveSuffix)
+}
+
+// Delete removes an archive and its index entry. The returned warning is set
+// when the archive's S3 copy could not be cleaned but local deletion
+// proceeded anyway, because the recorded target is gone and retrying would
+// never succeed.
+func (s *Store) Delete(name string) (string, error) {
+	if !s.opMu.TryLock() {
+		return "", ErrBusy
+	}
+	defer s.opMu.Unlock()
+	return s.delete(name)
+}
+
+func (s *Store) delete(name string) (string, error) {
+	warning, err := s.deleteRemote(name)
+	if err != nil {
+		return warning, err
+	}
 	p, err := s.Path(name)
 	if err != nil {
-		return err
+		return warning, err
 	}
 	if err := os.Remove(p); err != nil {
-		return fmt.Errorf("remove backup: %w", err)
+		return warning, fmt.Errorf("remove backup: %w", err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -212,12 +243,31 @@ func (s *Store) Delete(name string) error {
 			break
 		}
 	}
-	return s.save()
+	return warning, s.save()
 }
 
 // Create archives the whole data directory (minus the backup directory itself)
 // into a new gzipped tar and records it in the index.
 func (s *Store) Create(createdBy, note string, auto bool) (Meta, error) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if s.hasPending() {
+		return Meta{}, ErrPending
+	}
+	return s.create(createdBy, note, kindOf(auto))
+}
+
+func kindOf(auto bool) string {
+	if auto {
+		return "safety"
+	}
+	return "manual"
+}
+
+// create persists Kind in the index up front, so the archive is never recorded
+// under the wrong retention class even if the process dies before the task
+// goroutine finishes remote replication.
+func (s *Store) create(createdBy, note, kind string) (Meta, error) {
 	if s.dataDir == "" {
 		return Meta{}, ErrDisabled
 	}
@@ -228,13 +278,13 @@ func (s *Store) Create(createdBy, note string, auto bool) (Meta, error) {
 	// Writing to a temp name first means a crash mid-archive cannot leave a
 	// truncated file that looks like a usable backup.
 	tmp := dest + ".part"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return Meta{}, fmt.Errorf("create archive: %w", err)
 	}
 
 	hasher := sha256.New()
-	gz := gzip.NewWriter(io.MultiWriter(f, hasher))
+	gz := gzip.NewWriter(&limitedWriter{w: io.MultiWriter(f, hasher), remaining: MaxArchiveBytes})
 	tw := tar.NewWriter(gz)
 
 	files, walkErr := s.writeTree(tw)
@@ -265,7 +315,8 @@ func (s *Store) Create(createdBy, note string, auto bool) (Meta, error) {
 		Note:      note,
 		CreatedBy: createdBy,
 		CreatedAt: now,
-		Auto:      auto,
+		Auto:      kind != "manual",
+		Kind:      kind,
 	}
 
 	s.mu.Lock()
@@ -288,7 +339,7 @@ func (s *Store) Create(createdBy, note string, auto bool) (Meta, error) {
 // for reading, and overwriting that file would fail on Windows and corrupt the
 // restore everywhere else.
 func (s *Store) freeArchiveName(now time.Time) (string, string) {
-	base := archivePrefix + now.Format("20060102-150405")
+	base := archivePrefix + now.Format("20060102-150405.000000000")
 	for i := 0; ; i++ {
 		name := base + archiveSuffix
 		if i > 0 {
@@ -296,7 +347,9 @@ func (s *Store) freeArchiveName(now time.Time) (string, string) {
 		}
 		dest := filepath.Join(s.backupDir, name)
 		if _, err := os.Stat(dest); errors.Is(err, os.ErrNotExist) {
-			return name, dest
+			if _, err := os.Stat(dest + ".part"); errors.Is(err, os.ErrNotExist) {
+				return name, dest
+			}
 		}
 	}
 }
@@ -305,6 +358,9 @@ func (s *Store) freeArchiveName(now time.Time) (string, string) {
 // directory (so backups never nest) and transient artifacts.
 func (s *Store) writeTree(tw *tar.Writer) (int, error) {
 	count := 0
+	entries := 0
+	var total int64
+	manifest := archiveManifest{Format: "watchman-control-backup", Version: 1, Files: []archiveFile{}}
 	root := filepath.Clean(s.dataDir)
 
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
@@ -324,6 +380,16 @@ func (s *Store) writeTree(tw *tar.Writer) (int, error) {
 			return nil
 		}
 		slashRel := filepath.ToSlash(rel)
+		if excluded(slashRel) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		entries++
+		if entries > MaxRestoreEntries {
+			return fmt.Errorf("备份条目数超过 %d", MaxRestoreEntries)
+		}
 
 		if d.IsDir() {
 			if slashRel == backupsDirName {
@@ -342,14 +408,6 @@ func (s *Store) writeTree(tw *tar.Writer) (int, error) {
 			return nil
 		}
 
-		info, infoErr := d.Info()
-		if infoErr != nil {
-			if errors.Is(infoErr, os.ErrNotExist) {
-				return nil
-			}
-			return infoErr
-		}
-
 		src, openErr := os.Open(p)
 		if openErr != nil {
 			if errors.Is(openErr, os.ErrNotExist) {
@@ -358,6 +416,14 @@ func (s *Store) writeTree(tw *tar.Writer) (int, error) {
 			return openErr
 		}
 		defer src.Close()
+		info, infoErr := src.Stat()
+		if infoErr != nil {
+			return infoErr
+		}
+		total += info.Size()
+		if total > MaxRestoreBytes {
+			return fmt.Errorf("备份数据超过 64 GiB 恢复上限")
+		}
 
 		hdr := &tar.Header{
 			Name:     slashRel,
@@ -371,16 +437,40 @@ func (s *Store) writeTree(tw *tar.Writer) (int, error) {
 		}
 		// Copy exactly Size bytes: a file being appended to during the walk
 		// would otherwise desynchronise the tar stream.
-		if _, err := io.CopyN(tw, src, info.Size()); err != nil {
-			if !errors.Is(err, io.EOF) {
-				return err
-			}
+		h := sha256.New()
+		if _, err := io.CopyN(io.MultiWriter(tw, h), src, info.Size()); err != nil {
+			return err
 		}
+		manifest.Files = append(manifest.Files, archiveFile{Path: slashRel, Size: info.Size(), SHA256: hex.EncodeToString(h.Sum(nil))})
 		count++
+		s.progress("archiving", count, total)
 		return nil
 	})
 
-	return count, err
+	if err != nil {
+		return count, err
+	}
+	return count, writeManifest(tw, manifest)
+}
+
+func excluded(name string) bool {
+	name = strings.ToLower(name)
+	first := strings.SplitN(name, "/", 2)[0]
+	return first == backupsDirName || first == "bin" || first == "volume-uploads" || name == manifestName || strings.HasSuffix(name, ".part") || strings.HasSuffix(name, ".tmp") || strings.HasPrefix(filepath.Base(name), ".write-")
+}
+
+type limitedWriter struct {
+	w         io.Writer
+	remaining int64
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > w.remaining {
+		return 0, fmt.Errorf("备份归档超过 65 GiB 上限")
+	}
+	n, err := w.w.Write(p)
+	w.remaining -= int64(n)
+	return n, err
 }
 
 func firstErr(errs ...error) error {
@@ -392,101 +482,18 @@ func firstErr(errs ...error) error {
 	return nil
 }
 
-// RestoreFile restores from an archive already in the backup directory.
+// RestoreFile validates and stages an existing archive; startup applies it.
 func (s *Store) RestoreFile(name, actor string) (RestoreResult, error) {
-	p, err := s.Path(name)
-	if err != nil {
-		return RestoreResult{}, err
-	}
-	f, err := os.Open(p)
-	if err != nil {
-		return RestoreResult{}, fmt.Errorf("open backup: %w", err)
-	}
-	defer f.Close()
-	return s.Restore(f, actor, "restore-from:"+name)
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	return s.prepareFile(name, actor, "")
 }
 
-// Restore unpacks a gzipped tar over the data directory. The pre-restore state
-// is archived first, so an unintended restore can be walked back.
-//
-// Files are written but nothing already on disk is deleted: a restore overlays
-// the archive. That is deliberate -- a partial archive should not silently
-// erase host registrations it never contained.
+// Restore never changes live business files. ApplyPending runs before stores open.
 func (s *Store) Restore(r io.Reader, actor, note string) (RestoreResult, error) {
-	if s.dataDir == "" {
-		return RestoreResult{}, ErrDisabled
-	}
-
-	safety, err := s.Create(actor, "restore 前自动备份 ("+note+")", true)
-	if err != nil {
-		return RestoreResult{}, fmt.Errorf("pre-restore backup failed, aborting: %w", err)
-	}
-
-	gz, err := gzip.NewReader(r)
-	if err != nil {
-		return RestoreResult{}, fmt.Errorf("not a gzip archive: %w", err)
-	}
-	defer gz.Close()
-
-	root, err := filepath.Abs(s.dataDir)
-	if err != nil {
-		return RestoreResult{}, err
-	}
-
-	tr := tar.NewReader(gz)
-	res := RestoreResult{SafetyCopy: safety.Name, RestartRequired: true}
-
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return res, fmt.Errorf("read archive: %w", err)
-		}
-		if res.Files >= MaxRestoreEntries {
-			return res, fmt.Errorf("archive has more than %d entries, refusing", MaxRestoreEntries)
-		}
-
-		target, err := safeJoin(root, hdr.Name)
-		if err != nil {
-			return res, err
-		}
-
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o700); err != nil {
-				return res, fmt.Errorf("mkdir %s: %w", hdr.Name, err)
-			}
-		case tar.TypeReg:
-			if res.Bytes+hdr.Size > MaxRestoreBytes {
-				return res, fmt.Errorf("archive exceeds the %d byte restore limit", MaxRestoreBytes)
-			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-				return res, fmt.Errorf("mkdir %s: %w", filepath.Dir(hdr.Name), err)
-			}
-			n, err := writeFile(target, tr, hdr.Size)
-			if err != nil {
-				return res, err
-			}
-			res.Bytes += n
-			res.Files++
-		default:
-			// Symlinks, devices and hard links have no place in a data
-			// directory backup and are the usual escape hatch out of it.
-			s.log.Warn("backup restore skipped non-regular entry", "name", hdr.Name, "type", hdr.Typeflag)
-		}
-	}
-
-	s.mu.Lock()
-	reloadErr := s.load()
-	s.mu.Unlock()
-	if reloadErr != nil {
-		s.log.Warn("backup index reload after restore failed", "err", reloadErr)
-	}
-
-	s.log.Info("backup restored", "files", res.Files, "bytes", res.Bytes, "by", actor, "safety_copy", safety.Name)
-	return res, nil
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	return s.prepare(r, actor, note, "", "")
 }
 
 // safeJoin resolves an archive entry name inside root. Entries that are

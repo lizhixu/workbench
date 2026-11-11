@@ -138,6 +138,24 @@ func main() {
 		os.Exit(0)
 	}
 
+	// Apply a prepared restore before opening ANY business store or agent
+	// listener. No old in-memory state can overwrite the restored generation.
+	backupStore, err := backup.NewStore(*dataDir, log)
+	if err != nil {
+		log.Error("backup store init", "err", err)
+		os.Exit(1)
+	}
+	if err := backupStore.ApplyPending(); err != nil {
+		log.Error("restore startup transaction", "err", err)
+		os.Exit(1)
+	}
+	keys, err := backup.EnsureServerSecrets(*dataDir, *jwtKey, *vaultPass)
+	if err != nil {
+		log.Error("server secrets init", "err", err)
+		os.Exit(1)
+	}
+	*jwtKey, *vaultPass = keys.JWTKey, keys.VaultPass
+
 	// TLS must be configured as a pair: half-configured TLS must not
 	// silently fall back to plaintext.
 	if (*tlsCert == "") != (*tlsKey == "") {
@@ -282,11 +300,6 @@ func main() {
 
 	// Control-plane backup/restore, so the whole dataset can be archived and
 	// moved to another machine (AGENTS.md 5.1 数据自主可控).
-	backupStore, err := backup.NewStore(*dataDir, log)
-	if err != nil {
-		log.Error("backup store init", "err", err)
-		os.Exit(1)
-	}
 	log.Info("backup store ready", "backup_dir", backupStore.BackupDir(), "archives", len(backupStore.List()))
 
 	// Overlay networking store (Tailscale / Headscale).
@@ -365,6 +378,7 @@ func main() {
 		os.Exit(1)
 	}
 	snapshotEngine := snapshots.NewEngine(reg, snapshotStore, log)
+	backupStore.SetS3Targets(snapshotStore)
 	// App volume archives are stored in the snapshot module's default S3
 	// target; the store also resolves each archive's frozen target on restore.
 	appEngine.SetS3TargetStore(snapshotStore)
@@ -593,6 +607,7 @@ func main() {
 
 	// Snapshot scheduler: evaluates cron expressions on backup jobs every minute.
 	snapshotEngine.StartScheduler(ctx.Done(), log)
+	backupStore.StartScheduler(ctx)
 
 	// Application auto-healing: continuously checks application endpoints
 	// and automatically restarts containers failing 3 consecutive probes.
@@ -622,6 +637,9 @@ func main() {
 		limit := int64(512 << 20)
 		if strings.HasSuffix(r.URL.Path, "/volume-backups/upload-scan") {
 			limit = 21000 << 20
+		}
+		if r.URL.Path == "/api/v1/system/restore" {
+			limit = backup.MaxUploadBytes + (1 << 20)
 		}
 		http.MaxBytesHandler(hr, limit).ServeHTTP(w, r)
 	})

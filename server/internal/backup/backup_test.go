@@ -111,6 +111,35 @@ func TestCreateSkipsBackupDirSoArchivesDoNotNest(t *testing.T) {
 	}
 }
 
+func TestCreatePersistsKindImmediately(t *testing.T) {
+	s, dir := newTestStore(t)
+	writeSeed(t, dir)
+
+	// The kind must survive a crash between create and remote replication, so
+	// a scheduled archive is never recorded under the retention-exempt safety
+	// class.
+	m, err := s.create("admin", "scheduled fixture", "scheduled")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if m.Kind != "scheduled" || !m.Auto {
+		t.Fatalf("kind=%s auto=%v, want scheduled + server-initiated", m.Kind, m.Auto)
+	}
+	for _, e := range s.List() {
+		if e.Name == m.Name && e.Kind != "scheduled" {
+			t.Fatalf("index persisted kind=%s, want scheduled", e.Kind)
+		}
+	}
+
+	safety, err := s.Create("admin", "safety fixture", true)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if safety.Kind != "safety" || !safety.Auto {
+		t.Fatalf("safety kind=%s auto=%v", safety.Kind, safety.Auto)
+	}
+}
+
 func TestRestoreRoundTripAndSafetyCopy(t *testing.T) {
 	s, dir := newTestStore(t)
 	writeSeed(t, dir)
@@ -135,8 +164,24 @@ func TestRestoreRoundTripAndSafetyCopy(t *testing.T) {
 	if !res.RestartRequired {
 		t.Fatal("RestartRequired = false, want true: in-memory stores still hold pre-restore state")
 	}
-	if res.SafetyCopy == "" {
-		t.Fatal("SafetyCopy empty, want the pre-restore archive name")
+	if !res.Pending {
+		t.Fatal("restore must be staged until restart")
+	}
+	before, _ := os.ReadFile(filepath.Join(dir, "users.json"))
+	if string(before) != "CORRUPT" {
+		t.Fatal("online restore changed live data")
+	}
+	// Simulate a new process, before it has initialized any business stores.
+	s, err = NewStore(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyPending(); err != nil {
+		t.Fatal(err)
+	}
+	res = *s.Status().Result
+	if res.Pending || res.RestartRequired || res.SafetyCopy == "" {
+		t.Fatalf("bad applied result: %+v", res)
 	}
 
 	got, err := os.ReadFile(filepath.Join(dir, "users.json"))
@@ -228,7 +273,7 @@ func TestDeleteRemovesArchiveAndIndexEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := s.Delete(meta.Name); err != nil {
+	if _, err := s.Delete(meta.Name); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, backupsDirName, meta.Name)); !os.IsNotExist(err) {
@@ -237,7 +282,7 @@ func TestDeleteRemovesArchiveAndIndexEntry(t *testing.T) {
 	if got := len(s.List()); got != 0 {
 		t.Fatalf("List = %d after Delete, want 0", got)
 	}
-	if err := s.Delete(meta.Name); err == nil {
+	if _, err := s.Delete(meta.Name); err == nil {
 		t.Fatal("second Delete succeeded, want not-found error")
 	}
 }

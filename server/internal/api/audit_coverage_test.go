@@ -47,6 +47,12 @@ func TestDeriveMutationActionCoverage(t *testing.T) {
 		{http.MethodDelete, "/api/v1/hosts/:id/files", "file_remove", "host", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/hosts/:id/scans", "scan_trigger", "host", ""},
 		// Backups.
+		{http.MethodPost, "/api/v1/system/backup", "system_backup", "", audit.RiskMedium},
+		{http.MethodDelete, "/api/v1/system/backups/:name", "system_backup_delete", "", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/system/backups/:name/restore", "system_restore", "", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/system/restore", "system_restore", "", audit.RiskHigh},
+		{http.MethodPut, "/api/v1/system/backups/policy", "system_backup_policy", "system", audit.RiskMedium},
+		{http.MethodDelete, "/api/v1/system/restore/pending", "system_restore_cancel", "system", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/backups/jobs/:id/archives/:archiveID/restore", "backup_archive_restore", "backup", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/backups/s3-targets/:id/test", "backup_s3_test", "backup", audit.RiskLow},
 		// Git provider.

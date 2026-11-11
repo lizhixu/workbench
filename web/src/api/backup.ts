@@ -1,4 +1,3 @@
-// Control-plane backup / restore (AGENTS.md 5.1 数据自主可控).
 import { http, unwrap } from './http'
 
 export interface BackupMeta {
@@ -9,65 +8,83 @@ export interface BackupMeta {
   note: string
   created_by: string
   created_at: string
-  /** Archives the server took on its own, currently the pre-restore copy. */
   auto: boolean
+  kind?: 'manual' | 'scheduled' | 'safety'
+  remote_target?: string
+  remote_name?: string
+  remote_key?: string
+  remote_error?: string
 }
-
 export interface RestoreResult {
   files: number
   bytes: number
   safety_copy: string
   restart_required: boolean
+  pending: boolean
+  legacy: boolean
 }
-
-export interface RestoreResponse {
-  data: RestoreResult
-  message: string
+export interface BackupTask {
+  id: string
+  kind: 'backup' | 'restore'
+  status: '' | 'running' | 'ready' | 'success' | 'failed' | 'cancelled'
+  phase: string
+  files: number
+  bytes: number
+  error?: string
+  archive?: BackupMeta
+  result?: RestoreResult
+  started_at: string
+  finished_at?: string
 }
-
+export interface BackupPolicy {
+  enabled: boolean
+  time: string
+  retention: number
+  target_id: string
+  last_run?: string
+  last_error?: string
+}
+export interface BackupStatus {
+  data: BackupTask
+  pending: boolean
+  max_upload_bytes: number
+  max_data_bytes: number
+}
 export function listBackups() {
-  return unwrap<{ data: BackupMeta[] }>(http.get('/system/backups')).then((r) => r.data || [])
+  return unwrap<{ data: BackupMeta[] }>(http.get('/system/backups')).then(r => r.data || [])
 }
-
-// Archiving the whole data directory can take a while on a host with a lot of
-// recordings, so this call opts out of the short global timeout.
-export function createBackup(note = '') {
-  return unwrap<{ data: BackupMeta }>(
-    http.post('/system/backup', { note }, { timeout: 300000 }),
-  ).then((r) => r.data)
+export function backupStatus() {
+  return unwrap<BackupStatus>(http.get('/system/backups/status'))
 }
-
+export function getBackupPolicy() {
+  return unwrap<{ data: BackupPolicy }>(http.get('/system/backups/policy')).then(r => r.data)
+}
+export function saveBackupPolicy(policy: BackupPolicy) {
+  return unwrap<{ data: BackupPolicy }>(http.put('/system/backups/policy', policy)).then(r => r.data)
+}
+export function createBackup(note = '', targetID = 'local') {
+  return unwrap<{ data: BackupTask }>(http.post('/system/backup', { note, target_id: targetID, async: true })).then(r => r.data)
+}
 export function deleteBackup(name: string) {
-  return unwrap<{ ok: boolean }>(
-    http.delete(`/system/backups/${encodeURIComponent(name)}`),
-  )
+  return unwrap<{ ok: boolean; warning?: string }>(http.delete(`/system/backups/${encodeURIComponent(name)}`))
 }
-
-export function restoreBackup(name: string) {
-  return unwrap<RestoreResponse>(
-    http.post(`/system/backups/${encodeURIComponent(name)}/restore`, {}, { timeout: 300000 }),
-  )
+export function restoreBackup(name: string, vaultPass = '') {
+  return unwrap<{ data: BackupTask }>(http.post(`/system/backups/${encodeURIComponent(name)}/restore`, { vault_pass: vaultPass })).then(r => r.data)
 }
-
-export function uploadRestore(file: File, onProgress?: (percent: number) => void) {
+export function uploadRestore(file: File, vaultPass: string, onProgress: (percent: number) => void) {
   const form = new FormData()
+  // The streaming server reads bounded metadata before the file part.
+  form.append('vault_pass', vaultPass)
   form.append('file', file)
-  return unwrap<RestoreResponse>(
-    http.post('/system/restore', form, {
-      timeout: 600000,
-      onUploadProgress: (e) => {
-        if (!onProgress || !e.total) return
-        onProgress(Math.round((e.loaded / e.total) * 100))
-      },
-    }),
-  )
+  return unwrap<{ data: BackupTask }>(http.post('/system/restore', form, {
+    timeout: 0,
+    onUploadProgress: e => { if (e.total) onProgress(Math.round(e.loaded / e.total * 100)) },
+  })).then(r => r.data)
 }
-
-// The download endpoint streams a file, so it is reached by navigation rather
-// than XHR; the JWT rides along as a query parameter the same way the file
-// download and WebSocket endpoints take it.
+export function cancelPendingRestore() {
+  return unwrap<{ ok: boolean }>(http.delete('/system/restore/pending'))
+}
 export function backupDownloadUrl(name: string): string {
   const token = localStorage.getItem('watchman_token') || ''
-  const tokParam = token ? `?token=${encodeURIComponent(token)}` : ''
-  return `/api/v1/system/backups/${encodeURIComponent(name)}/download${tokParam}`
+  return `/api/v1/system/backups/${encodeURIComponent(name)}/download?token=${encodeURIComponent(token)}`
 }

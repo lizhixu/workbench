@@ -153,6 +153,8 @@ export const actionLabels: Record<string, string> = {
   system_backup: '创建控制端备份',
   system_backup_delete: '删除控制端备份',
   system_restore: '从备份恢复控制端',
+  system_backup_policy: '保存控制端自动备份策略',
+  system_restore_cancel: '取消待应用的控制端恢复',
   backup_job_create: '创建备份任务',
   backup_job_update: '更新备份任务',
   backup_job_delete: '删除备份任务',

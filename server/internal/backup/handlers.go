@@ -11,53 +11,73 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// MaxUploadBytes caps an uploaded archive. Restores are admin-only, but a
-// bounded reader is still what keeps a truncated upload from filling the disk.
-const MaxUploadBytes int64 = 2 << 30
+const MaxUploadBytes = MaxArchiveBytes
 
-// Handlers exposes the backup/restore REST endpoints (AGENTS.md B.8.2).
-type Handlers struct {
-	store *Store
-}
+type Handlers struct{ store *Store }
 
-// NewHandlers creates backup Handlers.
-func NewHandlers(store *Store) *Handlers {
-	return &Handlers{store: store}
-}
+func NewHandlers(store *Store) *Handlers { return &Handlers{store: store} }
 
-// Register mounts the backup routes. Every route here reads or rewrites the
-// whole control-plane dataset, so the caller is expected to pass an
-// admin-gated, audited group.
 func (h *Handlers) Register(rg *gin.RouterGroup) {
 	rg.GET("/system/backups", h.list)
+	rg.GET("/system/backups/status", h.status)
+	rg.GET("/system/backups/policy", h.getPolicy)
+	rg.PUT("/system/backups/policy", h.putPolicy)
 	rg.POST("/system/backup", h.create)
 	rg.GET("/system/backups/:name/download", h.download)
 	rg.DELETE("/system/backups/:name", h.remove)
 	rg.POST("/system/backups/:name/restore", h.restoreExisting)
 	rg.POST("/system/restore", h.restoreUpload)
+	rg.DELETE("/system/restore/pending", h.cancelPending)
 }
-
-func (h *Handlers) list(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"data": h.store.List()})
+func (h *Handlers) list(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"data": h.store.List()}) }
+func (h *Handlers) status(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"data": h.store.Status(), "pending": h.store.hasPending(), "max_upload_bytes": MaxUploadBytes, "max_data_bytes": MaxRestoreBytes})
 }
-
-func (h *Handlers) create(c *gin.Context) {
-	var body struct {
-		Note string `json:"note"`
+func (h *Handlers) getPolicy(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"data": h.store.Policy()}) }
+func (h *Handlers) putPolicy(c *gin.Context) {
+	var req Policy
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "请求体格式错误"})
+		return
 	}
-	_ = c.ShouldBindJSON(&body)
-
-	meta, err := h.store.Create(c.GetString("username"), strings.TrimSpace(body.Note), false)
+	if err := h.store.SavePolicy(req); err != nil {
+		h.fail(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"data": h.store.Policy()})
+}
+func (h *Handlers) create(c *gin.Context) {
+	var req struct {
+		Note     string `json:"note"`
+		TargetID string `json:"target_id"`
+		Async    bool   `json:"async"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(400, gin.H{"error": "请求体格式错误"})
+		return
+	}
+	if len([]rune(req.Note)) > 200 {
+		c.JSON(400, gin.H{"error": "备注不能超过 200 字"})
+		return
+	}
+	if req.Async || req.TargetID != "" {
+		task, err := h.store.StartBackup(c.GetString("username"), strings.TrimSpace(req.Note), req.TargetID, false)
+		if err != nil {
+			h.fail(c, err)
+			return
+		}
+		c.JSON(202, gin.H{"data": task})
+		return
+	}
+	meta, err := h.store.Create(c.GetString("username"), strings.TrimSpace(req.Note), false)
 	if err != nil {
 		h.fail(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": meta})
+	c.JSON(200, gin.H{"data": meta})
 }
-
 func (h *Handlers) download(c *gin.Context) {
-	name := c.Param("name")
-	p, err := h.store.Path(name)
+	p, err := h.store.Path(c.Param("name"))
 	if err != nil {
 		h.fail(c, err)
 		return
@@ -66,79 +86,103 @@ func (h *Handlers) download(c *gin.Context) {
 	c.Header("Content-Type", "application/gzip")
 	c.File(p)
 }
-
 func (h *Handlers) remove(c *gin.Context) {
-	if err := h.store.Delete(c.Param("name")); err != nil {
-		h.fail(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
-}
-
-func (h *Handlers) restoreExisting(c *gin.Context) {
-	res, err := h.store.RestoreFile(c.Param("name"), c.GetString("username"))
+	warning, err := h.store.Delete(c.Param("name"))
 	if err != nil {
 		h.fail(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"data":    res,
-		"message": "恢复完成，请重启控制端进程以加载恢复后的数据",
-	})
+	c.JSON(200, gin.H{"ok": true, "warning": warning})
 }
-
-// restoreUpload accepts an archive uploaded from the browser, either as a
-// multipart "file" field or as a raw request body.
+func (h *Handlers) restoreExisting(c *gin.Context) {
+	var req struct {
+		VaultPass string `json:"vault_pass"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(400, gin.H{"error": "请求体格式错误"})
+		return
+	}
+	task, err := h.store.StartRestoreFile(c.Param("name"), c.GetString("username"), req.VaultPass)
+	if err != nil {
+		h.fail(c, err)
+		return
+	}
+	c.JSON(202, gin.H{"data": task})
+}
 func (h *Handlers) restoreUpload(c *gin.Context) {
-	var (
-		src  io.Reader
-		note string
-	)
-
-	fh, err := c.FormFile("file")
-	switch {
-	case err == nil:
-		f, openErr := fh.Open()
-		if openErr != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "读取上传文件失败: " + openErr.Error()})
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxUploadBytes+(1<<20))
+	var src io.Reader = c.Request.Body
+	passphrase := ""
+	if strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/") {
+		mr, err := c.Request.MultipartReader()
+		if err != nil {
+			c.JSON(400, gin.H{"error": "上传格式错误"})
 			return
 		}
-		defer f.Close()
-		src = f
-		note = "upload:" + filepath.Base(fh.Filename)
-	case errors.Is(err, http.ErrMissingFile), errors.Is(err, http.ErrNotMultipart):
-		src = c.Request.Body
-		note = "upload:raw-body"
-	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "读取上传文件失败: " + err.Error()})
-		return
+		// Metadata parts are streamed before the file part, so vault_pass must
+		// come first: the loop stops at the file part and hands it straight to
+		// the disk-copying task, never scanning what follows it.
+		found := false
+		for {
+			part, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				h.fail(c, err)
+				return
+			}
+			if part.FormName() == "file" && part.FileName() != "" {
+				src = part
+				defer part.Close()
+				found = true
+				break
+			}
+			if part.FormName() == "vault_pass" {
+				raw, err := io.ReadAll(io.LimitReader(part, 4097))
+				if err != nil {
+					h.fail(c, err)
+					return
+				}
+				if len(raw) > 4096 {
+					c.JSON(400, gin.H{"error": "Vault 密钥过长"})
+					return
+				}
+				passphrase = string(raw)
+			}
+			part.Close()
+		}
+		if !found {
+			c.JSON(400, gin.H{"error": "请选择备份归档文件"})
+			return
+		}
 	}
-
-	res, err := h.store.Restore(io.LimitReader(src, MaxUploadBytes), c.GetString("username"), note)
+	task, err := h.store.StartRestoreUpload(src, c.GetString("username"), passphrase)
 	if err != nil {
 		h.fail(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"data":    res,
-		"message": "恢复完成，请重启控制端进程以加载恢复后的数据",
-	})
+	c.JSON(202, gin.H{"data": task})
 }
-
-// fail maps store errors onto status codes: a disabled store is a server
-// configuration problem, a bad name or archive is the caller's.
+func (h *Handlers) cancelPending(c *gin.Context) {
+	if err := h.store.CancelPending(); err != nil {
+		h.fail(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"ok": true})
+}
 func (h *Handlers) fail(c *gin.Context, err error) {
+	var tooLarge *http.MaxBytesError
 	switch {
 	case errors.Is(err, ErrDisabled):
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		c.JSON(503, gin.H{"error": err.Error()})
+	case errors.Is(err, ErrBusy), errors.Is(err, ErrPending):
+		c.JSON(409, gin.H{"error": err.Error()})
+	case errors.As(err, &tooLarge):
+		c.JSON(413, gin.H{"error": "上传归档超过容量上限"})
 	case strings.Contains(err.Error(), "not found"):
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-	case strings.Contains(err.Error(), "invalid backup name"),
-		strings.Contains(err.Error(), "refusing"),
-		strings.Contains(err.Error(), "not a gzip"),
-		strings.Contains(err.Error(), "truncated"):
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(404, gin.H{"error": err.Error()})
 	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(400, gin.H{"error": err.Error()})
 	}
 }

@@ -2135,6 +2135,8 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodDelete, "/api/v1/system/backups/:name", "system_backup_delete", "", "", audit.RiskHigh, "删除控制端备份"},
 		{http.MethodPost, "/api/v1/system/backups/:name/restore", "system_restore", "", "", audit.RiskHigh, "从备份恢复控制端数据"},
 		{http.MethodPost, "/api/v1/system/restore", "system_restore", "", "", audit.RiskHigh, "从备份恢复控制端数据"},
+		{http.MethodPut, "/api/v1/system/backups/policy", "system_backup_policy", "system", "", audit.RiskMedium, "保存控制端自动备份策略"},
+		{http.MethodDelete, "/api/v1/system/restore/pending", "system_restore_cancel", "system", "", audit.RiskHigh, "取消待应用的控制端恢复"},
 		// App lifecycle (Dokploy-style): deploy/rollback/start/stop/restart
 		// change the running state, so they are high-risk.
 		{http.MethodPost, "/api/v1/apps", "app_create", "app", "", "", "创建应用"},

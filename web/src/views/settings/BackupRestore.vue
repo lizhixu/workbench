@@ -258,7 +258,14 @@ const columns = computed<DataTableColumns<BackupMeta>>(() => [
         <template #feedback><span class="field-hint tip-hint">上传上限 {{ bytes(maxUploadBytes) }}；恢复数据上限 64 GiB。先完整校验，重启后再应用。</span></template>
       </NFormItem>
       <NFormItem label="原服务器 Vault 密钥（仅旧归档需要）">
-        <NInput v-model:value="vaultPass" type="password" show-password-on="click" :maxlength="4096" placeholder="新归档已包含密钥，通常留空" />
+        <NInput
+          v-model:value="vaultPass"
+          type="password"
+          show-password-on="click"
+          :input-props="{ autocomplete: 'new-password' }"
+          :maxlength="4096"
+          placeholder="新归档已包含密钥，通常留空"
+        />
         <template #feedback><span class="field-hint tip-hint">旧归档跨机器恢复时，填写原 watchman.env 中的 WATCHMAN_VAULT_PASS；密钥不匹配会拒绝恢复。</span></template>
       </NFormItem>
     </NForm>

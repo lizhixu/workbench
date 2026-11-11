@@ -266,6 +266,7 @@ onMounted(() => {
       <NFormItem label="LLM 接口端点 (Base URL)" required>
         <NInput
           v-model:value="aiConfig.base_url"
+          :input-props="{ autocomplete: 'off' }"
           placeholder="例如: https://api.deepseek.com 或 http://localhost:11434"
         />
       </NFormItem>
@@ -277,6 +278,7 @@ onMounted(() => {
           <NSelect
             v-model:value="modelValue"
             :options="modelOptions"
+            :input-props="{ autocomplete: 'off' }"
             tag
             filterable
             clearable
@@ -298,6 +300,7 @@ onMounted(() => {
         <NInput
           v-model:value="aiConfig.api_key"
           :type="keyVisible ? 'text' : 'password'"
+          :input-props="{ autocomplete: 'new-password' }"
           :placeholder="providerPresets[selectedProvider]?.key_tip || '输入 API Key'"
         >
           <template #suffix>

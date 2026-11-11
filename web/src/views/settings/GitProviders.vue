@@ -444,6 +444,7 @@ onMounted(() => {
           v-model:value="gitTokenInput"
           type="password"
           show-password-on="click"
+          :input-props="{ autocomplete: 'new-password' }"
           placeholder="github_pat_xxx 或 ghp_xxx"
         />
       </NFormItem>
@@ -469,7 +470,7 @@ onMounted(() => {
         在 GitHub 上已有 App 时填写：App ID 与私钥在 App 设置页查看，Webhook Secret 在 App 的 Webhook 设置里。保存后请到 GitHub 把 App 安装到账号或组织，再回面板点「同步安装」。
       </NAlert>
       <NFormItem label="App ID" required>
-        <NInput v-model:value="manualAppId" placeholder="如 123456" />
+        <NInput v-model:value="manualAppId" :input-props="{ autocomplete: 'off' }" placeholder="如 123456" />
       </NFormItem>
       <NFormItem label="私钥 (PEM)" required>
         <NInput
@@ -484,6 +485,7 @@ onMounted(() => {
           v-model:value="manualWebhookSecret"
           type="password"
           show-password-on="click"
+          :input-props="{ autocomplete: 'new-password' }"
           placeholder="GitHub App 的 Webhook Secret"
         />
       </NFormItem>

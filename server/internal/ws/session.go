@@ -107,8 +107,15 @@ func isLoopbackHost(hostport string) bool {
 
 // SessionInfo holds metadata for a registered terminal session.
 type SessionInfo struct {
-	AgentID   string
-	Shell     string
+	AgentID string
+	Shell   string
+	// Operator is the console user who opened the session (the REST caller),
+	// Hostname the host display name at open time. Both are captured here
+	// because the audit record is created on first WS attach, not at REST
+	// time — attribution must stay with the opener even if a share guest
+	// attaches first.
+	Operator  string
+	Hostname  string
 	CreatedAt time.Time
 }
 
@@ -131,7 +138,7 @@ var (
 )
 
 // RegisterSession records that session sid belongs to agentID with an optional custom shell.
-func RegisterSession(sid, agentID string, shell ...string) {
+func RegisterSession(sid, agentID, operator, hostname string, shell ...string) {
 	sessionMu.Lock()
 	defer sessionMu.Unlock()
 	sh := ""
@@ -141,6 +148,8 @@ func RegisterSession(sid, agentID string, shell ...string) {
 	sessionIdx[sid] = SessionInfo{
 		AgentID:   agentID,
 		Shell:     sh,
+		Operator:  operator,
+		Hostname:  hostname,
 		CreatedAt: time.Now(),
 	}
 }

@@ -352,6 +352,13 @@ export function deleteSession(id: string) {
   return unwrap<{ ok: boolean }>(http.delete(`/sessions/${id}`))
 }
 
+// Force-close a live terminal session (DELETE /api/v1/terminals/:sid). Only
+// the session operator or an admin may call it; a normal tab close never
+// does, so shared viewers are not cut off.
+export function closeTerminal(id: string) {
+  return unwrap<{ ok: boolean; closed: boolean }>(http.delete(`/terminals/${id}`))
+}
+
 export function sessionRecordingUrl(id: string): string {
   const baseURL = (http.defaults.baseURL || '/api/v1').replace(/\/$/, '')
   const token = localStorage.getItem('watchman_token') || ''

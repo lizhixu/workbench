@@ -125,6 +125,43 @@ func detachClient(sid string, conn *websocket.Conn, teardown func()) {
 	hubMu.Unlock()
 }
 
+// CloseSession tears a session down immediately, skipping the grace period:
+// it stops a pending reap timer, tells attached browsers the session ended,
+// closes their sockets and drops the hub. It reports whether a live session
+// existed. The agent-side PTY close and the audit End are the caller's job:
+// this only owns the in-memory WS state. It is safe to call twice — the second
+// call finds no hub and reports false — and the deferred detachClient of a
+// closing socket is a no-op once the hub is gone.
+func CloseSession(sid string) bool {
+	hubMu.Lock()
+	h, ok := activeHubs[sid]
+	if !ok {
+		hubMu.Unlock()
+		return false
+	}
+	delete(activeHubs, sid)
+	hubMu.Unlock()
+
+	h.mu.Lock()
+	if h.reapTimer != nil {
+		h.reapTimer.Stop()
+		h.reapTimer = nil
+	}
+	clients := make([]*websocket.Conn, 0, len(h.clients))
+	for c := range h.clients {
+		clients = append(clients, c)
+	}
+	h.clients = make(map[*websocket.Conn]string)
+	h.mu.Unlock()
+
+	for _, c := range clients {
+		_ = c.SetWriteDeadline(time.Now().Add(writeWait))
+		_ = c.WriteJSON(Frame{Type: "ended", Sid: sid, Reason: "closed by operator"})
+		_ = c.Close()
+	}
+	return true
+}
+
 // broadcast writes a frame to every attached client under a write deadline.
 func (h *sessionHub) broadcast(f Frame) {
 	h.mu.Lock()
@@ -135,9 +172,31 @@ func (h *sessionHub) broadcast(f Frame) {
 	}
 }
 
+// onTermOutput forwards one agent terminal output to attached browsers. An
+// empty output means the PTY has exited: browsers get the "ended" frame and the
+// audit record is closed right away. The record must not wait for the browser
+// to close its socket — a tab left open after the shell exits used to leave the
+// session at "0s 进行中" forever. End is idempotent, so the grace-period
+// teardown calling onEnd again later is a harmless no-op.
+func (h *sessionHub) onTermOutput(sid string, t *agentpb.TerminalOutput, onEnd func(string)) {
+	data := base64.StdEncoding.EncodeToString(t.GetData())
+	frame := Frame{Type: "output", Sid: sid, Data: data}
+	ended := len(t.GetData()) == 0
+	if ended {
+		frame = Frame{Type: "ended", Sid: sid}
+	}
+	h.broadcast(frame)
+	if ended && onEnd != nil {
+		onEnd(sid)
+	}
+}
+
 // TerminalHandler returns an http.HandlerFunc that upgrades to WebSocket and
 // bridges the browser to the agent terminal session identified by :sid.
-func TerminalHandler(reg *rpc.Registry, log *slog.Logger, onEnd func(sid string)) http.HandlerFunc {
+// onEnd closes the audit record; onStart creates it on first PTY open (both
+// may be nil). The record is intentionally NOT created at REST time, so a
+// session whose socket never connects leaves no phantom row.
+func TerminalHandler(reg *rpc.Registry, log *slog.Logger, onEnd, onStart func(sid string)) http.HandlerFunc {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -205,19 +264,38 @@ func TerminalHandler(reg *rpc.Registry, log *slog.Logger, onEnd func(sid string)
 		_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 		_ = conn.WriteJSON(Frame{Type: "notice", Sid: sid, Mode: mode})
 
+		// Teardown is deferred as soon as the client is attached: every return
+		// below must arm the grace timer, including the TermOpen failure path.
+		// Previously the defer sat below it, so a failed PTY open leaked the hub
+		// entry and the audit record never ended.
+		defer detachClient(sid, conn, func() {
+			// Nobody came back within the grace period: tear the PTY down and
+			// drop the session mapping so sessionIdx does not grow forever.
+			log.Info("terminal session reaped after grace period", "sid", sid, "grace", sessionGrace)
+			hub.SetTermHandler(sid, nil)
+			hub.Send(&agentpb.ServerMessage{
+				Payload: &agentpb.ServerMessage_TermClose{TermClose: &agentpb.TerminalClose{SessionId: sid}},
+			})
+			UnregisterSession(sid)
+			if onEnd != nil {
+				onEnd(sid)
+			}
+		})
+
 		// Only open a PTY when there is not one already. A reattach (second
 		// viewer, or the same browser coming back within the grace period) must
 		// reuse the running shell, otherwise the user loses their scrollback and
 		// any process still running in it.
 		if !ptyLive {
 			hub.SetTermHandler(sid, func(t *agentpb.TerminalOutput) {
-				data := base64.StdEncoding.EncodeToString(t.GetData())
-				frame := Frame{Type: "output", Sid: sid, Data: data}
-				if len(t.GetData()) == 0 {
-					frame = Frame{Type: "ended", Sid: sid}
-				}
-				sHub.broadcast(frame)
+				sHub.onTermOutput(sid, t, onEnd)
 			})
+
+			// First attach opens the PTY: this is when the audit record
+			// starts. A reattach must not recreate it (see Start).
+			if onStart != nil {
+				onStart(sid)
+			}
 
 			// Open PTY on agent
 			shellCmd := sessInfo.Shell
@@ -233,23 +311,16 @@ func TerminalHandler(reg *rpc.Registry, log *slog.Logger, onEnd func(sid string)
 			}) {
 				_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 				_ = conn.WriteJSON(Frame{Type: "ended", Sid: sid, Reason: "agent gone"})
+				// The PTY never started, so there is no shell to wait for: end
+				// the audit record now instead of leaving it live. The deferred
+				// detach still runs and its onEnd call is a no-op (End is
+				// idempotent).
+				if onEnd != nil {
+					onEnd(sid)
+				}
 				return
 			}
 		}
-
-		defer detachClient(sid, conn, func() {
-			// Nobody came back within the grace period: tear the PTY down and
-			// drop the session mapping so sessionIdx does not grow forever.
-			log.Info("terminal session reaped after grace period", "sid", sid, "grace", sessionGrace)
-			hub.SetTermHandler(sid, nil)
-			hub.Send(&agentpb.ServerMessage{
-				Payload: &agentpb.ServerMessage_TermClose{TermClose: &agentpb.TerminalClose{SessionId: sid}},
-			})
-			UnregisterSession(sid)
-			if onEnd != nil {
-				onEnd(sid)
-			}
-		})
 
 		// Pump browser -> agent
 		for {

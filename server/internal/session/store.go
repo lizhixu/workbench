@@ -2,7 +2,10 @@
 //
 // Every time an operator opens a Web terminal, a Session record is created
 // capturing who/when/which-host. When the terminal closes, the end time and
-// duration are recorded. The agent writes an asciinema cast v2 file locally
+// duration are recorded. A record still live when the server (re)starts is
+// closed at load time: the PTY, the hub and the grace timer all live only in
+// memory and cannot survive a restart, so such a record can never become live
+// again. The agent writes an asciinema cast v2 file locally
 // for each session; the server fetches it on demand via the agent's file-read
 // channel and caches it under dataDir/records so the audit page can replay it
 // even after the agent goes offline.
@@ -74,11 +77,28 @@ func (s *Store) load() error {
 	if err := json.Unmarshal(data, &list); err != nil {
 		return err
 	}
+	swept := false
 	s.mu.Lock()
 	for _, sess := range list {
+		if sess.Live {
+			// A live record belongs to a previous process run: the PTY, the
+			// hub and the grace timer are all in-memory and died with it, so
+			// no session can still be live after a restart. Close it here
+			// instead of leaving a "0s 进行中" row forever. The real end time
+			// is unknown, so the record is closed at its start time (duration
+			// stays 0) rather than inventing an end time that would inflate
+			// the duration.
+			sess.Live = false
+			sess.EndedAt = sess.StartedAt
+			sess.Duration = 0
+			swept = true
+		}
 		s.sessions[sess.ID] = sess
 	}
 	s.mu.Unlock()
+	if swept {
+		_ = s.persist()
+	}
 	return nil
 }
 
@@ -100,25 +120,33 @@ func (s *Store) persist() error {
 }
 
 // Start records a new terminal session.
+// Start records a new terminal session. It is create-if-absent: the record is
+// created on the first WS attach, and a later attach (reconnect, second
+// viewer) must not reset StartedAt or wipe the ended state. In particular it
+// must not resurrect a record an admin deleted mid-session.
 func (s *Store) Start(id, agentID, hostname, operator string) {
 	s.mu.Lock()
-	s.sessions[id] = &Session{
-		ID:        id,
-		AgentID:   agentID,
-		Hostname:  hostname,
-		Operator:  operator,
-		StartedAt: time.Now(),
-		Live:      true,
-		CastPath:  id + ".cast",
+	if _, ok := s.sessions[id]; !ok {
+		s.sessions[id] = &Session{
+			ID:        id,
+			AgentID:   agentID,
+			Hostname:  hostname,
+			Operator:  operator,
+			StartedAt: time.Now(),
+			Live:      true,
+			CastPath:  id + ".cast",
+		}
 	}
 	s.mu.Unlock()
 	_ = s.persist()
 }
 
-// End marks a session as closed.
+// End marks a session as closed. It is idempotent: the record is ended exactly
+// once, at the first call. Later calls are no-ops, so a PTY exit and the later
+// grace-period teardown cannot move EndedAt forward and inflate the duration.
 func (s *Store) End(id string) {
 	s.mu.Lock()
-	if sess, ok := s.sessions[id]; ok {
+	if sess, ok := s.sessions[id]; ok && sess.Live {
 		sess.EndedAt = time.Now()
 		sess.Duration = int64(sess.EndedAt.Sub(sess.StartedAt).Seconds())
 		sess.Live = false

@@ -128,6 +128,7 @@ func TestRoleGates(t *testing.T) {
 		{"扫描结果列表", "GET", "/api/v1/scans", true, true},
 
 		{"开终端", "POST", "/api/v1/hosts/" + host + "/terminals", false, true},
+		{"关闭终端会话", "DELETE", "/api/v1/terminals/no-such", false, true},
 		{"执行命令", "POST", "/api/v1/hosts/" + host + "/exec", false, true},
 		{"批量推送", "POST", "/api/v1/hosts/batch-exec", false, true},
 		{"新建目录", "POST", "/api/v1/hosts/" + host + "/files/mkdir", false, true},

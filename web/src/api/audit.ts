@@ -65,6 +65,7 @@ export const actionLabels: Record<string, string> = {
   // 终端 / 命令 / 隧道
   terminal_open: '打开终端',
   terminal_share: '分享终端',
+  terminal_close: '关闭终端会话',
   exec: '执行命令',
   batch_exec: '批量推送命令',
   tunnel_open: '打开内网隧道',

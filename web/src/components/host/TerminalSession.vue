@@ -188,12 +188,15 @@ function connect(wsPath: string) {
       if (f.type === 'output' && f.data) {
         term?.write(b64decode(f.data))
       } else if (f.type === 'ended') {
-        // 会话是真的结束了（用户 exit、PTY 退出），不要再重连。
+        // 会话是真的结束了（用户 exit、PTY 退出），不要再重连，并主动断开
+        // socket，让服务端的宽限期计时启动、hub 得以清理；否则 socket 一直
+        // 挂着，服务端永远等不到最后一个客户端离开。
         sessionEnded = true
         term?.writeln(
           `\x1b[31m\n● 会话结束${f.reason ? ': ' + f.reason : ''}\x1b[0m`
         )
         emit('ended')
+        ws?.close()
       }
     } catch {
       // ignore

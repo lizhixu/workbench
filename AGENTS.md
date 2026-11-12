@@ -1582,7 +1582,7 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 
 2. **重连不能重开 PTY**。`getOrCreateHub` 的第二个返回值表示「该会话已有活着的 PTY」，为真时必须跳过 `TermOpen`，否则会在原 shell 之上再开一个，用户看到的是被清空的终端。
 
-3. **宽限期到期要彻底清理**：`TermClose` + `UnregisterSession(sid)` + 审计 `End`。少了 `UnregisterSession`，`sessionIdx` 会无限增长。
+3. **宽限期到期要彻底清理**：`TermClose` + `UnregisterSession(sid)` + 审计 `End`。少了 `UnregisterSession`，`sessionIdx` 会无限增长。**审计 `End` 不只在宽限期到期时调**：PTY 退出（Agent 发空输出、服务端广播 `ended` 帧）时即调 `End`——记录的终结不能等浏览器关 socket，标签页开着不关会把会话永远留在「0s 进行中」；`TermOpen` 下发失败时同样立即 `End`（PTY 从未启动）。`End` 必须幂等：多次调用只取首次落终态，后到的宽限期清理不得把 `EndedAt` 往后推、把时长撑大。**服务端启动时扫尾**：`sessions.json` 里仍 `Live` 的记录属于上一进程——PTY、hub 与宽限期定时器全在内存，重启后不可能还活着——加载时即按开始时间落 `End`、时长记 0，不编造结束时间。**记录在首次 WS 接入时创建，不在 REST 时创建**：`openTerminal` 只登记 `sessionIdx` 映射（连同操作人、主机名，供首次接入时归属），审计记录由 WS 入口的 `onStart` 在首次开 PTY 时调 `Start` 创建；`Start` 必须 create-if-absent，重连或第二位观众接入不得重置 `StartedAt`、不得复活一条已被 admin 删除的记录。WS 一次都没连上过的会话不留任何审计记录——这是「0s 进行中」幽灵行的根治。
 
 4. **必须设读写超时**。浏览器每 25 秒发一次 ping，服务端 `SetReadDeadline(pongWait = 70s)`，任何客户端帧或 pong 都刷新它。没有这个，硬断线（拔网线、断电）要等 TCP keepalive 两小时才被发现，PTY 一直挂着占资源。写侧用 `SetWriteDeadline(10s)`，避免一个卡死的观众阻塞整个广播循环。
 
@@ -1592,9 +1592,11 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 
 6. **重连复用同一个 xterm 实例**，只重建 WebSocket。重建终端等于清屏，用户会以为会话丢了。`term.onData` / `term.onResize` 只在 `start()` 里绑一次。
 
-7. **区分「我们主动关」和「意外断开」**：组件卸载时先置 `closedByUs = true` 再 `ws.close()`，否则清理过程会触发一次无意义的重连。收到服务端 `ended` 帧同样要停止重连——那是 shell 真的退出了。
+7. **区分「我们主动关」和「意外断开」**：组件卸载时先置 `closedByUs = true` 再 `ws.close()`，否则清理过程会触发一次无意义的重连。收到服务端 `ended` 帧同样要停止重连——那是 shell 真的退出了；同时主动 `ws.close()`，让服务端的宽限期计时启动、hub 得以清理，否则 socket 一直挂着、服务端永远等不到最后一个客户端离开。
 
 8. 重连成功后要重新 `sendResize()`，把当前终端尺寸同步给远端 PTY。
+
+9. **显式关闭走 `DELETE /api/v1/terminals/:sid`，不要用它代替正常关标签**。该接口强制关闭一个活着的会话：审计 `End` + `ws.CloseSession`（停掉宽限期定时器、给已连接的浏览器发 `ended` 帧并关 socket）+ 给 Agent 发 `TermClose` + `UnregisterSession`；审计走 `auditMutation` 中间件，规则 `terminal_close`（high，目标 `session`）。只有会话操作人或 admin 能调，审计页 live 行上的「结束」按钮是唯一调用入口。正常关标签只关 WS、走宽限期——**绝不能在组件卸载时调 DELETE**，否则会把正在共享的观众一起踢掉；WS 从未连上过的会话没有审计记录，DELETE 只清 `sessionIdx` 映射、返回 `closed=false`。
 
 ### 8.6 维护握手与告警防抖规范
 

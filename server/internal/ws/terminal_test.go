@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"watchman/proto/agentpb"
 )
 
 // resetHubs clears global state so tests do not leak into each other.
@@ -140,6 +141,43 @@ func TestGraceExpiryTearsDownOnce(t *testing.T) {
 	}
 }
 
+// PTY 退出（空输出）时必须立即终结审计记录，不能等浏览器关 socket——标签页
+// 开着不关时记录会永远停在 0s 进行中；普通输出则不能碰 End。
+func TestOnTermOutputEndsSession(t *testing.T) {
+	resetHubs()
+	h, _ := getOrCreateHub("s-end", "agent-1")
+
+	var mu sync.Mutex
+	calls := 0
+	var lastSid string
+	onEnd := func(sid string) {
+		mu.Lock()
+		calls++
+		lastSid = sid
+		mu.Unlock()
+	}
+	endCalls := func() (int, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls, lastSid
+	}
+
+	// 普通输出：只广播，不 End。
+	h.onTermOutput("s-end", &agentpb.TerminalOutput{SessionId: "s-end", Data: []byte("hello")}, onEnd)
+	if n, _ := endCalls(); n != 0 {
+		t.Errorf("普通输出不应调 onEnd，实际调了 %d 次", n)
+	}
+
+	// 空输出 = PTY 已退出：End 恰好一次，且 sid 正确。
+	h.onTermOutput("s-end", &agentpb.TerminalOutput{SessionId: "s-end", Data: []byte{}}, onEnd)
+	if n, sid := endCalls(); n != 1 || sid != "s-end" {
+		t.Errorf("PTY 退出应恰好 End 1 次(sid=s-end)，实际 %d 次 sid=%q", n, sid)
+	}
+
+	// onEnd 为空时不能 panic（无审计 store 的 handler）。
+	h.onTermOutput("s-end", &agentpb.TerminalOutput{SessionId: "s-end", Data: []byte{}}, nil)
+}
+
 // Two viewers sharing a session: one leaving must not disturb the other, and no
 // teardown timer may be armed while anyone is still attached.
 func TestOneOfTwoClientsLeavingKeepsSession(t *testing.T) {
@@ -178,5 +216,60 @@ func TestOneOfTwoClientsLeavingKeepsSession(t *testing.T) {
 	}
 	if armed {
 		t.Error("仍有客户端在线时不应挂起销毁定时器")
+	}
+}
+
+// CloseSession 立即拆掉会话、跳过宽限期：hub 移除、待触发的 reap 定时器停掉，
+// 之后再调与 detachClient 都是 no-op，teardown 不会被触发两次。
+func TestCloseSession(t *testing.T) {
+	resetHubs()
+	teardownCalled := false
+	teardown := func() { teardownCalled = true }
+
+	// 挂一个假客户端再 detach，让 reap 定时器先武装起来。
+	h, live := getOrCreateHub("sid-close-1", "agent-1")
+	if live {
+		t.Fatal("首个接入应报告无 PTY")
+	}
+	c1 := &websocket.Conn{}
+	h.mu.Lock()
+	h.clients[c1] = "owner"
+	h.mu.Unlock()
+	detachClient("sid-close-1", c1, teardown)
+	h.mu.Lock()
+	armed := h.reapTimer != nil
+	h.mu.Unlock()
+	if !armed {
+		t.Fatal("最后一位客户端离开后应武装 reap 定时器")
+	}
+
+	if !CloseSession("sid-close-1") {
+		t.Fatal("CloseSession 应对存活会话返回 true")
+	}
+	h.mu.Lock()
+	armed = h.reapTimer != nil
+	h.mu.Unlock()
+	if armed {
+		t.Error("CloseSession 应停掉待触发的 reap 定时器")
+	}
+	hubMu.Lock()
+	_, still := activeHubs["sid-close-1"]
+	hubMu.Unlock()
+	if still {
+		t.Error("CloseSession 后 hub 应已移除")
+	}
+	// 第二次调与事后 detach 都是 no-op，teardown 不应被触发。
+	if CloseSession("sid-close-1") {
+		t.Error("第二次 CloseSession 应对不存在的会话返回 false")
+	}
+	detachClient("sid-close-1", c1, teardown)
+	if teardownCalled {
+		t.Error("CloseSession 后定时器与 detach 都不应再触发 teardown")
+	}
+
+	// 零客户端的 hub 同样能立即关闭。
+	getOrCreateHub("sid-close-2", "agent-1")
+	if !CloseSession("sid-close-2") {
+		t.Error("零客户端的 CloseSession 也应返回 true")
 	}
 }

@@ -202,6 +202,9 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// Terminal. An interactive shell is full write access to the host.
 	hostWrite.POST("/hosts/:id/terminals", h.openTerminal)
 	hostWrite.POST("/hosts/:id/terminals/:sid/share", h.shareTerminal)
+	// Explicit close for a live session (AGENTS.md §8.5): audited through the
+	// mutation middleware, so it needs a rule in deriveAllMutationRules.
+	hostWrite.Group("", h.auditMutation()).DELETE("/terminals/:sid", h.closeTerminal)
 
 	// Files: reads are open to every role, writes are not.
 	authed.GET("/hosts/:id/files", h.fileList)
@@ -531,11 +534,19 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 			}
 		}
 		c.Request.SetPathValue("sid", c.Param("sid"))
-		var onEnd func(string)
+		var onEnd, onStart func(string)
 		if sessStore != nil {
 			onEnd = func(sid string) { sessStore.End(sid) }
+			// The audit record starts on first WS attach, not at REST time.
+			// Operator/hostname come from RegisterSession (the REST caller),
+			// so a share guest attaching first still attributes the opener.
+			onStart = func(sid string) {
+				if info, ok := ws.LookupSessionInfo(sid); ok {
+					sessStore.Start(sid, info.AgentID, info.Hostname, info.Operator)
+				}
+			}
 		}
-		ws.TerminalHandler(reg, log, onEnd).ServeHTTP(c.Writer, c.Request)
+		ws.TerminalHandler(reg, log, onEnd, onStart).ServeHTTP(c.Writer, c.Request)
 	})
 
 	// Web console (go:embed, see server/web). Mounted last: unknown /api/*
@@ -950,12 +961,10 @@ func (h *handlers) openTerminal(c *gin.Context) {
 	}
 
 	sid := randomToken(12)
-	ws.RegisterSession(sid, agentID, body.Shell)
-	// Record the session start for audit.
-	if h.sess != nil {
-		operator := auth.Username(c)
-		h.sess.Start(sid, agentID, a.Hostname, operator)
-	}
+	// Only the mapping is registered here. The audit record is created on
+	// first WS attach (see the onStart closure at the WS endpoint): a session
+	// whose socket never connects must leave no phantom "0s 进行中" row.
+	ws.RegisterSession(sid, agentID, auth.Username(c), a.Hostname, body.Shell)
 	shell := body.Shell
 	if shell == "" {
 		shell = "default"
@@ -2127,6 +2136,8 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodPost, "/api/v1/hosts/:id/apps/install", "app_install", "", "", "", "安装应用"},
 		{http.MethodDelete, "/api/v1/hosts/:id/apps/:name", "app_uninstall", "", "", "", "卸载应用"},
 		{http.MethodPost, "/api/v1/hosts/:id/docker/install-script", "docker_install", "", "", audit.RiskHigh, "一键安装 Docker"},
+		// Terminal: closing a live session kills the shell, so it is high-risk.
+		{http.MethodDelete, "/api/v1/terminals/:sid", "terminal_close", "session", "sid", audit.RiskHigh, "关闭终端会话"},
 		{http.MethodPut, "/api/v1/me/settings", "user_settings_update", "", "", "", "更新个人设置"},
 		{http.MethodPut, "/api/v1/settings", "system_settings_update", "", "", "", "更新系统设置"},
 		// Control-plane backup / restore: a restore rewrites the whole dataset,
@@ -2482,6 +2493,57 @@ func (h *handlers) deleteSession(c *gin.Context) {
 	// Deleting a recording destroys audit evidence: always log it.
 	h.recordAudit(c, "session_delete", "session", sid, "删除会话/录像", audit.RiskHigh, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// closeTerminal force-closes a live terminal session: it ends the audit
+// record, drops the WS hub (attached browsers get the ended frame), tells the
+// agent to close the PTY and forgets the session mapping. It is the explicit
+// close the audit page offers for live sessions — a normal tab close still
+// goes through the WS disconnect + grace period and never calls this, so
+// closing your own tab cannot cut off a shared viewer. Only the session
+// operator or an admin may close a session; a never-attached session (no
+// record, only a mapping) is cleaned up the same way.
+func (h *handlers) closeTerminal(c *gin.Context) {
+	sid := c.Param("sid")
+	agentID := ""
+	operator := ""
+	if info, ok := ws.LookupSessionInfo(sid); ok {
+		agentID = info.AgentID
+		operator = info.Operator
+	}
+	if h.sess != nil {
+		if sess, ok := h.sess.Get(sid); ok {
+			if agentID == "" {
+				agentID = sess.AgentID
+			}
+			if operator == "" {
+				operator = sess.Operator
+			}
+		}
+	}
+	if agentID == "" && operator == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		return
+	}
+	caller := auth.Username(c)
+	if operator != "" && caller != operator && auth.RoleOf(c) != auth.RoleAdmin {
+		c.JSON(http.StatusForbidden, gin.H{"error": "only the session operator or an admin can close it"})
+		return
+	}
+	closed := ws.CloseSession(sid)
+	ws.UnregisterSession(sid)
+	if h.sess != nil {
+		h.sess.End(sid)
+	}
+	if closed && h.reg != nil {
+		if hub := h.reg.Hub(agentID); hub != nil {
+			hub.SetTermHandler(sid, nil)
+			hub.Send(&agentpb.ServerMessage{
+				Payload: &agentpb.ServerMessage_TermClose{TermClose: &agentpb.TerminalClose{SessionId: sid}},
+			})
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "closed": closed})
 }
 
 // ---- Health ----------------------------------------------------------

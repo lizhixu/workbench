@@ -6,9 +6,9 @@ import {
   NRadioGroup, NRadioButton, NTooltip,
 } from 'naive-ui'
 import {
-  PlayOutline, TrashOutline, RefreshOutline, FlashOutline, InformationCircleOutline,
+  PlayOutline, TrashOutline, RefreshOutline, FlashOutline, InformationCircleOutline, StopOutline,
 } from '@vicons/ionicons5'
-import { listSessions, deleteSession, sessionRecordingUrl } from '../../api/hosts'
+import { listSessions, deleteSession, closeTerminal, sessionRecordingUrl } from '../../api/hosts'
 import type { SessionRecord } from '../../api/types'
 import { fmtDateTime } from '../../utils/time'
 
@@ -77,7 +77,7 @@ const columns = [
   {
     title: '操作',
     key: 'actions',
-    width: 120,
+    width: 190,
     render: (row: SessionRecord) =>
       h(NSpace, { size: 4 }, {
         default: () => [
@@ -90,6 +90,13 @@ const columns = [
             icon: () => h(NIcon, { component: PlayOutline }),
             default: () => '回放',
           }),
+          ...(row.live ? [h(NPopconfirm, { onPositiveClick: () => doClose(row.id) }, {
+            trigger: () => h(NButton, { size: 'small', quaternary: true, type: 'warning' }, {
+              icon: () => h(NIcon, { component: StopOutline }),
+              default: () => '结束',
+            }),
+            default: () => '确认结束该终端会话？正在连接的浏览器会断开，Agent 上的 shell 会被关闭。',
+          })] : []),
           h(NPopconfirm, { onPositiveClick: () => doDelete(row.id) }, {
             trigger: () => h(NButton, { size: 'small', quaternary: true, type: 'error' }, {
               icon: () => h(NIcon, { component: TrashOutline }),
@@ -269,6 +276,16 @@ watch([playbackSpeed, skipIdle], () => {
     mountPlayer()
   }
 })
+
+async function doClose(id: string) {
+  try {
+    await closeTerminal(id)
+    message.success('会话已结束')
+    load()
+  } catch (e: any) {
+    message.error(e.message)
+  }
+}
 
 async function doDelete(id: string) {
   try {

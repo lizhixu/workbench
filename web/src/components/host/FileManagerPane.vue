@@ -65,7 +65,9 @@ const message = useMessage()
 const dialog = useDialog()
 const auth = useAuthStore()
 const settingsStore = useSettingsStore()
-const loading = ref(false)
+// 首轮加载完成前保持 loading：首帧若以 files=[] 渲染表格会闪出「无数据」假空状态
+//（onMounted 须先 await detectOS 与 settings 加载，load() 尚未开始）。
+const loading = ref(true)
 const hostOs = ref(props.os || '')
 
 // Viewers get a read-only file tree: download and preview only.

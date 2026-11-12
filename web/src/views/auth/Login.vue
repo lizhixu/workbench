@@ -27,7 +27,7 @@ const auth = useAuthStore()
 const settings = useSettingsStore()
 const message = useMessage()
 
-const username = ref('admin')
+const username = ref('')
 const password = ref('')
 const loading = ref(false)
 
@@ -158,7 +158,7 @@ async function handleLogin() {
           <div class="login-header">
             <img src="/k-works.png" class="login-logo-img" alt="Logo" />
             <div class="login-title-wrap">
-              <h1 class="login-title">Watchman 云堡垒机</h1>
+              <span class="login-title">Watchman 云堡垒机</span>
               <span class="login-sub">主机管理与安全运维审计平台</span>
             </div>
           </div>
@@ -198,7 +198,6 @@ async function handleLogin() {
             </NButton>
           </NSpace>
         </NForm>
-        <div class="hint">默认凭据 admin / admin · 登录后请及时修改</div>
       </NCard>
     </div>
   </div>
@@ -233,7 +232,6 @@ async function handleLogin() {
   --login-title-color: #f8fafc;
   --login-sub-color: #94a3b8;
   --login-icon-color: #64748b;
-  --login-hint-color: #64748b;
   --login-theme-btn-color: #94a3b8;
   --login-theme-btn-hover: #f8fafc;
   // 输入框 autofill 适配：Chrome 自动填充强制给 input 涂白底，
@@ -264,7 +262,6 @@ async function handleLogin() {
   --login-title-color: #0f172a;
   --login-sub-color: #64748b;
   --login-icon-color: #94a3b8;
-  --login-hint-color: #64748b;
   --login-theme-btn-color: #64748b;
   --login-theme-btn-hover: #0f172a;
   --login-input-autofill-bg: #ffffff;
@@ -430,15 +427,6 @@ async function handleLogin() {
     letter-spacing: 0.5px;
     box-shadow: 0 4px 12px rgba(99, 102, 241, 0.25);
   }
-}
-
-.hint {
-  margin-top: 14px;
-  text-align: center;
-  font-size: 11.5px;
-  color: var(--login-hint-color);
-  letter-spacing: 0.2px;
-  transition: color 0.3s ease;
 }
 
 // 移动端响应式处理：屏幕较窄时隐藏边缘装饰，防止喧宾夺主

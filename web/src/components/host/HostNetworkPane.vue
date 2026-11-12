@@ -2,7 +2,7 @@
 import { ref, onMounted } from 'vue'
 import {
   NCard, NSpace, NTag, NButton, NInput, NSwitch, NAlert, NPopconfirm,
-  NIcon, useMessage, NDescriptions, NDescriptionsItem, NSpin, NForm, NFormItem,
+  NIcon, useMessage, NDescriptions, NDescriptionsItem, NDivider, NSpin, NForm, NFormItem,
   NModal, NText,
 } from 'naive-ui'
 import {
@@ -62,6 +62,21 @@ async function copyText(text: string, label: string) {
   } else {
     message.warning('复制失败')
   }
+}
+
+// DERP 中继地域码说明：`tailscale status --json` 的 Self.Relay 是裸地域码
+// （如 lax / syd / tok），表示当前经哪座 DERP 中继服务器转发；直连时不展示。
+// 地域码本身是标识（如机场代码），不硬编码映射城市名：自建 Headscale / DERP
+// 可使用自定义地域码，原文保留在括号内。
+function derpLabel(derp?: string): string {
+  if (!derp) return 'DERP 转发'
+  const code = derp
+    .replace(/^DERP\(/i, '')
+    .replace(/\)\s*中继\s*$/, '')
+    .replace(/\)$/, '')
+    .trim()
+  if (!code || /^direct$/i.test(code)) return 'DERP 转发'
+  return `DERP 中继（${code}）`
 }
 
 async function loadData() {
@@ -217,8 +232,8 @@ onMounted(loadData)
                 未部署 Tailscale 客户端
               </NTag>
             </div>
-            <p class="pane-desc">
-              无公网 IP 节点之间自动打洞加密直连，通过虚拟网段 (100.64.0.0/10) 实现跨机房、家庭内网免端口映射双向互通。
+            <p class="pane-desc tip-hint">
+              无公网 IP 节点之间自动打洞加密直连，通过虚拟网段 (100.64.0.0/10) 实现跨机房、家庭内网免端口映射互通。
             </p>
           </div>
 
@@ -254,6 +269,8 @@ onMounted(loadData)
                   </template>
                   确认暂时断开本机的虚拟局域网连接 (tailscale down) 吗？
                 </NPopconfirm>
+
+                <NDivider vertical class="action-divider" />
 
                 <NPopconfirm @positive-click="() => handleLeave('logout')">
                   <template #trigger>
@@ -305,7 +322,7 @@ onMounted(loadData)
           <NDescriptionsItem label="打洞直连状态">
             <span v-if="!node?.online" class="text-muted">-</span>
             <span v-else-if="node?.direct" class="text-success font-semibold">P2P 直连</span>
-            <span v-else class="text-info">{{ node?.derp || 'DERP 转发' }}</span>
+            <span v-else class="text-info">{{ derpLabel(node?.derp) }}</span>
           </NDescriptionsItem>
 
           <NDescriptionsItem label="控制面地址">
@@ -489,6 +506,7 @@ onMounted(loadData)
         color: var(--n-text-color-3);
         max-width: 600px;
         line-height: 1.5;
+        text-wrap: balance;
       }
     }
 
@@ -543,6 +561,13 @@ onMounted(loadData)
 
 .text-info {
   color: #3b82f6;
+}
+
+// 「断开连接」与「注销节点」之间的竖线分隔：与按钮等高、垂直居中，
+// 让危险操作（注销节点）在视觉上与临时断开明确分开。
+.action-divider {
+  align-self: center;
+  height: 22px;
 }
 
 .ping-box {

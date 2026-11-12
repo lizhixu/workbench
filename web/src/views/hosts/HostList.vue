@@ -72,6 +72,9 @@ const enrolling = ref(false)
 const showBillingModal = ref(false)
 const selectedBillingHost = ref<Host | null>(null)
 
+// 首屏加载完成标记：计数只在首次拉取完成后才渲染，避免加载瞬间闪「共 0 台主机」
+const listLoaded = ref(false)
+
 // Host grouping: filter bar + per-host assignment modal.
 const groups = ref<HostGroup[]>([])
 const groupFilter = ref<string>('')
@@ -207,17 +210,8 @@ function hasPrice(h: Host): boolean {
   return h.price !== undefined && h.price !== null && !isNaN(Number(h.price))
 }
 
-function hasBilling(h: Host): boolean {
-  return (
-    hasPrice(h) ||
-    (h.traffic_limit_gb !== undefined && h.traffic_limit_gb !== null && Number(h.traffic_limit_gb) > 0) ||
-    !!h.expires_at ||
-    (!!h.notes && h.notes.trim() !== '')
-  )
-}
-
 function formatPrice(h: Host): string {
-  if (!hasPrice(h)) return '-'
+  if (!hasPrice(h)) return '—'
   const curMap: Record<string, string> = { CNY: '¥', USD: '$', EUR: '€', HKD: 'HK$', JPY: '¥', GBP: '£', USDT: 'USDT ' }
   const cur = curMap[h.currency || 'CNY'] || `${h.currency || ''} `
   const p = `${cur}${h.price}`
@@ -226,7 +220,7 @@ function formatPrice(h: Host): string {
 }
 
 function formatHostTraffic(h: Host): string {
-  if (!h.traffic_limit_gb) return '-'
+  if (!h.traffic_limit_gb) return '—'
   let used = (h.month_rx || 0) + (h.month_tx || 0)
   if (h.traffic_calc_type === 'out') used = h.month_tx || 0
   else if (h.traffic_calc_type === 'in') used = h.month_rx || 0
@@ -553,7 +547,10 @@ async function refresh() {
 
 onMounted(() => {
   workspace.setActiveKey('/hosts')
-  store.fetchList().catch((e) => message.error(e.message)).finally(() => checkPolling())
+  store.fetchList().catch((e) => message.error(e.message)).finally(() => {
+    listLoaded.value = true
+    checkPolling()
+  })
   loadGroups()
   loadNetworkNodes()
 })
@@ -568,6 +565,14 @@ onUnmounted(() => {
 
 <template>
   <div class="baichuan-host-list-view">
+    <!-- 页面顶栏：外层单文字标题 + 计数（DESIGN.md §9.3） -->
+    <div class="page-header">
+      <div class="header-left">
+        <h2 class="page-title">主机列表</h2>
+        <span v-if="listLoaded" class="total-count-text">共 {{ store.hosts.length }} 台主机</span>
+      </div>
+    </div>
+
     <div class="main-table-area">
       <!-- 顶部工具栏 Toolbar -->
       <div class="toolbar-bar">
@@ -589,7 +594,6 @@ onUnmounted(() => {
             size="small"
             style="width: 170px"
           />
-          <span class="total-count-text">共 {{ store.hosts.length }} 台主机</span>
         </div>
 
         <div class="toolbar-right">
@@ -660,7 +664,7 @@ onUnmounted(() => {
             <!-- 2. 主机名称与系统版本 -->
             <div class="col-host-info">
               <div class="host-name-row">
-                <span class="host-name">{{ host.hostname }}</span>
+                <span class="host-name" :title="host.hostname">{{ host.hostname }}</span>
                 <NTag v-if="host.group" size="tiny" :bordered="false" type="info">{{ host.group }}</NTag>
               </div>
               <div class="host-distro">
@@ -741,19 +745,19 @@ onUnmounted(() => {
               </div>
             </div>
 
-            <!-- 6. 财务与规格概要（配置什么展示什么，未配置不展示） -->
-            <div v-if="hasBilling(host)" class="col-billing">
-              <div v-if="hasPrice(host)" class="billing-line">
+            <!-- 6. 财务与规格概要（四行常驻，未配置的行以「—」占位，保证各卡片行高一致） -->
+            <div class="col-billing">
+              <div class="billing-line">
                 <span class="billing-label">资费</span>
                 <span class="billing-value" :title="formatPrice(host)">{{ formatPrice(host) }}</span>
               </div>
-              <div v-if="host.traffic_limit_gb" class="billing-line" :title="getTrafficTooltip(host)">
+              <div class="billing-line" :title="getTrafficTooltip(host)">
                 <span class="billing-label">流量</span>
                 <span class="billing-value">{{ formatHostTraffic(host) }}</span>
               </div>
-              <div v-if="host.expires_at" class="billing-line">
+              <div class="billing-line">
                 <span class="billing-label">到期</span>
-                <div class="expiry-group" :class="getExpiryClass(host.expires_at)" :title="`${host.expires_at} (${getExpiryDaysText(host.expires_at)})`">
+                <div v-if="host.expires_at" class="expiry-group" :class="getExpiryClass(host.expires_at)" :title="`${host.expires_at} (${getExpiryDaysText(host.expires_at)})`">
                   <span class="expiry-date">{{ host.expires_at }}</span>
                   <span class="expiry-badge">{{ getExpiryDaysText(host.expires_at) }}</span>
                   <span v-if="host.auto_renewal" class="auto-renew-badge">自续</span>
@@ -768,11 +772,12 @@ onUnmounted(() => {
                     <NIcon :component="LinkOutline" size="12" />
                   </a>
                 </div>
+                <span v-else class="billing-value">—</span>
               </div>
-              <!-- 备注行：配了就展示，没配隐藏 -->
-              <div v-if="host.notes && host.notes.trim()" class="billing-line" :title="`备注: ${host.notes}`">
+              <!-- 备注行：未配置以「—」占位 -->
+              <div class="billing-line" :title="host.notes && host.notes.trim() ? `备注: ${host.notes}` : ''">
                 <span class="billing-label">备注</span>
-                <span class="billing-value muted-notes">{{ host.notes }}</span>
+                <span class="billing-value muted-notes">{{ host.notes && host.notes.trim() ? host.notes : '—' }}</span>
               </div>
             </div>
 
@@ -879,12 +884,41 @@ onUnmounted(() => {
 <style scoped lang="scss">
 .baichuan-host-list-view {
   display: flex;
+  flex-direction: column;
   height: 100%;
+  min-height: 0;
   box-sizing: border-box;
+  gap: 12px;
+
+  .page-header {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+
+      .page-title {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 600;
+        color: var(--text-primary);
+      }
+
+      .total-count-text {
+        font-size: 13px;
+        color: var(--text-secondary);
+      }
+    }
+  }
 
   .main-table-area {
     flex: 1;
     min-width: 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -905,11 +939,6 @@ onUnmounted(() => {
         display: flex;
         align-items: center;
         gap: 12px;
-      }
-
-      .total-count-text {
-        font-size: 13px;
-        color: var(--text-secondary);
       }
     }
 
@@ -964,12 +993,21 @@ onUnmounted(() => {
               display: flex;
               align-items: center;
               gap: 6px;
+              min-width: 0;
 
               .host-name {
                 font-weight: 600;
                 font-size: 15px;
                 color: var(--text-primary);
                 letter-spacing: 0.2px;
+                min-width: 0;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+              }
+
+              .n-tag {
+                flex-shrink: 0;
               }
             }
 
@@ -996,8 +1034,8 @@ onUnmounted(() => {
               font-weight: 500;
 
               &.is-online {
-                background-color: #e6f8f0;
-                color: #059669;
+                background-color: rgba(16, 185, 129, 0.12);
+                color: #10b981;
               }
 
               &.is-offline {
@@ -1274,6 +1312,16 @@ onUnmounted(() => {
 /* ===================== 移动端适配 ===================== */
 @media (max-width: 768px) {
   .baichuan-host-list-view {
+    gap: 8px;
+
+    .page-header {
+      .header-left {
+        .total-count-text {
+          font-size: 12px;
+        }
+      }
+    }
+
     .main-table-area {
       gap: 8px;
 
@@ -1289,11 +1337,6 @@ onUnmounted(() => {
           .n-input {
             width: 100% !important;
             flex: 1;
-          }
-
-          .total-count-text {
-            font-size: 12px;
-            flex-shrink: 0;
           }
         }
 

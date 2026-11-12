@@ -24,9 +24,12 @@ const props = withDefaults(
     visible: true,
   },
 )
+export type TermConnStatus = 'connecting' | 'connected' | 'reconnecting' | 'ended'
+
 const emit = defineEmits<{
   (e: 'ended'): void
   (e: 'opened', sid: string): void
+  (e: 'status', status: TermConnStatus): void
 }>()
 
 const termPrefs = useTermPrefsStore()
@@ -51,6 +54,15 @@ const RECONNECT_MAX_DELAY = 15000
 // 超过服务端宽限期还没连上，PTY 已被回收，再重试只会连到一个不存在的会话。
 const RECONNECT_GIVE_UP_MS = 60000
 let firstDisconnectAt = 0
+
+// Connection status surfaced to the pane toolbar (NTag): the terminal echo
+// line alone is not a visible connection indicator (UI review 2026-11-12).
+const connStatus = ref<TermConnStatus>('connecting')
+function setStatus(s: TermConnStatus) {
+  if (connStatus.value === s) return
+  connStatus.value = s
+  emit('status', s)
+}
 
 function b64encode(s: string): string {
   const bytes = new TextEncoder().encode(s)
@@ -162,6 +174,7 @@ function connect(wsPath: string) {
   ws.binaryType = 'arraybuffer'
 
   ws.onopen = () => {
+    setStatus('connected')
     if (reconnectAttempt > 0) {
       term?.writeln('\x1b[32m● 已重新连接，会话已恢复\x1b[0m')
     } else {
@@ -192,6 +205,7 @@ function connect(wsPath: string) {
         // socket，让服务端的宽限期计时启动、hub 得以清理；否则 socket 一直
         // 挂着，服务端永远等不到最后一个客户端离开。
         sessionEnded = true
+        setStatus('ended')
         term?.writeln(
           `\x1b[31m\n● 会话结束${f.reason ? ': ' + f.reason : ''}\x1b[0m`
         )
@@ -226,12 +240,14 @@ function scheduleReconnect(wsPath: string) {
 
   if (now - firstDisconnectAt > RECONNECT_GIVE_UP_MS) {
     term?.writeln('\x1b[31m● 连接中断超过 60 秒，会话已被回收，请新开一个终端标签\x1b[0m')
+    setStatus('ended')
     emit('ended')
     return
   }
 
   const delay = Math.min(1000 * 2 ** reconnectAttempt, RECONNECT_MAX_DELAY)
   reconnectAttempt += 1
+  setStatus('reconnecting')
   term?.writeln(
     `\x1b[33m● 连接中断，${Math.round(delay / 1000)} 秒后尝试重连（第 ${reconnectAttempt} 次）\x1b[0m`,
   )
@@ -266,6 +282,7 @@ watch(
 
 onMounted(() => {
   start().catch((e) => {
+    setStatus('ended')
     term?.writeln(`\x1b[31m● 打开终端失败: ${e}\x1b[0m`)
   })
 })

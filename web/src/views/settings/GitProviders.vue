@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, watch, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NCard,
@@ -35,6 +35,23 @@ const router = useRouter()
 
 const gitStatus = ref<GitProvidersStatus | null>(null)
 const loadingGit = ref(false)
+
+// GitHub 头像首次加载缓慢时先显示 GitHub 标志占位，不留空白灰圆：
+// 头像预加载完成前渲染图标占位，加载成功后再换成真实头像，失败则一直留占位。
+// 不用 NAvatar 内置 placeholder 插槽：它要求同时开 lazy，而无
+// intersection-observer 配置时 lazy 会阻止图片开始加载。
+const avatarLoaded = ref(false)
+watch(
+  () => gitStatus.value?.github?.account?.avatar_url,
+  (url) => {
+    avatarLoaded.value = false
+    if (!url) return
+    const img = new Image()
+    img.onload = () => { avatarLoaded.value = true }
+    img.onerror = () => { avatarLoaded.value = false }
+    img.src = url
+  },
+)
 const showGitAuthModal = ref(false)
 const gitTokenInput = ref('')
 const connectingGit = ref(false)
@@ -255,11 +272,8 @@ onMounted(() => {
     <template #header>
       <span style="font-size: 16px; font-weight: 700">
         <NIcon style="vertical-align: middle; margin-right: 6px"><LogoGithub /></NIcon>
-        代码源集成 (Git Providers)
+        代码源集成
       </span>
-    </template>
-    <template #header-extra>
-      <span class="muted" style="font-size: 13px">Connect your Git provider for authentication.</span>
     </template>
 
     <NSpace vertical :size="14">
@@ -271,11 +285,19 @@ onMounted(() => {
         <NSpace align="center" justify="space-between" style="width: 100%">
           <NSpace align="center" :size="12">
             <NAvatar
-              v-if="gitStatus?.github?.connected && gitStatus.github.account?.avatar_url"
+              v-if="gitStatus?.github?.connected && gitStatus.github.account?.avatar_url && avatarLoaded"
               :src="gitStatus.github.account.avatar_url"
               round
               :size="36"
             />
+            <NAvatar
+              v-else-if="gitStatus?.github?.connected && gitStatus.github.account?.avatar_url"
+              round
+              :size="36"
+              color="var(--bg-card-subtle)"
+            >
+              <NIcon size="20" :component="LogoGithub" />
+            </NAvatar>
             <NIcon v-else size="32" :component="LogoGithub" />
             <div>
               <NSpace align="center" :size="8">

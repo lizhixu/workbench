@@ -40,7 +40,8 @@ const message = useMessage()
 const auth = useAuthStore()
 
 const entries = ref<CommandEntry[]>([])
-const loading = ref(false)
+// 初始即为加载态：首屏渲染时不先闪现空状态，等首轮请求落定再决定是否展示空态。
+const loading = ref(true)
 const saving = ref(false)
 const keyword = ref('')
 const shellFilter = ref('')
@@ -278,7 +279,7 @@ onMounted(refresh)
         :max-height="360"
       >
         <template #empty>
-          <NEmpty description="暂无常用命令，点击右上角新增" />
+          <NEmpty v-if="!loading" description="暂无常用命令，点击右上角新增" />
         </template>
       </NDataTable>
     </NSpace>

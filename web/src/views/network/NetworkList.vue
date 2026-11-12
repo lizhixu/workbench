@@ -2,7 +2,7 @@
 import { onMounted, ref, computed } from 'vue'
 import {
   NButton, NSpace, NTag, NModal, NForm, NFormItem,
-  NInput, NSelect, NSwitch, useMessage, NIcon, NAlert, NPopconfirm, NText,
+  NInput, NSelect, NSwitch, useMessage, NIcon, NAlert, NPopconfirm, NText, NTooltip,
   NSpin, NEmpty,
 } from 'naive-ui'
 import {
@@ -271,17 +271,25 @@ onMounted(loadData)
       <div class="header-left">
         <div class="title-wrap">
           <h2 class="page-title">异地组网</h2>
-          <NTag size="small" :bordered="false" round type="success">
-            {{ config.control_plane === 'headscale' ? 'Headscale 自托管' : 'Tailscale 官方' }}
-          </NTag>
-          <NTag v-if="config.server_url" size="small" :bordered="false" round type="info">
-            {{ config.server_url }}
-          </NTag>
         </div>
       </div>
 
       <div class="header-right">
         <NSpace align="center" :size="12">
+          <NTag size="small" :bordered="false" round type="success">
+            {{ config.control_plane === 'headscale' ? 'Headscale 自托管' : 'Tailscale 官方' }}
+          </NTag>
+          <NTag
+            v-if="config.server_url"
+            size="small"
+            :bordered="false"
+            round
+            type="info"
+            class="server-url-tag"
+            :title="config.server_url"
+          >
+            {{ config.server_url }}
+          </NTag>
           <div class="stat-group">
             <div class="stat-item">
               <span class="stat-num">{{ stats.total }}</span>
@@ -381,7 +389,12 @@ onMounted(loadData)
           <!-- 2. 主机名与物理 IP -->
           <div class="col-host">
             <div class="host-title-row">
-              <span class="host-name">{{ row.hostname || row.host_id.slice(0, 8) }}</span>
+              <NTooltip trigger="hover">
+                <template #trigger>
+                  <span class="host-name">{{ row.hostname || row.host_id.slice(0, 8) }}</span>
+                </template>
+                {{ row.hostname || row.host_id.slice(0, 8) }}
+              </NTooltip>
               <NTag v-if="row.agent_online" size="tiny" :bordered="false" type="success">在线</NTag>
               <NTag v-else size="tiny" :bordered="false" type="error">离线</NTag>
             </div>
@@ -758,6 +771,18 @@ onMounted(loadData)
   .header-right {
     display: flex;
     align-items: center;
+
+    // 服务地址过长时截断，完整地址由 title 承载
+    .server-url-tag {
+      max-width: 260px;
+
+      :deep(.n-tag__content) {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+    }
   }
 }
 
@@ -917,11 +942,21 @@ onMounted(loadData)
           display: flex;
           align-items: center;
           gap: 6px;
+          min-width: 0;
+
+          :deep(.n-tag) {
+            flex-shrink: 0;
+          }
 
           .host-name {
+            flex: 1;
+            min-width: 0;
             font-weight: 600;
             font-size: 14px;
             color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
           }
         }
 

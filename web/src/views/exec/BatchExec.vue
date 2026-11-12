@@ -32,6 +32,16 @@ const libraryEntries = ref<CommandEntry[]>([])
 const libraryLoading = ref(false)
 const libraryKeyword = ref('')
 
+const onlineHostCount = computed(() => hosts.value.filter((h) => h.status === 'online').length)
+const offlineHostCount = computed(() => hosts.value.length - onlineHostCount.value)
+const canRun = computed(() => command.value.trim() !== '' && selectedHostIds.value.length > 0)
+const runDisabledReason = computed(() => {
+  if (!command.value.trim() && selectedHostIds.value.length === 0) return '请输入命令并选择目标主机后执行'
+  if (!command.value.trim()) return '请输入命令后执行'
+  if (selectedHostIds.value.length === 0) return '请先选择目标主机'
+  return ''
+})
+
 const shellOptions = [
   { label: '自动', value: '' },
   { label: 'bash', value: 'bash' },
@@ -83,6 +93,10 @@ async function loadHosts() {
   try {
     const res = await listHosts()
     hosts.value = res.data || res
+    // 离线主机不可选：剔除此前已选、现已离线的主机，避免带着失效勾选执行
+    selectedHostIds.value = selectedHostIds.value.filter((id) =>
+      hosts.value.some((h) => h.id === id && h.status === 'online'),
+    )
   } catch (e: any) {
     message.error(e.message)
   } finally {
@@ -91,7 +105,7 @@ async function loadHosts() {
 }
 
 async function run() {
-  if (!command.value) {
+  if (!command.value.trim()) {
     message.warning('请输入命令')
     return
   }
@@ -164,24 +178,36 @@ async function copyResult(r: BatchExecResult) {
 }
 
 const hostColumns = [
-  { type: 'selection' as const },
-  { title: '主机名', key: 'hostname' },
-  { title: '系统', key: 'os', width: 80 },
+  {
+    type: 'selection' as const,
+    width: 40,
+    // 离线主机列出但不可选（走查：离线主机无声缺席）
+    disabled: (row: Host) => row.status !== 'online',
+  },
+  { title: '主机名', key: 'hostname', width: 220, ellipsis: { tooltip: true } },
+  { title: '系统', key: 'os', width: 100, ellipsis: { tooltip: true } },
   {
     title: 'IP 地址',
     key: 'ip',
-    width: 150,
+    width: 160,
+    ellipsis: { tooltip: true },
     render: (row: Host) => row.public_ip || row.internal_ip || '-',
   },
   {
-    title: '状态', key: 'status', width: 80,
+    title: '状态', key: 'status', width: 90,
     render: (row: Host) => row.status === 'online'
       ? h(NTag, { type: 'success', size: 'small', bordered: false }, { default: () => '在线' })
-      : h(NTag, { type: 'default', size: 'small', bordered: false }, { default: () => '离线' }),
+      : row.status === 'maintenance'
+        ? h(NTag, { type: 'warning', size: 'small', bordered: false }, { default: () => '维护' })
+        : h(NTag, { type: 'default', size: 'small', bordered: false }, { default: () => '离线' }),
   },
 ]
 
 function rowProps(row: Host) {
+  // 离线行整行不可点选，只读展示
+  if (row.status !== 'online') {
+    return { style: 'cursor: not-allowed' }
+  }
   return {
     style: 'cursor: pointer',
     onClick: (e: MouseEvent) => {
@@ -245,6 +271,9 @@ function applyRouteQuery() {
   }
   if (route.query.host_id) {
     const hid = String(route.query.host_id)
+    // 已知离线的主机不预选（离线不可执行）
+    const target = hosts.value.find((h) => h.id === hid)
+    if (target && target.status !== 'online') return
     if (!selectedHostIds.value.includes(hid)) {
       selectedHostIds.value = [hid]
     }
@@ -290,33 +319,45 @@ onMounted(async () => {
             placeholder="输入要执行的命令，如: uptime; df -h; free -m"
           />
           <NSpace align="center">
-            <NButton type="primary" :loading="running" @click="run">执行</NButton>
+            <NButton type="primary" :loading="running" :disabled="!canRun" @click="run">执行</NButton>
             <NButton secondary :disabled="!command.trim()" @click="copyCommand">
               <template #icon><NIcon :component="CopyOutline" /></template>
               复制命令
             </NButton>
-            <span class="muted" style="margin-left: 8px">已选 {{ selectedHostIds.length }} 台主机</span>
+            <span class="muted selected-count">已选 {{ selectedHostIds.length }} 台主机</span>
+            <span v-if="runDisabledReason" class="run-hint">{{ runDisabledReason }}</span>
           </NSpace>
         </NSpace>
       </NCard>
 
-      <NCard title="选择目标主机" :bordered="false">
+      <NCard :bordered="false">
+        <template #header>
+          <span class="card-title">选择目标主机</span>
+        </template>
+        <template #header-extra>
+          <span class="host-count">共 {{ hosts.length }} 台（在线 {{ onlineHostCount }} 台 · 离线 {{ offlineHostCount }} 台）</span>
+        </template>
         <NSpin v-if="loading" />
-        <!-- 主机勾选框：辅助性小表格，限高不分页（AGENTS.md 8.2 例外） -->
-        <NDataTable
-          v-else
-          :columns="hostColumns"
-          :data="hosts.filter(h => h.status === 'online')"
-          :row-key="(r: Host) => r.id"
-          v-model:checked-row-keys="selectedHostIds"
-          :row-props="rowProps"
-          :bordered="false"
-          size="small"
-          :max-height="240"
-        />
+        <template v-else>
+          <div class="host-tip">离线主机已列出但不可选，仅在线主机参与执行。</div>
+          <!-- 主机勾选框：辅助性小表格，限高不分页（AGENTS.md 8.2 例外） -->
+          <NDataTable
+            :columns="hostColumns"
+            :data="hosts"
+            :row-key="(r: Host) => r.id"
+            v-model:checked-row-keys="selectedHostIds"
+            :row-props="rowProps"
+            :bordered="false"
+            size="small"
+            :max-height="240"
+          />
+        </template>
       </NCard>
 
-      <NCard v-if="results.length > 0" title="执行结果" :bordered="false">
+      <NCard v-if="results.length > 0" :bordered="false">
+        <template #header>
+          <span class="card-title">执行结果</span>
+        </template>
         <!-- 结果条数 = 所选主机数，天然有限（AGENTS.md 8.2 例外） -->
         <NDataTable
           :columns="resultColumns"
@@ -374,6 +415,11 @@ onMounted(async () => {
   color: var(--text-primary);
 }
 .muted { color: #9ca3af; font-size: 13px; }
+.selected-count { margin-left: 8px; }
+.run-hint { font-size: 12px; color: var(--text-secondary); }
+.card-title { font-size: 16px; font-weight: 700; color: var(--text-primary); }
+.host-count { font-size: 13px; color: var(--text-secondary); }
+.host-tip { font-size: 12px; line-height: 1.6; color: var(--text-secondary); margin-bottom: 8px; }
 
 .library-list {
   display: flex;

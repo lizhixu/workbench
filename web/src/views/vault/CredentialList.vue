@@ -337,13 +337,11 @@ onMounted(refresh)
     <!-- Header: 标题 + 刷新/新建 -->
     <div class="cred-header">
       <div class="header-left">
-        <div class="title-wrap">
-          <h2 class="page-title">凭据金库</h2>
-          <NTag size="small" :bordered="false" round type="info">AES-256-GCM 硬件加密</NTag>
-        </div>
+        <h2 class="page-title">凭据金库</h2>
       </div>
       <div class="header-right">
         <NSpace align="center" :size="10">
+          <NTag size="small" :bordered="false" round type="info">AES-256-GCM 硬件加密</NTag>
           <NButton :loading="loading" @click="refresh">
             <template #icon><NIcon :component="RefreshOutline" /></template>
             刷新
@@ -557,17 +555,11 @@ onMounted(refresh)
     flex-direction: column;
     gap: 4px;
 
-    .title-wrap {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-
-      .page-title {
-        margin: 0;
-        font-size: 18px;
-        font-weight: 600;
-        color: var(--text-primary);
-      }
+    .page-title {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-primary);
     }
   }
 

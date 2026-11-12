@@ -605,14 +605,13 @@ onUnmounted(stopJobPoll)
               </div>
               <div v-if="availableEntryHint" class="port-error-hint">{{ availableEntryHint }}。</div>
             </NAlert>
-
-            <p class="muted tip-hint bound-tip">
-              面板仅可通过该域名访问：IP / 其他域名返回 403，「域名 + 主端口」在免端口入口可用时自动跳转。
-              <template v-if="activeEntryURL">免端口入口：<code>{{ activeEntryURL }}</code>。</template>
-              批量升级 Agent 的安装包地址使用该域名，内网环境请确保能解析。
-              对外地址按面板实际服务状态生成：SSL 开启且 :443 在监听时为 https，否则为 http；面板默认最外层，不信任前置反代的请求头，如需对外 https 请开启面板 SSL。
-            </p>
           </div>
+          <p v-if="certStatus?.panel_domain" class="muted tip-hint bound-tip">
+            面板仅可通过该域名访问：IP / 其他域名返回 403，「域名 + 主端口」在免端口入口可用时自动跳转。
+            <template v-if="activeEntryURL">免端口入口：<code>{{ activeEntryURL }}</code>。</template>
+            批量升级 Agent 的安装包地址使用该域名，内网环境请确保能解析。
+            对外地址按面板实际服务状态生成：SSL 开启且 :443 在监听时为 https，否则为 http；面板默认最外层，不信任前置反代的请求头，如需对外 https 请开启面板 SSL。
+          </p>
           <NForm v-else label-placement="top" :show-feedback="false">
             <NFormItem label="绑定域名后，面板只能通过该域名访问">
               <NSpace style="width: 100%">
@@ -935,11 +934,12 @@ onUnmounted(stopJobPoll)
     margin-top: 6px;
     font-size: 12px;
   }
+}
 
-  .bound-tip {
-    width: 100%;
-    margin: 0;
-  }
+/* 绑定说明段落：普通块级段落，不再作为 .bound-row 的 flex 子项，
+   避免多行说明在 flex 行内被挤压、截断，只按常规折行完整展示。 */
+.bound-tip {
+  margin: 8px 0 0;
 }
 
 .switch-item {

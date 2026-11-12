@@ -10,7 +10,7 @@ import {
 import type { DataTableColumns, UploadCustomRequestOptions, UploadFileInfo } from 'naive-ui'
 import {
   AddOutline,
-  ArrowBackOutline, ArrowUpCircleOutline, BuildOutline, CloudUploadOutline, CopyOutline,
+  ArrowBackOutline, ArrowUpCircleOutline, CloudUploadOutline, CopyOutline,
   DownloadOutline, FolderOutline,
   GitCommitOutline, MoveOutline, PlayOutline, RefreshOutline, SparklesOutline, StopOutline,
   SwapHorizontalOutline, TerminalOutline, TrashOutline,
@@ -58,6 +58,9 @@ const auth = useAuthStore()
 const appId = computed(() => String(route.params.id ?? ''))
 const app = ref<AppEntity | null>(null)
 const status = ref<AppStatus | null>(null)
+// 状态是否已首轮加载完成：加载期 status 为 null 时启动/停止按钮会按
+// 错误状态渲染（停止变启动），必须等首轮落定后再按真实状态显示。
+const statusLoaded = ref(false)
 const deployments = ref<Deployment[]>([])
 const total = ref(0)
 const page = ref(1)
@@ -988,6 +991,8 @@ async function loadStatus() {
     status.value = await getAppStatus(appId.value)
   } catch {
     status.value = null
+  } finally {
+    statusLoaded.value = true
   }
 }
 
@@ -2158,7 +2163,7 @@ const volArchiveStatusTag = (s: string) => {
   if (s === 'success') return h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => '成功' })
   if (s === 'running') return h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '备份中' })
   if (s === 'failed') return h(NTag, { size: 'small', type: 'error', bordered: false }, { default: () => '失败' })
-  if (s === 'uploaded') return h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '上传' })
+  if (s === 'uploaded') return h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '已上传' })
   return h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => '未知状态' })
 }
 
@@ -2275,9 +2280,10 @@ const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
   },
   {
     title: '状态', key: 'status', width: 80,
-    // 上传记录无 S3 对象、状态恒为 uploaded，不走备份成功/失败的标签。
+    // 上传记录是用户上传的恢复文件（来源），不是一次备份的结果：
+    // 状态列显示灰色「上传文件」来源标签，不与成功/失败的备份状态混用。
     render: (r) => r.source === 'upload'
-      ? h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '上传' })
+      ? h(NTag, { size: 'small', type: 'default', bordered: false }, { default: () => '上传文件' })
       : volArchiveStatusTag(r.status),
   },
   {
@@ -2799,16 +2805,15 @@ onUnmounted(() => {
 
 <template>
   <div v-if="app" class="app-detail-view page-flex-column">
-    <div class="detail-header">
-      <NButton quaternary @click="$router.push('/apps')">
-        <template #icon>
-          <NIcon><ArrowBackOutline /></NIcon>
-        </template>
-        应用列表
-      </NButton>
-      <NSpace align="center" style="flex: 1; justify-content: center">
-        <NIcon size="20"><BuildOutline /></NIcon>
-        <span class="app-title">{{ app.name }}</span>
+    <div class="page-header">
+      <NSpace align="center" :size="12">
+        <NButton quaternary @click="$router.push('/apps')">
+          <template #icon>
+            <NIcon><ArrowBackOutline /></NIcon>
+          </template>
+          应用列表
+        </NButton>
+        <h2 class="page-title">{{ app.name }}</h2>
         <NTag v-if="deploying" type="info" size="small">部署中</NTag>
         <NTag v-else-if="status?.state === 'running'" type="success" size="small">运行中</NTag>
         <NTag v-else-if="status?.state === 'undeployed'" size="small">未部署</NTag>
@@ -2819,7 +2824,7 @@ onUnmounted(() => {
       <NSpace v-if="canWrite">
         <NPopconfirm v-if="deploying" @positive-click="doDeploy(true)">
           <template #trigger>
-            <NButton size="small" type="primary" :loading="acting">
+            <NButton size="small" type="primary" :loading="acting" :disabled="!statusLoaded">
               <template #icon>
                 <NIcon><CloudUploadOutline /></NIcon>
               </template>
@@ -2828,13 +2833,13 @@ onUnmounted(() => {
           </template>
           当前已有部署任务正在进行中，继续将终止当前任务并启动全新部署。是否继续？
         </NPopconfirm>
-        <NButton v-else size="small" type="primary" :loading="acting" @click="doDeploy(false)">
+        <NButton v-else size="small" type="primary" :loading="acting" :disabled="!statusLoaded" @click="doDeploy(false)">
           <template #icon>
             <NIcon><CloudUploadOutline /></NIcon>
           </template>
-          {{ status?.state === 'undeployed' ? '部署' : '重新部署' }}
+          {{ statusLoaded && status?.state !== 'undeployed' ? '重新部署' : '部署' }}
         </NButton>
-        <NButton v-if="app.source_type !== 'git'" size="small" :loading="acting" :disabled="deploying" @click="doUpgrade">
+        <NButton v-if="app.source_type !== 'git'" size="small" :loading="acting" :disabled="!statusLoaded || deploying" @click="doUpgrade">
           <template #icon>
             <NIcon><ArrowUpCircleOutline /></NIcon>
           </template>
@@ -2853,7 +2858,7 @@ onUnmounted(() => {
         </NPopconfirm>
         <NPopconfirm @positive-click="doRollback()">
           <template #trigger>
-            <NButton size="small" :loading="acting || deploying" :disabled="deploying">
+            <NButton size="small" :loading="acting || deploying" :disabled="!statusLoaded || deploying">
               <template #icon>
                 <NIcon><SwapHorizontalOutline /></NIcon>
               </template>
@@ -2865,7 +2870,7 @@ onUnmounted(() => {
         <NButton
           size="small"
           :loading="acting"
-          :disabled="deploying || status?.state === 'undeployed'"
+          :disabled="!statusLoaded || deploying || status?.state === 'undeployed'"
           @click="showMigrate = true"
         >
           <template #icon>
@@ -2873,19 +2878,19 @@ onUnmounted(() => {
           </template>
           迁移服务
         </NButton>
-        <NButton size="small" :loading="acting" @click="doAction('restart')">
+        <NButton size="small" :loading="acting" :disabled="!statusLoaded" @click="doAction('restart')">
           <template #icon>
             <NIcon><RefreshOutline /></NIcon>
           </template>
           重启
         </NButton>
-        <NButton v-if="status?.state === 'running'" size="small" :loading="acting" @click="doAction('stop')">
+        <NButton v-if="statusLoaded && status?.state === 'running'" size="small" :loading="acting" @click="doAction('stop')">
           <template #icon>
             <NIcon><StopOutline /></NIcon>
           </template>
           停止
         </NButton>
-        <NButton v-else size="small" :loading="acting" :disabled="status?.state === 'undeployed'" @click="doAction('start')">
+        <NButton v-else size="small" :loading="acting" :disabled="!statusLoaded || status?.state === 'undeployed'" @click="doAction('start')">
           <template #icon>
             <NIcon><PlayOutline /></NIcon>
           </template>
@@ -2909,7 +2914,7 @@ onUnmounted(() => {
       </div>
     </NAlert>
 
-    <div class="detail-body">
+    <div class="tabs-container">
       <NTabs v-model:value="activeTab" type="line" style="height: 100%; display: flex; flex-direction: column">
         <NTabPane name="overview" tab="概览">
           <div class="overview-scroll">
@@ -2937,6 +2942,12 @@ onUnmounted(() => {
                   {{ sourceTypeLabel }}
                 </NTag>
               </NDescriptionsItem>
+              <NDescriptionsItem label="目标服务器">
+                <span class="mono">{{ appHostname || app.host_id }}</span>
+              </NDescriptionsItem>
+              <NDescriptionsItem label="创建时间">
+                <span class="mono">{{ formatTime(app.created_at) }}</span>
+              </NDescriptionsItem>
               <NDescriptionsItem v-if="app.source_type === 'template'" label="应用模板">
                 <span class="mono">{{ app.template_id }}</span>
               </NDescriptionsItem>
@@ -2955,7 +2966,7 @@ onUnmounted(() => {
                 </NTag>
                 <span v-else>-</span>
               </NDescriptionsItem>
-              <NDescriptionsItem v-if="app.source_type === 'image' || app.source_type === 'template'" label="镜像">
+              <NDescriptionsItem label="镜像">
                 <span class="mono">{{ app.image || '-' }}</span>
               </NDescriptionsItem>
               <NDescriptionsItem label="组网端口转发">
@@ -3070,7 +3081,7 @@ onUnmounted(() => {
             </NAlert>
             <template v-else>
               <!-- 卡片 1：应用挂载卷 -->
-              <NCard size="small" :bordered="true" class="vol-block-card">
+              <NCard size="small" :bordered="false" class="vol-block-card">
                 <template #header>
                   <div class="vol-card-title">
                     <span>应用挂载卷</span>
@@ -3113,7 +3124,7 @@ onUnmounted(() => {
               </NCard>
 
               <!-- 卡片 2：备份归档记录 -->
-              <NCard size="small" :bordered="true" class="vol-block-card">
+              <NCard size="small" :bordered="false" class="vol-block-card">
                 <template #header>
                   <div class="vol-card-title">
                     <span>备份归档记录</span>
@@ -3177,7 +3188,7 @@ onUnmounted(() => {
               </NCard>
 
               <!-- 卡片 3：定时备份计划 -->
-              <NCard size="small" :bordered="true" class="vol-block-card">
+              <NCard size="small" :bordered="false" class="vol-block-card">
                 <template #header>
                   <div class="vol-card-title">
                     <span>定时备份计划</span>
@@ -3584,19 +3595,6 @@ onUnmounted(() => {
                     <NIcon><RefreshOutline /></NIcon>
                   </template>
                   刷新
-                </NButton>
-                <NButton
-                  v-if="canWrite"
-                  size="small"
-                  type="primary"
-                  :loading="acting"
-                  :disabled="deploying"
-                  @click="doDeploy(false)"
-                >
-                  <template #icon>
-                    <NIcon><CloudUploadOutline /></NIcon>
-                  </template>
-                  {{ status?.state === 'undeployed' ? '部署' : '重新部署' }}
                 </NButton>
               </NSpace>
             </div>
@@ -4047,7 +4045,7 @@ onUnmounted(() => {
         </NTabPane>
 
         <NTabPane v-if="app.source_type === 'raw_compose' || app.compose_content" name="compose" tab="Compose 编排">
-          <div class="overview-scroll" style="max-width: 800px">
+          <div class="overview-scroll">
             <NAlert type="info" :show-icon="true" style="margin-bottom: 12px">
               当前应用为 Docker Compose 复合微服务栈。您可直接在此修改 YAML 编排内容，保存后系统会自动在目标主机更新配置并重新发布。
             </NAlert>
@@ -4366,37 +4364,34 @@ onUnmounted(() => {
   gap: 12px;
 }
 
-.detail-header {
+/* 页眉：DESIGN.md §9.3——标题行不包卡片，标题左对齐、操作按钮在右。 */
+.page-header {
   flex-shrink: 0;
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 12px;
-  background-color: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  box-shadow: var(--shadow-sm);
-  padding: 10px 16px;
+  flex-wrap: wrap;
 }
 
-.app-title {
-  font-size: 16px;
+.page-title {
+  font-size: 18px;
   font-weight: 600;
+  line-height: 1.4;
+  margin: 0;
 }
 
-.detail-body {
+/* 页签容器：DESIGN.md §9.5——页签移出卡片，容器只做纵向 flex 高度链，
+   卡片样式由各页签内部自己承担。 */
+.tabs-container {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background-color: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  box-shadow: var(--shadow-sm);
-  padding: var(--card-padding);
   overflow: hidden;
 }
 
-/* 必须显式撑满页签高度：父级 .n-tab-pane 是固定高、.detail-body 又是
+/* 必须显式撑满页签高度：父级 .n-tab-pane 是固定高、.tabs-container 又是
    overflow: hidden，子容器高度按内容自长时滚动条永不出现、底部内容被裁掉。 */
 .overview-scroll {
   height: 100%;
@@ -4486,14 +4481,15 @@ onUnmounted(() => {
   min-width: 0;
   box-sizing: border-box;
   border-radius: 8px;
-  border: 1px solid var(--border-color);
+  /* DESIGN.md §9.6：卡片不画外层实线边框，靠底色与阴影分隔。 */
+  border: none;
   background: var(--bg-card);
   box-shadow: var(--shadow-sm);
   overflow: hidden;
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  transition: box-shadow 0.2s ease;
 
   &:hover {
-    border-color: var(--border-dashed);
+    box-shadow: var(--shadow-md);
   }
 
   :deep(.n-card-header) {

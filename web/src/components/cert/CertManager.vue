@@ -163,6 +163,10 @@ const daysLeft = (cert: Certificate) =>
 
 // 证书列表列（宝塔式 11 列）：域名 / 其他域名 / 申请方式 / ACME 账号 / 状态 /
 // 日志 / 颁发组织 / 备注 / 自动续签 / 过期时间 / 操作。
+// 列宽按内容贴合：ACME 账号与颁发组织放得下「Google Trust Services」
+// （21 字符）、申请方式放得下「手动 DNS-01 签发」标签、过期时间单行
+// 放得下天数标签 + 日期、操作列放得下 5 个按钮；11 列宽合计 1680，
+// 与模板 :scroll-x 一致，改任一列宽时同步改 scroll-x。
 const certColumns = computed<DataTableColumns<Certificate>>(() => [
   {
     title: '域名',
@@ -175,7 +179,7 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
   {
     title: '其他域名',
     key: 'other_domains',
-    width: 130,
+    width: 120,
     ellipsis: { tooltip: true },
     render: (row) => {
       const rest = row.domains.slice(1)
@@ -187,7 +191,7 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
   {
     title: '申请方式',
     key: 'source',
-    width: 100,
+    width: 130,
     render: (r) => {
       if (!r.source) return h('span', { style: 'color: #999' }, '-')
       const m = certSourceMeta(r.source)
@@ -197,14 +201,14 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
   {
     title: 'ACME 账号',
     key: 'account_name',
-    width: 110,
+    width: 170,
     ellipsis: { tooltip: true },
     render: (r) => r.account_name || h('span', { style: 'color: #999' }, '-'),
   },
   {
     title: '状态',
     key: 'status',
-    width: 80,
+    width: 90,
     render: (r) => {
       const s = certStatus(r)
       return h(NTag, { size: 'small', type: s.type, bordered: false }, { default: () => s.text })
@@ -213,7 +217,7 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
   {
     title: '日志',
     key: 'last_error',
-    width: 135,
+    width: 150,
     render: (r) => {
       if (r.status === 'pending' || r.renewing) {
         return h(
@@ -275,14 +279,14 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
   {
     title: '颁发组织',
     key: 'issuer',
-    width: 120,
+    width: 170,
     ellipsis: { tooltip: true },
     render: (r) => r.issuer || h('span', { style: 'color: #999' }, '-'),
   },
   {
     title: '备注',
     key: 'remark',
-    width: 140,
+    width: 150,
     render: (r) => renderRemarkCell(r),
   },
   {
@@ -301,7 +305,7 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
   {
     title: '过期时间',
     key: 'not_after',
-    width: 120,
+    width: 200,
     render: (row) => {
       if (row.status === 'pending') {
         return h('span', { style: 'color: #999' }, '签发中')
@@ -311,16 +315,17 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
       }
       const days = daysLeft(row)
       const type = days > 30 ? 'success' : days > 7 ? 'warning' : 'error'
-      return h('span', null, [
+      // 单行展示：天数标签 + 日期并排不换行（此前 NTag + div 两行结构占两行高）。
+      return h('div', { style: 'display: flex; align-items: center; gap: 6px; white-space: nowrap' }, [
         h(NTag, { size: 'small', type, bordered: false }, { default: () => (days > 0 ? `${days} 天后到期` : '已过期') }),
-        h('div', { style: 'font-size: 11px; color: #999; margin-top: 2px' }, formatDate(row.not_after)),
+        h('span', { style: 'font-size: 11px; color: #999' }, formatDate(row.not_after)),
       ])
     },
   },
   {
     title: '操作',
     key: 'actions',
-    width: 230,
+    width: 250,
     fixed: 'right',
     render: (r) =>
       h(NSpace, { size: 6, wrap: false }, {
@@ -553,10 +558,27 @@ const accountColumns = computed<DataTableColumns<ACMEAccount>>(() => [
   {
     title: 'ACME Directory URL',
     key: 'directory_url',
-    ellipsis: { tooltip: true },
+    width: 310,
+    // URL 常是长无空格单行文本：内置 ellipsis tooltip 默认一行铺开且无
+    // 宽度上限，弹层会宽到被视口裁掉。限宽 + 任意断行 + 限高滚动（§9.4），
+    // 保证整条 URL 在弹层内完整可读（tooltip 选项原样透传给 NTooltip）。
+    ellipsis: {
+      tooltip: {
+        scrollable: true,
+        style: { maxWidth: '480px' },
+        contentStyle: { maxHeight: '320px', wordBreak: 'break-all' as const },
+      },
+    },
     render: (r) => h('code', { style: 'font-size: 11px' }, r.directory_url),
   },
-  { title: '账户邮箱', key: 'email', width: 180, ellipsis: { tooltip: true } },
+  {
+    title: '账户邮箱',
+    key: 'email',
+    width: 180,
+    ellipsis: { tooltip: true },
+    // 无 render 时空邮箱渲染为空白：加空值回落，与同表其他列一致。
+    render: (r) => r.email || h('span', { style: 'color: #999' }, '-'),
+  },
   {
     title: 'EAB 外部绑定',
     key: 'eab_key_id',
@@ -586,9 +608,18 @@ const accountColumns = computed<DataTableColumns<ACMEAccount>>(() => [
 
 function rowName(r: ACMEAccount) { return r.name }
 
+// 默认标记与机构表「机构名称」列的绿色 NTag 统一，不再用「(默认)」括号文字。
 const accountSelectOptions = computed(() =>
   accounts.value.map((a) => ({
-    label: `${a.name}${a.is_default ? ' (默认)' : ''} [${a.directory_url}]`,
+    label: () =>
+      h(NSpace, { size: 6, align: 'center', wrap: false }, {
+        default: () => [
+          h('span', null, `${a.name} [${a.directory_url}]`),
+          a.is_default
+            ? h(NTag, { size: 'tiny', type: 'success', bordered: false }, { default: () => '默认' })
+            : null,
+        ],
+      }),
     value: a.id,
   })),
 )
@@ -1246,7 +1277,7 @@ onUnmounted(() => {
                 :row-key="(r: Certificate) => r.id"
                 :pagination="certPagination"
                 :bordered="false"
-                :scroll-x="1365"
+                :scroll-x="1680"
                 size="small"
               />
             </NCard>

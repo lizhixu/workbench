@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { defineAsyncComponent, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NSpin, NIcon, useMessage, NTooltip } from 'naive-ui'
+import { NSpin, NIcon, NSkeleton, useMessage, NTooltip, NTabs, NTabPane } from 'naive-ui'
 import { getHost } from '../../api/hosts'
 import type { Host } from '../../api/types'
 import { useWorkspaceStore } from '../../stores/workspace'
@@ -46,6 +46,35 @@ function resolveTab(raw: unknown): string {
 
 const activeSubTab = ref(resolveTab(route.query.tab))
 
+// 系统状态子页签由本页持有（DESIGN.md §9.5：Tab 在卡片外渲染），
+// SysInfoPane 只按传入的页签取数。
+const sysinfoTab = ref('process')
+
+// 系统状态子页签横向滚动：窄屏下页签放不下时，纵向滚轮转为横向滚动。
+function onTabWheel(e: WheelEvent) {
+  const el = e.currentTarget as HTMLElement
+  if (!el) return
+  if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+    el.scrollLeft += e.deltaY * 0.8
+    e.preventDefault()
+  }
+}
+
+// 左侧图标导航 tooltip 受控显隐：Naive 默认 keep-alive-on-hover 会让弹层在
+// 鼠标移入弹层本身后继续存活，叠加切页签时触发节点重渲染丢 mouseleave，弹层
+// 会长时间盖住右侧内容（文件管理工具栏 / 系统状态 PID=1 首行 / Docker 首行
+// 容器名）。显隐由本文件接管：切页签时强制全部隐藏，鼠标离开触发器即隐藏。
+const navTooltipShown = ref<Record<string, boolean>>({})
+
+function hideNavTooltips() {
+  for (const item of subNavItems) navTooltipShown.value[item.key] = false
+}
+
+// Suspense fallback 的加载文案：按当前子页签给明确提示，避免只有转圈。
+const activeTabLabel = computed(
+  () => subNavItems.find((i) => i.key === activeSubTab.value)?.label || '',
+)
+
 // 设置可能在挂载后才加载完（比如首屏直连主机详情）。只在用户没有显式
 // 选过页签（URL 或点击）时应用首选项，避免覆盖用户操作。
 settings.load().then(() => {
@@ -58,6 +87,7 @@ settings.load().then(() => {
 // 除了写 URL，还把带 query 的完整路径回写到工作区页签上——点页签回来时用的
 // 就是这个 path，不带 query 的话会退回默认的「文件管理」，终端会话就断了。
 function selectTab(key: string) {
+  hideNavTooltips()
   if (activeSubTab.value === key) return
   activeSubTab.value = key
   const query = { ...route.query, tab: key }
@@ -166,12 +196,17 @@ onMounted(load)
             :key="item.key"
             trigger="hover"
             placement="right"
+            :keep-alive-on-hover="false"
+            :delay="200"
+            :show="navTooltipShown[item.key]"
+            @update:show="(v: boolean) => { navTooltipShown[item.key] = v }"
           >
             <template #trigger>
               <div
                 class="sub-nav-item"
                 :class="{ active: activeSubTab === item.key }"
                 @click="selectTab(item.key)"
+                @mouseleave="navTooltipShown[item.key] = false"
               >
                 <NIcon size="20">
                   <component :is="item.icon" />
@@ -182,56 +217,78 @@ onMounted(load)
           </NTooltip>
         </div>
 
-        <!-- 右侧子视图面板 -->
-        <div class="sub-view-pane" :class="{ 'is-terminal': activeSubTab === 'terminal' }">
-          <!-- 面板按需加载，首次切换时显示等待态而不是空白 -->
-          <Suspense>
-            <template #default>
-              <!-- 文件管理 -->
-              <FileManagerPane
-                v-if="activeSubTab === 'files'"
-                :host-id="host.id"
-                :os="host.os"
-              />
+        <!-- 右侧子视图列：系统状态子页签在卡片外（DESIGN.md §9.5），其余页签无 Tabs -->
+        <div class="sub-view-column">
+          <div v-if="activeSubTab === 'sysinfo'" class="tabs-container">
+            <div class="tabs-scroller" @wheel.prevent="onTabWheel">
+              <NTabs v-model:value="sysinfoTab" type="line" size="small">
+                <NTabPane name="process" tab="进程清单" />
+                <NTabPane name="port" tab="网络端口" />
+                <NTabPane name="user" tab="系统账号" />
+                <NTabPane name="login" tab="登录历史" />
+              </NTabs>
+            </div>
+          </div>
 
-              <!-- 资源监控 (Overview) -->
-              <MetricsPane
-                v-else-if="activeSubTab === 'metrics'"
-                :host-id="host.id"
-                :probe-enabled="!!host.probe_enabled"
-              />
+          <div class="sub-view-pane" :class="{ 'is-terminal': activeSubTab === 'terminal' }">
+            <!-- 面板按需加载，首次切换时显示等待态而不是空白 -->
+            <Suspense>
+              <template #default>
+                <!-- 文件管理 -->
+                <FileManagerPane
+                  v-if="activeSubTab === 'files'"
+                  :host-id="host.id"
+                  :os="host.os"
+                />
 
-              <!-- 系统状态与进程 -->
-              <SysInfoPane
-                v-else-if="activeSubTab === 'sysinfo'"
-                :host-id="host.id"
-              />
+                <!-- 资源监控 (Overview) -->
+                <MetricsPane
+                  v-else-if="activeSubTab === 'metrics'"
+                  :host-id="host.id"
+                  :probe-enabled="!!host.probe_enabled"
+                />
 
-              <!-- 在线终端 -->
-              <div v-else-if="activeSubTab === 'terminal'" class="terminal-pane-wrapper">
-                <TerminalPane :host-id="host.id" :os="host.os" :distro="host.distro" />
-              </div>
+                <!-- 系统状态与进程 -->
+                <SysInfoPane
+                  v-else-if="activeSubTab === 'sysinfo'"
+                  :host-id="host.id"
+                  :active-tab="sysinfoTab"
+                  @update:active-tab="sysinfoTab = $event"
+                />
 
-              <!-- Docker 管理（观测与运维入口，应用部署统一走全局应用中心） -->
-              <DockerView v-else-if="activeSubTab === 'docker'" />
+                <!-- 在线终端 -->
+                <div v-else-if="activeSubTab === 'terminal'" class="terminal-pane-wrapper">
+                  <TerminalPane :host-id="host.id" :os="host.os" :distro="host.distro" />
+                </div>
 
-              <!-- 漏洞管理 (P3) -->
-              <VulnerabilitiesView v-else-if="activeSubTab === 'vulnerabilities'" :host-id="host.id" />
+                <!-- Docker 管理（观测与运维入口，应用部署统一走全局应用中心） -->
+                <DockerView v-else-if="activeSubTab === 'docker'" />
 
-              <!-- 异地组网 (Tailscale) -->
-              <HostNetworkPane
-                v-else-if="activeSubTab === 'network'"
-                :host-id="host.id"
-                :hostname="host.hostname"
-                :os="host.os"
-              />
-            </template>
-            <template #fallback>
-              <div class="pane-loading">
-                <NSpin size="medium" />
-              </div>
-            </template>
-          </Suspense>
+                <!-- 漏洞管理 (P3) -->
+                <VulnerabilitiesView v-else-if="activeSubTab === 'vulnerabilities'" :host-id="host.id" />
+
+                <!-- 异地组网 (Tailscale) -->
+                <HostNetworkPane
+                  v-else-if="activeSubTab === 'network'"
+                  :host-id="host.id"
+                  :hostname="host.hostname"
+                  :os="host.os"
+                />
+              </template>
+              <template #fallback>
+                <!-- 子面板异步 chunk 加载中：骨架 + 明确文案，不要只有转圈和空白 -->
+                <div class="pane-loading">
+                  <NSkeleton text :repeat="1" :width="'40%'" />
+                  <NSkeleton text :repeat="3" />
+                  <NSkeleton :height="'180px'" :sharp="false" />
+                  <div class="pane-loading-text">
+                    <NSpin size="small" />
+                    <span>正在加载{{ activeTabLabel }}，请稍候…</span>
+                  </div>
+                </div>
+              </template>
+            </Suspense>
+          </div>
         </div>
       </div>
     </template>
@@ -305,11 +362,47 @@ onMounted(load)
       }
     }
 
+    /* 右侧子视图列：Tab 在卡片外（DESIGN.md §9.5），tabs-container 与
+       sub-view-pane 纵向排列，卡片吃掉剩余高度。 */
+    .sub-view-column {
+      flex: 1;
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+
+      .tabs-container {
+        flex-shrink: 0;
+
+        .tabs-scroller {
+          overflow-x: auto;
+          overflow-y: hidden;
+          -webkit-overflow-scrolling: touch;
+          scrollbar-width: none;
+
+          &::-webkit-scrollbar {
+            display: none;
+          }
+
+          :deep(.n-tabs) {
+            min-width: max-content;
+          }
+
+          :deep(.n-tabs-tab) {
+            white-space: nowrap;
+          }
+        }
+      }
+    }
+
     .sub-view-pane {
       flex: 1;
       min-width: 0;
+      min-height: 0;
       background-color: var(--bg-card);
-      border: 1px solid var(--border-color);
+      /* DESIGN.md §9.6：卡片不画外层实线边框，靠底色与阴影分隔。 */
+      border: none;
       border-radius: 8px;
       box-shadow: var(--shadow-sm);
       overflow-y: auto;
@@ -334,10 +427,22 @@ onMounted(load)
 
       .pane-loading {
         display: flex;
-        align-items: center;
-        justify-content: center;
+        flex-direction: column;
+        align-items: stretch;
+        justify-content: flex-start;
+        gap: 12px;
         min-height: 240px;
         height: 100%;
+
+        .pane-loading-text {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          margin-top: 4px;
+          color: var(--text-secondary);
+          font-size: 13px;
+        }
       }
     }
   }

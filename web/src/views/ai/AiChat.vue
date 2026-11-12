@@ -512,7 +512,7 @@ onBeforeUnmount(() => {
     .chat-resize-handle {
       position: relative;
       flex-shrink: 0;
-      height: 12px;
+      height: 16px;
       margin-bottom: 4px;
       display: flex;
       align-items: center;
@@ -531,10 +531,12 @@ onBeforeUnmount(() => {
         background: var(--border-color);
       }
 
+      /* 抓手线加长加粗（64×5px），仅约 30px 的细线视觉提示过弱；
+         仍只用主题变量，不引入硬编码色。 */
       .grip {
-        width: 36px;
-        height: 3px;
-        border-radius: 2px;
+        width: 64px;
+        height: 5px;
+        border-radius: 3px;
         background: var(--border-color);
         transition: background-color 0.15s;
       }

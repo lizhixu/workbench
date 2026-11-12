@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, h, onActivated, onDeactivated, onMounted, ref } from 'vue'
+import { computed, h, onActivated, onDeactivated, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NButton, NDataTable, NEmpty, NIcon, NInput, NModal,
-  NSpace, NTag, NCheckbox, NAlert, useMessage,
+  NSpace, NSpin, NTag, NCheckbox, NAlert, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import {
@@ -16,6 +16,7 @@ import {
 import { listHosts } from '../../api/hosts'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { useAuthStore } from '../../stores/auth'
+import { useTablePagination } from '../../composables/useTablePagination'
 import { fmtDateTimeMinute } from '../../utils/time'
 import AppMigrateModal from '../../components/apps/AppMigrateModal.vue'
 
@@ -27,9 +28,11 @@ const workspace = useWorkspaceStore()
 const auth = useAuthStore()
 
 const apps = ref<AppEntity[]>([])
-const loading = ref(false)
+const loading = ref(true)
 const searchKeyword = ref('')
 const statuses = ref<Record<string, AppStatus>>({})
+// 状态首轮拉取未完成前，状态格不得渲染「未知」等确定性文案（见 stateTag）。
+const statusesLoading = ref(false)
 // host_id → hostname. /apps does not join the host record; the list maps it
 // client-side from the host inventory (same pattern as AppDetail).
 const hostnameById = ref<Map<string, string>>(new Map())
@@ -56,6 +59,36 @@ function sourceLabel(row: AppEntity): string {
   }
 }
 
+// 当前版本的真实数据字段按来源区分（后端只持久化这些，见 server
+// internal/apps/types.go: CurrentCommit 与 deploy.go: finishDeploySuccess）：
+//   git            → current_commit（部署时取 rev-parse --short HEAD 的短哈希）
+//   image/template → image 字段本身就是已部署的镜像引用，版本号是它的 tag
+//   raw_compose    → 没有任何版本字段（CurrentCommit 只在 git 路径赋值），
+//                    不编造版本号，显示占位。
+function imageTag(image?: string): string | null {
+  if (!image) return null
+  const slash = image.lastIndexOf('/')
+  const colon = image.lastIndexOf(':')
+  // registry 端口里的冒号在最后一个 / 之前，不算 tag 分隔符。
+  if (colon > slash) return image.slice(colon + 1) || null
+  return image
+}
+
+function versionCell(row: AppEntity) {
+  if (row.source_type === 'git') {
+    return row.current_commit
+      ? h(NTag, { size: 'small', bordered: false, type: 'info' }, { icon: () => h(NIcon, null, { default: () => h(GitCommitOutline) }), default: () => row.current_commit })
+      : h('span', { style: 'color: var(--text-secondary)' }, '-')
+  }
+  if (row.source_type === 'image' || row.source_type === 'template') {
+    const tag = imageTag(row.image)
+    return tag
+      ? h('span', { title: row.image }, tag)
+      : h('span', { style: 'color: var(--text-secondary)' }, '-')
+  }
+  return h('span', { style: 'color: var(--text-secondary)' }, '-')
+}
+
 const filteredApps = computed(() => {
   const q = searchKeyword.value.trim().toLowerCase()
   if (!q) return apps.value
@@ -69,9 +102,21 @@ const filteredApps = computed(() => {
   )
 })
 
+const rowCount = computed(() => filteredApps.value.length)
+const { pagination, resetPage } = useTablePagination({ pageSize: 20, pageSizes: [10, 20, 50], rowCount })
+// 筛选条件收紧可能让当前页越界：回第一页（越界夹回另由 useTablePagination 兜底）。
+watch(searchKeyword, () => resetPage())
+
 const stateTag = (a: AppEntity) => {
   const st = statuses.value[a.id]
-  if (!st) return h(NTag, { size: 'small', bordered: false }, { default: () => '未知' })
+  if (!st) {
+    // 加载期内不渲染确定性文案：状态尚未取回时「未知」是误导（走查：
+    // 初载先闪「未知」再变「运行中」），先给加载态，取回后再显示真实状态。
+    if (loading.value || statusesLoading.value) {
+      return h(NSpin, { size: 'small' })
+    }
+    return h(NTag, { size: 'small', bordered: false }, { default: () => '未知' })
+  }
   if (st.deploying) {
     return h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => '部署中' })
   }
@@ -96,6 +141,7 @@ const columns = computed<DataTableColumns<AppEntity>>(() => [
     title: '应用名称',
     key: 'name',
     width: 180,
+    ellipsis: { tooltip: true },
     render: (row) =>
       h('span', { style: 'font-weight: 600; cursor: pointer;', onClick: () => openDetail(row) }, row.name),
   },
@@ -109,7 +155,16 @@ const columns = computed<DataTableColumns<AppEntity>>(() => [
   {
     title: '来源',
     key: 'source_type',
-    ellipsis: { tooltip: true },
+    // 此列原先无 width，独自吸走全部剩余宽度（约 600px 空白的根因）；
+    // 各列现全部定宽，合计 1310，配 :scroll-x="1310"。
+    width: 240,
+    // 仓库 URL 是无空格长 token：弹层限宽 + 任意断行，否则单行铺开被视口裁掉（DESIGN §9.4）。
+    ellipsis: {
+      tooltip: {
+        style: { maxWidth: '480px' },
+        contentStyle: { wordBreak: 'break-all' },
+      },
+    },
     render: (row) =>
       h('span', { style: 'font-size: 12px; color: var(--n-text-color-disabled, #999)' },
         sourceLabel(row)),
@@ -117,28 +172,27 @@ const columns = computed<DataTableColumns<AppEntity>>(() => [
   {
     title: '当前版本',
     key: 'current_commit',
-    width: 140,
-    render: (row) => row.current_commit
-      ? h(NTag, { size: 'small', bordered: false, type: 'info' }, { icon: () => h(NIcon, null, { default: () => h(GitCommitOutline) }), default: () => row.current_commit })
-      : h('span', { style: 'color: #999' }, '-'),
+    width: 170,
+    ellipsis: { tooltip: true },
+    render: (row) => versionCell(row),
   },
   { title: '状态', key: 'state', width: 100, render: (row) => stateTag(row) },
   {
     title: '最近部署',
     key: 'last_deploy_at',
-    width: 160,
+    width: 150,
     render: (row) => row.last_deploy_at ? formatTime(row.last_deploy_at) : '-',
   },
   {
     title: '最近更新',
     key: 'updated_at',
-    width: 160,
+    width: 150,
     render: (row) => row.updated_at ? formatTime(row.updated_at) : (row.created_at ? formatTime(row.created_at) : '-'),
   },
   {
     title: '操作',
     key: 'actions',
-    width: 160,
+    width: 150,
     render: (row) =>
       h(NSpace, { size: 8 }, {
         default: () => {
@@ -177,6 +231,7 @@ function formatTime(v: string) {
 
 async function loadData() {
   loading.value = true
+  statusesLoading.value = true
   try {
     // Hosts come from the inventory in parallel: the apps response carries
     // only host_id, and a failed host fetch must not blank the app list.
@@ -197,12 +252,16 @@ async function loadData() {
 }
 
 async function refreshStatuses() {
-  for (const a of apps.value) {
-    try {
-      statuses.value[a.id] = await getAppStatus(a.id)
-    } catch {
-      statuses.value[a.id] = { app_id: a.id, deploying: false, agent_online: false, state: 'unknown' }
+  try {
+    for (const a of apps.value) {
+      try {
+        statuses.value[a.id] = await getAppStatus(a.id)
+      } catch {
+        statuses.value[a.id] = { app_id: a.id, deploying: false, agent_online: false, state: 'unknown' }
+      }
     }
+  } finally {
+    statusesLoading.value = false
   }
 }
 
@@ -319,6 +378,7 @@ onDeactivated(() => {
           </template>
           刷新
         </NButton>
+        <span class="muted">共 {{ filteredApps.length }} 个应用</span>
       </NSpace>
       <NButton v-if="canWrite" type="primary" @click="openCreate">
         <template #icon>
@@ -335,14 +395,11 @@ onDeactivated(() => {
         :columns="columns"
         :data="filteredApps"
         :row-key="(row: AppEntity) => row.id"
-        :pagination="{
-          pageSize: 20,
-          showSizePicker: true,
-          pageSizes: [10, 20, 50],
-        }"
+        :pagination="pagination"
+        :scroll-x="1310"
       />
       <NEmpty
-        v-else
+        v-else-if="!loading"
         style="flex: 1; display: flex; flex-direction: column; justify-content: center"
         description="还没有创建任何应用">
         <template #icon>
@@ -352,6 +409,7 @@ onDeactivated(() => {
           创建第一个应用
         </NButton>
       </NEmpty>
+      <NSpin v-else class="spin-center" />
     </div>
 
     <!-- 服务迁移：与详情页共用同一弹窗，成功后进入详情页部署历史看进度 -->
@@ -415,9 +473,25 @@ onDeactivated(() => {
   justify-content: space-between;
 }
 
+.muted {
+  color: var(--text-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
 .table-card {
   background: var(--bg-card);
   border-radius: 8px;
   padding: 4px;
+}
+
+// 首轮数据落定前以加载态占位，不渲染「还没有创建任何应用」假空状态
+//（与 FileManager.vue 的 .spin-center 同款）。
+.spin-center {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex: 1;
+  min-height: 0;
 }
 </style>

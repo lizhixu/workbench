@@ -5,6 +5,7 @@ import {
   NGridItem,
   NRadioGroup,
   NRadioButton,
+  NSkeleton,
   NSpin,
   NTag,
   NButton,
@@ -134,9 +135,11 @@ const CHART_GRID_TOP =
   TITLE_TOP + TITLE_LINE_HEIGHT + HEADER_GAP + SUBTEXT_LINE_HEIGHT + HEADER_GAP // 60
 
 // 绘图区固定内边距：left 需要容纳最长的 y 轴刻度（"1023 KB/s" 约 55px）+ 轴间距 8 + 余量，
+// right 需要容纳末尾 x 轴标签 "HH:mm:ss" 的右半边（11px 字号约 26px）+ 余量，
+// 否则末尾时间标签会被画布右缘裁掉（走查第 9 条："15:28:1"）。
 // 六张图共用同一组数值，绘图区大小才会完全一致。
 const CHART_GRID_LEFT = 70
-const CHART_GRID_RIGHT = 16
+const CHART_GRID_RIGHT = 32
 const CHART_GRID_BOTTOM = 26
 
 function getBaseChartOption(title: string, sub: string, yAxisFormatter?: (v: number) => string, max?: number) {
@@ -177,7 +180,9 @@ function getBaseChartOption(title: string, sub: string, yAxisFormatter?: (v: num
       type: 'category',
       boundaryGap: false,
       axisLine: { lineStyle: { color: isDark ? 'rgba(255,255,255,0.1)' : '#e2e8f0' } },
-      axisLabel: { color: isDark ? '#9ca3af' : '#64748b', fontSize: 11, margin: 8 },
+      // 24h/7d 档位的 "YYYY-MM-DD HH:mm:ss" 标签很长，拥挤时自动隐藏重叠项，
+      // 末尾标签的防裁切靠 CHART_GRID_RIGHT 预留的右留白（见上）。
+      axisLabel: { color: isDark ? '#9ca3af' : '#64748b', fontSize: 11, margin: 8, hideOverlap: true },
       splitLine: { show: false },
       data: [] as string[],
     },
@@ -185,8 +190,11 @@ function getBaseChartOption(title: string, sub: string, yAxisFormatter?: (v: num
       type: 'value',
       max: max,
       min: 0,
-      // 刻度少而疏，避免数值轴上挤出一串几乎相同的标签
-      splitNumber: 4,
+      // 刻度少而疏，避免数值轴上挤出一串几乎相同的标签（走查第 9 条：100%/90% 两行贴在一起）。
+      // max 已知时直接按 max/4 定步长（如 0/25/50/75/100），不让 ECharts 自选 10 这样的密步长；
+      // max 未知（如延迟图）时仍由 splitNumber 控疏密。
+      splitNumber: 3,
+      interval: max === undefined ? undefined : max / 4,
       // 小于 1 个单位的刻度（B、ms）四舍五入后会出现重复标签，强制最小步长
       minInterval: 1,
       axisLine: { show: false },
@@ -194,6 +202,7 @@ function getBaseChartOption(title: string, sub: string, yAxisFormatter?: (v: num
         color: isDark ? '#9ca3af' : '#64748b',
         fontSize: 11,
         margin: 8,
+        hideOverlap: true,
         formatter: yAxisFormatter || ((v: number) => v.toString()),
       },
       splitLine: { lineStyle: { color: isDark ? 'rgba(255,255,255,0.06)' : '#f1f5f9' } },
@@ -683,7 +692,24 @@ watch(() => settings.themeMode, () => {
       </div>
     </div>
 
-    <NSpin v-if="loading && (!cpuChart || timeSpan !== 'realtime')" class="spin-box" />
+    <!-- 首载骨架屏：加载期按图表卡片的真实版式占位并明示“正在加载”，
+         不再只留空白卡片 + 一个转圈（走查第 9 条：8–10 秒空白）。
+         档位切换且已有图表时不走这里，旧图继续展示（见下方 v-show）。 -->
+    <div v-if="loading && (!cpuChart || timeSpan !== 'realtime')" class="loading-skeleton">
+      <div class="loading-hint">
+        <NSpin size="small" />
+        <span>正在加载监控数据，请稍候…</span>
+      </div>
+      <NGrid cols="1 s:2" :x-gap="14" :y-gap="14" responsive="screen">
+        <NGridItem v-for="i in probeEnabled ? 6 : 4" :key="i">
+          <div class="chart-skeleton">
+            <NSkeleton text :width="'38%'" />
+            <NSkeleton text :width="'62%'" />
+            <NSkeleton :height="'118px'" :sharp="false" />
+          </div>
+        </NGridItem>
+      </NGrid>
+    </div>
 
     <!-- 实时快捷指标条：负载 / Swap / 连接数 / 进程数 / CPU 型号 -->
     <div v-if="currentMetrics" class="quick-stats-strip">
@@ -878,6 +904,9 @@ watch(() => settings.themeMode, () => {
         }
 
         .chip-sub {
+          // 数字与 ESTABLISHED 之间只靠模板里的单空格，渲染后几乎贴在一起
+          // （走查第 9 条："127 ESTABLISHED" 无间距）；改用固定外边距保证间距。
+          margin-left: 6px;
           font-size: 10px;
           font-weight: 400;
           color: var(--text-secondary);
@@ -962,10 +991,33 @@ watch(() => settings.themeMode, () => {
     }
   }
 
-  .spin-box {
+  .loading-skeleton {
     display: flex;
-    justify-content: center;
-    padding: 80px 0;
+    flex-direction: column;
+    gap: 12px;
+
+    .loading-hint {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 2px 0;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    // 与下方 .chart-card 同款版式（背景/边框/圆角/高度），只做加载占位。
+    // 注意：.chart-card 的样式嵌在 .grid-4-container 下，这里不能直接复用类名。
+    .chart-skeleton {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      background-color: var(--bg-card-subtle);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 10px;
+      height: 220px;
+      box-shadow: var(--shadow-sm);
+    }
   }
 
   .error-banner {
@@ -1017,6 +1069,12 @@ watch(() => settings.themeMode, () => {
 
     .grid-4-container {
       .chart-card {
+        height: 200px;
+      }
+    }
+
+    .loading-skeleton {
+      .chart-skeleton {
         height: 200px;
       }
     }

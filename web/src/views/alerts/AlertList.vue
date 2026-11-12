@@ -5,7 +5,6 @@ import {
   NCard,
   NButton,
   NSpace,
-  NTable,
   NTag,
   NModal,
   NForm,
@@ -55,6 +54,7 @@ import {
 import { useWorkspaceStore } from '../../stores/workspace'
 import { useNotificationStore } from '../../stores/notifications'
 import { fmtDateTime } from '../../utils/time'
+import { useTablePagination } from '../../composables/useTablePagination'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'AlertList' })
@@ -285,6 +285,81 @@ const eventPagination = computed(() => ({
   },
   onUpdatePageSize: handlePageSizeChange,
 }))
+
+// 告警规则同样分页（与消息列表对齐）：规则全量已在内存，走前端分页。
+const ruleCount = computed(() => rules.value.length)
+const { pagination: rulePagination } = useTablePagination({ pageSize: 20, rowCount: ruleCount })
+
+const ruleColumns = computed<DataTableColumns<AlertRule>>(() => [
+  {
+    title: '规则名称',
+    key: 'name',
+    ellipsis: { tooltip: true },
+    render: (r) =>
+      h('span', { class: 'rule-title-cell', onClick: () => openEditRule(r) }, r.name),
+  },
+  {
+    title: '监控类型',
+    key: 'type',
+    width: 120,
+    render: (r) => ruleTypeLabel(r.type),
+  },
+  {
+    title: '告警级别',
+    key: 'severity',
+    width: 90,
+    render: (r) =>
+      h(NTag, { type: sevTagType(r.severity), size: 'small', round: true }, {
+        default: () => sevLabel(r.severity),
+      }),
+  },
+  {
+    title: '触发阈值',
+    key: 'threshold',
+    width: 110,
+    render: (r) =>
+      r.type === 'offline'
+        ? '心跳中断'
+        : r.type === 'anomaly'
+          ? `> ${r.threshold}σ`
+          : `> ${r.threshold}%`,
+  },
+  {
+    title: '主机过滤',
+    key: 'host_filter',
+    width: 120,
+    ellipsis: { tooltip: true },
+    render: (r) => r.host_filter || '全部主机',
+  },
+  {
+    title: '状态',
+    key: 'enabled',
+    width: 70,
+    render: (r) =>
+      h(NSwitch, {
+        value: r.enabled,
+        size: 'small',
+        'onUpdate:value': (v: boolean) => toggleRule(r, v),
+      }),
+  },
+  {
+    title: '操作',
+    key: 'actions',
+    width: 110,
+    render: (r) =>
+      h(NSpace, { size: 4 }, {
+        default: () => [
+          h(NButton, { size: 'small', quaternary: true, onClick: () => openEditRule(r) }, { default: () => '编辑' }),
+          h(NPopconfirm, { onPositiveClick: () => doDeleteRule(r.id) }, {
+            trigger: () => h(NButton, { size: 'small', quaternary: true, type: 'error' }, {
+              icon: () => h(NIcon, { component: TrashOutline }),
+            }),
+            default: () => `确认删除规则 ${r.name}？`,
+          }),
+        ],
+      }),
+  },
+])
 
 function sevTagType(s: Severity) {
   if (s === 'critical') return 'error' as const
@@ -600,7 +675,7 @@ onMounted(() => {
     <!-- Header -->
     <div class="page-header">
       <div class="header-left">
-        <h2 class="page-title">消息与告警中心</h2>
+        <h2 class="page-title">消息中心</h2>
       </div>
       <div class="header-right">
         <NSpace :size="10">
@@ -716,63 +791,23 @@ onMounted(() => {
                 <template #icon><NIcon :component="AddCircleOutline" /></template>
                 新增规则
               </NButton>
+              <span class="result-count">共 {{ rules.length }} 条规则</span>
             </div>
 
             <div class="table-card">
-              <NEmpty v-if="rules.length === 0" description="暂无告警规则，点击上方按钮新增" />
-              <!-- 告警规则清单：条数天然有限，不分页（AGENTS.md 8.2 例外） -->
-              <NTable v-else :single-line="false" size="small" class="custom-table">
-                <thead>
-                  <tr>
-                    <th>规则名称</th>
-                    <th>监控类型</th>
-                    <th>告警级别</th>
-                    <th>触发阈值</th>
-                    <th>主机过滤</th>
-                    <th>状态</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="r in rules" :key="r.id">
-                    <td class="rule-title-cell" @click="openEditRule(r)">
-                      {{ r.name }}
-                    </td>
-                    <td>{{ ruleTypeLabel(r.type) }}</td>
-                    <td>
-                      <NTag :type="sevTagType(r.severity)" size="small" round>
-                        {{ sevLabel(r.severity) }}
-                      </NTag>
-                    </td>
-                    <td>{{
-                      r.type === 'offline' ? '心跳中断'
-                      : r.type === 'anomaly' ? `> ${r.threshold}σ`
-                      : `> ${r.threshold}%`
-                    }}</td>
-                    <td>{{ r.host_filter || '全部主机' }}</td>
-                    <td>
-                      <NSwitch
-                        :value="r.enabled"
-                        size="small"
-                        @update:value="(v: boolean) => toggleRule(r, v)"
-                      />
-                    </td>
-                    <td>
-                      <NSpace :size="4">
-                        <NButton size="small" quaternary @click="openEditRule(r)">编辑</NButton>
-                        <NPopconfirm @positive-click="doDeleteRule(r.id)">
-                          <template #trigger>
-                            <NButton size="small" quaternary type="error">
-                              <template #icon><NIcon :component="TrashOutline" /></template>
-                            </NButton>
-                          </template>
-                          确认删除规则 {{ r.name }}？
-                        </NPopconfirm>
-                      </NSpace>
-                    </td>
-                  </tr>
-                </tbody>
-              </NTable>
+              <NDataTable
+                :columns="ruleColumns"
+                :data="rules"
+                :pagination="rulePagination"
+                :bordered="false"
+                size="small"
+                :row-key="(r: AlertRule) => r.id"
+                :scroll-x="760"
+              >
+                <template #empty>
+                  <NEmpty description="暂无告警规则，点击上方按钮新增" />
+                </template>
+              </NDataTable>
             </div>
           </div>
         </NTabPane>
@@ -780,7 +815,8 @@ onMounted(() => {
         <!-- Webhook 通知渠道 Tab -->
         <NTabPane name="webhook" tab="通知渠道 (Webhook)">
           <div class="webhook-tab-content">
-            <NCard title="Webhook 告警推送" class="webhook-card">
+            <NCard class="webhook-card">
+              <div class="webhook-card-title">Webhook 告警推送</div>
               <p class="webhook-intro">
                 配置企业微信、钉钉、飞书或自建系统 Webhook 地址，当告警触发时系统会自动格式化推送消息并发送 HTTP POST 请求。
               </p>
@@ -1118,30 +1154,13 @@ onMounted(() => {
       color: var(--text-secondary);
     }
 
-    // 告警规则页签仍是原生 NTable（规则数量天然有限，属 8.2 例外）。
-    .custom-table {
-      width: 100%;
-
-      th {
-        background-color: var(--bg-card-subtle);
-        color: var(--text-secondary);
-        font-weight: 600;
-        font-size: 12px;
-      }
-
-      td {
-        color: var(--text-primary);
-        font-size: 13px;
-        vertical-align: middle;
-      }
-
-      .rule-title-cell {
-        font-weight: 600;
-        cursor: pointer;
-        color: #3b82f6;
-        &:hover {
-          text-decoration: underline;
-        }
+    // 告警规则页签同样用 NDataTable（render 生成单元格，样式需穿透 scoped）。
+    :deep(.rule-title-cell) {
+      font-weight: 600;
+      cursor: pointer;
+      color: #3b82f6;
+      &:hover {
+        text-decoration: underline;
       }
     }
   }
@@ -1152,7 +1171,15 @@ onMounted(() => {
   }
 
   .toolbar-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     margin-bottom: 12px;
+
+    .result-count {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
   }
 
   .webhook-card {
@@ -1160,6 +1187,13 @@ onMounted(() => {
     background-color: var(--bg-card);
     border: 1px solid var(--border-color);
     border-radius: 8px;
+
+    .webhook-card-title {
+      margin-bottom: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
 
     .webhook-intro {
       margin: 0;

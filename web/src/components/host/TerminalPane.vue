@@ -9,6 +9,7 @@ import {
   NButton,
   NIcon,
   NInput,
+  NTag,
   useMessage,
 } from 'naive-ui'
 import {
@@ -21,6 +22,7 @@ import { nl2command } from '../../api/ai'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { useTermPrefsStore } from '../../stores/termPrefs'
 import TerminalSession from './TerminalSession.vue'
+import type { TermConnStatus } from './TerminalSession.vue'
 import RemoteAssistModal from '../terminal/RemoteAssistModal.vue'
 import TerminalAiCopilot from '../terminal/TerminalAiCopilot.vue'
 
@@ -51,12 +53,13 @@ interface TermTab {
   seq: number
   sid: string
   ended: boolean
+  status: TermConnStatus
 }
 
 let seqCounter = 0
 function makeTab(): TermTab {
   seqCounter += 1
-  return { id: `t${Date.now().toString(36)}-${seqCounter}`, seq: seqCounter, sid: '', ended: false }
+  return { id: `t${Date.now().toString(36)}-${seqCounter}`, seq: seqCounter, sid: '', ended: false, status: 'connecting' }
 }
 
 const tabs = ref<TermTab[]>([makeTab()])
@@ -131,6 +134,24 @@ const osLabel = computed(() => {
 
 const activeTab = computed(() => tabs.value.find((t) => t.id === activeId.value) || null)
 const currentSid = computed(() => activeTab.value?.sid || '')
+
+// Connection status of the active tab, shown as a Tag in the toolbar.
+// NTag type comes from Naive UI's own theme tokens — no hardcoded colors (§9.1).
+const activeStatus = computed<TermConnStatus>(() => activeTab.value?.status || 'connecting')
+const statusMeta = computed(() => {
+  const meta: Record<TermConnStatus, { label: string; type: 'info' | 'success' | 'warning' | 'error' }> = {
+    connecting: { label: '连接中', type: 'info' },
+    connected: { label: '已连接', type: 'success' },
+    reconnecting: { label: '重连中', type: 'warning' },
+    ended: { label: '已断开', type: 'error' },
+  }
+  return meta[activeStatus.value]
+})
+
+function onStatus(id: string, s: TermConnStatus) {
+  const t = tabs.value.find((x) => x.id === id)
+  if (t) t.status = s
+}
 
 const selectedTheme = computed(() => termPrefs.prefs.theme)
 // Theme names come from the server (prefs.Themes) so the picker cannot offer
@@ -285,6 +306,7 @@ async function handleAiGenerate() {
       </div>
 
       <div class="toolbar-right">
+        <NTag :type="statusMeta.type" size="small" round>{{ statusMeta.label }}</NTag>
         <NSelect
           :value="selectedTheme"
           :options="themeOptions"
@@ -337,6 +359,7 @@ async function handleAiGenerate() {
             :shell="shell"
             :visible="t.id === activeId"
             @opened="(sid: string) => onOpened(t.id, sid)"
+            @status="(s: TermConnStatus) => onStatus(t.id, s)"
             @ended="onEnded(t.id)"
           />
         </div>
@@ -360,7 +383,8 @@ async function handleAiGenerate() {
     <div class="ai-cmd-bar">
       <NInput
         v-model:value="aiInput"
-        placeholder="用自然语言描述意图（如：查看占用 CPU 最高的 5 个进程），按 Enter 自动生成命令并发送..."
+        placeholder="用自然语言描述意图，按 Enter 生成命令"
+        title="例如：查看占用 CPU 最高的 5 个进程"
         size="small"
         @keyup.enter="handleAiGenerate"
       >

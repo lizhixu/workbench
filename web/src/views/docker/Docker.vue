@@ -32,6 +32,7 @@ import {
   dockerOp,
   dockerGetMirrors,
   dockerSetMirrors,
+  getHost,
   installDocker,
 } from '../../api/hosts'
 import { listApps, type AppEntity } from '../../api/apps'
@@ -205,7 +206,8 @@ async function doOp(op: string, container: string) {
         if (cn === name) {
           return {
             ...c,
-            Status: op === 'stop' ? 'Exited' : `Up (optimistic)`,
+            // 乐观值只写裸 Up（本地化后显示「运行中」），后台重拉后对账。
+            Status: op === 'stop' ? 'Exited' : 'Up',
             State: op === 'stop' ? 'exited' : 'running',
           }
         }
@@ -365,8 +367,84 @@ async function handleSaveMirrors() {
   }
 }
 
+// docker ps 的状态串是英文原始值（如 Up 7 weeks、Exited (0) 3 days ago），
+// 直接展示用户读不懂，按中文习惯本地化；未知形态原样返回，不编造。
+const DURATION_UNIT_ZH: Record<string, string> = {
+  second: '秒',
+  seconds: '秒',
+  minute: '分钟',
+  minutes: '分钟',
+  hour: '小时',
+  hours: '小时',
+  day: '天',
+  days: '天',
+  week: '周',
+  weeks: '周',
+  month: '月',
+  months: '月',
+  year: '年',
+  years: '年',
+}
+
+function localizeDuration(text: string): string {
+  return text.replace(
+    /(\d+)\s*(seconds?|minutes?|hours?|days?|weeks?|months?|years?)/g,
+    (_m, n: string, unit: string) => `${n} ${DURATION_UNIT_ZH[unit] ?? unit}`,
+  )
+}
+
+function localizeContainerStatus(status: string): string {
+  if (!status) return '-'
+  const s = status.trim()
+  const healthMatch = s.match(/\((healthy|unhealthy|health: starting)\)\s*$/)
+  const healthZh: Record<string, string> = {
+    healthy: '健康',
+    unhealthy: '不健康',
+    'health: starting': '健康检查启动中',
+  }
+  const base = healthMatch ? s.slice(0, healthMatch.index).trim() : s
+  const healthSuffix = healthMatch ? `（${healthZh[healthMatch[1]]}）` : ''
+  if (/^Up\b/i.test(base)) {
+    const rest = base.replace(/^Up\b/i, '').trim()
+    if (!rest) return `运行中${healthSuffix}`
+    if (/^About an hour$/i.test(rest)) return `已运行约 1 小时${healthSuffix}`
+    if (/^About a minute$/i.test(rest)) return `已运行约 1 分钟${healthSuffix}`
+    if (/^Less than a second$/i.test(rest)) return `已运行不到 1 秒${healthSuffix}`
+    return `已运行 ${localizeDuration(rest)}${healthSuffix}`
+  }
+  const exited = base.match(/^Exited\s*\((\d+)\)\s*(.*)$/i)
+  if (exited) {
+    const ago = exited[2] ? `${localizeDuration(exited[2].replace(/\s*ago\s*$/i, ''))}前` : ''
+    return ago ? `已退出 ${ago}（退出码 ${exited[1]}）` : `已退出（退出码 ${exited[1]}）`
+  }
+  if (/^Exited$/i.test(base)) return `已退出${healthSuffix}`
+  if (/^Created$/i.test(base)) return `已创建${healthSuffix}`
+  if (/^Paused$/i.test(base)) return `已暂停${healthSuffix}`
+  if (/^Restarting$/i.test(base)) return `重启中${healthSuffix}`
+  if (/^Removing$/i.test(base)) return `删除中${healthSuffix}`
+  if (/^Dead$/i.test(base)) return `已失效${healthSuffix}`
+  if (/^running$/i.test(base)) return '运行中'
+  if (/^exited$/i.test(base)) return '已退出'
+  return status
+}
+
 const containerColumns = [
-  { title: '名称', key: 'Names', width: 140, ellipsis: { tooltip: true } },
+  {
+    title: '名称',
+    key: 'Names',
+    width: 140,
+    // 容器名超长截断时悬停显示全名：内置 ellipsis tooltip 默认单行铺开、无
+    // 宽度上限，弹层会被视口裁掉（DESIGN.md §9.4），故限宽 + 任意断行。
+    // render 去掉 docker ps 自带的前导 /（如 /watchman-heads），与启停等
+    // 操作里用的去斜杠名字保持一致。
+    ellipsis: {
+      tooltip: {
+        style: { maxWidth: '480px' },
+        contentStyle: { wordBreak: 'break-all' as const },
+      },
+    },
+    render: (row: any) => (row.Names || row.ID || '').replace(/^\//, ''),
+  },
   { title: '镜像', key: 'Image', ellipsis: { tooltip: true } },
   {
     title: '状态',
@@ -379,7 +457,7 @@ const containerColumns = [
         { type: running ? 'success' : 'default', size: 'small', round: true, class: 'container-status-tag' },
         {
           default: () =>
-            h(NEllipsis, { tooltip: true }, { default: () => row.Status || row.State || '-' }),
+            h(NEllipsis, { tooltip: true }, { default: () => localizeContainerStatus(row.Status || row.State || '') }),
         },
       )
     },
@@ -487,9 +565,35 @@ const imageColumns = [
   },
 ]
 
+// 挂载时自注册 Workspace 页签（与 HostDetail.load() 同款）：直接访问
+// /docker/:id 时 AppShell 不会自动建签，标题取主机名、拉不到时回落主机 ID。
+// viewName 取路由 meta（Docker），与组件 defineOptions 的 name 一致，缺了
+// 它该页签不会进 KeepAlive 的 include。
+// 守卫：本组件也被主机详情以 DockerView 内嵌在 docker 子页签里，那时当前
+// 路由是 host-detail，页签属于主机详情——注册会抢走激活态并多出一个
+// /docker/:id 页签，故只在独立路由（route.name === 'docker'）时注册。
+async function registerWorkspaceTab() {
+  if (route.name !== 'docker') return
+  let title = hostId
+  try {
+    const host = await getHost(hostId)
+    if (host?.hostname) title = host.hostname
+  } catch {
+    // 主机信息拉不到也不阻塞页签注册，标题回落主机 ID。
+  }
+  workspace.openTab({
+    key: `/docker/${hostId}`,
+    title,
+    path: `/docker/${hostId}`,
+    closable: true,
+    viewName: (route.meta.viewName as string) || 'Docker',
+  })
+}
+
 onMounted(() => {
   loadContainers()
   loadManagedApps()
+  registerWorkspaceTab()
 })
 </script>
 
@@ -522,107 +626,120 @@ onMounted(() => {
       </div>
     </NAlert>
 
-    <NCard :bordered="false" class="docker-card">
+    <!-- Tab 在卡片外（DESIGN.md §9.5）：tabs-container 包 NTabs，各页签内
+         tab-pane-content 包 NCard.table-flex-fill，再放工具栏与表格。 -->
+    <div class="tabs-container">
       <NTabs
         v-model:value="tab"
         type="line"
-        class="docker-tabs"
         @update:value="(v: string) => { if (v === 'images' && images.length === 0) loadImages() }"
       >
         <NTabPane name="containers" tab="容器" display-directive="show:lazy">
-          <div class="tab-body">
-            <NSpace align="center" justify="space-between" class="tab-toolbar">
-              <NSpace align="center" :size="8">
-                <NButton size="small" :loading="loading" @click="loadContainers">
-                  <template #icon><NIcon :component="RefreshOutline" /></template>
-                  刷新
-                </NButton>
-                <NButton size="small" type="primary" @click="openDeployApp">
-                  <template #icon><NIcon :component="AddOutline" /></template>
-                  部署新应用
-                </NButton>
-              </NSpace>
-              <NButton
-                v-if="dockerNotInstalled && canInstall"
-                size="small"
-                type="warning"
-                @click="showInstallModal = true; startInstallDocker()"
-              >
-                一键安装 Docker
-              </NButton>
-            </NSpace>
-            <NDataTable
-              flex-height
-              :columns="containerColumns"
-              :data="containers"
-              :pagination="containerPagination"
-              :bordered="false"
-              size="small"
-              :loading="loading"
-              :scroll-x="900"
-            >
-              <template #empty>无容器或 Docker 未运行</template>
-            </NDataTable>
+          <div class="tab-pane-content">
+            <NCard :bordered="false" class="table-flex-fill">
+              <div class="tab-body">
+                <NSpace align="center" justify="space-between" class="tab-toolbar">
+                  <NSpace align="center" :size="8">
+                    <NButton size="small" :loading="loading" @click="loadContainers">
+                      <template #icon><NIcon :component="RefreshOutline" /></template>
+                      刷新
+                    </NButton>
+                    <NButton size="small" type="primary" @click="openDeployApp">
+                      <template #icon><NIcon :component="AddOutline" /></template>
+                      部署新应用
+                    </NButton>
+                  </NSpace>
+                  <NButton
+                    v-if="dockerNotInstalled && canInstall"
+                    size="small"
+                    type="warning"
+                    @click="showInstallModal = true; startInstallDocker()"
+                  >
+                    一键安装 Docker
+                  </NButton>
+                </NSpace>
+                <NDataTable
+                  flex-height
+                  :columns="containerColumns"
+                  :data="containers"
+                  :pagination="containerPagination"
+                  :bordered="false"
+                  size="small"
+                  :loading="loading"
+                  :scroll-x="900"
+                >
+                  <template #empty>无容器或 Docker 未运行</template>
+                </NDataTable>
+              </div>
+            </NCard>
           </div>
         </NTabPane>
 
         <NTabPane name="images" tab="镜像" display-directive="show:lazy">
-          <div class="tab-body">
-            <NSpace align="center" justify="space-between" class="tab-toolbar">
-              <NSpace align="center">
-                <NButton size="small" :loading="loading" @click="loadImages">
-                  <template #icon><NIcon :component="RefreshOutline" /></template>
-                  刷新
-                </NButton>
-                <NInput
-                  v-model:value="pullImageName"
-                  placeholder="nginx:latest"
+          <div class="tab-pane-content">
+            <NCard :bordered="false" class="table-flex-fill">
+              <div class="tab-body">
+                <NSpace align="center" justify="space-between" class="tab-toolbar">
+                  <NSpace align="center">
+                    <NButton size="small" :loading="loading" @click="loadImages">
+                      <template #icon><NIcon :component="RefreshOutline" /></template>
+                      刷新
+                    </NButton>
+                    <NInput
+                      v-model:value="pullImageName"
+                      placeholder="nginx:latest"
+                      size="small"
+                      style="width: 200px"
+                    />
+                    <NButton
+                      size="small"
+                      type="primary"
+                      :loading="pulling"
+                      @click="pullImage"
+                    >
+                      <template #icon><NIcon :component="DownloadOutline" /></template>
+                      拉取
+                    </NButton>
+                    <NPopconfirm @positive-click="pruneImages">
+                      <template #trigger>
+                        <NButton size="small" type="warning">清除未使用</NButton>
+                      </template>
+                      确认清除所有未使用镜像？
+                    </NPopconfirm>
+                  </NSpace>
+                  <NButton size="small" @click="openMirrorsModal">
+                    <template #icon><NIcon :component="SpeedometerOutline" /></template>
+                    镜像加速
+                  </NButton>
+                </NSpace>
+                <NDataTable
+                  flex-height
+                  :columns="imageColumns"
+                  :data="images"
+                  :pagination="imagePagination"
+                  :bordered="false"
                   size="small"
-                  style="width: 200px"
-                />
-                <NButton
-                  size="small"
-                  type="primary"
-                  :loading="pulling"
-                  @click="pullImage"
+                  :loading="loading"
                 >
-                  <template #icon><NIcon :component="DownloadOutline" /></template>
-                  拉取
-                </NButton>
-                <NPopconfirm @positive-click="pruneImages">
-                  <template #trigger>
-                    <NButton size="small" type="warning">清除未使用</NButton>
-                  </template>
-                  确认清除所有未使用镜像？
-                </NPopconfirm>
-              </NSpace>
-              <NButton size="small" @click="openMirrorsModal">
-                <template #icon><NIcon :component="SpeedometerOutline" /></template>
-                镜像加速
-              </NButton>
-            </NSpace>
-            <NDataTable
-              flex-height
-              :columns="imageColumns"
-              :data="images"
-              :pagination="imagePagination"
-              :bordered="false"
-              size="small"
-              :loading="loading"
-            >
-              <template #empty>无镜像或 Docker 未运行</template>
-            </NDataTable>
+                  <template #empty>无镜像或 Docker 未运行</template>
+                </NDataTable>
+              </div>
+            </NCard>
           </div>
         </NTabPane>
 
         <NTabPane name="logs" tab="容器日志" display-directive="show:lazy">
-          <div class="tab-body">
-            <span class="muted">容器: {{ logsContainer || '请从容器列表点击"日志"' }}</span>
-            <pre class="log-output log-output-fill">{{ logsText || '暂无日志' }}</pre>
+          <div class="tab-pane-content">
+            <NCard :bordered="false" class="table-flex-fill">
+              <div class="tab-body">
+                <span class="muted">容器: {{ logsContainer || '请从容器列表点击"日志"' }}</span>
+                <pre class="log-output log-output-fill">{{ logsText || '暂无日志' }}</pre>
+              </div>
+            </NCard>
           </div>
         </NTabPane>
       </NTabs>
-    </NCard>
+    </div>
 
     <!-- 容器终端直连弹窗 -->
     <NModal
@@ -715,6 +832,7 @@ onMounted(() => {
 <style scoped lang="scss">
 .docker-view {
   gap: 12px;
+  overflow: hidden;
 }
 
 .docker-toolbar {
@@ -732,14 +850,24 @@ onMounted(() => {
   flex-shrink: 0;
 }
 
-/* 卡片吃掉剩余高度，tabs 内容区再向下传递，使表格能按视口计算滚动区 */
-.docker-card {
+/* Tab 在卡片外（DESIGN.md §9.5）：tabs-container 与 pane 都要具备 flex
+   能力，否则表格无法按视口高度收缩、分页条会被推到首屏之外。 */
+.tabs-container {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 
-  :deep(.n-card-content) {
+  :deep(.n-tabs) {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  :deep(.n-tabs-pane-wrapper),
+  :deep(.n-tab-pane) {
     flex: 1;
     min-height: 0;
     display: flex;
@@ -748,19 +876,12 @@ onMounted(() => {
   }
 }
 
-.docker-tabs {
+.tab-pane-content {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-
-  :deep(.n-tabs-pane-wrapper),
-  :deep(.n-tab-pane) {
-    flex: 1;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-  }
+  overflow: hidden;
 }
 
 .tab-body {
@@ -769,6 +890,9 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* 全局 .table-flex-fill 会把卡片内容区 padding 清零，这里按 §9.2 在
+     内容层补回 --card-padding，保持工具栏与表格离卡片边一个档位。 */
+  padding: var(--card-padding, 16px);
 
   .tab-toolbar {
     flex-shrink: 0;

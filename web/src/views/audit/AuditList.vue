@@ -10,6 +10,7 @@ import {
   NModal,
   NPagination,
   NSelect,
+  NSpace,
   NTag,
   NTooltip,
   useMessage,
@@ -286,7 +287,21 @@ onMounted(load)
 </script>
 
 <template>
-  <div class="audit-view">
+  <div class="audit-view page-flex-column">
+    <div class="page-header">
+      <h2 class="page-title">操作审计</h2>
+      <NSpace align="center" :size="8">
+        <NButton size="small" secondary type="info" @click="exportCSV">
+          <template #icon><NIcon><DownloadOutline /></NIcon></template>
+          导出 CSV
+        </NButton>
+        <NButton quaternary size="small" :loading="loading" @click="load">
+          <template #icon><NIcon><RefreshOutline /></NIcon></template>
+          刷新
+        </NButton>
+      </NSpace>
+    </div>
+
     <!-- Stats cards -->
     <div class="stats-row">
       <NCard size="small" class="stat-card">
@@ -325,13 +340,6 @@ onMounted(load)
         查询
       </NButton>
       <NButton size="small" @click="resetFilters">重置</NButton>
-      <NButton size="small" secondary type="info" @click="exportCSV">
-        <template #icon><NIcon><DownloadOutline /></NIcon></template>
-        导出 CSV
-      </NButton>
-      <NButton quaternary size="small" :loading="loading" @click="load">
-        <template #icon><NIcon><RefreshOutline /></NIcon></template>
-      </NButton>
     </div>
 
     <!-- Table：表头与分页固定，仅数据区滚动（AGENTS.md 8.2） -->
@@ -393,13 +401,23 @@ onMounted(load)
 
 <style scoped lang="scss">
 .audit-view {
-  display: flex;
-  flex-direction: column;
   gap: 12px;
-  height: 100%;
-  min-height: 0;
   /* 滚动交给表格自身，外层不再滚动，避免出现双层滚动条 */
   overflow: hidden;
+}
+
+.page-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
 }
 
 .stats-row {

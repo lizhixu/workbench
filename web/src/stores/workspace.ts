@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 export interface WorkspaceTab {
   key: string
@@ -12,7 +12,10 @@ export interface WorkspaceTab {
 }
 
 export const useWorkspaceStore = defineStore('workspace', () => {
-  const tabs = ref<WorkspaceTab[]>([
+  const STORAGE_KEY = 'watchman_workspace_tabs'
+  const MAX_RESTORED_TABS = 20
+
+  const DEFAULT_TABS: WorkspaceTab[] = [
     {
       key: '/hosts',
       title: '主机列表',
@@ -20,9 +23,62 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       closable: false,
       viewName: 'HostList',
     },
-  ])
+  ]
 
-  const activeKey = ref<string>('/hosts')
+  /**
+   * 页签只存内存时，刷新后只剩首页与当前页。启动时从 localStorage 恢复
+   * 上次打开的页签（带 viewName，保证 KeepAlive 仍能缓存），恢复失败或
+   * 数据非法时回落到默认单页签。固定页签 /hosts 必须在首位且不可关闭。
+   */
+  function restoreTabs(): { tabs: WorkspaceTab[]; activeKey: string } {
+    const fallback = { tabs: DEFAULT_TABS.map((t) => ({ ...t })), activeKey: '/hosts' }
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY)
+      if (!raw) return fallback
+      const parsed = JSON.parse(raw) as { tabs?: unknown; activeKey?: unknown }
+      if (!parsed || !Array.isArray(parsed.tabs)) return fallback
+      const restored: WorkspaceTab[] = (parsed.tabs as Array<Record<string, unknown>>)
+        .filter((t) => t && typeof t.key === 'string' && typeof t.title === 'string' && typeof t.path === 'string')
+        .slice(0, MAX_RESTORED_TABS)
+        .map((t): WorkspaceTab => ({
+          key: t.key as string,
+          title: t.title as string,
+          path: t.path as string,
+          closable: typeof t.closable === 'boolean' ? (t.closable as boolean) : true,
+          viewName: typeof t.viewName === 'string' ? (t.viewName as string) : undefined,
+        }))
+      const hostTab = restored.find((t) => t.key === '/hosts')
+      if (!hostTab) {
+        restored.unshift({ ...DEFAULT_TABS[0] })
+      } else {
+        hostTab.closable = false
+      }
+      const active =
+        typeof parsed.activeKey === 'string' && restored.some((t) => t.key === parsed.activeKey)
+          ? (parsed.activeKey as string)
+          : restored[0].key
+      return { tabs: restored, activeKey: active }
+    } catch {
+      return fallback
+    }
+  }
+
+  const restored = restoreTabs()
+  const tabs = ref<WorkspaceTab[]>(restored.tabs)
+  const activeKey = ref<string>(restored.activeKey)
+
+  // 页签增删、改名、排序、切换都落盘；存储不可用时静默失败，不影响页签本身。
+  watch(
+    [tabs, activeKey],
+    () => {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ tabs: tabs.value, activeKey: activeKey.value }))
+      } catch {
+        // ignore
+      }
+    },
+    { deep: true },
+  )
 
   /**
    * 仍处于打开状态的页签对应的组件名，交给 KeepAlive 的 include。

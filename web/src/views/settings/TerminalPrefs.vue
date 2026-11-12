@@ -182,14 +182,13 @@ onMounted(refresh)
             </div>
             <div><span :style="{ color: previewTheme.green }">●</span> nginx.service - A high performance web server</div>
             <div>
-              &nbsp;&nbsp;&nbsp;Active: <span :style="{ color: previewTheme.green }">active (running)</span>
-              since Mon 2026-09-02 09:14:03 CST
+              &nbsp;&nbsp;&nbsp;Active:&nbsp;<span :style="{ color: previewTheme.green }">active (running)</span>&nbsp;since Mon 2026-09-02 09:14:03 CST
             </div>
             <div>
-              &nbsp;&nbsp;&nbsp;&nbsp;Warn: <span :style="{ color: previewTheme.yellow }">worker process 1024 exited</span>
+              &nbsp;&nbsp;&nbsp;&nbsp;Warn:&nbsp;<span :style="{ color: previewTheme.yellow }">worker process 1024 exited</span>
             </div>
             <div>
-              &nbsp;&nbsp;&nbsp;&nbsp;Fail: <span :style="{ color: previewTheme.red }">connect() failed (111: Connection refused)</span>
+              &nbsp;&nbsp;&nbsp;&nbsp;Fail:&nbsp;<span :style="{ color: previewTheme.red }">connect() failed (111: Connection refused)</span>
             </div>
           </div>
         </div>

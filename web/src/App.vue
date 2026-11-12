@@ -75,7 +75,10 @@ const themeOverrides = computed<GlobalThemeOverrides>(() => {
     },
     Card: {
       borderRadius: '8px',
-      borderColor: isDark ? 'rgba(255, 255, 255, 0.08)' : '#e2e8f0',
+      // §9.6：表格卡片容器严禁外层实线边框。NCard 默认边框是全站卡片
+      // 外层生硬矩形框的来源，改为透明后以卡片与页面底色差分隔，
+      // 亮色 #ffffff/#f1f5f9、暗色 #131b2e/#0b0f19 均有足够对比。
+      borderColor: 'transparent',
       color: isDark ? '#131b2e' : '#ffffff',
     },
     DataTable: {

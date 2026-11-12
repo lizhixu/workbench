@@ -176,6 +176,16 @@ function viewJob(job: ScanJob) {
   followupHistory.value = []
 }
 
+// 「AI 报告解读」置灰原因：disabled 的 NButton 不触发 mouseenter，包在外层的
+// NTooltip 永远弹不出来，故把原因以常驻文字写在按钮旁。不用 .tip-hint：
+// 置灰原因是业务关键信息，不受 appearance.show_tips 开关控制（DESIGN.md §9.11）。
+const aiReportDisabledReason = computed(() => {
+  if (!currentJob.value) return '请先完成一次扫描'
+  if (currentJob.value.status === 'running') return '扫描进行中，完成后可解读'
+  if (currentJob.value.status === 'failed') return '上次扫描失败，请重新扫描后解读'
+  return ''
+})
+
 async function openAIReport() {
   if (!currentJob.value || currentJob.value.status !== 'completed') {
     message.warning('请先完成一次扫描')
@@ -325,6 +335,7 @@ onMounted(async () => {
           </template>
           使用 AI 生成中文安全报告，含修复优先级与可执行命令
         </NTooltip>
+        <span v-if="aiReportDisabledReason" class="ai-report-hint">{{ aiReportDisabledReason }}</span>
       </div>
     </div>
 
@@ -558,6 +569,13 @@ onMounted(async () => {
     .header-actions {
       display: flex;
       gap: 12px;
+
+      .ai-report-hint {
+        align-self: center;
+        font-size: 12px;
+        color: var(--text-secondary);
+        white-space: nowrap;
+      }
     }
   }
 

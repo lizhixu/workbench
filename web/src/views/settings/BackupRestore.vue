@@ -56,6 +56,15 @@ function bytes(n: number) {
   return `${(n / 1024 ** i).toFixed(i ? 1 : 0)} ${units[i]}`
 }
 
+// 零值时间（0001-01-01）表示从未调度过：先判零值再格式化，不把公元 1 年
+// 当成真实时间展示（与 AppDetail.vue formatTime 同款口径）。
+function formatLastRun(v?: string): string {
+  if (!v) return '未执行过'
+  const d = new Date(v)
+  if (Number.isNaN(d.getTime()) || d.getUTCFullYear() < 1970) return '未执行过'
+  return fmtDateTime(d)
+}
+
 let active = false
 let inFlight = false
 let sequence = 0
@@ -234,7 +243,7 @@ const columns = computed<DataTableColumns<BackupMeta>>(() => [
         <span class="field-hint tip-hint">保留策略仅清理定时备份，手动归档和恢复前安全副本保留。S3 目标在快照备份中配置。</span>
         <NButton type="primary" :loading="savingPolicy" @click="savePolicy">保存策略</NButton>
       </NSpace>
-      <p v-if="policy.last_run" class="field-hint">最近调度：{{ fmtDateTime(policy.last_run) }}</p>
+      <p class="field-hint">最近调度：{{ formatLastRun(policy.last_run) }}</p>
       <NAlert v-if="policy.last_error" type="error" :bordered="false">{{ policy.last_error }}</NAlert>
     </NCard>
 

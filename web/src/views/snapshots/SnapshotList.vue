@@ -19,6 +19,7 @@ import {
 } from '../../api/snapshots'
 import { listHosts } from '../../api/hosts'
 import { listApps, type AppEntity } from '../../api/apps'
+import { useTablePagination } from '../../composables/useTablePagination'
 import { fmtDateTimeMinute } from '../../utils/time'
 
 defineOptions({ name: 'SnapshotList' })
@@ -32,6 +33,11 @@ const jobs = ref<BackupJob[]>([])
 const loading = ref(false)
 const showCreate = ref(false)
 const creating = ref(false)
+
+// 备份任务前端分页（§9.4：全量数组已在内存，走 useTablePagination；
+// 平铺视图的 NDataTable 接此对象，聚合视图每组表各接一个独立实例，见下方 groupPaginationMap）。
+const jobCount = computed(() => jobs.value.length)
+const { pagination: jobPagination, resetPage: resetJobPage } = useTablePagination({ pageSize: 20, rowCount: jobCount })
 
 // ---- S3 存储目标状态 ----
 const s3Targets = ref<S3Target[]>([])
@@ -212,11 +218,11 @@ function onS3ProviderChange(val: string) {
 }
 
 const columns = computed<DataTableColumns<BackupJob>>(() => [
-  { title: '任务名称', key: 'name', width: 170, render: (r) => h('span', { style: 'font-weight: 600' }, r.name) },
+  { title: '任务名称', key: 'name', width: 170, ellipsis: { tooltip: true }, render: (r) => h('span', { style: 'font-weight: 600' }, r.name) },
   {
     title: '类型',
     key: 'kind',
-    width: 130,
+    width: 110,
     render: (r) => {
       const label = r.kind === 'app_volume'
         ? '应用数据卷'
@@ -231,18 +237,31 @@ const columns = computed<DataTableColumns<BackupJob>>(() => [
   {
     title: '目标对象',
     key: 'target',
+    width: 280,
     ellipsis: { tooltip: true },
     render: (r) => {
       if (r.kind === 'app_volume') {
         const app = apps.value.find((a) => a.id === r.app_id)
-        return h(NSpace, { size: 6, align: 'center' }, {
-          default: () => [
-            h('span', { style: 'font-weight: 500' }, app?.name || r.app_id || '应用已删除'),
-            h('span', {
-              class: 'mono-font', style: { fontSize: '11px' }, title: r.target,
-            }, appVolumeTargetLabel(r.target)),
-          ],
-        })
+        const appName = app?.name || r.app_id || '应用已删除'
+        // 单行 flex、不换行：应用名超长时省略（title 给全名），卷文案不换行不压缩。
+        return h('div', {
+          style: {
+            display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0,
+          },
+        }, [
+          h('span', {
+            style: {
+              fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap', minWidth: 0, flex: '1 1 auto',
+            },
+            title: appName,
+          }, appName),
+          h('span', {
+            class: 'mono-font',
+            style: { fontSize: '11px', whiteSpace: 'nowrap', flexShrink: 0 },
+            title: r.target,
+          }, appVolumeTargetLabel(r.target)),
+        ])
       }
       return r.target + (r.db_name ? ` / ${r.db_name}` : '')
     },
@@ -272,18 +291,18 @@ const columns = computed<DataTableColumns<BackupJob>>(() => [
         : h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => 'S3 (未知)' })
     },
   },
-  { title: '调度计划', key: 'schedule', width: 120, render: (r) => r.schedule?.cron ? h('code', { style: 'font-size: 12px' }, r.schedule.cron) : '仅手动' },
-  { title: '保留', key: 'retention', width: 80, render: (r) => `${r.retention} 份` },
+  { title: '调度计划', key: 'schedule', width: 110, render: (r) => r.schedule?.cron ? h('code', { style: 'font-size: 12px' }, r.schedule.cron) : '仅手动' },
+  { title: '保留', key: 'retention', width: 64, render: (r) => `${r.retention} 份` },
   {
     title: '最近执行',
     key: 'last_run',
-    width: 170,
+    width: 160,
     render: (r) => {
       if (!r.last_run) return '-'
       const hasErr = Boolean(r.last_error)
-      return h(NSpace, { size: 4, align: 'center' }, {
+      return h(NSpace, { size: 4, align: 'center', wrap: false }, {
         default: () => [
-          h('span', { style: 'font-size: 12px' }, formatTime(r.last_run)),
+          h('span', { style: 'font-size: 12px', whiteSpace: 'nowrap' }, formatTime(r.last_run)),
           hasErr ? h(NTag, { size: 'tiny', type: 'error', bordered: false }, { default: () => '失败' }) : null,
         ],
       })
@@ -292,7 +311,7 @@ const columns = computed<DataTableColumns<BackupJob>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 220,
+    width: 210,
     render: (r) =>
       h(NSpace, { size: 6 }, {
         default: () => [
@@ -561,6 +580,9 @@ async function loadData() {
   loading.value = true
   try {
     jobs.value = await listBackupJobs()
+    // 刷新后回第 1 页（§9.4：刷新、切页签或筛选变更时复位页码）。
+    resetJobPage()
+    resetGroupPages()
   } catch (e: any) {
     message.error(e.message || '获取备份任务失败')
   } finally {
@@ -750,6 +772,9 @@ async function submitCreate() {
 // app_volume 任务按 app_id 分组，其他种类任务仍平铺在「其他备份任务」。
 const jobView = ref<'flat' | 'byApp'>('byApp')
 
+// 切聚合/平铺视图时复位页码（平铺表接 jobPagination，聚合视图各组表见 groupPaginationMap）。
+watch(jobView, () => { resetJobPage(); resetGroupPages() })
+
 const appVolumeGroups = computed(() => {
   const groups: { appId: string; appName: string; jobs: BackupJob[] }[] = []
   const byId = new Map<string, { appId: string; appName: string; jobs: BackupJob[] }>()
@@ -768,6 +793,43 @@ const appVolumeGroups = computed(() => {
 })
 
 const otherJobs = computed(() => jobs.value.filter((j) => j.kind !== 'app_volume'))
+
+const OTHER_GROUP_KEY = '__other__'
+
+// 聚合视图每组独立分页（§9.4）：一个共享 jobPagination 无法分给 N 张表
+// （页码串扰）；每组按 key 各建一个 useTablePagination 实例，rowCount 按
+// 该组实际行数取值，行数变少时页码自动收敛，杜绝空白页。
+const groupPaginationMap = reactive<Record<string, ReturnType<typeof useTablePagination>>>({})
+
+function ensureGroupPagination(key: string) {
+  let entry = groupPaginationMap[key]
+  if (!entry) {
+    const rowCount = computed(() =>
+      key === OTHER_GROUP_KEY
+        ? otherJobs.value.length
+        : jobs.value.filter((j) => j.kind === 'app_volume' && (j.app_id || '') === key).length,
+    )
+    entry = useTablePagination({ pageSize: 20, rowCount })
+    groupPaginationMap[key] = entry
+  }
+  return entry
+}
+
+function resetGroupPages() {
+  for (const entry of Object.values(groupPaginationMap)) entry.resetPage()
+}
+
+// 组增减时同步建/删分页实例（watch 在 setup 中执行，避免在模板渲染时创建 watcher）。
+watch(
+  () => [...appVolumeGroups.value.map((g) => g.appId), ...(otherJobs.value.length > 0 ? [OTHER_GROUP_KEY] : [])],
+  (keys) => {
+    for (const key of keys) ensureGroupPagination(key)
+    for (const key of Object.keys(groupPaginationMap)) {
+      if (!keys.includes(key)) delete groupPaginationMap[key]
+    }
+  },
+  { immediate: true },
+)
 
 async function doRun(job: BackupJob) {
   try {
@@ -888,29 +950,36 @@ onActivated(() => {
           <div class="tab-pane-content">
             <div class="job-view-toolbar">
               <span class="tip-hint" style="font-size: 12px; color: var(--text-secondary)">按应用聚合时，应用数据卷任务按应用分组，其他类型任务归入「其他备份任务」。</span>
-              <NRadioGroup v-model:value="jobView" size="small">
-                <NRadioButton value="byApp">按应用聚合</NRadioButton>
-                <NRadioButton value="flat">平铺</NRadioButton>
-              </NRadioGroup>
+              <div class="job-view-right">
+                <span class="job-total">共 {{ jobs.length }} 个任务</span>
+                <NRadioGroup v-model:value="jobView" size="small">
+                  <NRadioButton value="byApp">按应用聚合</NRadioButton>
+                  <NRadioButton value="flat">平铺</NRadioButton>
+                </NRadioGroup>
+              </div>
             </div>
-            <!-- 聚合视图：每组任务数天然有限，属 §8.2 例外：不分页；组列表自身滚动（外层 overflow hidden，见下方样式） -->
+            <!-- 聚合视图：每组表各接一个独立分页实例（groupPaginationMap），页码互不串扰；组列表自身滚动（外层 overflow hidden，见下方样式） -->
             <div v-if="jobView === 'byApp' && jobs.length > 0" class="job-group-scroll">
               <div v-for="g in appVolumeGroups" :key="g.appId" class="job-group-card">
-                <NCard :bordered="false" size="small" :title="`${g.appName}（${g.jobs.length} 个任务）`" :content-style="{ padding: 0 }">
+                <NCard :bordered="false" size="small" :title="`${g.appName}（共 ${g.jobs.length} 个任务）`" :content-style="{ padding: 0 }">
                   <NDataTable
                     :columns="columns"
                     :data="g.jobs"
                     :row-key="(r: BackupJob) => r.id"
+                    :scroll-x="1280"
+                    :pagination="groupPaginationMap[g.appId]?.pagination"
                     :bordered="false"
                     size="small"
                   />
                 </NCard>
               </div>
-              <NCard v-if="otherJobs.length > 0" :bordered="false" size="small" title="其他备份任务" :content-style="{ padding: 0 }">
+              <NCard v-if="otherJobs.length > 0" :bordered="false" size="small" :title="`其他备份任务（共 ${otherJobs.length} 个任务）`" :content-style="{ padding: 0 }">
                 <NDataTable
                   :columns="columns"
                   :data="otherJobs"
                   :row-key="(r: BackupJob) => r.id"
+                  :scroll-x="1280"
+                  :pagination="groupPaginationMap[OTHER_GROUP_KEY]?.pagination"
                   :bordered="false"
                   size="small"
                 />
@@ -922,7 +991,8 @@ onActivated(() => {
                 :columns="columns"
                 :data="jobs"
                 :row-key="(r: BackupJob) => r.id"
-                :pagination="{ pageSize: 20 }"
+                :scroll-x="1280"
+                :pagination="jobPagination"
                 :bordered="false"
                 size="small"
               >
@@ -1261,6 +1331,18 @@ onActivated(() => {
     flex-wrap: wrap;
     margin-bottom: 10px;
     flex-shrink: 0;
+  }
+
+  .job-view-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .job-total {
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
   }
 
   .job-group-scroll {

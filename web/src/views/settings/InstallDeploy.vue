@@ -5,6 +5,7 @@ import {
   NSpace,
   NButton,
   NIcon,
+  NInput,
   NTag,
   useMessage,
 } from 'naive-ui'
@@ -52,6 +53,15 @@ async function genToken() {
   }
 }
 
+async function copyToken() {
+  const ok = await copyToClipboard(enrollToken.value)
+  if (ok) {
+    message.success('已复制注册令牌')
+  } else {
+    message.error('复制失败，请手动选中文本复制')
+  }
+}
+
 async function copyCmd() {
   const ok = await copyToClipboard(installCmd.value)
   if (ok) {
@@ -75,39 +85,44 @@ onMounted(() => {
           一键安装 Agent
         </span>
       </template>
-      <template #header-extra>
-        <div class="os-selector-wrap">
-          <span class="selector-label">目标系统:</span>
-          <div class="os-segment-group">
-            <button
-              type="button"
-              class="os-segment-btn"
-              :class="{ active: osType === 'linux' }"
-              @click="osType = 'linux'"
-            >
-              <OsLogo os="linux" :show-badge="false" :size="16" class="btn-logo" />
-              <span class="btn-text">Linux</span>
-              <span class="btn-sub">x86 / arm</span>
-            </button>
-            <button
-              type="button"
-              class="os-segment-btn"
-              :class="{ active: osType === 'windows' }"
-              @click="osType = 'windows'"
-            >
-              <OsLogo os="windows" :show-badge="false" :size="14" class="btn-logo win-logo" />
-              <span class="btn-text">Windows</span>
-              <span class="btn-sub">x64</span>
-            </button>
-          </div>
-        </div>
-      </template>
 
       <NSpace vertical :size="16">
-        <!-- Token display -->
+        <!-- 目标系统切换：标题区只留单文字标题，切换控件移到卡片内容顶部右侧 -->
+        <NSpace justify="end">
+          <div class="os-selector-wrap">
+            <span class="selector-label">目标系统:</span>
+            <div class="os-segment-group">
+              <button
+                type="button"
+                class="os-segment-btn"
+                :class="{ active: osType === 'linux' }"
+                @click="osType = 'linux'"
+              >
+                <OsLogo os="linux" :show-badge="false" :size="16" class="btn-logo" />
+                <span class="btn-text">Linux</span>
+                <span class="btn-sub">x86 / arm</span>
+              </button>
+              <button
+                type="button"
+                class="os-segment-btn"
+                :class="{ active: osType === 'windows' }"
+                @click="osType = 'windows'"
+              >
+                <OsLogo os="windows" :show-badge="false" :size="14" class="btn-logo win-logo" />
+                <span class="btn-text">Windows</span>
+                <span class="btn-sub">x64</span>
+              </button>
+            </div>
+          </div>
+        </NSpace>
+
+        <!-- Token display：注册令牌默认掩码展示，与其他密钥同款
+             NInput type=password + show-password-on=click（点眼睛查看明文）；
+             复制按钮复制完整令牌，安装命令本身仍含完整令牌以便一键安装。 -->
         <div v-if="enrollToken" class="token-box">
           <span class="token-label">注册令牌:</span>
-          <code class="token-value">{{ enrollToken }}</code>
+          <NInput :value="enrollToken" type="password" show-password-on="click" readonly :input-props="{ autocomplete: 'off' }" class="token-input" />
+          <NButton size="tiny" quaternary @click="copyToken">复制</NButton>
           <NButton size="tiny" quaternary @click="genToken">重新生成</NButton>
         </div>
         <NButton v-else type="primary" @click="genToken">生成注册令牌</NButton>
@@ -273,13 +288,7 @@ code { font-size: 12px; }
   border: 1px solid var(--border-color);
 }
 .token-label { font-size: 13px; color: var(--text-secondary); flex-shrink: 0; }
-.token-value {
-  font-family: 'SFMono-Regular', Consolas, monospace;
-  font-size: 13px;
-  word-break: break-all;
-  flex: 1;
-  color: var(--text-primary);
-}
+.token-input { flex: 1; min-width: 0; }
 
 .cmd-section { margin-top: 4px; }
 .cmd-label { font-size: 14px; font-weight: 600; margin-bottom: 8px; color: var(--text-primary); }

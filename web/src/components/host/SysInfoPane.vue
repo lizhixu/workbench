@@ -1,8 +1,6 @@
 <script setup lang="ts">
 import { h, ref, watch, onMounted, computed } from 'vue'
 import {
-  NTabs,
-  NTabPane,
   NDataTable,
   NSpin,
   NButton,
@@ -21,11 +19,17 @@ import { useAuthStore } from '../../stores/auth'
 import { useTablePagination } from '../../composables/useTablePagination'
 import { fmtDateTime } from '../../utils/time'
 
-const props = defineProps<{ hostId: string }>()
+// 子页签状态由 HostDetail 持有（DESIGN.md §9.5：Tab 在卡片外，由父级渲染），
+// 本组件只按传入的页签取数。
+const props = defineProps<{ hostId: string; activeTab: string }>()
+const emit = defineEmits<{ (e: 'update:activeTab', value: string): void }>()
 const message = useMessage()
 const auth = useAuthStore()
 const loading = ref(false)
-const activeTab = ref('process')
+const activeTab = computed({
+  get: () => props.activeTab,
+  set: (v: string) => emit('update:activeTab', v),
+})
 const updateTime = ref('')
 const rows = ref<Record<string, any>[]>([])
 const rawText = ref('')
@@ -91,9 +95,29 @@ const loginColumns = computed<DataTableColumns<Record<string, any>>>(() => {
   const detailTag = (_row: Record<string, any>, _idx: number) => {
     const d = (_row as any)?.detail
     if (!d) return h('span', { class: 'muted-cell' }, '—')
-    const type: 'success' | 'warning' | 'default' =
-      d === 'still logged in' ? 'success' : d === 'still running' ? 'info' as any : 'default'
-    return h(NTag, { size: 'small', bordered: false, type: type as any }, { default: () => d })
+    const map: Record<string, { text: string; type: 'success' | 'info' | 'warning' | 'error' | 'default' }> = {
+      'still logged in': { text: '仍在线', type: 'success' },
+      'still running': { text: '运行中', type: 'info' },
+      'gone - no logout': { text: '未正常退出', type: 'warning' },
+      crash: { text: '崩溃', type: 'error' },
+      down: { text: '已停止', type: 'default' },
+    }
+    const e = map[d] || { text: d, type: 'default' as const }
+    return h(NTag, { size: 'small', bordered: false, type: e.type }, { default: () => e.text })
+  }
+  // `last -F` 把开始时间、结束时间与时长拼进同一字段
+  // （如 "Aug 20 12:21 - 14:57 (02:35)"）：只取 " - " 之前的开始时间，
+  // 再用 fmtDateTime 按面板时区格式化；时长另有 duration 列，不重复展示。
+  const startedLabel = (row: Record<string, any>) => {
+    const raw = String((row as any)?.started || '').trim()
+    if (!raw) return '—'
+    const start = raw.split(' - ')[0].replace(/\s*\(\d{2}:\d{2}\)\s*$/, '').trim()
+    // 无 -F 的 `last` 输出不带年份（如 "Aug 20 12:21"，指当年）；V8 解析
+    // 缺少年份的英文时间会默认成 2001 年，必须先补当年年份。
+    const withYear = /\b\d{4}\b/.test(start) ? start : `${start} ${new Date().getFullYear()}`
+    const d = new Date(withYear)
+    if (Number.isNaN(d.getTime())) return start
+    return fmtDateTime(d)
   }
   const typeLabel = (row: Record<string, any>) => {
     const t = (row as any)?.type
@@ -101,6 +125,7 @@ const loginColumns = computed<DataTableColumns<Record<string, any>>>(() => {
       session: { text: '用户登录', color: 'info' },
       reboot: { text: '重启', color: 'warning' },
       shutdown: { text: '关机', color: 'error' },
+      crash: { text: '崩溃', color: 'error' },
       wtmp: { text: '日志起点', color: 'default' },
     }
     const e = map[t] || { text: t || '未知', color: 'default' }
@@ -111,7 +136,7 @@ const loginColumns = computed<DataTableColumns<Record<string, any>>>(() => {
     { title: '用户', key: 'user', width: 120 },
     { title: '终端', key: 'tty', width: 90 },
     { title: '来源', key: 'from', minWidth: 140, ellipsis: { tooltip: true } },
-    { title: '开始时间', key: 'started', minWidth: 180 },
+    { title: '开始时间', key: 'started', minWidth: 180, ellipsis: { tooltip: true }, render: startedLabel },
     { title: '时长', key: 'duration', width: 100 },
     { title: '状态', key: 'detail', width: 130, render: detailTag },
     { title: '内核', key: 'kernel', width: 160 },
@@ -149,14 +174,26 @@ const genericColumns = computed<DataTableColumns<Record<string, any>>>(() => {
   if (!first) return [] as DataTableColumns<Record<string, any>>
   const titleMap: Record<string, Record<string, string>> = {
     process: { name: '进程名', pid: 'PID', user: '用户', uid: 'UID', start_time: '启动时间', cpu: 'CPU(%)', mem: '内存', cmd: '命令参数', command: '命令' },
-    port: { proto: '协议', addr: '监听地址', laddr: '本地地址', process: '进程名', pid: 'PID', state: '状态' },
+    port: { proto: '协议', address: '地址', port: '端口', process: '进程名', pid: 'PID', state: '状态' },
   }
   const titles = titleMap[activeTab.value] || {}
-  const cols = Object.keys(first).map((k) => ({
-    title: titles[k] || k,
-    key: k,
-    ellipsis: { tooltip: true },
-  })) as DataTableColumns<Record<string, any>>
+  const cols = Object.keys(first).map((k) => {
+    const col: Record<string, any> = {
+      title: titles[k] || k,
+      key: k,
+      ellipsis: { tooltip: true },
+    }
+    // gopsutil 返回的 CPU/内存是未格式化的百分比浮点
+    // （如 0.008562769145701074），保留 2 位小数并补 % 单位。
+    if (activeTab.value === 'process' && (k === 'cpu' || k === 'mem')) {
+      col.width = 100
+      col.render = (row: Record<string, any>) => {
+        const v = Number(row[k])
+        return Number.isFinite(v) ? `${v.toFixed(2)}%` : '—'
+      }
+    }
+    return col
+  }) as DataTableColumns<Record<string, any>>
   if (activeTab.value === 'process' && canKill.value) {
     cols.push({
       title: '操作',
@@ -213,15 +250,6 @@ const columns = computed<DataTableColumns<Record<string, any>>>(() => {
 
 const isStructured = computed(() => activeTab.value === 'login' || activeTab.value === 'user')
 
-function onTabWheel(e: WheelEvent) {
-  const el = e.currentTarget as HTMLElement
-  if (!el) return
-  if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
-    el.scrollLeft += e.deltaY * 0.8
-    e.preventDefault()
-  }
-}
-
 watch(activeTab, refresh)
 onMounted(refresh)
 </script>
@@ -229,15 +257,6 @@ onMounted(refresh)
 <template>
   <div class="sysinfo-pane">
     <div class="sysinfo-header">
-      <div class="tabs-scroller" @wheel.prevent="onTabWheel">
-        <NTabs v-model:value="activeTab" type="line" size="small">
-          <NTabPane name="process" tab="进程清单" />
-          <NTabPane name="port" tab="网络端口" />
-          <NTabPane name="user" tab="系统账号" />
-          <NTabPane name="login" tab="登录历史" />
-        </NTabs>
-      </div>
-
       <div class="update-time-box">
         <span v-if="updateTime">数据更新于 {{ updateTime }}</span>
         <NButton quaternary size="tiny" :loading="loading" @click="refresh">
@@ -280,54 +299,14 @@ onMounted(refresh)
   height: 100%;
   min-height: 0;
 
+  /* Tab 已上提到 HostDetail 的卡片外（DESIGN.md §9.5），这里只剩右对齐的
+     更新时间与刷新按钮。 */
   .sysinfo-header {
-    position: sticky;
-    /* 抵消 .sub-view-pane 的内边距，使吸顶条能贴住面板上沿 */
-    top: calc(-1 * var(--card-padding));
-    z-index: 20;
-    background: var(--bg-card);
-    margin: calc(-1 * var(--card-padding)) calc(-1 * var(--card-padding)) 12px;
-    padding: 10px var(--card-padding) 0;
     display: flex;
-    align-items: flex-end;
-    justify-content: space-between;
-    gap: 16px;
-    border-bottom: 1px solid var(--border-color);
-
-    .tabs-scroller {
-      flex: 1;
-      min-width: 0;
-      overflow-x: auto;
-      overflow-y: hidden;
-      -webkit-overflow-scrolling: touch;
-      scrollbar-width: none;
-
-      &::-webkit-scrollbar {
-        display: none;
-      }
-
-      :deep(.n-tabs) {
-        min-width: max-content;
-      }
-
-      :deep(.n-tabs-nav-scroll-content) {
-        border-bottom: none !important;
-      }
-
-      :deep(.n-tabs-rail) {
-        border-bottom: none !important;
-      }
-
-      :deep(.n-tabs-tab) {
-        padding: 6px 12px 10px 12px;
-        white-space: nowrap;
-        font-size: 13px;
-      }
-
-      :deep(.n-tabs-bar) {
-        bottom: 0 !important;
-      }
-    }
+    align-items: center;
+    justify-content: flex-end;
+    flex-shrink: 0;
+    margin-bottom: 12px;
 
     .update-time-box {
       font-size: 12px;
@@ -336,7 +315,6 @@ onMounted(refresh)
       align-items: center;
       gap: 6px;
       flex-shrink: 0;
-      padding-bottom: 8px;
       user-select: none;
     }
   }
@@ -373,24 +351,6 @@ onMounted(refresh)
     white-space: pre;
     text-align: left;
     margin: 0;
-  }
-}
-
-/* 窄屏：tab 区域占满，更新时间换行 */
-@media (max-width: 768px) {
-  .sysinfo-header {
-    flex-wrap: wrap;
-
-    .tabs-scroller {
-      order: 1;
-      flex: 1 1 100%;
-    }
-
-    .update-time-box {
-      order: 2;
-      flex: 1 1 100%;
-      justify-content: flex-end;
-    }
   }
 }
 </style>

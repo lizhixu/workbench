@@ -695,5 +695,5 @@ AI 助手页（`web/src/views/ai/AiChat.vue`）的输入区域采用现代化的
 ### 9.19 品牌区与侧栏折叠联动规范（`AppShell.vue`）
 - **折叠状态单一事实源**：左侧栏折叠由 `navCollapsed` ref 承载并持久化到 `localStorage`（`watchman_nav_collapsed`）；顶栏品牌区与侧栏共用该状态，品牌区不得维护第二份折叠状态。
 - **标题即时收纳**：折叠时品牌标题（`.brand-title`）经模板 `v-if` 即时隐藏，与侧栏 `side-nav-label` 同款语义（宽度过渡、文字瞬隐）；展开时随状态恢复显示。
-- **Logo 与图标列对齐**：折叠态下 logo（30px）须与侧栏折叠后的图标列中心对齐——侧栏 52px、内边距 8px、右边框 1px → 18px 图标居中列中心 x≈25.5；header 左内边距 16px → logo 中心 x=31。以 `margin-left: -5.5px` 平移补偿，过渡 `0.18s ease` 与侧栏宽度过渡同步。
+- **Logo 与图标列对齐**：折叠态下 logo（30px）须与侧栏折叠后的图标列中心对齐——侧栏 52px、内边距 8px、右边框 1px → 18px 图标居中列中心 x≈25.5；header 左内边距 16px → logo 中心 x=31。折叠时顶栏左内边距改为 10.5px 补偿（`.app-top-header.collapsed { padding-left: 10.5px }`，过渡 `0.18s ease` 与侧栏宽度过渡同步），logo 中心随之落在 x=25.5。**严禁在 `.brand-logo` 上用负 `margin-left` 平移补偿**：`.header-left` 是 `overflow: hidden`，负 margin 会把 logo 左缘顶出裁剪区（左约 5.5px 被切），且切完可见中心也对不齐目标——2026-11-12 浏览器像素取证已确认该裁剪（六边形左描边消失、K 笔画左移 5px），`transform: translateX` 同样会被同一裁剪祖先切掉。
 - **窄屏豁免**：≤768px 移动端品牌标题恒隐藏、侧栏强制 48px 自有几何；logo 平移规则仅作用于 ≥769px 视口，不得影响移动端布局。

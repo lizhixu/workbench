@@ -72,7 +72,10 @@
           class="log-line"
           :class="line.cls"
         >
-          <span v-if="line.ts" class="log-ts">{{ line.ts }}</span><span>{{ line.rest }}</span>
+          <!-- 时间戳与正文之间保留一个空格：docker logs 行首是「ISO 时间 + 空格 +
+               正文」，上方的 tsRe 用 \s? 吃掉了这个分隔空格；不补回来的话 ISO
+               时间会与正文（常带应用自己的格式化时间）粘成一段，原文被改写。 -->
+          <span v-if="line.ts" class="log-ts">{{ line.ts }} </span><span>{{ line.rest }}</span>
         </div>
       </div>
       <p class="tip-hint">

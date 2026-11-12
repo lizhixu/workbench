@@ -185,7 +185,9 @@ const form = reactive({
   mesh_forward_entry_port: null as number | null,
   mesh_forward_target_port: null as number | null,
   env_vars_text: '',
-  ports: [] as (PortMapping & { bind_scope: 'public' | 'mesh' })[],
+  // 端口映射默认给一行初始空行（宿主/容器端口均为 0，仅占位展示）：
+  // 用户一眼可见填法，提交与校验时把“双 0 空行”当未填忽略。
+  ports: [{ host: 0, container: 0, bind_scope: 'public' }] as (PortMapping & { bind_scope: 'public' | 'mesh' })[],
   volumes_text: '',
   healthcheck_url: '',
   container_name: '',
@@ -427,13 +429,22 @@ function selectTemplate(id: string) {
   form.template_params = {}
 }
 
+function isEmptyPortRow(p: { host: number; container: number }): boolean {
+  return p.host === 0 && p.container === 0
+}
+
+// 端口列表是否“实际为空”：无行，或仅剩初始/用户清空后的双 0 空行。
+function isPortsEffectivelyEmpty(): boolean {
+  return form.ports.length === 0 || form.ports.every(isEmptyPortRow)
+}
+
 watch(sourceMode, (mode) => {
   // 切来源时清空模板残留，避免把模板端口误提交成镜像应用的配置
   if (mode !== 'template') {
     form.template_id = ''
     form.template_params = {}
   }
-  if (mode === 'image' && form.ports.length === 0) {
+  if (mode === 'image' && isPortsEffectivelyEmpty()) {
     form.ports = [{ host: 8080, container: 8080, bind_scope: 'public' }]
   }
 })
@@ -551,8 +562,9 @@ function applyImageProbe() {
   }
   const real = (m.exposed_ports || []).filter((p) => p > 0 && p <= 65535)
   if (real.length > 0) {
-    const isPlaceholder = form.ports.length === 1
-      && form.ports[0].host === 8080 && form.ports[0].container === 8080
+    const isPlaceholder = (form.ports.length === 1
+      && form.ports[0].host === 8080 && form.ports[0].container === 8080)
+      || (form.ports.length === 1 && isEmptyPortRow(form.ports[0]))
     if (form.ports.length === 0 || isPlaceholder) {
       form.ports = real.map((p) => ({ host: p, container: p, bind_scope: 'public' as const }))
     } else {
@@ -640,7 +652,7 @@ function applyRepoProbeAuto(meta: RepoMetadata) {
   } else if (meta.has_dockerfile && pathIsDefault && meta.dockerfile_path !== 'Dockerfile') {
     form.dockerfile = meta.dockerfile_path
   }
-  if (form.build_type === 'dockerfile' && meta.exposed_ports?.length && form.ports.length === 0) {
+  if (form.build_type === 'dockerfile' && meta.exposed_ports?.length && isPortsEffectivelyEmpty()) {
     form.ports = meta.exposed_ports
       .filter((p) => p > 0 && p <= 65535)
       .map((p) => ({ host: p, container: p, bind_scope: 'public' as const }))
@@ -1083,7 +1095,7 @@ async function loadData() {
   void loadCertSupport()
   // Docker 面板「部署新应用」跳转时带 host_id，直接预选目标主机
   const presetHost = typeof route.query.host_id === 'string' ? route.query.host_id : ''
-  if (presetHost && hosts.value.some((h) => h.id === presetHost)) {
+  if (presetHost && hosts.value.some((h) => h.id === presetHost && h.status === 'online')) {
     form.host_id = presetHost
   }
   // 无预选且在线主机只剩一台时直接选中：唯一选项不需要用户再点一次，
@@ -1225,6 +1237,9 @@ onActivated(() => {
 function validate(): string | null {
   if (!form.name.trim()) return '请填写应用名称'
   if (!form.host_id) return '请选择目标主机'
+  // 下拉已把离线主机置灰，但主机可能在选定后才离线：提交前再拦一次。
+  const targetHost = hosts.value.find((h) => h.id === form.host_id)
+  if (targetHost && targetHost.status !== 'online') return '所选目标主机已离线，请选择在线主机'
   switch (sourceMode.value) {
     case 'template':
       if (!form.template_id) return '请选择应用模板'
@@ -1251,6 +1266,8 @@ function validate(): string | null {
       break
   }
   for (const p of form.ports) {
+    // 双 0 空行是初始占位，未填即忽略，不当非法端口报错
+    if (isEmptyPortRow(p)) continue
     if (p.host <= 0 || p.host > 65535 || p.container <= 0 || p.container > 65535) {
       return `端口映射非法: ${p.host}:${p.container}`
     }
@@ -1496,7 +1513,7 @@ onMounted(loadData)
                   @click="selectTemplate(tpl.id)"
                 >
                   <div class="tpl-head">
-                    <span class="tpl-name">{{ tpl.name }}</span>
+                    <span class="tpl-name" :title="tpl.name">{{ tpl.name }}</span>
                     <NTag size="tiny" :bordered="false">{{ tpl.category }}</NTag>
                   </div>
                   <div class="tpl-desc">{{ tpl.description }}</div>
@@ -1516,8 +1533,9 @@ onMounted(loadData)
                     v-model:value="form.template_params[f.key]"
                     :type="f.is_secret ? 'password' : 'text'"
                     :show-password-on="f.is_secret ? 'click' : undefined"
-                    :placeholder="f.default ? `默认: ${f.default}` : f.description"
+                    :placeholder="f.default ? `默认: ${f.default}` : ''"
                   />
+                  <div v-if="f.description" class="field-hint tip-hint">{{ f.description }}</div>
                 </div>
                 <NAlert v-if="!selectedTemplate.env_fields.length" type="default" :show-icon="false">
                   该模板无必填参数，直接部署即可
@@ -1527,10 +1545,16 @@ onMounted(loadData)
 
             <NSpace>
               <NFormItem label="应用名称" required style="flex: 1">
-                <NInput v-model:value="form.name" placeholder="留空默认使用模板名" />
+                <NInput v-model:value="form.name" placeholder="如 my-app" />
+                <template #feedback>
+                  <span class="field-hint tip-hint">留空默认使用模板名</span>
+                </template>
               </NFormItem>
-              <NFormItem label="容器名（可选）" style="flex: 1">
-                <NInput v-model:value="form.container_name" placeholder="留空自动生成" />
+              <NFormItem label="容器名" style="flex: 1">
+                <NInput v-model:value="form.container_name" />
+                <template #feedback>
+                  <span class="field-hint tip-hint">可选，留空自动生成</span>
+                </template>
               </NFormItem>
             </NSpace>
           </template>
@@ -1541,8 +1565,11 @@ onMounted(loadData)
               <NFormItem label="应用名称" required style="flex: 1">
                 <NInput v-model:value="form.name" placeholder="如 my-nginx" />
               </NFormItem>
-              <NFormItem label="容器名（可选）" style="flex: 1">
-                <NInput v-model:value="form.container_name" placeholder="留空自动生成" />
+              <NFormItem label="容器名" style="flex: 1">
+                <NInput v-model:value="form.container_name" />
+                <template #feedback>
+                  <span class="field-hint tip-hint">可选，留空自动生成</span>
+                </template>
               </NFormItem>
             </NSpace>
 
@@ -1659,9 +1686,12 @@ onMounted(loadData)
                   :options="repoOptions"
                   :loading="loadingRepos"
                   :disabled="!githubMethod"
-                  :placeholder="githubMethod ? '搜索并选择您的代码仓库 (支持私有库与组织仓库)' : '请先选择接入方式'"
+                  :placeholder="githubMethod ? '搜索并选择您的代码仓库' : '请先选择接入方式'"
                   filterable
                 />
+                <template #feedback>
+                  <span class="field-hint tip-hint">支持私有库与组织仓库；未选择接入方式时不可选</span>
+                </template>
               </NFormItem>
               <div v-if="githubMethod && !loadingRepos && repoOptions.length === 0" class="hint github-method-hint">
                 {{
@@ -1707,12 +1737,15 @@ onMounted(loadData)
               <NInput v-model:value="form.branch" placeholder="main" />
             </NFormItem>
 
-            <NFormItem label="Git 凭据（私有仓库需要）">
+            <NFormItem label="Git 凭据">
               <NSelect
                 v-model:value="form.auth_vault_id"
                 :options="vaultOptions"
-                placeholder="从凭据金库选择 Access Token"
+                placeholder="选择凭据"
               />
+              <template #feedback>
+                <span class="field-hint tip-hint">私有仓库需要；从凭据金库选择 Access Token，公开仓库可不选</span>
+              </template>
             </NFormItem>
           </template>
 
@@ -1751,9 +1784,12 @@ onMounted(loadData)
             <NSelect
               v-model:value="form.host_id"
               :options="hostOptions"
-              placeholder="选择部署到的受管主机（需在线）"
+              placeholder="选择部署到的受管主机"
               filterable
             />
+            <template #feedback>
+              <span class="field-hint tip-hint">仅在线主机可选；离线主机在下拉中置灰并注明“离线”，上线后即可选择</span>
+            </template>
           </NFormItem>
 
           <!-- Git 构建配置 -->
@@ -1774,8 +1810,11 @@ onMounted(loadData)
                   :placeholder="form.build_type === 'compose' ? 'compose.yaml' : 'Dockerfile'"
                 />
               </NFormItem>
-              <NFormItem label="构建超时（秒）" style="flex: 1">
+              <NFormItem label="构建超时" style="flex: 1">
                 <NInputNumber v-model:value="form.build_timeout_sec" :min="60" style="width: 100%" />
+                <template #feedback>
+                  <span class="field-hint tip-hint">单位：秒，最少 60 秒</span>
+                </template>
               </NFormItem>
             </NSpace>
           </template>
@@ -1796,10 +1835,6 @@ onMounted(loadData)
                   <NButton quaternary type="error" size="small" @click="removePort(idx)">移除</NButton>
                 </NSpace>
                 <NButton dashed size="small" @click="addPort">添加端口映射</NButton>
-                <span v-if="meshProbeLoading" class="hint">正在探测目标主机的组网 IP…</span>
-                <span v-else-if="selectedHostMeshIP" class="hint">
-                  目标主机组网 IP：{{ selectedHostMeshIP }}（{{ selectedHostMeshSource === 'live' ? '实时探测' : '缓存' }}），「仅异地组网」端口将只绑定该 IP，公网无法访问
-                </span>
                 <NAlert
                   v-if="form.host_id && hasMeshPort && !selectedHostMeshIP"
                   type="warning"
@@ -1820,13 +1855,23 @@ onMounted(loadData)
                   </NButton>
                 </NAlert>
               </NSpace>
+              <template #feedback>
+                <span class="field-hint tip-hint">每行一条：宿主端口 → 容器端口，再选公网开放或仅异地组网；未填写的空行提交时自动忽略。</span>
+                <span v-if="meshProbeLoading" class="field-hint tip-hint">正在探测目标主机的组网 IP…</span>
+                <span v-else-if="selectedHostMeshIP" class="field-hint tip-hint">
+                  目标主机组网 IP：{{ selectedHostMeshIP }}（{{ selectedHostMeshSource === 'live' ? '实时探测' : '缓存' }}），「仅异地组网」端口将只绑定该 IP，公网无法访问
+                </span>
+              </template>
             </NFormItem>
 
-            <NFormItem label="健康检查 URL（可选，推荐）">
+            <NFormItem label="健康检查 URL">
               <NInput
                 v-model:value="form.healthcheck_url"
-                placeholder="http://127.0.0.1:8080/healthz（探活失败将自动保留旧版本）"
+                placeholder="http://127.0.0.1:8080/healthz"
               />
+              <template #feedback>
+                <span class="field-hint tip-hint">可选，推荐填写；探活失败将自动保留旧版本</span>
+              </template>
             </NFormItem>
           </template>
 
@@ -1843,13 +1888,16 @@ onMounted(loadData)
             <template v-if="form.mesh_forward_enabled">
               <NGrid :cols="24" :x-gap="12" style="margin-top: 12px;">
                 <NGi :span="12">
-                  <NFormItem label="入口主机（流量进入的主机）" required>
+                  <NFormItem label="入口主机" required>
                     <NSelect
                       v-model:value="form.mesh_forward_host_id"
                       :options="forwardHostOptions"
-                      placeholder="选择入口主机（优先推荐带公网 IP 的节点）"
+                      placeholder="选择入口主机"
                       filterable
                     />
+                    <template #feedback>
+                      <span class="field-hint tip-hint">流量进入的主机；优先推荐带公网 IP 的节点</span>
+                    </template>
                   </NFormItem>
                 </NGi>
                 <NGi :span="6">
@@ -1919,26 +1967,32 @@ onMounted(loadData)
             :mesh-forward-target-port="form.mesh_forward_target_port"
           />
 
-          <NFormItem v-if="sourceMode === 'image' || sourceMode === 'template'" label="挂载卷（每行 宿主路径:容器路径）">
+          <NFormItem v-if="sourceMode === 'image' || sourceMode === 'template'" label="挂载卷">
             <NInput
               v-model:value="form.volumes_text"
               type="textarea"
               :rows="2"
               placeholder="/opt/apps/demo/data:/app/data"
             />
+            <template #feedback>
+              <span class="field-hint tip-hint">每行一条，格式为“宿主路径:容器路径”</span>
+            </template>
           </NFormItem>
 
-          <NFormItem v-if="sourceMode !== 'template'" label="环境变量（每行 KEY=VALUE，值支持 {{ vault:id:secret }} 引用）">
+          <NFormItem v-if="sourceMode !== 'template'" label="环境变量">
             <NInput
               v-model:value="form.env_vars_text"
               type="textarea"
               :rows="4"
               placeholder="DATABASE_URL=postgres://...&#10;API_KEY={{ vault:cred123:secret }}"
             />
+            <template #feedback>
+              <span class="field-hint tip-hint">每行一条 KEY=VALUE；值支持 &#123;&#123; vault:id:secret &#125;&#125; 引用</span>
+            </template>
           </NFormItem>
 
           <!-- 域名与网关（创建时可选，创建后立即绑定反代） -->
-          <NFormItem label="域名与反代（可选，多域名支持，创建后自动绑定）">
+          <NFormItem label="域名与反代">
             <NSpace vertical style="width: 100%">
               <div
                 v-for="(item, idx) in domainRows"
@@ -1972,12 +2026,12 @@ onMounted(loadData)
                 </NButton>
               </div>
               <div style="display: flex; align-items: center; gap: 8px;">
-                <NButton dashed size="small" @click="addDomainRow">添加域名</NButton>
-                <span class="hint">证书默认自动匹配覆盖该域名的可用证书，无需逐个选择</span>
+                <!-- secondary 而非 dashed：dashed 在暗色下呈低对比灰态，看着像被禁用；
+                     本按钮始终可用，禁用原因见下方 #feedback。 -->
+                <NButton secondary size="small" @click="addDomainRow">添加域名</NButton>
               </div>
 
               <template v-if="activeDomains.length > 0">
-                <span class="hint">绑定后将在目标主机自动初始化系统托管的反代 Nginx 容器（占用 80/443，仅 Linux 主机）</span>
                 <NRadioGroup v-model:value="form.proxy_mode">
                   <NSpace>
                     <NRadio value="local">节点本地（应用所在主机运行反代）</NRadio>
@@ -1988,17 +2042,9 @@ onMounted(loadData)
                   v-if="form.proxy_mode === 'gateway'"
                   v-model:value="form.gateway_host_id"
                   :options="gatewayOptions"
-                  placeholder="选择网关主机（可走组网或直连）"
+                  placeholder="选择网关主机"
                   filterable
                 />
-                <span v-if="form.proxy_mode === 'gateway'" class="hint">
-                  <template v-if="gatewayMeshLink">
-                    公网用户 -&gt; 网关主机 (Nginx/SSL) -&gt; 异地组网 ({{ selectedHostMeshIP }}) -&gt; 应用主机，应用主机无需公网 IP
-                  </template>
-                  <template v-else>
-                    公网用户 -&gt; 网关主机 (Nginx/SSL) -&gt; 直连 应用主机 {{ selectedHost?.public_ip || '内网 IP' }}，无需异地组网；请确认网关能访问该地址
-                  </template>
-                </span>
                 <NAlert
                   v-if="form.proxy_mode === 'local' && selectedHost && !selectedHost.public_ip"
                   type="warning"
@@ -2096,18 +2142,33 @@ onMounted(loadData)
                         前往配置
                       </NButton>
                     </NAlert>
-                    <span class="hint">
-                      HTTP-01 验证在控制端主机临时监听 80 端口，仅当域名解析到控制端时可用；应用域名通常应选 DNS-01（需 dns-mng 自动解析）。
-                    </span>
                   </template>
-                  <span class="hint">
-                    通配符域名（如 *.example.com）不支持在线自动签发：请先到
-                    <a @click.prevent="router.push('/certs')">证书中心</a>
-                    手动 DNS-01 签发后，回到本页提交（或在上方高级中直接指定）。
-                  </span>
                 </template>
               </template>
             </NSpace>
+            <template #feedback>
+              <span class="field-hint tip-hint">可选，支持多域名，创建后自动绑定；“添加域名”始终可用，每点一次多一行，每行填一个域名。</span>
+              <span class="field-hint tip-hint">证书默认自动匹配覆盖该域名的可用证书，无需逐个选择。</span>
+              <span class="field-hint tip-hint">仅剩一行时“删除”不可用：至少保留一行域名输入框。</span>
+              <span v-if="activeDomains.length > 0" class="field-hint tip-hint">绑定后将在目标主机自动初始化系统托管的反代 Nginx 容器（占用 80/443，仅 Linux 主机）。</span>
+              <span v-if="form.proxy_mode === 'gateway' && activeDomains.length > 0" class="field-hint tip-hint">
+                可走组网或直连：
+                <template v-if="gatewayMeshLink">
+                  公网用户 -&gt; 网关主机 (Nginx/SSL) -&gt; 异地组网 ({{ selectedHostMeshIP }}) -&gt; 应用主机，应用主机无需公网 IP
+                </template>
+                <template v-else>
+                  公网用户 -&gt; 网关主机 (Nginx/SSL) -&gt; 直连 应用主机 {{ selectedHost?.public_ip || '内网 IP' }}，无需异地组网；请确认网关能访问该地址
+                </template>
+              </span>
+              <span v-if="hasUncoveredDomains && canIssue && issueAccounts.length > 0" class="field-hint tip-hint">
+                HTTP-01 验证在控制端主机临时监听 80 端口，仅当域名解析到控制端时可用；应用域名通常应选 DNS-01（需 dns-mng 自动解析）。
+              </span>
+              <span v-if="hasUncoveredDomains" class="field-hint tip-hint">
+                通配符域名（如 *.example.com）不支持在线自动签发：请先到
+                <a @click.prevent="router.push('/certs')">证书中心</a>
+                手动 DNS-01 签发后，回到本页提交（或在上方高级中直接指定）。
+              </span>
+            </template>
           </NFormItem>
         </NForm>
 
@@ -2199,9 +2260,11 @@ onMounted(loadData)
   min-width: 420px;
   position: sticky;
   top: 0;
-  /* 右侧面板高度铺满可视区域：100vh 减去顶栏(50px)、页面上下内边距与
-     页头（返回按钮+标题一行 ≈46px），卡片内部再自行切分滚动区。 */
-  height: calc(100vh - 50px - var(--page-padding) * 2 - 46px);
+  /* 高度跟随内容、不强制撑满视口：内容短时卡片贴合内容（旧的固定
+     calc(100vh…) 高度会在内容不足时在卡片底部留出约 400px 空白）；
+     内容长时以视口高度为上限，卡片内部自行滚动。 */
+  height: auto;
+  max-height: calc(100vh - 50px - var(--page-padding) * 2 - 46px);
 }
 
 @media (max-width: 1240px) {
@@ -2252,9 +2315,19 @@ onMounted(loadData)
     gap: 8px;
     margin-bottom: 6px;
 
+    /* 模板名过长（如 MySQL Relational Database）时单行省略、悬停看全名，
+       不再折到第二行把卡片撑高；分类标签不参与压缩。 */
     .tpl-name {
       font-weight: 600;
       font-size: 13px;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .n-tag {
+      flex-shrink: 0;
     }
   }
 
@@ -2309,6 +2382,15 @@ onMounted(loadData)
 .hint {
   font-size: 12px;
   color: var(--n-text-color-disabled, #999);
+}
+
+/* 表单字段说明文字（DESIGN.md §9.16）：统一 12px / 行高 1.6 / 次要文字色，
+   一律放在 NFormItem #feedback 插槽内，不写默认插槽、不写内联样式。 */
+.field-hint {
+  display: block;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
 }
 
 .github-method-hint {

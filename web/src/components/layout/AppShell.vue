@@ -350,6 +350,21 @@ function onTabsWheel(e: WheelEvent) {
   }
 }
 
+// 页签过多时新开的当前页签可能被挤出可视区：activeKey 变化后把当前
+// 页签滚动到可见位置（inline: nearest，只在超出可视区时滚动）。
+const tabsBarRef = ref<HTMLElement | null>(null)
+watch(
+  () => workspace.activeKey,
+  () => {
+    nextTick(() => {
+      tabsBarRef.value
+        ?.querySelector('.workspace-tab-item.active')
+        ?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' })
+    })
+  },
+  { flush: 'post' },
+)
+
 /**
  * KeepAlive 的 include。
  *
@@ -398,7 +413,7 @@ function handleUser(key: string) {
 <template>
   <NLayout style="height: 100vh" class="app-layout">
     <!-- 顶部 Header 导航与多 Workspace 页签栏 -->
-    <NLayoutHeader class="app-top-header">
+    <NLayoutHeader class="app-top-header" :class="{ collapsed: navCollapsed }">
       <div class="header-left">
         <div class="brand-logo" :class="{ collapsed: navCollapsed }" @click="router.push('/hosts')">
           <img src="/k-works.png" class="logo-img" alt="Logo" />
@@ -406,7 +421,7 @@ function handleUser(key: string) {
         </div>
 
         <!-- 顶部 Workspace 多页签栏 -->
-        <div class="workspace-tabs" @wheel.prevent="onTabsWheel">
+        <div class="workspace-tabs" ref="tabsBarRef" @wheel.prevent="onTabsWheel">
           <div
             v-for="(tab, index) in workspace.tabs"
             :key="tab.key"
@@ -622,6 +637,16 @@ function handleUser(key: string) {
   user-select: none;
   background-color: var(--bg-card);
   border-bottom: 1px solid var(--border-color);
+  // 侧栏折叠时左内边距 16px→10.5px，logo 中心由 x=31 移到 x=25.5，
+  // 与折叠后侧栏图标列中心对齐；与侧栏宽度过渡同步。只作用于桌面端，
+  // 窄屏（≤768px）顶栏另有 padding: 0 8px，不参与。
+  transition: padding-left 0.18s ease;
+
+  @media (min-width: 769px) {
+    &.collapsed {
+      padding-left: 10.5px;
+    }
+  }
 
   .header-left {
     display: flex;
@@ -643,17 +668,11 @@ function handleUser(key: string) {
     // 品牌区固定不收缩，页签再多也不被挤变形
     flex-shrink: 0;
     // 侧栏折叠时品牌区跟随收纳：标题由模板 v-if 即时隐藏（与
-    // side-nav-label 同款语义），logo 左移对齐折叠后的图标列——折叠
-    // 侧栏 52px、内边距 8px、右边框 1px，18px 图标居中列中心 x≈25.5；
-    // header 左内边距 16px + 30px logo 中心在 x=31，左移 5.5px 后两中
-    // 心落在同一竖线。窄屏（≤768px）标题恒隐藏、侧栏另有几何，不平移。
-    transition: margin-left 0.18s ease;
-
-    @media (min-width: 769px) {
-      &.collapsed {
-        margin-left: -5.5px;
-      }
-    }
+    // side-nav-label 同款语义）。logo 与折叠后图标列对齐不再用负
+    // margin 平移——.header-left 是 overflow:hidden，负 margin 会把
+    // logo 左缘顶出裁剪区切掉约 5.5px；改为顶栏折叠态左内边距
+    // 16px→10.5px 补偿（见 .app-top-header.collapsed），logo 中心
+    // 同样落在 x=25.5，且无任何裁剪。
 
     .logo-img {
       width: 30px;

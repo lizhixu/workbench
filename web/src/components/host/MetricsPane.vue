@@ -5,7 +5,6 @@ import {
   NGridItem,
   NRadioGroup,
   NRadioButton,
-  NSkeleton,
   NSpin,
   NTag,
   NButton,
@@ -692,24 +691,7 @@ watch(() => settings.themeMode, () => {
       </div>
     </div>
 
-    <!-- 首载骨架屏：加载期按图表卡片的真实版式占位并明示“正在加载”，
-         不再只留空白卡片 + 一个转圈（走查第 9 条：8–10 秒空白）。
-         档位切换且已有图表时不走这里，旧图继续展示（见下方 v-show）。 -->
-    <div v-if="loading && (!cpuChart || timeSpan !== 'realtime')" class="loading-skeleton">
-      <div class="loading-hint">
-        <NSpin size="small" />
-        <span>正在加载监控数据，请稍候…</span>
-      </div>
-      <NGrid cols="1 s:2" :x-gap="14" :y-gap="14" responsive="screen">
-        <NGridItem v-for="i in probeEnabled ? 6 : 4" :key="i">
-          <div class="chart-skeleton">
-            <NSkeleton text :width="'38%'" />
-            <NSkeleton text :width="'62%'" />
-            <NSkeleton :height="'118px'" :sharp="false" />
-          </div>
-        </NGridItem>
-      </NGrid>
-    </div>
+    <NSpin v-if="loading && (!cpuChart || timeSpan !== 'realtime')" class="spin-box" />
 
     <!-- 实时快捷指标条：负载 / Swap / 连接数 / 进程数 / CPU 型号 -->
     <div v-if="currentMetrics" class="quick-stats-strip">
@@ -991,33 +973,10 @@ watch(() => settings.themeMode, () => {
     }
   }
 
-  .loading-skeleton {
+  .spin-box {
     display: flex;
-    flex-direction: column;
-    gap: 12px;
-
-    .loading-hint {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 2px 0;
-      font-size: 12px;
-      color: var(--text-secondary);
-    }
-
-    // 与下方 .chart-card 同款版式（背景/边框/圆角/高度），只做加载占位。
-    // 注意：.chart-card 的样式嵌在 .grid-4-container 下，这里不能直接复用类名。
-    .chart-skeleton {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      background-color: var(--bg-card-subtle);
-      border: 1px solid var(--border-color);
-      border-radius: 6px;
-      padding: 10px;
-      height: 220px;
-      box-shadow: var(--shadow-sm);
-    }
+    justify-content: center;
+    padding: 80px 0;
   }
 
   .error-banner {
@@ -1069,12 +1028,6 @@ watch(() => settings.themeMode, () => {
 
     .grid-4-container {
       .chart-card {
-        height: 200px;
-      }
-    }
-
-    .loading-skeleton {
-      .chart-skeleton {
         height: 200px;
       }
     }

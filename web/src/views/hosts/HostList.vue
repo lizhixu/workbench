@@ -210,8 +210,17 @@ function hasPrice(h: Host): boolean {
   return h.price !== undefined && h.price !== null && !isNaN(Number(h.price))
 }
 
+function hasBilling(h: Host): boolean {
+  return (
+    hasPrice(h) ||
+    (h.traffic_limit_gb !== undefined && h.traffic_limit_gb !== null && Number(h.traffic_limit_gb) > 0) ||
+    !!h.expires_at ||
+    (!!h.notes && h.notes.trim() !== '')
+  )
+}
+
 function formatPrice(h: Host): string {
-  if (!hasPrice(h)) return '—'
+  if (!hasPrice(h)) return '-'
   const curMap: Record<string, string> = { CNY: '¥', USD: '$', EUR: '€', HKD: 'HK$', JPY: '¥', GBP: '£', USDT: 'USDT ' }
   const cur = curMap[h.currency || 'CNY'] || `${h.currency || ''} `
   const p = `${cur}${h.price}`
@@ -220,7 +229,7 @@ function formatPrice(h: Host): string {
 }
 
 function formatHostTraffic(h: Host): string {
-  if (!h.traffic_limit_gb) return '—'
+  if (!h.traffic_limit_gb) return '-'
   let used = (h.month_rx || 0) + (h.month_tx || 0)
   if (h.traffic_calc_type === 'out') used = h.month_tx || 0
   else if (h.traffic_calc_type === 'in') used = h.month_rx || 0
@@ -745,19 +754,19 @@ onUnmounted(() => {
               </div>
             </div>
 
-            <!-- 6. 财务与规格概要（四行常驻，未配置的行以「—」占位，保证各卡片行高一致） -->
-            <div class="col-billing">
-              <div class="billing-line">
+            <!-- 6. 财务与规格概要（配置什么展示什么，未配置不展示） -->
+            <div v-if="hasBilling(host)" class="col-billing">
+              <div v-if="hasPrice(host)" class="billing-line">
                 <span class="billing-label">资费</span>
                 <span class="billing-value" :title="formatPrice(host)">{{ formatPrice(host) }}</span>
               </div>
-              <div class="billing-line" :title="getTrafficTooltip(host)">
+              <div v-if="host.traffic_limit_gb" class="billing-line" :title="getTrafficTooltip(host)">
                 <span class="billing-label">流量</span>
                 <span class="billing-value">{{ formatHostTraffic(host) }}</span>
               </div>
-              <div class="billing-line">
+              <div v-if="host.expires_at" class="billing-line">
                 <span class="billing-label">到期</span>
-                <div v-if="host.expires_at" class="expiry-group" :class="getExpiryClass(host.expires_at)" :title="`${host.expires_at} (${getExpiryDaysText(host.expires_at)})`">
+                <div class="expiry-group" :class="getExpiryClass(host.expires_at)" :title="`${host.expires_at} (${getExpiryDaysText(host.expires_at)})`">
                   <span class="expiry-date">{{ host.expires_at }}</span>
                   <span class="expiry-badge">{{ getExpiryDaysText(host.expires_at) }}</span>
                   <span v-if="host.auto_renewal" class="auto-renew-badge">自续</span>
@@ -772,12 +781,11 @@ onUnmounted(() => {
                     <NIcon :component="LinkOutline" size="12" />
                   </a>
                 </div>
-                <span v-else class="billing-value">—</span>
               </div>
-              <!-- 备注行：未配置以「—」占位 -->
-              <div class="billing-line" :title="host.notes && host.notes.trim() ? `备注: ${host.notes}` : ''">
+              <!-- 备注行：配了就展示，没配隐藏 -->
+              <div v-if="host.notes && host.notes.trim()" class="billing-line" :title="`备注: ${host.notes}`">
                 <span class="billing-label">备注</span>
-                <span class="billing-value muted-notes">{{ host.notes && host.notes.trim() ? host.notes : '—' }}</span>
+                <span class="billing-value muted-notes">{{ host.notes }}</span>
               </div>
             </div>
 
@@ -982,8 +990,13 @@ onUnmounted(() => {
           }
 
           // 2. 主机名与系统
+          // 列宽必须锁死：min-width: 0 抵消 flex item 的 min-width: auto（自动最小值 =
+          // 内容 min-content），否则长主机名会把整列撑大、顶偏后面所有列
+          //（instance-20260909-083055 实测 253px 顶偏 +30px）。同列 .col-ips /
+          // .col-billing 已有 min-width: 0，本列此前漏写。
           .col-host-info {
             flex: 0 0 190px;
+            min-width: 0;
             display: flex;
             flex-direction: column;
             gap: 4px;
@@ -1055,9 +1068,9 @@ onUnmounted(() => {
             }
           }
 
-          // 4. CPU 与内存规格
+          // 4. CPU 与内存规格（与异地组网第 4 列同宽 200px，见 DESIGN.md §9.20）
           .col-specs {
-            flex: 0 0 180px;
+            flex: 0 0 200px;
             display: flex;
             flex-direction: column;
             gap: 4px;

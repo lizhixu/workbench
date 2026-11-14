@@ -2,7 +2,7 @@
 import { computed, h, onActivated, onMounted, reactive, ref, watch } from 'vue'
 import {
   NAlert, NButton, NCard, NCheckbox, NDataTable, NEmpty, NForm, NFormItem, NIcon, NInput,
-  NInputNumber, NModal, NPopconfirm, NRadio, NRadioButton, NRadioGroup, NSelect,
+  NInputNumber, NModal, NPopconfirm, NRadio, NRadioGroup, NSelect,
   NSpace, NSwitch, NTabPane, NTabs, NTag, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
@@ -34,8 +34,7 @@ const loading = ref(false)
 const showCreate = ref(false)
 const creating = ref(false)
 
-// 备份任务前端分页（§9.4：全量数组已在内存，走 useTablePagination；
-// 平铺视图的 NDataTable 接此对象，聚合视图每组表各接一个独立实例，见下方 groupPaginationMap）。
+// 备份任务前端分页（§9.4：全量数组已在内存，走 useTablePagination）。
 const jobCount = computed(() => jobs.value.length)
 const { pagination: jobPagination, resetPage: resetJobPage } = useTablePagination({ pageSize: 20, rowCount: jobCount })
 
@@ -237,7 +236,7 @@ const columns = computed<DataTableColumns<BackupJob>>(() => [
   {
     title: '目标对象',
     key: 'target',
-    width: 280,
+    minWidth: 220,
     ellipsis: { tooltip: true },
     render: (r) => {
       if (r.kind === 'app_volume') {
@@ -291,12 +290,12 @@ const columns = computed<DataTableColumns<BackupJob>>(() => [
         : h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => 'S3 (未知)' })
     },
   },
-  { title: '调度计划', key: 'schedule', width: 110, render: (r) => r.schedule?.cron ? h('code', { style: 'font-size: 12px' }, r.schedule.cron) : '仅手动' },
+  { title: '调度计划', key: 'schedule', width: 100, render: (r) => r.schedule?.cron ? h('code', { style: 'font-size: 12px' }, r.schedule.cron) : '仅手动' },
   { title: '保留', key: 'retention', width: 64, render: (r) => `${r.retention} 份` },
   {
     title: '最近执行',
     key: 'last_run',
-    width: 160,
+    width: 150,
     render: (r) => {
       if (!r.last_run) return '-'
       const hasErr = Boolean(r.last_error)
@@ -311,9 +310,9 @@ const columns = computed<DataTableColumns<BackupJob>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 210,
+    width: 224,
     render: (r) =>
-      h(NSpace, { size: 6 }, {
+      h(NSpace, { size: 6, wrap: false }, {
         default: () => [
           h(NButton, { size: 'tiny', secondary: true, type: 'primary', onClick: () => doRun(r) }, {
             icon: () => h(NIcon, null, { default: () => h(PlayOutline) }),
@@ -582,7 +581,6 @@ async function loadData() {
     jobs.value = await listBackupJobs()
     // 刷新后回第 1 页（§9.4：刷新、切页签或筛选变更时复位页码）。
     resetJobPage()
-    resetGroupPages()
   } catch (e: any) {
     message.error(e.message || '获取备份任务失败')
   } finally {
@@ -770,66 +768,23 @@ async function submitCreate() {
 // ---- 按应用聚合视图 ----
 // 应用详情页可以直接建本应用的备份任务，快照页则按应用聚合展示：
 // app_volume 任务按 app_id 分组，其他种类任务仍平铺在「其他备份任务」。
-const jobView = ref<'flat' | 'byApp'>('byApp')
-
-// 切聚合/平铺视图时复位页码（平铺表接 jobPagination，聚合视图各组表见 groupPaginationMap）。
-watch(jobView, () => { resetJobPage(); resetGroupPages() })
-
-const appVolumeGroups = computed(() => {
-  const groups: { appId: string; appName: string; jobs: BackupJob[] }[] = []
-  const byId = new Map<string, { appId: string; appName: string; jobs: BackupJob[] }>()
-  for (const j of jobs.value) {
-    if (j.kind !== 'app_volume') continue
-    let g = byId.get(j.app_id || '')
-    if (!g) {
-      const app = apps.value.find((a) => a.id === j.app_id)
-      g = { appId: j.app_id || '', appName: app?.name || j.app_id || '应用已删除', jobs: [] }
-      byId.set(j.app_id || '', g)
-      groups.push(g)
-    }
-    g.jobs.push(j)
+// 单列表按应用排序：应用数据卷任务按所属应用名升序（应用 ID 本身是
+// app_xxx 随机串，按它排看不出规律，故按名字排）；无所属应用的任务
+// （数据库/卷/目录）排在最后；同应用内按任务名称排序。
+const sortedJobs = computed(() => {
+  const appName = (j: BackupJob) => {
+    if (j.kind !== 'app_volume') return ''
+    return apps.value.find((a) => a.id === j.app_id)?.name || j.app_id || '应用已删除'
   }
-  return groups
+  return [...jobs.value].sort((a, b) => {
+    const an = appName(a)
+    const bn = appName(b)
+    if (!an && bn) return 1
+    if (an && !bn) return -1
+    if (an !== bn) return an.localeCompare(bn, 'zh-CN')
+    return a.name.localeCompare(b.name, 'zh-CN')
+  })
 })
-
-const otherJobs = computed(() => jobs.value.filter((j) => j.kind !== 'app_volume'))
-
-const OTHER_GROUP_KEY = '__other__'
-
-// 聚合视图每组独立分页（§9.4）：一个共享 jobPagination 无法分给 N 张表
-// （页码串扰）；每组按 key 各建一个 useTablePagination 实例，rowCount 按
-// 该组实际行数取值，行数变少时页码自动收敛，杜绝空白页。
-const groupPaginationMap = reactive<Record<string, ReturnType<typeof useTablePagination>>>({})
-
-function ensureGroupPagination(key: string) {
-  let entry = groupPaginationMap[key]
-  if (!entry) {
-    const rowCount = computed(() =>
-      key === OTHER_GROUP_KEY
-        ? otherJobs.value.length
-        : jobs.value.filter((j) => j.kind === 'app_volume' && (j.app_id || '') === key).length,
-    )
-    entry = useTablePagination({ pageSize: 20, rowCount })
-    groupPaginationMap[key] = entry
-  }
-  return entry
-}
-
-function resetGroupPages() {
-  for (const entry of Object.values(groupPaginationMap)) entry.resetPage()
-}
-
-// 组增减时同步建/删分页实例（watch 在 setup 中执行，避免在模板渲染时创建 watcher）。
-watch(
-  () => [...appVolumeGroups.value.map((g) => g.appId), ...(otherJobs.value.length > 0 ? [OTHER_GROUP_KEY] : [])],
-  (keys) => {
-    for (const key of keys) ensureGroupPagination(key)
-    for (const key of Object.keys(groupPaginationMap)) {
-      if (!keys.includes(key)) delete groupPaginationMap[key]
-    }
-  },
-  { immediate: true },
-)
 
 async function doRun(job: BackupJob) {
   try {
@@ -945,53 +900,20 @@ onActivated(() => {
     <!-- Tabs Container：Tab 与表格分层，完全对齐 AlertList 规范 -->
     <div class="tabs-container">
       <NTabs v-model:value="activeTab" type="line">
-        <!-- 备份任务列表 -->
+        <!-- 备份任务列表：单表，按应用排序（应用数据卷任务按所属应用名升序，
+          无所属应用的任务排最后），不再按应用分多张卡片。 -->
         <NTabPane name="jobs" tab="备份任务列表">
           <div class="tab-pane-content">
-            <div class="job-view-toolbar">
-              <span class="tip-hint" style="font-size: 12px; color: var(--text-secondary)">按应用聚合时，应用数据卷任务按应用分组，其他类型任务归入「其他备份任务」。</span>
-              <div class="job-view-right">
-                <span class="job-total">共 {{ jobs.length }} 个任务</span>
-                <NRadioGroup v-model:value="jobView" size="small">
-                  <NRadioButton value="byApp">按应用聚合</NRadioButton>
-                  <NRadioButton value="flat">平铺</NRadioButton>
-                </NRadioGroup>
-              </div>
-            </div>
-            <!-- 聚合视图：每组表各接一个独立分页实例（groupPaginationMap），页码互不串扰；组列表自身滚动（外层 overflow hidden，见下方样式） -->
-            <div v-if="jobView === 'byApp' && jobs.length > 0" class="job-group-scroll">
-              <div v-for="g in appVolumeGroups" :key="g.appId" class="job-group-card">
-                <NCard :bordered="false" size="small" :title="`${g.appName}（共 ${g.jobs.length} 个任务）`" :content-style="{ padding: 0 }">
-                  <NDataTable
-                    :columns="columns"
-                    :data="g.jobs"
-                    :row-key="(r: BackupJob) => r.id"
-                    :scroll-x="1280"
-                    :pagination="groupPaginationMap[g.appId]?.pagination"
-                    :bordered="false"
-                    size="small"
-                  />
-                </NCard>
-              </div>
-              <NCard v-if="otherJobs.length > 0" :bordered="false" size="small" :title="`其他备份任务（共 ${otherJobs.length} 个任务）`" :content-style="{ padding: 0 }">
-                <NDataTable
-                  :columns="columns"
-                  :data="otherJobs"
-                  :row-key="(r: BackupJob) => r.id"
-                  :scroll-x="1280"
-                  :pagination="groupPaginationMap[OTHER_GROUP_KEY]?.pagination"
-                  :bordered="false"
-                  size="small"
-                />
-              </NCard>
-            </div>
-            <NCard v-else :bordered="false" class="table-flex-fill">
+            <NCard :bordered="false" size="small" class="table-flex-fill job-list-card" :header-style="{ paddingLeft: '8px' }">
+              <template #header>
+                <span class="job-list-title">备份任务（共 {{ jobs.length }} 个任务）</span>
+              </template>
               <NDataTable
                 flex-height
                 :columns="columns"
-                :data="jobs"
+                :data="sortedJobs"
                 :row-key="(r: BackupJob) => r.id"
-                :scroll-x="1280"
+                :scroll-x="1200"
                 :pagination="jobPagination"
                 :bordered="false"
                 size="small"
@@ -1224,9 +1146,13 @@ onActivated(() => {
             归档保存在本地主机或 S3 存储桶中。执行恢复前系统会自动为当前状态创建临时安全副本（SafetyCopy）。
           </template>
         </NAlert>
-        <div style="flex: 1; min-height: 0">
+        <!-- NDataTable flex-height 必须自身有 flex: 1 才能拿到可用高度：
+          早前表格直接塞进 flex 列，表体高度算出来是 0，只剩表头和分页条，
+          5 条归档全渲染在 0 高滚动区里（AppDetail 部署历史同款教训）。 -->
+        <div style="flex: 1; min-height: 0; display: flex; flex-direction: column">
           <NDataTable
             flex-height
+            style="flex: 1; min-height: 0"
             :scroll-x="1180"
             :columns="archiveColumns"
             :data="archives"
@@ -1322,42 +1248,19 @@ onActivated(() => {
     overflow: hidden;
   }
 
-  /* 备份任务视图切换栏：左侧说明 + 右侧分段控件，窄屏自动换行 */
-  .job-view-toolbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    flex-wrap: wrap;
-    margin-bottom: 10px;
+  /* 列表标题与设置分区卡片标题同款：16px/700（NCard small 默认标题字重偏轻，
+     与 600 的表头比层级不突出）。标题左缘对齐首列文字：small 表格单元格
+     横向内边距 8px，卡片 header 左内边距覆写为 8px（模板 :header-style）。 */
+  .job-list-title {
+    font-size: 16px;
+    font-weight: 700;
+  }
+
+  /* 标题行底部分隔线：标题与表头色带之间划一道线，标题行不再悬浮。
+     用 var(--border-color)，禁用 --n-border-color（卡片内继承为透明，见 §9.6）。 */
+  .job-list-card :deep(.n-card-header) {
     flex-shrink: 0;
-  }
-
-  .job-view-right {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-
-  .job-total {
-    font-size: 12px;
-    color: var(--text-secondary);
-    white-space: nowrap;
-  }
-
-  .job-group-scroll {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    overscroll-behavior: contain;
-  }
-
-  .job-group-card {
-    margin-bottom: 12px;
-  }
-
-  .job-group-card:last-child {
-    margin-bottom: 0;
+    border-bottom: 1px solid var(--border-color);
   }
 }
 </style>

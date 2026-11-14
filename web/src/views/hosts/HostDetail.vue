@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from 'vue'
+import { defineAsyncComponent, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NSpin, NIcon, NSkeleton, useMessage, NTooltip, NTabs, NTabPane } from 'naive-ui'
+import { NSpin, NIcon, useMessage, NTooltip, NTabs, NTabPane } from 'naive-ui'
 import { getHost } from '../../api/hosts'
 import type { Host } from '../../api/types'
 import { useWorkspaceStore } from '../../stores/workspace'
@@ -69,11 +69,6 @@ const navTooltipShown = ref<Record<string, boolean>>({})
 function hideNavTooltips() {
   for (const item of subNavItems) navTooltipShown.value[item.key] = false
 }
-
-// Suspense fallback 的加载文案：按当前子页签给明确提示，避免只有转圈。
-const activeTabLabel = computed(
-  () => subNavItems.find((i) => i.key === activeSubTab.value)?.label || '',
-)
 
 // 设置可能在挂载后才加载完（比如首屏直连主机详情）。只在用户没有显式
 // 选过页签（URL 或点击）时应用首选项，避免覆盖用户操作。
@@ -276,15 +271,8 @@ onMounted(load)
                 />
               </template>
               <template #fallback>
-                <!-- 子面板异步 chunk 加载中：骨架 + 明确文案，不要只有转圈和空白 -->
                 <div class="pane-loading">
-                  <NSkeleton text :repeat="1" :width="'40%'" />
-                  <NSkeleton text :repeat="3" />
-                  <NSkeleton :height="'180px'" :sharp="false" />
-                  <div class="pane-loading-text">
-                    <NSpin size="small" />
-                    <span>正在加载{{ activeTabLabel }}，请稍候…</span>
-                  </div>
+                  <NSpin size="medium" />
                 </div>
               </template>
             </Suspense>
@@ -427,22 +415,10 @@ onMounted(load)
 
       .pane-loading {
         display: flex;
-        flex-direction: column;
-        align-items: stretch;
-        justify-content: flex-start;
-        gap: 12px;
+        align-items: center;
+        justify-content: center;
         min-height: 240px;
         height: 100%;
-
-        .pane-loading-text {
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          gap: 8px;
-          margin-top: 4px;
-          color: var(--text-secondary);
-          font-size: 13px;
-        }
       }
     }
   }

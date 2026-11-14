@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, h, onActivated, onDeactivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
-  NAlert, NButton, NCard, NDataTable, NEmpty, NForm, NFormItem, NInput,
+  NAlert, NButton, NCard, NDataTable, NEmpty, NForm, NFormItem, NIcon, NInput,
   NInputNumber, NModal, NPopconfirm, NProgress, NSelect, NSpace, NSwitch,
   NTag, NUpload, useMessage, type DataTableColumns, type UploadFileInfo,
 } from 'naive-ui'
+import { ArchiveOutline, TimeOutline } from '@vicons/ionicons5'
 import {
   backupDownloadUrl, backupStatus, cancelPendingRestore, createBackup, deleteBackup,
   getBackupPolicy, listBackups, restoreBackup, saveBackupPolicy, uploadRestore,
@@ -207,12 +208,19 @@ const columns = computed<DataTableColumns<BackupMeta>>(() => [
 <template>
   <NEmpty v-if="!isAdmin" description="备份与恢复仅管理员可用" />
   <NSpace v-else vertical :size="16">
-    <NAlert type="warning" :bordered="false">
-      备份包含控制端配置、凭据和解密密钥，请妥善保存。恢复会采用归档中的账号、面板域名与安全入口；被管主机上的应用数据需单独备份。
-    </NAlert>
     <NAlert v-if="loadError" type="error" :bordered="false">{{ loadError }}</NAlert>
-    <NCard v-if="task?.id || pending" size="small" :title="taskTitle">
-      <NAlert v-if="task?.error" type="error" :bordered="false">{{ task.error }}</NAlert>
+    <!-- 任务状态卡：仅在任务未成功时展示（进行中/失败/已取消/待重启）；成功后自动收起，
+      不常驻「备份已完成」/「恢复已应用」标题，成功结果以归档列表的新记录为准。
+      错误跟随记录：任务失败且已生成归档时，错误在归档行展示（S3 副本列），顶部不再重复；
+      只有失败且无对应归档记录（打包失败、恢复失败）时，错误才在顶部展示。 -->
+    <NCard v-if="(task?.id && task.status !== 'success') || pending" :bordered="false" size="small">
+      <template #header>
+        <span style="font-size: 16px; font-weight: 700">
+          <NIcon style="vertical-align: middle; margin-right: 6px"><ArchiveOutline /></NIcon>
+          {{ taskTitle }}
+        </span>
+      </template>
+      <NAlert v-if="task?.error && !task.archive" type="error" :bordered="false">{{ task.error }}</NAlert>
       <p v-if="task?.status === 'running'" class="task-detail">{{ phaseLabels[task.phase] || task.phase }} · 已处理 {{ task.files }} 个文件 / {{ bytes(task.bytes) }}</p>
       <p v-if="task?.result?.safety_copy" class="task-detail">恢复前安全副本：{{ task.result.safety_copy }}</p>
       <NAlert v-if="pending" type="warning" :bordered="false">
@@ -230,7 +238,13 @@ const columns = computed<DataTableColumns<BackupMeta>>(() => [
       </NSpace>
     </NCard>
 
-    <NCard title="自动备份" size="small">
+    <NCard :bordered="false" size="small">
+      <template #header>
+        <span style="font-size: 16px; font-weight: 700">
+          <NIcon style="vertical-align: middle; margin-right: 6px"><TimeOutline /></NIcon>
+          自动备份
+        </span>
+      </template>
       <NForm label-placement="top">
         <div class="policy-grid">
           <NFormItem label="启用每日备份"><NSwitch v-model:value="policy.enabled" /></NFormItem>
@@ -247,7 +261,13 @@ const columns = computed<DataTableColumns<BackupMeta>>(() => [
       <NAlert v-if="policy.last_error" type="error" :bordered="false">{{ policy.last_error }}</NAlert>
     </NCard>
 
-    <NCard title="备份归档" size="small">
+    <NCard :bordered="false" size="small">
+      <template #header>
+        <span style="font-size: 16px; font-weight: 700">
+          <NIcon style="vertical-align: middle; margin-right: 6px"><ArchiveOutline /></NIcon>
+          备份归档
+        </span>
+      </template>
       <template #header-extra><NSpace><NButton size="small" :loading="loading" @click="refresh">刷新</NButton><NButton size="small" :disabled="busy" @click="openRestore()">上传归档恢复</NButton></NSpace></template>
       <div class="backup-toolbar">
         <NInput v-model:value="note" :maxlength="200" clearable placeholder="备份备注（可选）" />

@@ -319,53 +319,52 @@ onMounted(loadData)
       </div>
     </div>
 
-    <!-- 筛选条 -->
-    <div class="network-toolbar">
-      <NSpace align="center" :size="12">
-        <NInput
-          v-model:value="searchKeyword"
-          placeholder="搜索主机名、物理 IP 或虚拟组网 IP..."
-          clearable
-          style="width: 280px"
-        >
-          <template #prefix><NIcon :component="SearchOutline" /></template>
-        </NInput>
-
-        <div class="filter-pills">
-          <button
-            class="pill-btn"
-            :class="{ active: statusFilter === 'all' }"
-            @click="statusFilter = 'all'"
-          >
-            全部节点 ({{ stats.total }})
-          </button>
-          <button
-            class="pill-btn"
-            :class="{ active: statusFilter === 'connected' }"
-            @click="statusFilter = 'connected'"
-          >
-            已连接 ({{ stats.connected }})
-          </button>
-          <button
-            class="pill-btn"
-            :class="{ active: statusFilter === 'not_joined' }"
-            @click="statusFilter = 'not_joined'"
-          >
-            未加入 ({{ stats.installed - stats.connected }})
-          </button>
-          <button
-            class="pill-btn"
-            :class="{ active: statusFilter === 'not_installed' }"
-            @click="statusFilter = 'not_installed'"
-          >
-            未安装 ({{ stats.total - stats.installed }})
-          </button>
-        </div>
-      </NSpace>
-    </div>
-
-    <!-- 采用与主机列表完全一致的卡片行列表 (清晰、不压缩、不挤压) -->
+    <!-- 卡片行列表：与主机列表共用同一套行距/列宽（见 DESIGN.md §9.20） -->
     <div class="network-card-wrap">
+      <!-- 筛选条：与主机列表一致，放在卡片内（见 DESIGN.md §9.20） -->
+      <div class="network-toolbar">
+        <NSpace align="center" :size="12">
+          <NInput
+            v-model:value="searchKeyword"
+            placeholder="搜索主机名、物理 IP 或虚拟组网 IP..."
+            clearable
+            style="width: 280px"
+          >
+            <template #prefix><NIcon :component="SearchOutline" /></template>
+          </NInput>
+
+          <div class="filter-pills">
+            <button
+              class="pill-btn"
+              :class="{ active: statusFilter === 'all' }"
+              @click="statusFilter = 'all'"
+            >
+              全部节点 ({{ stats.total }})
+            </button>
+            <button
+              class="pill-btn"
+              :class="{ active: statusFilter === 'connected' }"
+              @click="statusFilter = 'connected'"
+            >
+              已连接 ({{ stats.connected }})
+            </button>
+            <button
+              class="pill-btn"
+              :class="{ active: statusFilter === 'not_joined' }"
+              @click="statusFilter = 'not_joined'"
+            >
+              未加入 ({{ stats.installed - stats.connected }})
+            </button>
+            <button
+              class="pill-btn"
+              :class="{ active: statusFilter === 'not_installed' }"
+              @click="statusFilter = 'not_installed'"
+            >
+              未安装 ({{ stats.total - stats.installed }})
+            </button>
+          </div>
+        </NSpace>
+      </div>
       <NSpin v-if="loading && nodes.length === 0" style="padding: 60px" />
 
       <div v-else-if="filteredNodes.length === 0" class="empty-box">
@@ -440,7 +439,7 @@ onMounted(loadData)
           <div class="col-node">
             <div class="field-label">节点内部域名 / 版本</div>
             <div v-if="row.installed" class="node-fqdn-box">
-              <span class="fqdn-text">{{ row.node_name || '-' }}</span>
+              <span class="fqdn-text" :title="row.node_name">{{ row.node_name || '-' }}</span>
               <span class="ver-text">{{ row.version ? `v${row.version}` : '' }}</span>
             </div>
             <div v-else class="text-muted">未部署客户端</div>
@@ -734,7 +733,7 @@ onMounted(loadData)
 
 <style scoped lang="scss">
 .network-view {
-  gap: 16px;
+  gap: 12px;
   overflow-y: auto;
 }
 
@@ -858,9 +857,14 @@ onMounted(loadData)
 
 .network-card-wrap {
   flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
   background: var(--bg-card);
   border: 1px solid var(--border-color);
   border-radius: 8px;
+  padding: var(--card-padding);
   overflow: hidden;
 
   .empty-box {
@@ -876,7 +880,7 @@ onMounted(loadData)
     .node-row {
       display: flex;
       align-items: center;
-      padding: 16px 20px;
+      padding: 18px 12px;
       border-bottom: 1px solid var(--border-color);
       transition: background-color 0.15s ease;
 
@@ -931,8 +935,11 @@ onMounted(loadData)
         }
       }
 
+      // 主机名列：与主机列表 .col-host-info 同款，min-width: 0 锁死 190px 列宽，
+      // 长主机名只在列内截断、不得撑大列宽顶偏后面各列（见 DESIGN.md §9.20）。
       .col-host {
-        flex: 0 0 200px;
+        flex: 0 0 190px;
+        min-width: 0;
         display: flex;
         flex-direction: column;
         gap: 4px;
@@ -952,7 +959,7 @@ onMounted(loadData)
             flex: 1;
             min-width: 0;
             font-weight: 600;
-            font-size: 14px;
+            font-size: 15px;
             color: var(--text-primary);
             white-space: nowrap;
             overflow: hidden;
@@ -975,7 +982,7 @@ onMounted(loadData)
         .status-pill {
           display: inline-flex;
           align-items: center;
-          padding: 4px 12px;
+          padding: 4px 14px;
           border-radius: 14px;
           font-size: 12px;
           font-weight: 500;
@@ -1044,18 +1051,27 @@ onMounted(loadData)
           color: var(--text-tertiary, #8c8c8c);
         }
 
+        // 域名与版本同一行：域名过长时只在列内截断（单行省略号），版本不被挤掉；
+        // 此前两者均无任何截断样式，长域名会换行两行、窄视口下溢出盖住后面的列。
         .node-fqdn-box {
           display: flex;
           align-items: baseline;
           gap: 6px;
+          min-width: 0;
 
           .fqdn-text {
+            flex: 1;
+            min-width: 0;
             font-size: 12.5px;
             font-weight: 500;
             color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
           }
 
           .ver-text {
+            flex-shrink: 0;
             font-size: 11px;
             color: var(--text-secondary);
           }

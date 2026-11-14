@@ -850,7 +850,7 @@ onMounted(async () => {
     .banner-changelog {
       margin-top: 6px;
       background: var(--n-color-modal);
-      border: 1px solid var(--n-border-color);
+      border: 1px solid var(--border-color);
       border-radius: 6px;
       overflow: hidden;
 
@@ -952,14 +952,14 @@ onMounted(async () => {
         :deep(blockquote) {
           margin: 6px 0;
           padding: 2px 0 2px 8px;
-          border-left: 2px solid var(--n-border-color);
+          border-left: 2px solid var(--border-color);
           color: var(--n-text-color-3);
         }
 
         :deep(hr) {
           margin: 10px 0;
           border: none;
-          border-top: 1px solid var(--n-border-color);
+          border-top: 1px solid var(--border-color);
         }
       }
     }
@@ -969,7 +969,7 @@ onMounted(async () => {
     background: var(--n-color-modal);
     padding: 10px 16px;
     border-radius: 6px;
-    border: 1px solid var(--n-border-color);
+    border: 1px solid var(--border-color);
 
     .highlight {
       color: var(--primary-color, #6366f1);
@@ -989,7 +989,7 @@ onMounted(async () => {
 
   .section-box {
     background: var(--n-color-modal);
-    border: 1px solid var(--n-border-color);
+    border: 1px solid var(--border-color);
     border-radius: 6px;
     padding: 14px;
     display: flex;
@@ -1107,7 +1107,7 @@ onMounted(async () => {
   }
 
   .hosts-preview-box {
-    border: 1px solid var(--n-border-color);
+    border: 1px solid var(--border-color);
     border-radius: 6px;
     background: var(--n-color-modal);
     overflow: hidden;
@@ -1118,7 +1118,7 @@ onMounted(async () => {
       align-items: center;
       padding: 8px 12px;
       background: rgba(125, 125, 125, 0.06);
-      border-bottom: 1px solid var(--n-border-color);
+      border-bottom: 1px solid var(--border-color);
       font-size: 12px;
       font-weight: 600;
       color: var(--text-secondary);
@@ -1136,7 +1136,7 @@ onMounted(async () => {
         transition: background-color 0.15s ease;
 
         &:not(:last-child) {
-          border-bottom: 1px dashed var(--n-border-color);
+          border-bottom: 1px dashed var(--border-color);
         }
 
         &:hover {

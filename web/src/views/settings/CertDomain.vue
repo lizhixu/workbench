@@ -150,7 +150,7 @@ const availableEntryHint = computed(() => {
   if (activeEntryURL.value) {
     const hint = `面板仍可通过 ${activeEntryURL.value} 访问`
     return certStatus.value?.ssl_enabled && activeEntryURL.value.startsWith('http://')
-      ? `${hint}（:443 不可用，强制 HTTPS 跳转已自动跳过）`
+      ? `${hint}（:443 不可用，已跳过强制 HTTPS 跳转）`
       : hint
   }
   return `免端口入口暂不可用，面板回退到 ${fallbackURL(domain)}`
@@ -194,7 +194,7 @@ function showMoveDialog(domain: string, opts: { title: string; sslReset?: boolea
       h(
         'p',
         { style: 'margin-top:6px;font-size:12px;color:var(--text-secondary)' },
-        `若该地址无法打开（:80/:443 被其他服务占用或防火墙未放行），可在服务器本机用 ${fallback} 访问（回环地址始终放行），或执行「域名防失联与紧急恢复」中的解绑命令恢复 IP 访问。`,
+        `打不开时可在服务器本机用 ${fallback} 访问，或用解绑命令恢复 IP 访问。`,
       ),
     )
   }
@@ -203,7 +203,7 @@ function showMoveDialog(domain: string, opts: { title: string; sslReset?: boolea
       h(
         'p',
         { style: 'margin-top:8px;color:#d03050;font-size:12px' },
-        '原域名证书绑定、面板 SSL 与强制 HTTPS 已自动清除，避免旧证书与新域名不匹配导致无法访问。请在新地址下重新签发或绑定证书，再按需开启 HTTPS。',
+        '原证书绑定、面板 SSL 与强制 HTTPS 已自动清除，请在新地址下重新签发或绑定证书。',
       ),
     )
   }
@@ -212,7 +212,7 @@ function showMoveDialog(domain: string, opts: { title: string; sslReset?: boolea
       h(
         'p',
         { style: 'margin-top:8px;font-size:12px;color:var(--text-secondary)' },
-        '若此前为公网 IP 签发过证书，其自动续期已自动关闭；面板不再经 IP 提供访问，该证书已无用途，建议到证书中心删除（暂停原因已写入其日志；解绑面板域名后可重新申请）。',
+        '此前为 IP 签发的证书已停止自动续期、无用途，建议到证书中心删除。',
       ),
     )
   }
@@ -244,7 +244,7 @@ async function doBind(v: string, sslWasReset: boolean) {
   await refreshStatus()
   message.success(`已绑定域名 ${v}`)
   if (sslWasReset) {
-    message.info('面板 SSL 与证书绑定已清除，请重新签发或绑定证书，并按需开启强制 HTTPS')
+    message.info('面板 SSL 与证书绑定已清除，请重新签发或绑定证书')
   }
 }
 
@@ -260,13 +260,11 @@ function bindDomain() {
   const children = [
     h(
       'p',
-      `绑定后面板只能通过 ${v} 访问，通过 IP 或其他域名发起的请求将被 403 拦截。请确认 DNS 已解析到本服务器。`,
+      `绑定后只能通过 ${v} 访问（IP / 其他域名返回 403）。请确认 DNS 已解析到本服务器。`,
     ),
-    // 严格域名限制在任何绑定下都会让 IP 证书失去唯一入口（面板 403 IP 访问），
-    // 因此该提示不挂在 SSL 开关分支下，恒以条件句展示；绑定后 IP 证书已无用途，
-    // 主动建议删除而非仅告知「可随时删除」。
+    // IP 证书在绑定后失去唯一入口，恒提示建议删除（不挂在 SSL 分支下）。
     h('p', { style: 'margin-top:8px' }, [
-      '若此前为公网 IP 签发过证书，绑定后其自动续期将自动关闭；面板不再经 IP 提供访问，该证书已无用途，建议到',
+      '此前为 IP 签发的证书将停止自动续期、无用途，建议到',
       h(
         'a',
         {
@@ -279,18 +277,18 @@ function bindDomain() {
         },
         '证书中心',
       ),
-      '删除（暂停原因已写入其日志；解绑面板域名后可重新申请）。',
+      '删除（解绑后可重新申请）。',
     ]),
   ]
   if (changing) {
-    children.push(h('p', { style: 'margin-top:8px' }, `当前绑定域名为 ${current}，绑定后将切换为 ${v}。`))
+    children.push(h('p', { style: 'margin-top:8px' }, `当前绑定域名为 ${current}，将切换为 ${v}。`))
   }
   if (sslActive) {
     children.push(
       h(
         'p',
         { style: 'margin-top:8px;color:#d03050' },
-        '当前已开启面板 SSL / 强制 HTTPS：更换域名时原证书绑定、面板 SSL 与强制 HTTPS 会被自动清除，否则旧证书与域名不匹配将导致无法访问。请在新域名下重新签发或绑定证书。',
+        '当前已开启面板 SSL / 强制 HTTPS：更换域名会清除原证书绑定、面板 SSL 与强制 HTTPS，请在新域名下重新签发或绑定证书。',
       ),
     )
   }
@@ -306,14 +304,14 @@ function bindDomain() {
 function unbindDomain() {
   const sslActive = !!(certStatus.value?.ssl_enabled || certStatus.value?.force_https)
   const children = [
-    h('p', '解绑后面板将恢复为通过 IP 访问，且不再拦截直接 IP 访问。'),
+    h('p', '解绑后恢复 IP 访问，不再拦截直接 IP 访问。'),
   ]
   if (sslActive) {
     children.push(
       h(
         'p',
         { style: 'margin-top:8px;color:#d03050' },
-        '解绑会同步关闭面板 SSL、清除证书绑定与强制 HTTPS（避免残留证书拦截访问），端口 :443 的 HTTPS 监听也会停止。',
+        '解绑会同步关闭面板 SSL、清除证书绑定与强制 HTTPS，:443 HTTPS 监听也会停止。',
       ),
     )
   }
@@ -335,7 +333,7 @@ function unbindDomain() {
             title: 'HTTPS 已关闭，请切换访问地址',
             content: () =>
               h('div', { style: 'line-height:1.8' }, [
-                h('p', '面板 SSL 已随域名解绑一同关闭，请使用以下地址访问（也可使用服务器 IP）：'),
+                h('p', '面板 SSL 已随解绑关闭，请使用以下地址访问：'),
                 h('p', { style: 'margin-top:8px;font-family:monospace;font-size:13px' }, target),
               ]),
             positiveText: '立即前往',
@@ -357,7 +355,7 @@ async function setSSLEnabled(v: boolean) {
     dialog.warning({
       title: '关闭面板 HTTPS',
       content:
-        '当前页面通过 HTTPS 访问，关闭后 HTTPS 监听（含 :443 免端口访问）会停止，本页面将无法继续使用。确定关闭？',
+        '当前页面通过 HTTPS 访问，关闭后本页面将无法继续使用。确定关闭？',
       positiveText: '确定关闭',
       negativeText: '取消',
       onPositiveClick: async () => {
@@ -403,7 +401,7 @@ async function setForceHTTPS(v: boolean) {
     return
   }
   if (v && !certStatus.value?.active) {
-    message.warning('当前没有生效的 HTTPS 证书，开启强制跳转后 HTTP 会被重定向到不可用的 HTTPS，导致面板无法访问；请先签发或绑定证书')
+    message.warning('当前没有生效的 HTTPS 证书，开启后 HTTP 将被重定向到不可用的 HTTPS；请先签发或绑定证书')
     await refreshStatus()
     return
   }
@@ -428,13 +426,13 @@ function pollJob(jobId: string) {
       if (j.status === 'awaiting_dns') {
         // 手动 DNS-01：停止轮询，等待管理员添加 TXT 解析后手动确认
         stopJobPoll()
-        message.info('签发任务已创建，请按指引手动添加 TXT 解析记录后再确认验证')
+        message.info('签发任务已创建，请添加 TXT 解析记录后再确认验证')
         return
       }
       if (j.status !== 'running') {
         stopJobPoll()
         if (j.status === 'done') {
-          message.success('证书签发成功，已自动绑定并启用 HTTPS（证书已进入证书中心「已签发证书」列表）')
+          message.success('证书签发成功，已自动绑定并启用 HTTPS')
         } else {
           message.error(j.error || '证书签发失败')
         }
@@ -607,10 +605,9 @@ onUnmounted(stopJobPoll)
             </NAlert>
           </div>
           <p v-if="certStatus?.panel_domain" class="muted tip-hint bound-tip">
-            面板仅可通过该域名访问：IP / 其他域名返回 403，「域名 + 主端口」在免端口入口可用时自动跳转。
+            仅可通过该域名访问（IP / 其他域名返回 403）。
             <template v-if="activeEntryURL">免端口入口：<code>{{ activeEntryURL }}</code>。</template>
-            批量升级 Agent 的安装包地址使用该域名，内网环境请确保能解析。
-            对外地址按面板实际服务状态生成：SSL 开启且 :443 在监听时为 https，否则为 http；面板默认最外层，不信任前置反代的请求头，如需对外 https 请开启面板 SSL。
+            Agent 安装包地址使用该域名，内网请确保能解析。
           </p>
           <NForm v-else label-placement="top" :show-feedback="false">
             <NFormItem label="绑定域名后，面板只能通过该域名访问">
@@ -626,15 +623,14 @@ onUnmounted(stopJobPoll)
             </NFormItem>
           </NForm>
           <p class="muted tip-hint" style="margin: 8px 0 0">
-            绑定后只能通过该域名访问（IP / 其他域名返回 403），自动在 :80（HTTPS 开启时含 :443）提供免端口访问；
-            更换域名会解除原证书绑定并关闭 HTTPS。Agent 注册与数据接口不受影响。
+            自动提供 :80（HTTPS 开启时含 :443）免端口访问；更换域名会清除原证书绑定并关闭 HTTPS。
           </p>
 
           <NAlert type="warning" :show-icon="true" class="emergency-alert">
             <template #header>无法访问面板？</template>
             在服务器终端执行
             <code>watchman-server -reset-panel-domain -data /opt/watchman/data</code>
-            解绑域名并恢复 IP 访问（同时关闭面板 SSL），重启 watchman-server 后生效。
+            解绑域名恢复 IP 访问，重启后生效。
           </NAlert>
         </div>
 
@@ -693,7 +689,7 @@ onUnmounted(stopJobPoll)
           <!-- 一键签发 -->
           <div class="issue-block">
             <NAlert type="info" :show-icon="true" size="small" style="margin-bottom: 12px">
-              使用证书中心的默认 ACME 账户签发；报错 invalidContact 时请检查该账户邮箱是否为有效公网域名邮箱。
+              默认 ACME 账户签发；invalidContact 报错请检查账户邮箱是否为有效公网域名邮箱。
             </NAlert>
             <template v-if="certStatus?.panel_domain">
               <NSpace align="center" style="width: 100%">
@@ -715,8 +711,8 @@ onUnmounted(stopJobPoll)
                 </NRadioGroup>
               </NSpace>
               <p class="muted tip-hint" style="margin: 8px 0 0">
-                为 {{ certStatus.panel_domain }} 签发证书，成功后自动绑定并启用 HTTPS。自动模式优先 HTTP-01
-                （需 :80 可被 CA 访问），失败回退 DNS-01（需在证书中心启用 dns-mng）；「手动解析」由您自行添加 TXT 记录。
+                签发成功后自动绑定并启用 HTTPS。自动模式优先 HTTP-01（需 :80 可被 CA 访问），失败回退 DNS-01
+                （需启用 dns-mng）；「手动解析」需自行添加 TXT 记录。
               </p>
             </template>
             <template v-else>
@@ -739,8 +735,7 @@ onUnmounted(stopJobPoll)
                 <NButton text size="small" @click="detectIP" :loading="ipDetecting">重新检测 IP</NButton>
               </NSpace>
               <p class="muted tip-hint" style="margin: 8px 0 0">
-                为公网 IP 签发免费证书（HTTP-01 验证，签发期间需临时开放 :80），成功后自动绑定并启用 HTTPS；
-                证书有效期较短，系统自动续期。
+                HTTP-01 验证，签发期间需临时开放 :80；成功后自动绑定并启用 HTTPS，证书有效期较短、自动续期。
               </p>
             </template>
 
@@ -777,8 +772,7 @@ onUnmounted(stopJobPoll)
                 </div>
               </div>
               <p class="muted tip-hint" style="margin: 8px 0">
-                请到您的 DNS 服务商添加以上记录，等待解析生效后再点击下方按钮通知 CA 验证。
-                任务保留 2 小时，超时需重新发起。
+                到 DNS 服务商添加以上记录，解析生效后点击下方按钮通知 CA 验证；任务保留 2 小时，超时需重新发起。
               </p>
               <NButton type="primary" size="small" :loading="confirming" @click="confirmJob">
                 <template #icon><NIcon><ShieldCheckmarkOutline /></NIcon></template>
@@ -788,7 +782,7 @@ onUnmounted(stopJobPoll)
                 <template #trigger>
                   <NButton size="small" :disabled="cancelling" style="margin-left: 8px">取消任务</NButton>
                 </template>
-                确定取消该面板证书签发任务？CA 侧订单将自然过期，已添加的 TXT 记录需自行到 DNS 服务商删除。
+                取消后 CA 侧订单将过期，已添加的 TXT 记录需自行删除。
               </NPopconfirm>
             </NAlert>
 
@@ -799,8 +793,7 @@ onUnmounted(stopJobPoll)
               size="small"
               style="margin-top: 12px"
             >
-              正在为 {{ job.target }} 签发证书（{{ challengeLabel(job) }}），
-              通常需要几十秒，请稍候……
+              正在为 {{ job.target }} 签发证书（{{ challengeLabel(job) }}），请稍候……
             </NAlert>
 
             <NAlert
@@ -811,7 +804,7 @@ onUnmounted(stopJobPoll)
               style="margin-top: 12px"
             >
               签发失败：{{ job.error }}
-              <template v-if="job.terminal">该订单已终态失败，不可重试，请重新发起签发。</template>
+              <template v-if="job.terminal">该订单已失败，不可重试，请重新发起。</template>
               <NButton
                 v-if="job.challenge === 'dns-01-manual' && !job.terminal"
                 size="small"
@@ -837,7 +830,7 @@ onUnmounted(stopJobPoll)
                   @update:value="setSSLEnabled"
                 />
                 <span class="switch-label">
-                  {{ certStatus?.ssl_enabled ? '已启用（支持 HTTPS 安全连接）' : '未启用（仅 HTTP 明文运行）' }}
+                  {{ certStatus?.ssl_enabled ? '已启用' : '未启用（仅 HTTP）' }}
                 </span>
               </NSpace>
             </NFormItem>
@@ -849,18 +842,18 @@ onUnmounted(stopJobPoll)
                   @update:value="setForceHTTPS"
                 />
                 <span class="switch-label">
-                  {{ certStatus?.force_https ? '已开启（HTTP 自动 301 跳转到 HTTPS）' : '未开启' }}
+                  {{ certStatus?.force_https ? '已开启（HTTP 自动跳转到 HTTPS）' : '未开启' }}
                 </span>
               </NSpace>
             </NFormItem>
           </NForm>
           <p class="muted tip-hint" style="margin: 8px 0 0; font-size: 12px">
-            启用 HTTPS 后同时在 :443 提供免端口 HTTPS（需已绑定域名）；端口被占用时上方会显示占用进程。
+            启用后同时在 :443 提供免端口 HTTPS（需已绑定域名）；端口被占用时上方会显示占用进程。
           </p>
 
           <!-- 上传已有证书 -->
           <NCollapse class="upload-cert-collapse" style="margin-top: 8px">
-            <NCollapseItem title="上传已有证书（其他渠道申请的证书，自动进入证书中心）" name="upload">
+            <NCollapseItem title="上传已有证书（自动进入证书中心）" name="upload">
               <NForm class="upload-cert-form" label-placement="top" :show-feedback="false">
                 <NFormItem label="证书内容 (PEM)">
                   <NInput
@@ -891,7 +884,7 @@ onUnmounted(stopJobPoll)
             <template #header>HTTPS 无法访问？</template>
             在服务器终端执行
             <code>watchman-server -reset-panel-ssl -data /opt/watchman/data</code>
-            关闭面板 SSL 并恢复 HTTP 访问，重启 watchman-server 后生效。
+            关闭面板 SSL 恢复 HTTP 访问，重启后生效。
           </NAlert>
         </div>
       </NSpace>

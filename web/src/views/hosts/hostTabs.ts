@@ -11,6 +11,7 @@ import {
   ShieldCheckmarkOutline,
   TerminalOutline,
   GitNetworkOutline,
+  TrashOutline,
 } from '@vicons/ionicons5'
 
 export interface HostTabItem {
@@ -25,6 +26,7 @@ export const subNavItems: HostTabItem[] = [
   { key: 'sysinfo', label: '系统状态', icon: ListOutline },
   { key: 'terminal', label: '在线终端', icon: TerminalOutline },
   { key: 'docker', label: 'Docker', icon: CubeOutline },
+  { key: 'cleanup', label: '系统清理', icon: TrashOutline },
   { key: 'vulnerabilities', label: '漏洞管理', icon: ShieldCheckmarkOutline },
   { key: 'network', label: '异地组网', icon: GitNetworkOutline },
 ]

@@ -230,10 +230,16 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	authed.GET("/hosts/:id/sysinfo/:kind", h.getSysInfo)
 	hostWrite.POST("/hosts/:id/processes/:pid/kill", h.killProcess)
 
+	// System cleanup: preview rides the read-only sysinfo path
+	// (GET /hosts/:id/sysinfo/cleanup); execution is a mutating hostWrite
+	// route with its own audit entry.
+	hostWrite.POST("/hosts/:id/system-cleanup", h.systemCleanup)
+
 	// Docker: inspection is read-only, container/image operations are not.
 	authed.GET("/hosts/:id/docker/ps", h.dockerPs)
 	authed.GET("/hosts/:id/docker/images", h.dockerImages)
 	authed.GET("/hosts/:id/docker/all", h.dockerAll)
+	authed.GET("/hosts/:id/docker/system-df", h.dockerSystemDf)
 	authed.GET("/hosts/:id/docker/mirrors", h.dockerGetMirrors)
 	hostWrite.PUT("/hosts/:id/docker/mirrors", h.dockerSetMirrors)
 	hostWrite.POST("/hosts/:id/docker/:op", h.dockerOp)
@@ -1589,6 +1595,95 @@ func (h *handlers) sysInfoCall(hub *rpc.Hub, q *agentpb.SysInfoQuery) (int, []by
 	}
 }
 
+// validCleanupCategories validates a cleanup request: non-empty, known
+// names only, no duplicates. The agent enforces the same allowlist.
+func validCleanupCategories(categories []string) error {
+	if len(categories) == 0 {
+		return fmt.Errorf("未选择清理类别")
+	}
+	seen := map[string]bool{}
+	for _, cat := range categories {
+		switch cat {
+		case "apt_cache", "journal", "tmp_stale", "logs_old":
+		default:
+			return fmt.Errorf("未知清理类别: %s", cat)
+		}
+		if seen[cat] {
+			return fmt.Errorf("重复的清理类别: %s", cat)
+		}
+		seen[cat] = true
+	}
+	return nil
+}
+
+// systemCleanup executes a system cleanup on the target host. Categories are
+// validated against the agent's allowlist (apt_cache/journal/tmp_stale/
+// logs_old); unknown or empty selections are rejected before anything runs.
+// The agent runs one fixed argv per category and reports the reclaimed bytes
+// per step; a failed step does not stop the remaining steps.
+func (h *handlers) systemCleanup(c *gin.Context) {
+	var body struct {
+		Categories []string `json:"categories"`
+	}
+	_ = c.ShouldBindJSON(&body)
+	if err := validCleanupCategories(body.Categories); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	hub := h.reg.Hub(c.Param("id"))
+	if hub == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline"})
+		return
+	}
+	detail := fmt.Sprintf("系统清理 %s", strings.Join(body.Categories, ","))
+	cleanupID := randomToken(8)
+	resultCh := make(chan *agentpb.CleanupEvent, 1)
+	hub.SetRespHandler(cleanupID, func(msg *agentpb.AgentMessage) {
+		hub.SetRespHandler(cleanupID, nil)
+		if msg == nil {
+			resultCh <- nil
+			return
+		}
+		resultCh <- msg.GetCleanup()
+	})
+	hub.Send(&agentpb.ServerMessage{
+		Payload: &agentpb.ServerMessage_Cleanup{
+			Cleanup: &agentpb.CleanupRequest{
+				CleanupId:  cleanupID,
+				Categories: body.Categories,
+			},
+		},
+	})
+	defer hub.SetRespHandler(cleanupID, nil)
+	select {
+	case ev := <-resultCh:
+		result := audit.ResultSuccess
+		if ev == nil || !ev.GetOk() {
+			result = audit.ResultFailed
+		}
+		h.recordAudit(c, "system_cleanup", "host", c.Param("id"), detail, audit.RiskHigh, result)
+		if ev == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent disconnected"})
+			return
+		}
+		if !ev.GetOk() {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": ev.GetError()})
+			return
+		}
+		var parsed struct {
+			Steps []any `json:"steps"`
+		}
+		if json.Unmarshal(ev.GetPayloadJson(), &parsed) == nil && parsed.Steps != nil {
+			c.JSON(http.StatusOK, gin.H{"ok": true, "data": parsed.Steps})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true, "raw": string(ev.GetPayloadJson())})
+	case <-time.After(5 * time.Minute):
+		h.recordAudit(c, "system_cleanup", "host", c.Param("id"), detail, audit.RiskHigh, audit.ResultFailed)
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "cleanup timeout"})
+	}
+}
+
 // ---- Docker ----------------------------------------------------------
 
 func (h *handlers) dockerPs(c *gin.Context) {
@@ -1605,6 +1700,12 @@ func (h *handlers) dockerAll(c *gin.Context) {
 	h.dockerCall(c, "ps_images", "", "", nil)
 }
 
+// dockerSystemDf reports per-category disk usage (docker system df) for the
+// deep-clean preview. Read-only like ps/images: no audit.
+func (h *handlers) dockerSystemDf(c *gin.Context) {
+	h.dockerCall(c, "system_df", "", "", nil)
+}
+
 func (h *handlers) dockerOp(c *gin.Context) {
 	op := c.Param("op")
 	var body struct {
@@ -1615,13 +1716,13 @@ func (h *handlers) dockerOp(c *gin.Context) {
 	_ = c.ShouldBindJSON(&body)
 	// Mutating docker operations are audited; read-only ones (ps/images) are not.
 	switch op {
-	case "start", "stop", "restart", "rm", "pull", "rmi", "prune", "remove_image", "run":
+	case "start", "stop", "restart", "rm", "pull", "rmi", "prune", "remove_image", "run", "system_prune", "volume_prune":
 		target := body.Container
 		if target == "" {
 			target = body.Image
 		}
 		risk := audit.RiskLow
-		if op == "rm" || op == "rmi" || op == "remove_image" || op == "prune" {
+		if op == "rm" || op == "rmi" || op == "remove_image" || op == "prune" || op == "system_prune" || op == "volume_prune" {
 			risk = audit.RiskHigh
 		}
 		h.recordAudit(c, "docker_op", "host", c.Param("id"),
@@ -1710,9 +1811,10 @@ func (h *handlers) dockerCall(c *gin.Context, op, container, image string, argsJ
 // dockerOpTimeout returns the HTTP-side wait budget for a docker op. Pulls can
 // take minutes, and `docker run` pulls a missing image before creating the
 // container, so both match the agent's longer budget instead of forcing a 504
-// at 30s while the agent keeps working.
+// at 30s while the agent keeps working. Prune ops share the long budget:
+// deleting gigabytes of images and build cache routinely exceeds 30s.
 func dockerOpTimeout(op string) time.Duration {
-	if op == "pull" || op == "run" {
+	if op == "pull" || op == "run" || op == "system_prune" || op == "prune" || op == "volume_prune" {
 		return 5 * time.Minute
 	}
 	return 30 * time.Second

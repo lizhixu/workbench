@@ -319,11 +319,67 @@ export function dockerAll(hostId: string): Promise<{ containers: any[]; images: 
   ).then((r) => r.data || { containers: [], images: [] })
 }
 
+// dockerPsAll fetches all containers (including stopped ones) so the images
+// table can mark each image used/unused: Docker's own "unused" means "not
+// referenced by any container", and `docker ps` alone only lists running ones.
+export function dockerPsAll(hostId: string) {
+  return dockerOp(hostId, 'ps_all').then((r: any) => r?.data || [])
+}
+
+// dockerSystemDf reports per-category disk usage for the deep-clean preview.
+export function dockerSystemDf(hostId: string) {
+  return unwrap<{ data: any[] }>(http.get(`/hosts/${hostId}/docker/system-df`)).then((r) => r.data || [])
+}
+
+// ---- System cleanup ----
+
+export interface CleanupCategory {
+  name: string
+  title: string
+  desc: string
+  reclaimable: number
+  error?: string
+}
+
+export interface CleanupPreview {
+  os: string
+  supported: boolean
+  categories: CleanupCategory[]
+}
+
+// systemCleanupPreview fetches per-category reclaimable bytes. The server
+// returns the agent's raw JSON through the sysinfo path, not a {data} wrapper.
+export function systemCleanupPreview(hostId: string) {
+  return unwrap<CleanupPreview>(http.get(`/hosts/${hostId}/sysinfo/cleanup`))
+}
+
+export interface CleanupStep {
+  name: string
+  reclaimed: number
+  ok: boolean
+  error?: string
+}
+
+// systemCleanup executes the selected categories. Client timeout matches the
+// server's 5-minute budget (apt/journal/find can take a while on big hosts).
+export function systemCleanup(hostId: string, categories: string[]) {
+  return unwrap<{ data: CleanupStep[] }>(
+    http.post(`/hosts/${hostId}/system-cleanup`, { categories }, { timeout: 320000 }),
+  ).then((r) => r.data || [])
+}
+
 // dockerOp 的客户端超时必须长于服务端同操作预算（router.go dockerOpTimeout：
-// pull/run 5 分钟、其余 30 秒），否则大镜像拉取时浏览器先在 15s 默认超时处
+// pull/run 与清理操作 5 分钟、其余 30 秒），否则大镜像拉取时浏览器先在 15s 默认超时处
 // 中断报错，而 Agent 侧仍在继续执行，列表也就等不到结果。
 export function dockerOp(hostId: string, op: string, container = '', image = '', args?: Record<string, unknown>) {
-  const timeout = op === 'pull' || op === 'run' ? 320000 : 40000
+  const timeout =
+    op === 'pull' ||
+    op === 'run' ||
+    op === 'system_prune' ||
+    op === 'prune' ||
+    op === 'volume_prune'
+      ? 320000
+      : 40000
   return unwrap<any>(
     http.post(`/hosts/${hostId}/docker/${op}`, { container, image, args_json: args }, { timeout }),
   )

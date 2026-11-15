@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 
+	"watchman/agent/internal/cleanup"
 	"watchman/agent/internal/config"
 	"watchman/agent/internal/conn"
 	"watchman/agent/internal/docker"
@@ -85,6 +86,7 @@ func main() {
 	d.SetMetricsManager(mm)
 	d.SetSysInfoManager(sysinfo.NewManager(log))
 	d.SetDockerManager(docker.NewManager(log))
+	d.SetCleanupManager(cleanup.NewManager(log))
 	upMgr := upgrade.NewManager(log)
 	if err := upMgr.SetPublicKeyHEX(cfg.UpgradePubKey); err != nil {
 		log.Error("invalid upgrade public key", "err", err)

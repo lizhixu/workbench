@@ -79,7 +79,8 @@
 - **部署新应用**：容器页签工具栏提供「部署新应用」入口，跳转 `/apps/create?host_id=<当前主机>`，预选目标主机后由应用中心完成创建。
 - **镜像加速**：主机详情 Docker「镜像」页签提供「镜像加速」入口，支持查看当前主机的 `registry-mirrors`、快捷选取常用国内加速源（DaoCloud、1ms 等）、手动编辑加速镜像列表，保存后自动平滑更新 `daemon.json` 并重载 Docker 守护进程，无需停机或重启现有容器。
 - **容器终端**：一键进入容器 shell。
-- **镜像管理**：镜像名称、ID、大小、创建时间；支持删除单个、批量删除、清除未使用镜像。
+- **镜像管理**：镜像名称、ID、大小、创建时间、使用状态（使用中/未使用，按是否被任意容器引用，含已停止容器）；支持删除单个、批量删除、清除悬空镜像；深度清理带磁盘占用预览（已停止容器、未使用镜像/网络、构建缓存，可选同时清理未使用卷），应用中心纳管的已停止容器（含 -prev 回滚容器）受保护不删除。
+- **系统清理**：主机详情「系统清理」页签（与 Docker 页签并列）。先预览每类可回收量（APT 缓存、journal 日志、临时文件、旧日志），勾选后确认执行，分项回显每步回收量；仅 Debian/Ubuntu（按 /etc/os-release 判定），其余系统直接提示不支持；执行为高危审计操作，5 分钟超时。apt autoremove 不在 v1 范围内。
 - **一键安装 Docker**：若主机未安装 Docker，控制端可一键为其安装。
 
 ### 3.5 在线终端（Web Terminal）
@@ -570,7 +571,7 @@ watchman/                       # 仓库名（暂定，可改）
 │   │   ├── shell/              # 终端会话管理
 │   │   ├── file/               # 文件操作（read/write/stat/list/分片）
 │   │   ├── exec/               # 命令/脚本执行
-│   │   ├── sysinfo/            # 系统状态采集（进程/端口/账号/登录）
+│   │   ├── sysinfo/            # 系统状态采集（进程/端口/账号/登录/清理预览）
 │   │   ├── monitor/           # 资源监控采集（CPU/内存/磁盘/网络）
 │   │   ├── docker/            # Docker 容器与镜像操作
 │   │   ├── enroll/            # 首次注册（token → 长期凭证）
@@ -728,7 +729,7 @@ message MetricsSample {
   }
 }
 
-message SysInfoQuery { string kind=1; }   // process/port/user/login
+message SysInfoQuery { string kind=1; }   // process/port/user/login/cleanup（cleanup 为系统清理预览）
 message SysInfoSnapshot {
   string kind = 1; bytes json_payload = 2; // 结构化 JSON（不同 kind 不同 schema）
 }
@@ -1440,7 +1441,7 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 
 ### B.8.3 协议补充
 
-- **DockerOp/DockerEvent**：`op` 含 `ps/images/start/stop/restart/rm/logs/inspect/remove_image/prune_images/pull/run`；Agent 侧 shelling out to the docker CLI 执行（`agent/internal/docker/docker.go`）。`run` 的参数走 `DockerOp.args_json`：`{"name":"...","ports":["hostPort:containerPort"],"volumes":["/host:/container"],"env":["KEY=VALUE"],"restart_policy":"no|on-failure|always|unless-stopped","command":["arg1","arg2"]}`，空值条目跳过；**每个字段先过字符白名单正则（容器名/端口/卷/环境变量键/重启策略/镜像引用，拒绝以 `-` 开头等伪装 docker flag 的载荷）再进 argv，exec 不走 shell**；镜像缺失由 docker CLI 自动拉取，故 `pull/run` 的服务端下发与 agent 执行均取 5 分钟超时。`logs` 的参数同样走 `args_json`：`{"tail":200,"since":"24h","timestamps":true}`（`tail` 1~10000 默认 200；`since` 空或 `all` = 不传 `--since`，其余只接受 `数字+smhd` 的 duration；非法值直接失败、不拼进 argv；容器名为空或以 `-` 开头同样拒绝；老 Agent 忽略 `logs` 的 `args_json`、恒返回 `--tail 200`；服务端 `dockerCall` 对 `logs` 固定返回 `{"ok":true,"raw":<docker logs 原文>}`，不做结构化 `data` 包装，前端按行渲染/着色/搜索/导出，`ps`/`images` 仍做数组规范化）。`logs` 的原文是容器 stdout 与 stderr 合并：docker CLI 把容器 stderr 分流到自身 stderr，Agent 侧对 logs 单独走合并抓取（其余 op 只抓 stdout，stderr 混入会污染 `ps`/`images` 的 NDJSON 解析）；老 Agent 只抓 stdout，写 stderr 的应用日志（如 Go 默认 log）在老 Agent 上继续缺失，直至 Agent 升级。
+- **DockerOp/DockerEvent**：`op` 含 `ps/ps_all/images/start/stop/restart/rm/logs/inspect/remove_image/prune_images/pull/run/system_df/system_prune/volume_prune/prune`；Agent 侧 shelling out to the docker CLI 执行（`agent/internal/docker/docker.go`）。`ps_all` 跑 `docker ps -a --format {{json .}}` 供镜像表「使用状态」列判断镜像是否被任意容器引用（含已停止容器）；只读，不审计，30 秒超时。`system_df` 跑 `docker system df --format {{json .}}` 供深度清理预览；`system_prune`（`prune` 为别名）是复合操作，按容器（带 `label!=watchman.app` 过滤，保护应用中心纳管的已停止容器与 -prev 回滚容器）→ 镜像 `-a` → 网络 → 构建缓存 `-a` 顺序执行，返回 `{"steps":[{"name","reclaimed"}]}`；`volume_prune` 单独清理未使用卷（深度清理弹窗里默认关闭的可选项）。三者与 pull/run 同取 5 分钟超时（服务端 `dockerOpTimeout` 与 Agent `opTimeout` 同步）。`run` 的参数走 `DockerOp.args_json`：`{"name":"...","ports":["hostPort:containerPort"],"volumes":["/host:/container"],"env":["KEY=VALUE"],"restart_policy":"no|on-failure|always|unless-stopped","command":["arg1","arg2"]}`，空值条目跳过；**每个字段先过字符白名单正则（容器名/端口/卷/环境变量键/重启策略/镜像引用，拒绝以 `-` 开头等伪装 docker flag 的载荷）再进 argv，exec 不走 shell**；镜像缺失由 docker CLI 自动拉取，故 `pull/run` 的服务端下发与 agent 执行均取 5 分钟超时。`logs` 的参数同样走 `args_json`：`{"tail":200,"since":"24h","timestamps":true}`（`tail` 1~10000 默认 200；`since` 空或 `all` = 不传 `--since`，其余只接受 `数字+smhd` 的 duration；非法值直接失败、不拼进 argv；容器名为空或以 `-` 开头同样拒绝；老 Agent 忽略 `logs` 的 `args_json`、恒返回 `--tail 200`；服务端 `dockerCall` 对 `logs` 固定返回 `{"ok":true,"raw":<docker logs 原文>}`，不做结构化 `data` 包装，前端按行渲染/着色/搜索/导出，`ps`/`images` 仍做数组规范化）。`logs` 的原文是容器 stdout 与 stderr 合并：docker CLI 把容器 stderr 分流到自身 stderr，Agent 侧对 logs 单独走合并抓取（其余 op 只抓 stdout，stderr 混入会污染 `ps`/`images` 的 NDJSON 解析）；老 Agent 只抓 stdout，写 stderr 的应用日志（如 Go 默认 log）在老 Agent 上继续缺失，直至 Agent 升级。`CleanupRequest`/`CleanupEvent`（系统清理执行，`cleanup` 字段）：`categories` 为 `apt_cache/journal/tmp_stale/logs_old` 子集（服务端与 Agent 双重白名单校验，空/未知/重复直接拒绝）；Agent 逐类跑固定 argv（`apt-get clean`、`journalctl --vacuum-size=500M --vacuum-time=7d`、`find /tmp /var/tmp -type f -atime +10 -delete`（跳过 systemd 私有目录）、`find /var/log -type f -name '*.gz' -mtime +30 -delete`），每步前后量用量算回收量，单步失败不中断其余步，结果为 `{"steps":[{"name","reclaimed","ok","error"}]}`；仅 Debian/Ubuntu（按 /etc/os-release 判定），其余系统直接拒绝；预览走 sysinfo `cleanup` kind（只读，不审计），执行走 `POST /hosts/:id/system-cleanup`（hostWrite 角色，高危审计，5 分钟超时）。
 - **终端 PTY 启动（shell 带参数与启动失败回显）**：`TerminalOpen.shell` 可带参数——容器终端下发的是 `docker exec -it <容器> /bin/sh` 整行；Agent 按 shell 词法（空白分隔、单/双引号与反斜杠转义）拆成命令与参数后直接 exec，不走 shell 解释，单字 shell（如 `bash`）行为不变；Windows 沿用 ConPTY 命令行字符串语义。PTY 启动失败时 Agent 把错误文本作为该会话的终端输出回传、随后以空输出标记会话结束，面板显示错误而不是静默挂起（此前失败只记一条 WARN，浏览器侧一直显示已建立、按键还被转发到不存在的会话）。
 - **安全扫描（Mimosa / 基线与漏洞检查）**：新增 `ScanRequest(type, rule_set)` / `ScanResult(progress, findings json, report_ref)`，走 exec + 结果回传，不引入新通道。
 - **Agent 自更新**：新增 `UpgradeRequest(version, url, sha256)` / `UpgradeProgress`，控制端可下发升级，Agent 校验签名后热更新（解耦发布）。升级签名密钥由控制端启动时从 `vault-pass` 经域分隔 SHA-256 派生 Ed25519（重启稳定、无需新密钥文件，`api.InitSigner`），公钥 hex 经 `GET /api/v1/version` 的 `upgrade_pubkey` 公开；agent 安装脚本自动带上 `-upgrade-pubkey`，agent 验签（未配置则跳过，只校验 sha256）。下载 URL 走面板对外地址统一解析（绑定域名 → 请求 Host，解决反代/NAT 下 Host 不可信）。升级进度判定只认 stage：`UpgradeProgress.Error` 仅在 stage 为 `error` 时表示失败，非 error 阶段的 Agent 不得往 Error 字段填状态文案、服务端也不得把非 error 阶段的非空 Error 当失败处理（此前状态文案曾导致每次单台升级都在格式校验步骤被误判失败）。

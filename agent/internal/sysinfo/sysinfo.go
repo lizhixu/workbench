@@ -3,6 +3,7 @@
 package sysinfo
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"watchman/agent/internal/cleanup"
 	"watchman/proto/agentpb"
 )
 
@@ -55,6 +57,10 @@ func (m *Manager) Handle(q *agentpb.SysInfoQuery) {
 		payload, err = m.loginHistory()
 	case "osinfo":
 		payload, err = m.osInfo()
+	case "cleanup":
+		// 系统清理预览：每类可回收量。非 Debian 系返回 supported:false
+		// 而不是报错，前端据此显示「当前系统不支持」。
+		payload, err = cleanup.PreviewDefault(context.Background())
 	case "kill":
 		payload, err = m.killProcess(q.GetPid(), q.GetForce())
 	default:
@@ -83,12 +89,12 @@ func (m *Manager) send(kind string, payload []byte) {
 
 // Process represents a single process entry.
 type Process struct {
-	PID     int32  `json:"pid"`
-	Name    string `json:"name"`
-	User    string `json:"user"`
+	PID     int32   `json:"pid"`
+	Name    string  `json:"name"`
+	User    string  `json:"user"`
 	CPU     float64 `json:"cpu"`
 	Mem     float64 `json:"mem"`
-	Cmdline string `json:"cmdline"`
+	Cmdline string  `json:"cmdline"`
 }
 
 func (m *Manager) processList() ([]byte, error) {
@@ -124,8 +130,8 @@ type User struct {
 	GID      string `json:"gid"`
 	Home     string `json:"home"`
 	Shell    string `json:"shell"`
-	LoginOK  bool   `json:"login_ok"`           // false if UID < 1000 and shell == nologin/false
-	IsSystem bool   `json:"is_system"`          // UID < 1000 (service/system accounts)
+	LoginOK  bool   `json:"login_ok"`  // false if UID < 1000 and shell == nologin/false
+	IsSystem bool   `json:"is_system"` // UID < 1000 (service/system accounts)
 }
 
 func (m *Manager) userList() ([]byte, error) {
@@ -210,7 +216,7 @@ func (m *Manager) loginHistory() ([]byte, error) {
 // loginEntry is one parsed line from `last`. The `Type` distinguishes user
 // sessions (User/Tty/From/Duration) from system events (reboot/shutdown).
 type loginEntry struct {
-	Type     string `json:"type"`     // "session" | "reboot" | "shutdown" | "crash" | "wtmp"
+	Type     string `json:"type"` // "session" | "reboot" | "shutdown" | "crash" | "wtmp"
 	User     string `json:"user,omitempty"`
 	Tty      string `json:"tty,omitempty"`
 	From     string `json:"from,omitempty"`     // remote host / "system boot"

@@ -31,6 +31,7 @@ message AgentMessage {
     DockerEvent docker = 8; // (P2)
     ScanProgress scan_progress = 9; // (P3)
     UpgradeProgress upgrade_progress = 10; // (P3)
+    CleanupEvent cleanup = 13; // system cleanup result
     TunnelData tunnel_data = 11; // reverse TCP tunnel payload (agent -> server)
     TunnelClose tunnel_close = 12; // reverse TCP tunnel teardown (agent -> server)
     Ack ack = 99;
@@ -53,6 +54,7 @@ message ServerMessage {
     DockerOp docker_op = 11; // (P2)
     ScanRequest scan = 12; // (P3)
     UpgradeRequest upgrade = 13; // (P3)
+    CleanupRequest cleanup = 21; // system cleanup execution (preview rides SysInfoQuery kind="cleanup")
     MaintenanceNotice maintenance = 14; // server restarting / maintenance announcement
     TunnelOpen tunnel_open = 17; // ask agent to open a TCP tunnel leg
     TunnelData tunnel_data = 18; // reverse TCP tunnel payload (server -> agent)
@@ -265,7 +267,7 @@ message Mount {
 // ---- System info -----------------------------------------------------
 
 message SysInfoQuery {
-  string kind = 1; // process / port / user / login / osinfo / kill
+  string kind = 1; // process / port / user / login / osinfo / kill / cleanup
   // pid targets a single process; only meaningful for kind="kill".
   int32 pid = 2;
   // force selects SIGKILL over SIGTERM (taskkill /F on Windows).
@@ -289,7 +291,12 @@ message SysInfoSnapshot {
 message DockerOp {
   string op_id = 1;
   // op is one of: ps, images, start, stop, restart, rm, logs, inspect,
-  // remove_image, prune_images, pull, run, get_mirrors, set_mirrors.
+  // remove_image, prune_images, pull, run, get_mirrors, set_mirrors,
+  // system_df, system_prune, volume_prune, prune. system_prune (and its
+  // prune alias) is a compound op: container prune guarded by a
+  // label!=watchman.app filter, then image/network/builder prune; it
+  // returns {"steps":[{"name","reclaimed"}]}. system_df returns the
+  // `docker system df` rows as NDJSON.
   string op = 2;
   string container = 3;
   string image = 4;
@@ -311,6 +318,26 @@ message DockerEvent {
   bool ok = 2;
   string error = 3;
   bytes payload_json = 4; // result payload
+}
+
+// ---- System cleanup --------------------------------------------------
+
+message CleanupRequest {
+  string cleanup_id = 1;
+  // categories is a subset of: apt_cache, journal, tmp_stale, logs_old.
+  // Unknown names are rejected by the agent; empty means nothing runs.
+  repeated string categories = 2;
+}
+
+message CleanupEvent {
+  string cleanup_id = 1;
+  bool ok = 2;
+  string error = 3;
+  // payload_json is {"steps":[{"name","reclaimed","ok","error"}]} — one
+  // entry per requested category, in request order. A failed step does not
+  // stop the remaining steps; ok is false only when the request itself was
+  // rejected (unknown category, unsupported OS, empty selection).
+  bytes payload_json = 4;
 }
 
 // ---- Security scan (P3) ---------------------------------------------

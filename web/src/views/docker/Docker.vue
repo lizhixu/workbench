@@ -5,6 +5,7 @@ import {
   NCard,
   NSpace,
   NButton,
+  NCheckbox,
   NDataTable,
   NTabs,
   NTabPane,
@@ -14,10 +15,10 @@ import {
   NInput,
   NIcon,
   NModal,
-  NAlert,
   NForm,
   NFormItem,
   NDynamicInput,
+  NAlert,
   NSpin,
   useMessage,
 } from 'naive-ui'
@@ -33,6 +34,8 @@ import {
 import {
   dockerAll,
   dockerOp,
+  dockerPsAll,
+  dockerSystemDf,
   dockerGetMirrors,
   dockerSetMirrors,
   getHost,
@@ -62,6 +65,12 @@ const loading = ref(false)
 const tab = ref('containers')
 const containers = ref<any[]>([])
 const images = ref<any[]>([])
+
+// usedImageKeys 是全部容器（docker ps -a，含已停止）引用的镜像键：容器
+// Image（仓库:标签）与 ImageID。镜像表「使用状态」列据此判断使用/未使用；
+// usageLoaded 为 false 时取数失败，该列显示 — 而不是把全部镜像错标成未使用。
+const usedImageKeys = ref<Set<string>>(new Set())
+const usageLoaded = ref(false)
 const logsContainer = ref('')
 const logsText = ref('')
 const pullImageName = ref('')
@@ -188,7 +197,48 @@ async function loadImages() {
   // dockerAll 一次往返同时带回容器与镜像，没有单独的镜像列表接口；镜像操作
   // （拉取/删除/清理）后与手动刷新都必须无条件重拉，此前仅当列表为空才刷新，
   // 导致操作成功后页面停留在旧数据。
-  await loadAll()
+  // 使用状态另取一次 ps -a：dockerAll 的容器列表只含运行中容器，按它算会
+  // 把已停止容器引用的镜像错标成未使用。
+  await Promise.all([loadAll(), loadImageUsage()])
+}
+
+// loadImageUsage 取全部容器（含已停止）建立「被引用镜像」集合，供镜像表
+// 「使用状态」列判断。取数失败时 usageLoaded 保持 false，该列显示 —。
+async function loadImageUsage() {
+  try {
+    const all = await dockerPsAll(hostId)
+    const keys = new Set<string>()
+    for (const c of all || []) {
+      if (c.Image) keys.add(c.Image)
+      if (c.ImageID) keys.add(String(c.ImageID))
+    }
+    usedImageKeys.value = keys
+    usageLoaded.value = true
+  } catch {
+    usageLoaded.value = false
+  }
+}
+
+// normImageId 去掉 sha256: 前缀：docker ps 与 docker images 给出的 ID
+// 可能是完整摘要或 12 位短 ID，比较时按前缀归一。
+function normImageId(id: string): string {
+  return (id || '').replace(/^sha256:/, '')
+}
+
+// imageUsed 按 Docker 口径判断镜像是否被任意容器引用：仓库:标签命中，
+// 或 ID 前缀互含（ps 的 ImageID 与 images 的 ID 长度可能不同，
+// 仅当双方都是十六进制 ID 时才做前缀比较，防仓库名误撞）。
+function imageUsed(row: any): boolean {
+  if (usedImageKeys.value.has(`${row.Repository}:${row.Tag}`)) return true
+  const id = normImageId(row.ID || row.Id || '')
+  if (!id || !/^[0-9a-f]+$/.test(id)) return false
+  for (const k of usedImageKeys.value) {
+    const nk = normImageId(k)
+    if (nk && /^[0-9a-f]+$/.test(nk) && (nk === id || nk.startsWith(id) || id.startsWith(nk))) {
+      return true
+    }
+  }
+  return false
 }
 
 async function doOp(op: string, container: string) {
@@ -257,10 +307,111 @@ async function removeImage(imageId: string) {
 async function pruneImages() {
   try {
     await dockerOp(hostId, 'prune_images')
-    message.success('已清除未使用镜像')
+    message.success('已清除悬空镜像')
     await loadImages()
   } catch (e: any) {
     message.error(e.message)
+  }
+}
+
+// Docker 深度清理弹窗状态
+const showDeepClean = ref(false)
+const deepCleanLoading = ref(false)
+const deepCleanRunning = ref(false)
+const deepCleanVolumes = ref(false)
+const deepCleanDf = ref<any[]>([])
+const deepCleanResult = ref<string[]>([])
+const deepCleanError = ref('')
+
+// docker system df 的 Type 字段是英文原值，预览表展示中文。
+function dfTypeLabel(t: unknown): string {
+  switch (t) {
+    case 'Images':
+      return '镜像'
+    case 'Containers':
+      return '容器'
+    case 'Local Volumes':
+      return '本地卷'
+    case 'Build Cache':
+      return '构建缓存'
+    default:
+      return typeof t === 'string' ? t : '未知'
+  }
+}
+
+const deepCleanColumns = [
+  { title: '类型', key: 'typeLabel', width: 90 },
+  { title: '总数', key: 'TotalCount', width: 70 },
+  { title: '活跃', key: 'Active', width: 70 },
+  { title: '占用', key: 'Size', width: 110 },
+  { title: '可回收', key: 'Reclaimable' },
+]
+
+// system_prune 各步骤的英文名 → 结果行中文。
+const deepCleanStepLabels: Record<string, string> = {
+  containers: '已停止容器',
+  images: '未使用镜像',
+  networks: '未使用网络',
+  builder: '构建缓存',
+}
+
+async function openDeepClean() {
+  showDeepClean.value = true
+  deepCleanResult.value = []
+  deepCleanError.value = ''
+  deepCleanVolumes.value = false
+  await loadDeepCleanDf()
+}
+
+async function loadDeepCleanDf() {
+  deepCleanLoading.value = true
+  try {
+    const rows = await dockerSystemDf(hostId)
+    deepCleanDf.value = (rows || []).map((r: any) => ({ ...r, typeLabel: dfTypeLabel(r.Type) }))
+    deepCleanError.value = ''
+  } catch (e: any) {
+    deepCleanDf.value = []
+    deepCleanError.value = e.message
+  } finally {
+    deepCleanLoading.value = false
+  }
+}
+
+// volume_prune 走通用 dockerOp 通道，返回的是纯文本 raw；回收量从
+// Total reclaimed space 行解析。
+function reclaimedFromRaw(raw: unknown): string {
+  const text = typeof raw === 'string' ? raw : ''
+  const m = text.match(/Total reclaimed space:\s*(.+)/)
+  return m ? m[1].trim() : ''
+}
+
+async function runDeepClean() {
+  deepCleanRunning.value = true
+  deepCleanResult.value = []
+  deepCleanError.value = ''
+  try {
+    const res = await dockerOp(hostId, 'system_prune')
+    const steps = res?.data?.steps
+    if (Array.isArray(steps)) {
+      for (const s of steps) {
+        const label = deepCleanStepLabels[s.name] || s.name
+        deepCleanResult.value.push(`${label}：已回收 ${s.reclaimed || '未知'}`)
+      }
+    } else {
+      deepCleanResult.value.push('清理已完成')
+    }
+    if (deepCleanVolumes.value) {
+      const vres = await dockerOp(hostId, 'volume_prune')
+      const line = reclaimedFromRaw(vres?.raw ?? vres?.data)
+      deepCleanResult.value.push(`未使用卷：已回收 ${line || '未知'}`)
+    }
+    // 清理后刷新容器/镜像列表与预览（可回收量应归零）。
+    await loadAll()
+    await loadDeepCleanDf()
+  } catch (e: any) {
+    deepCleanError.value = e.message
+  } finally {
+    deepCleanRunning.value = false
   }
 }
 
@@ -545,6 +696,20 @@ const imageColumns = [
   { title: 'ID', key: 'ID', width: 80, ellipsis: { tooltip: true } },
   { title: '大小', key: 'Size', width: 80 },
   {
+    title: '使用状态',
+    key: 'usage',
+    width: 90,
+    render: (row: any) => {
+      // 使用状态取数失败时显示 —：宁可未知，不把镜像错标成未使用。
+      if (!usageLoaded.value) {
+        return h('span', { style: 'color: var(--text-color-3)' }, '—')
+      }
+      return imageUsed(row)
+        ? h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => '使用中' })
+        : h(NTag, { size: 'small', bordered: false }, { default: () => '未使用' })
+    },
+  },
+  {
     title: '操作',
     key: 'actions',
     width: 100,
@@ -705,10 +870,13 @@ onMounted(() => {
                     </NButton>
                     <NPopconfirm @positive-click="pruneImages">
                       <template #trigger>
-                        <NButton size="small" type="warning">清除未使用</NButton>
+                        <NButton size="small" type="warning">清除悬空镜像</NButton>
                       </template>
-                      确认清除所有未使用镜像？
+                      确认清除所有悬空镜像？
                     </NPopconfirm>
+                    <NButton size="small" type="error" @click="openDeepClean">
+                      深度清理
+                    </NButton>
                   </NSpace>
                   <NButton size="small" @click="openMirrorsModal">
                     <template #icon><NIcon :component="SpeedometerOutline" /></template>
@@ -825,6 +993,52 @@ onMounted(() => {
             @click="handleSaveMirrors"
           >
             保存并重载 Docker
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- Docker 深度清理弹窗 -->
+    <NModal
+      v-model:show="showDeepClean"
+      preset="card"
+      title="Docker 深度清理"
+      style="width: 620px"
+    >
+      <NSpace vertical size="medium">
+        <NAlert type="warning" :bordered="false">
+          将清理已停止的容器、未使用的镜像、未使用的网络与构建缓存。运行中的容器与正在使用的镜像不受影响；应用中心纳管的已停止容器（含 -prev 回滚容器）同样保留，不会被删除。
+        </NAlert>
+        <NSpin :show="deepCleanLoading">
+          <NDataTable
+            :columns="deepCleanColumns"
+            :data="deepCleanDf"
+            :bordered="false"
+            size="small"
+          >
+            <template #empty>暂无磁盘占用数据</template>
+          </NDataTable>
+        </NSpin>
+        <NCheckbox v-model:checked="deepCleanVolumes" :disabled="deepCleanRunning">
+          同时清理未使用的卷（docker volume prune）
+        </NCheckbox>
+        <NAlert v-if="deepCleanError" type="error" :bordered="false">
+          {{ deepCleanError }}
+        </NAlert>
+        <NAlert v-if="deepCleanResult.length" type="success" :bordered="false">
+          <div v-for="line in deepCleanResult" :key="line">{{ line }}</div>
+        </NAlert>
+      </NSpace>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton :disabled="deepCleanRunning" @click="showDeepClean = false">关闭</NButton>
+          <NButton
+            type="error"
+            :loading="deepCleanRunning"
+            :disabled="deepCleanLoading || deepCleanDf.length === 0"
+            @click="runDeepClean"
+          >
+            开始清理
           </NButton>
         </NSpace>
       </template>

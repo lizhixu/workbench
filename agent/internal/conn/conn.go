@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"watchman/agent/internal/cleanup"
 	"watchman/agent/internal/config"
 	"watchman/agent/internal/docker"
 	"watchman/agent/internal/exec"
@@ -47,6 +48,7 @@ type Dialer struct {
 	metrics *metrics.Manager
 	sysinfo *sysinfo.Manager
 	docker  *docker.Manager
+	cleanup *cleanup.Manager
 	upgrade *upgrade.Manager
 	scan    *scan.Manager
 	tunnel  *tunnel.Manager
@@ -86,6 +88,9 @@ func (d *Dialer) SetSysInfoManager(m *sysinfo.Manager) { d.sysinfo = m }
 
 // SetDockerManager wires Docker operations.
 func (d *Dialer) SetDockerManager(m *docker.Manager) { d.docker = m }
+
+// SetCleanupManager wires system cleanup execution.
+func (d *Dialer) SetCleanupManager(m *cleanup.Manager) { d.cleanup = m }
 
 // SetUpgradeManager wires agent self-upgrade.
 func (d *Dialer) SetUpgradeManager(m *upgrade.Manager) { d.upgrade = m }
@@ -283,6 +288,9 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 	if d.docker != nil {
 		d.docker.SetSender(hub)
 	}
+	if d.cleanup != nil {
+		d.cleanup.SetSender(hub)
+	}
 	if d.upgrade != nil {
 		d.upgrade.SetSender(hub)
 	}
@@ -393,6 +401,14 @@ func (d *Dialer) handleServerMessage(msg *agentpb.ServerMessage) error {
 			return fmt.Errorf("docker not available")
 		}
 		d.docker.Handle(p.DockerOp)
+		return nil
+
+	// System cleanup.
+	case *agentpb.ServerMessage_Cleanup:
+		if d.cleanup == nil {
+			return fmt.Errorf("cleanup not available")
+		}
+		d.cleanup.Handle(p.Cleanup)
 		return nil
 
 	// Upgrade.

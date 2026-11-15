@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -211,6 +212,183 @@ func TestLogsArgsBoundaries(t *testing.T) {
 		if strings.Join(got, " ") != tc.want {
 			t.Errorf("%s: 得到 %q, 想要 %q", tc.name, strings.Join(got, " "), tc.want)
 		}
+	}
+}
+
+// TestDockerArgsPruneOps locks the deep-clean argv: system_df reports
+// reclaimable space, volume_prune deletes unused volumes, and the compound
+// system_prune/prune ops must NOT go through dockerArgs (Manager.run
+// dispatches them to runSystemPrune instead, like logs goes to logsArgs).
+func TestDockerArgsPruneOps(t *testing.T) {
+	cases := []struct {
+		op   string
+		want string
+	}{
+		{"system_df", "system df --format {{json .}}"},
+		{"volume_prune", "volume prune -f"},
+	}
+	for _, tc := range cases {
+		args, ok := dockerArgs(tc.op, "", "")
+		if !ok {
+			t.Errorf("dockerArgs(%q) 应被接受", tc.op)
+			continue
+		}
+		if strings.Join(args, " ") != tc.want {
+			t.Errorf("dockerArgs(%q) = %q, 想要 %q", tc.op, strings.Join(args, " "), tc.want)
+		}
+	}
+	for _, op := range []string{"system_prune", "prune"} {
+		if args, ok := dockerArgs(op, "", ""); ok || args != nil {
+			t.Errorf("dockerArgs(%q) 应走 runSystemPrune，实际 (%v,%v)", op, args, ok)
+		}
+	}
+	// Prune ops share the long budget with pull/run: deleting gigabytes of
+	// images and build cache routinely exceeds 30 seconds.
+	for _, op := range []string{"system_prune", "prune", "volume_prune"} {
+		if got := opTimeout(op); got != 5*time.Minute {
+			t.Errorf("opTimeout(%q) 应为 5 分钟，实际 %v", op, got)
+		}
+	}
+	if got := opTimeout("system_df"); got != 30*time.Second {
+		t.Errorf("opTimeout(system_df) 应为 30 秒，实际 %v", got)
+	}
+}
+
+// ps_all 供镜像表「使用状态」列取全部容器（含已停止）：只读，30 秒超时。
+func TestDockerArgsPsAll(t *testing.T) {
+	args, ok := dockerArgs("ps_all", "", "")
+	if !ok {
+		t.Fatalf("dockerArgs(ps_all) 应被接受")
+	}
+	if want := "ps -a --format {{json .}}"; strings.Join(args, " ") != want {
+		t.Errorf("dockerArgs(ps_all) = %q, 想要 %q", strings.Join(args, " "), want)
+	}
+	if got := opTimeout("ps_all"); got != 30*time.Second {
+		t.Errorf("opTimeout(ps_all) 应为 30 秒，实际 %v", got)
+	}
+}
+
+// runSystemPrune 必须按依赖顺序删除（先容器、后镜像：被删容器释放的镜像要
+// 在同一次清理里被镜像清理带走），容器清理必须带 label!=watchman.app 过滤
+// （应用中心纳管的已停止容器——含 -prev 回滚容器——绝不能删），每步回收量
+// 从各步输出的 Total reclaimed space 行解析。
+func TestRunSystemPrune(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = \"container\" ]; then echo 'Total reclaimed space: 100MB'; exit 0; fi\n" +
+		"if [ \"$1\" = \"image\" ]; then echo 'Total reclaimed space: 1.5GB'; exit 0; fi\n" +
+		"if [ \"$1\" = \"network\" ]; then echo 'Total reclaimed space: 0B'; exit 0; fi\n" +
+		"if [ \"$1\" = \"builder\" ]; then echo 'Total reclaimed space: 2.3GB'; exit 0; fi\n" +
+		"echo unexpected >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := NewManager(nil)
+	m.lookPath = func(string) (string, error) { return filepath.Join(dir, "docker"), nil }
+	s := &captureSender{}
+	m.SetSender(s)
+	m.run(&agentpb.DockerOp{Op: "system_prune"})
+	if s.msg == nil {
+		t.Fatal("Manager.run 未发送 DockerEvent")
+	}
+	ev := s.msg.GetDocker()
+	if !ev.GetOk() {
+		t.Fatalf("system_prune 应成功，实际失败：%s", ev.GetError())
+	}
+	var payload struct {
+		Steps []struct {
+			Name      string `json:"name"`
+			Reclaimed string `json:"reclaimed"`
+		} `json:"steps"`
+	}
+	if err := json.Unmarshal(ev.GetPayloadJson(), &payload); err != nil {
+		t.Fatalf("system_prune payload 应为 JSON，实际 %q: %v", string(ev.GetPayloadJson()), err)
+	}
+	want := []struct {
+		name      string
+		reclaimed string
+	}{
+		{"containers", "100MB"},
+		{"images", "1.5GB"},
+		{"networks", "0B"},
+		{"builder", "2.3GB"},
+	}
+	if len(payload.Steps) != len(want) {
+		t.Fatalf("应返回 %d 步，实际 %d 步：%v", len(want), len(payload.Steps), payload.Steps)
+	}
+	for i, w := range want {
+		if payload.Steps[i].Name != w.name || payload.Steps[i].Reclaimed != w.reclaimed {
+			t.Errorf("第 %d 步应为 %+v，实际 %+v", i, w, payload.Steps[i])
+		}
+	}
+
+	// 调用顺序与容器过滤：第一条必须是带 label 过滤的容器清理。
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("应恰好调用 4 次 docker，实际 %d 次：%v", len(lines), lines)
+	}
+	if lines[0] != "container prune -f --filter label!=watchman.app" {
+		t.Errorf("容器清理应带 label!=watchman.app 过滤，实际 %q", lines[0])
+	}
+	if lines[1] != "image prune -af" || lines[2] != "network prune -f" || lines[3] != "builder prune -af" {
+		t.Errorf("清理顺序应为容器/镜像/网络/构建缓存，实际 %v", lines)
+	}
+
+	// "prune" 别名走同一条复合路径。
+	s2 := &captureSender{}
+	m.SetSender(s2)
+	m.run(&agentpb.DockerOp{Op: "prune"})
+	if s2.msg == nil || !s2.msg.GetDocker().GetOk() {
+		t.Error("prune 别名应与 system_prune 同样成功")
+	}
+}
+
+// 某一步失败时 system_prune 整体失败、后续步骤不再执行（fail-fast），
+// 而不是报成功。
+func TestRunSystemPruneFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = \"container\" ]; then echo 'Total reclaimed space: 100MB'; exit 0; fi\n" +
+		"if [ \"$1\" = \"image\" ]; then echo 'Error: daemon busy' >&2; exit 1; fi\n" +
+		"echo unexpected >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := NewManager(nil)
+	m.lookPath = func(string) (string, error) { return filepath.Join(dir, "docker"), nil }
+	s := &captureSender{}
+	m.SetSender(s)
+	m.run(&agentpb.DockerOp{Op: "system_prune"})
+	if s.msg == nil {
+		t.Fatal("Manager.run 未发送 DockerEvent")
+	}
+	ev := s.msg.GetDocker()
+	if ev.GetOk() {
+		t.Error("镜像清理失败时整体应失败")
+	} else if !strings.Contains(ev.GetError(), "images prune failed") {
+		t.Errorf("失败信息应指明 images 步骤，实际 %q", ev.GetError())
+	}
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+	if len(lines) != 2 {
+		t.Errorf("失败后应停在第 2 步，实际调用 %d 次：%v", len(lines), lines)
 	}
 }
 

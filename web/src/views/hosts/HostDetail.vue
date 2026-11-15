@@ -20,6 +20,7 @@ const MetricsPane = defineAsyncComponent(() => import('../../components/host/Met
 const SysInfoPane = defineAsyncComponent(() => import('../../components/host/SysInfoPane.vue'))
 const TerminalPane = defineAsyncComponent(() => import('../../components/host/TerminalPane.vue'))
 const DockerView = defineAsyncComponent(() => import('../docker/Docker.vue'))
+const SystemCleanupView = defineAsyncComponent(() => import('./tabs/SystemCleanup.vue'))
 const VulnerabilitiesView = defineAsyncComponent(() => import('./tabs/Vulnerabilities.vue'))
 const HostNetworkPane = defineAsyncComponent(() => import('../../components/host/HostNetworkPane.vue'))
 
@@ -258,6 +259,9 @@ onMounted(load)
 
                 <!-- Docker 管理（观测与运维入口，应用部署统一走全局应用中心） -->
                 <DockerView v-else-if="activeSubTab === 'docker'" />
+
+                <!-- 系统清理（APT 缓存、journal、临时文件、旧日志） -->
+                <SystemCleanupView v-else-if="activeSubTab === 'cleanup'" :host-id="host.id" />
 
                 <!-- 漏洞管理 (P3) -->
                 <VulnerabilitiesView v-else-if="activeSubTab === 'vulnerabilities'" :host-id="host.id" />

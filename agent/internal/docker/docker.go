@@ -106,6 +106,20 @@ func (m *Manager) run(op *agentpb.DockerOp) {
 		return
 	}
 
+	// "system_prune" (and its "prune" alias, which the server's dockerOp
+	// whitelist already advertises) is a compound op: it runs the four
+	// targeted prunes in dependency order and returns one JSON document with
+	// the reclaimed space per step. Containers go first so images freed by
+	// deleted containers are caught by the image prune in the same run; the
+	// container prune carries a label!=watchman.app filter so
+	// application-centre containers — including stopped -prev rollback
+	// containers — are never deleted.
+	if op.GetOp() == "system_prune" || op.GetOp() == "prune" {
+		m.runSystemPrune(ctx, result)
+		m.send(result)
+		return
+	}
+
 	// "run" takes op-specific args (name/ports/volumes/env/restart policy)
 	// instead of the plain container/image pairs every other op uses, so it
 	// gets its own path. A missing image is pulled by `docker run` itself,
@@ -215,6 +229,58 @@ func (m *Manager) runPsImages(ctx context.Context, result *agentpb.DockerEvent) 
 	if err != nil {
 		result.Ok = false
 		result.Error = "marshal ps_images: " + err.Error()
+		return
+	}
+	result.Ok = true
+	result.PayloadJson = payload
+}
+
+// systemPruneStep is one targeted prune inside the system_prune compound op.
+// Argv is the docker CLI invocation; Reclaimed is the "Total reclaimed
+// space" value parsed from that step's stdout ("" when the line is absent).
+type systemPruneStep struct {
+	Name      string   `json:"name"` // containers | images | networks | builder
+	Argv      []string `json:"-"`
+	Reclaimed string   `json:"reclaimed"`
+}
+
+var reclaimedSpaceRe = regexp.MustCompile(`(?m)^Total reclaimed space:\s*(.+?)\s*$`)
+
+// runSystemPrune runs the four targeted prunes in dependency order and
+// returns {"steps":[...]} with the reclaimed space per step. A step failure
+// aborts the remaining steps (fail-fast) so a half-finished cleanup is
+// reported as a failure, not a success.
+func (m *Manager) runSystemPrune(ctx context.Context, result *agentpb.DockerEvent) {
+	steps := []systemPruneStep{
+		{Name: "containers", Argv: []string{"container", "prune", "-f", "--filter", "label!=watchman.app"}},
+		{Name: "images", Argv: []string{"image", "prune", "-af"}},
+		{Name: "networks", Argv: []string{"network", "prune", "-f"}},
+		{Name: "builder", Argv: []string{"builder", "prune", "-af"}},
+	}
+	for i := range steps {
+		out, err := exec.CommandContext(ctx, "docker", steps[i].Argv...).Output()
+		if err != nil {
+			errOut := ""
+			if ee, ok := err.(*exec.ExitError); ok {
+				errOut = string(ee.Stderr)
+			}
+			if errOut == "" {
+				errOut = string(out)
+			}
+			result.Ok = false
+			result.Error = steps[i].Name + " prune failed: " + err.Error() + ": " + errOut
+			return
+		}
+		if match := reclaimedSpaceRe.FindSubmatch(out); match != nil {
+			steps[i].Reclaimed = string(match[1])
+		}
+	}
+	payload, err := json.Marshal(struct {
+		Steps []systemPruneStep `json:"steps"`
+	}{Steps: steps})
+	if err != nil {
+		result.Ok = false
+		result.Error = "marshal system_prune: " + err.Error()
 		return
 	}
 	result.Ok = true
@@ -414,6 +480,11 @@ func dockerArgs(op, container, image string) ([]string, bool) {
 	switch op {
 	case "ps":
 		return []string{"ps", "--format", "{{json .}}"}, true
+	case "ps_all":
+		// ps_all 跑 `docker ps -a`：镜像表「使用状态」列按 Docker 口径判断
+		// 镜像是否被任意容器引用（含已停止容器）。只用运行中容器算会把
+		// -prev 回滚容器等已停止容器引用的镜像错标成未使用。
+		return []string{"ps", "-a", "--format", "{{json .}}"}, true
 	case "images":
 		return []string{"images", "--format", "{{json .}}"}, true
 	case "start":
@@ -430,6 +501,10 @@ func dockerArgs(op, container, image string) ([]string, bool) {
 		return []string{"rmi", image}, true
 	case "prune_images":
 		return []string{"image", "prune", "-f"}, true
+	case "system_df":
+		return []string{"system", "df", "--format", "{{json .}}"}, true
+	case "volume_prune":
+		return []string{"volume", "prune", "-f"}, true
 	case "pull":
 		return []string{"pull", image}, true
 	}
@@ -449,9 +524,11 @@ func (m *Manager) send(ev *agentpb.DockerEvent) {
 
 // opTimeout returns the command timeout for a given docker op. Image pulls can
 // take minutes — and `docker run` pulls a missing image before creating the
-// container — so both get a long budget like the server side.
+// container — so both get a long budget like the server side. Prune ops share
+// the long budget: deleting gigabytes of images and build cache routinely
+// exceeds 30 seconds.
 func opTimeout(op string) time.Duration {
-	if op == "pull" || op == "run" {
+	if op == "pull" || op == "run" || op == "system_prune" || op == "prune" || op == "volume_prune" {
 		return 5 * time.Minute
 	}
 	if op == "ps_images" {

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 // `docker ps --format {{json .}}` prints one object per line: zero containers is
@@ -47,6 +48,22 @@ func TestParseNDJSONRejectsGarbage(t *testing.T) {
 	for _, raw := range []string{"not json", `{"ok":true}` + "\nnot json", "<html>error</html>"} {
 		if rows := parseNDJSON([]byte(raw)); rows != nil {
 			t.Errorf("非 JSON 输入 %q 不应被解析为列表，得到 %v", raw, rows)
+		}
+	}
+}
+
+// Prune operations can delete gigabytes of images and build cache, so they
+// share the 5-minute budget with pull/run instead of the 30-second default;
+// otherwise the HTTP call would 504 while the agent keeps deleting.
+func TestDockerOpTimeout(t *testing.T) {
+	for _, op := range []string{"pull", "run", "system_prune", "prune", "volume_prune"} {
+		if got := dockerOpTimeout(op); got != 5*time.Minute {
+			t.Errorf("%s 应为 5 分钟，实际 %v", op, got)
+		}
+	}
+	for _, op := range []string{"ps", "images", "system_df", "start", "rm", "bogus"} {
+		if got := dockerOpTimeout(op); got != 30*time.Second {
+			t.Errorf("%s 应为 30 秒，实际 %v", op, got)
 		}
 	}
 }

@@ -37,6 +37,7 @@ import {
   triggerScan,
   listScans,
   getLatestScan,
+  getScan,
   analyzeScanReport,
   scanReportFollowup,
   type ScanType,
@@ -133,9 +134,19 @@ async function loadHistory() {
     const list = await listScans({ host_id: props.hostId })
     jobs.value = list || []
     // Auto-load the latest scan of the current type if present.
+    // 列表行剥掉了 findings：直接拿它覆盖会丢掉已取回的全量发现（主结果区变空），
+    // 只有不是当前任务时才取单条全量，取失败则保留已有任务。
     const latestOfType = jobs.value.find((j) => j.type === scanType.value && j.status === 'completed')
-    if (latestOfType) {
-      currentJob.value = latestOfType
+    if (latestOfType && currentJob.value?.id !== latestOfType.id) {
+      try {
+        const full = await getScan(latestOfType.id)
+        currentJob.value = full
+        scanType.value = full.type
+      } catch {
+        if (!currentJob.value) {
+          currentJob.value = latestOfType
+        }
+      }
     }
   } catch (e: any) {
     // Silent: history is best-effort.
@@ -169,11 +180,19 @@ async function runScan() {
   }
 }
 
-function viewJob(job: ScanJob) {
+// 历史列表剥掉了 findings 发现内容，点「查看」需取单条全量，否则主结果区仍为空。
+async function viewJob(job: ScanJob) {
   currentJob.value = job
   scanType.value = job.type
   report.value = null
   followupHistory.value = []
+  try {
+    const full = await getScan(job.id)
+    currentJob.value = full
+    scanType.value = full.type
+  } catch {
+    // 取全量失败时保留列表行的元数据，不报错打断查看。
+  }
 }
 
 // 「AI 报告解读」置灰原因：disabled 的 NButton 不触发 mouseenter，包在外层的

@@ -125,7 +125,7 @@ func (h *Handlers) triggerScan(c *gin.Context) {
 					// Client already disconnected; persist result and bail silently.
 					return
 				}
-				c.JSON(http.StatusOK, gin.H{
+				c.JSON(http.StatusOK, gin.H{"data": gin.H{
 					"id":             job.ID,
 					"host_id":        job.HostID,
 					"hostname":       job.Hostname,
@@ -134,8 +134,8 @@ func (h *Handlers) triggerScan(c *gin.Context) {
 					"started_at":     job.StartedAt,
 					"finished_at":    job.FinishedAt,
 					"findings_count": job.FindingsCount,
-					"findings":       json.RawMessage(job.FindingsJSON),
-				})
+					"findings_json":  json.RawMessage(job.FindingsJSON),
+				}})
 				return
 			}
 		case <-timeout:
@@ -215,7 +215,7 @@ func (h *Handlers) getScan(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "scan not found"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{
 		"id":             job.ID,
 		"host_id":        job.HostID,
 		"hostname":       job.Hostname,
@@ -224,9 +224,9 @@ func (h *Handlers) getScan(c *gin.Context) {
 		"started_at":     job.StartedAt,
 		"finished_at":    job.FinishedAt,
 		"findings_count": job.FindingsCount,
-		"findings":       json.RawMessage(job.FindingsJSON),
+		"findings_json":  json.RawMessage(job.FindingsJSON),
 		"error":          job.Error,
-	})
+	}})
 }
 
 // getLatestScan returns the most recent scan for a host.
@@ -236,7 +236,7 @@ func (h *Handlers) getLatestScan(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no scans found for this host"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{
 		"id":             job.ID,
 		"host_id":        job.HostID,
 		"hostname":       job.Hostname,
@@ -245,8 +245,8 @@ func (h *Handlers) getLatestScan(c *gin.Context) {
 		"started_at":     job.StartedAt,
 		"finished_at":    job.FinishedAt,
 		"findings_count": job.FindingsCount,
-		"findings":       json.RawMessage(job.FindingsJSON),
-	})
+		"findings_json":  json.RawMessage(job.FindingsJSON),
+	}})
 }
 
 func randomID() string {

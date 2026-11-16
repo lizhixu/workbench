@@ -1,6 +1,7 @@
 package apps
 
 import (
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -81,14 +82,28 @@ func putUpgradeTestApp(t *testing.T, store *Store, app *Application) *Applicatio
 	return app
 }
 
-func waitDeploymentTerminal(t *testing.T, store *Store, appID, depID string) *Deployment {
+// waitDeploymentTerminal blocks until the deployment record reaches a
+// terminal state AND the engine's running slot is released. The pipeline
+// goroutine can keep writing after the terminal record becomes visible
+// (updated_at bumps, forwarder sync), and the store dir is a t.TempDir:
+// returning while the goroutine is still alive races testing's RemoveAll
+// cleanup — on Windows that loses the unlink race and fails the test with
+// "directory is not empty" — so both conditions must hold before return.
+func waitDeploymentTerminal(t *testing.T, e *Engine, store *Store, appID, depID string) *Deployment {
 	t.Helper()
+	var seen *Deployment
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if d, ok := store.GetDeployment(appID, depID); ok && isTerminalDeploymentStatus(d.Status) {
-			return d
+			seen = d
+			if !e.IsRunning(appID) {
+				return seen
+			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
+	}
+	if seen != nil {
+		t.Fatalf("engine slot for %s was not released after the deployment finished", appID)
 	}
 	t.Fatalf("deployment %s did not reach a terminal state in time", depID)
 	return nil
@@ -108,7 +123,7 @@ func TestStartUpgradeImagePullsBeforeRun(t *testing.T) {
 	if dep.Trigger != TriggerUpgrade {
 		t.Errorf("Trigger = %q, want %q", dep.Trigger, TriggerUpgrade)
 	}
-	got := waitDeploymentTerminal(t, store, app.ID, dep.ID)
+	got := waitDeploymentTerminal(t, e, store, app.ID, dep.ID)
 	if got.Status != DeploySuccess {
 		t.Fatalf("status = %q, error = %q, log = %q", got.Status, got.Error, got.BuildLog)
 	}
@@ -140,7 +155,7 @@ func TestStartUpgradePullFailureKeepsOldContainer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartUpgrade: %v", err)
 	}
-	got := waitDeploymentTerminal(t, store, app.ID, dep.ID)
+	got := waitDeploymentTerminal(t, e, store, app.ID, dep.ID)
 	if got.Status != DeployFailed {
 		t.Fatalf("status = %q, want failed", got.Status)
 	}
@@ -164,7 +179,7 @@ func TestStartUpgradeRawComposePullsBeforeUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartUpgrade: %v", err)
 	}
-	got := waitDeploymentTerminal(t, store, app.ID, dep.ID)
+	got := waitDeploymentTerminal(t, e, store, app.ID, dep.ID)
 	if got.Status != DeploySuccess {
 		t.Fatalf("status = %q, error = %q, log = %q", got.Status, got.Error, got.BuildLog)
 	}
@@ -198,7 +213,7 @@ func TestStartUpgradeRejectsWhileRunning(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "already running") {
 		t.Errorf("second StartUpgrade error = %q, want already-running", err.Error())
 	}
-	waitDeploymentTerminal(t, store, app.ID, dep.ID)
+	waitDeploymentTerminal(t, e, store, app.ID, dep.ID)
 }
 
 func TestUpgradeAppHTTPHandler(t *testing.T) {
@@ -238,4 +253,13 @@ func TestUpgradeAppHTTPHandler(t *testing.T) {
 	if !strings.Contains(w.Body.String(), `"trigger":"upgrade"`) {
 		t.Errorf("response does not carry trigger=upgrade: %s", w.Body.String())
 	}
+	var resp struct{ Data Deployment }
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not a deployment entity: %v (%s)", err, w.Body.String())
+	}
+	// The handler only queues the async pipeline: the engine goroutine
+	// keeps writing into the store dir (== t.TempDir) after the test would
+	// return, which on Windows races t.TempDir's RemoveAll cleanup. Wait
+	// for the goroutine to fully settle before returning.
+	waitDeploymentTerminal(t, engine, store, app.ID, resp.Data.ID)
 }

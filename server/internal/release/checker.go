@@ -49,11 +49,11 @@ type UpdateInfo struct {
 }
 
 var (
-	cacheMu     sync.Mutex
-	cachedInfo  *UpdateInfo
-	cachedAt    time.Time
-	cachedBeta  bool
-	cachedCurV  string
+	cacheMu    sync.Mutex
+	cachedInfo *UpdateInfo
+	cachedAt   time.Time
+	cachedBeta bool
+	cachedCurV string
 )
 
 // ClearUpdateCache clears the in-memory update check cache.

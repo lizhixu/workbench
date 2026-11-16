@@ -20,9 +20,9 @@ func TestParseReference(t *testing.T) {
 		{"ghcr.io/xerxes-2/clewdr", Reference{"ghcr.io", "xerxes-2/clewdr", "latest"}, false},
 		{"ghcr.io/xerxes-2/clewdr:v2", Reference{"ghcr.io", "xerxes-2/clewdr", "v2"}, false},
 		{"registry.example.com:5000/app:v1", Reference{"registry.example.com:5000", "app", "v1"}, false},
-		{"ghcr.io/Owner/Clewdr", Reference{}, true},                    // 大写仓库名
-		{"ghcr.io/a/b@sha256:abc", Reference{}, true},                  // digest 引用
-		{"https://ghcr.io/a/b", Reference{}, true},                     // 含 URL scheme
+		{"ghcr.io/Owner/Clewdr", Reference{}, true},   // 大写仓库名
+		{"ghcr.io/a/b@sha256:abc", Reference{}, true}, // digest 引用
+		{"https://ghcr.io/a/b", Reference{}, true},    // 含 URL scheme
 		{"", Reference{}, true},
 		{"ghcr.io/", Reference{}, true},
 		// SSRF 防护：环回/私网字面地址一律拒绝

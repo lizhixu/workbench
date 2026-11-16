@@ -26,14 +26,14 @@ type TaskPlanRequest struct {
 // TaskPlanStep is one ordered step in an automation plan.
 type TaskPlanStep struct {
 	Index           int    `json:"index"`
-	Title           string `json:"title"`                      // short label (e.g. "安装 Docker")
-	Description     string `json:"description"`                // what this step does / why
-	Command         string `json:"command"`                    // shell command to run
-	RiskLevel       string `json:"risk_level"`                 // low / medium / high
-	NeedsConfirm    bool   `json:"needs_confirm"`              // true => pause for human confirm
-	Probe           bool   `json:"probe,omitempty"`            // read-only check / verification step
+	Title           string `json:"title"`                       // short label (e.g. "安装 Docker")
+	Description     string `json:"description"`                 // what this step does / why
+	Command         string `json:"command"`                     // shell command to run
+	RiskLevel       string `json:"risk_level"`                  // low / medium / high
+	NeedsConfirm    bool   `json:"needs_confirm"`               // true => pause for human confirm
+	Probe           bool   `json:"probe,omitempty"`             // read-only check / verification step
 	ContinueOnError bool   `json:"continue_on_error,omitempty"` // best-effort; don't abort plan on failure
-	MatchedPattern  string `json:"matched_pattern,omitempty"`  // policy pattern that raised the risk
+	MatchedPattern  string `json:"matched_pattern,omitempty"`   // policy pattern that raised the risk
 }
 
 // TaskPlanResponse is the full generated plan.
@@ -54,12 +54,12 @@ type TaskPlanResponse struct {
 // hostPlanContext captures everything a blueprint or the LLM needs to know
 // about the target host to tailor commands.
 type hostPlanContext struct {
-	Hostname string
-	OS       string // linux / windows / darwin
-	Distro   string // debian / ubuntu / centos / rhel / alpine / windows ...
-	Arch     string // amd64 / arm64
-	Shell    string // bash / sh / powershell
-	PkgMgr   string // apt / dnf / yum / apk / (empty on windows)
+	Hostname  string
+	OS        string // linux / windows / darwin
+	Distro    string // debian / ubuntu / centos / rhel / alpine / windows ...
+	Arch      string // amd64 / arm64
+	Shell     string // bash / sh / powershell
+	PkgMgr    string // apt / dnf / yum / apk / (empty on windows)
 	IsWindows bool
 }
 
@@ -267,4 +267,3 @@ func extractFirstJSONObject(s string) string {
 	}
 	return ""
 }
-

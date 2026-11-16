@@ -26,10 +26,10 @@ type Sender interface {
 
 // Manager owns all terminal sessions for this agent.
 type Manager struct {
-	mu       sync.Mutex
-	sessions map[string]*session
-	sender   Sender
-	log      *slog.Logger
+	mu        sync.Mutex
+	sessions  map[string]*session
+	sender    Sender
+	log       *slog.Logger
 	recordDir string // directory for asciinema cast files
 }
 

@@ -31,9 +31,9 @@ func (h *Handlers) Register(rg *gin.RouterGroup) {
 	rg.POST("/alerts/events/:id/ack", h.ackEvent)
 	rg.DELETE("/alerts/events/:id", h.deleteEvent)
 	rg.DELETE("/alerts/events", h.clearEvents)
-		rg.GET("/alerts/webhook", h.getWebhook)
-		rg.PUT("/alerts/webhook", h.setWebhook)
-		rg.POST("/alerts/webhook/test", h.testWebhook)
+	rg.GET("/alerts/webhook", h.getWebhook)
+	rg.PUT("/alerts/webhook", h.setWebhook)
+	rg.POST("/alerts/webhook/test", h.testWebhook)
 }
 
 func (h *Handlers) listRules(c *gin.Context) {

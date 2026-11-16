@@ -32,8 +32,8 @@ const (
 // Policy is the persisted command control configuration.
 type Policy struct {
 	Enabled          bool     `json:"enabled"`
-	Blacklist        []string `json:"blacklist"`         // regex patterns; match => blocked
-	Whitelist        []string `json:"whitelist"`         // regex patterns; match => allow (skip high-risk confirm)
+	Blacklist        []string `json:"blacklist"`          // regex patterns; match => blocked
+	Whitelist        []string `json:"whitelist"`          // regex patterns; match => allow (skip high-risk confirm)
 	HighRiskPatterns []string `json:"high_risk_patterns"` // regex patterns; match => require confirm
 }
 
@@ -68,19 +68,19 @@ type Store struct {
 	policy   Policy
 	audit    []AuditEntry
 	compiled struct {
-		blacklist  []*regexp.Regexp
-		whitelist  []*regexp.Regexp
-		highRisk   []*regexp.Regexp
+		blacklist []*regexp.Regexp
+		whitelist []*regexp.Regexp
+		highRisk  []*regexp.Regexp
 	}
 }
 
 // DefaultHighRiskPatterns are built-in high-risk command patterns that always
 // apply (as a server-side baseline) even before user configuration.
 var DefaultHighRiskPatterns = []string{
-	`rm\s+-[rfRF]+\s+/(\s|$)`,        // rm -rf /
-	`rm\s+-[rfRF]+\s+/\*`,            // rm -rf /*
+	`rm\s+-[rfRF]+\s+/(\s|$)`,         // rm -rf /
+	`rm\s+-[rfRF]+\s+/\*`,             // rm -rf /*
 	`mkfs`,                            // mkfs any filesystem
-	`dd\s+if=.*of=/dev/(sd|nvme|hd)`, // dd to disk device
+	`dd\s+if=.*of=/dev/(sd|nvme|hd)`,  // dd to disk device
 	`\bshutdown\b`,                    // shutdown
 	`\breboot\b`,                      // reboot
 	`\bhalt\b`,                        // halt
@@ -89,8 +89,8 @@ var DefaultHighRiskPatterns = []string{
 	`drop\s+table`,                    // sql drop table
 	`drop\s+database`,                 // sql drop database
 	`truncate\s+table`,                // sql truncate
-	`chmod\s+-R\s+777\s+/`,           // chmod -R 777 /
-	`>\s*/dev/sd[a-z]`,               // overwrite disk device
+	`chmod\s+-R\s+777\s+/`,            // chmod -R 777 /
+	`>\s*/dev/sd[a-z]`,                // overwrite disk device
 	`kill\s+-9\s+-1`,                  // kill all processes
 	`killall\s+-9`,                    // killall -9
 	`\binit\s+0\b`,                    // init 0 (shutdown)

@@ -102,14 +102,14 @@ type metricsPoint struct {
 
 // AlertEventProxy mirrors alert.Event (exported so main can build adapters).
 type AlertEventProxy struct {
-	ID        string
-	RuleName  string
-	Severity  string
-	HostID    string
-	Hostname  string
-	Message   string
-	FiredAt   time.Time
-	Resolved  bool
+	ID       string
+	RuleName string
+	Severity string
+	HostID   string
+	Hostname string
+	Message  string
+	FiredAt  time.Time
+	Resolved bool
 }
 
 // SetMetricsStore injects the metrics store for ops reports / tool calling.
@@ -341,17 +341,17 @@ func (a *Assistant) Nl2Command(ctx context.Context, prompt string, hostID string
 
 // ReportResponse is the AI-generated structured analysis of a scan report.
 type ReportResponse struct {
-	Summary          string               `json:"summary"`
-	Priorities       []PriorityItem       `json:"priorities"`
-	Recommendations  []RecommendationItem `json:"recommendations"`
-	Model            string               `json:"model"`
+	Summary         string               `json:"summary"`
+	Priorities      []PriorityItem       `json:"priorities"`
+	Recommendations []RecommendationItem `json:"recommendations"`
+	Model           string               `json:"model"`
 }
 
 // PriorityItem ranks a finding by remediation urgency.
 type PriorityItem struct {
-	Level   string `json:"level"`   // critical / high / medium / low
-	Title   string `json:"title"`
-	Reason  string `json:"reason"`
+	Level  string `json:"level"` // critical / high / medium / low
+	Title  string `json:"title"`
+	Reason string `json:"reason"`
 }
 
 // RecommendationItem is an actionable fix suggestion.
@@ -720,15 +720,15 @@ func (a *Assistant) GetOpsReport(id string) (*OpsReport, bool) {
 
 // ChatMessage is a single message in a conversation.
 type ChatMessage struct {
-	Role    string `json:"role"`    // user / assistant
+	Role    string `json:"role"` // user / assistant
 	Content string `json:"content"`
 }
 
 // ChatResponse is the result of a natural language Q&A.
 type ChatResponse struct {
-	Answer  string `json:"answer"`
-	Model   string `json:"model"`
-	ToolsUsed []string `json:"tools_used,omitempty"`
+	Answer    string     `json:"answer"`
+	Model     string     `json:"model"`
+	ToolsUsed []string   `json:"tools_used,omitempty"`
 	Trace     *CallTrace `json:"trace,omitempty"`
 	Usage     *LLMUsage  `json:"usage,omitempty"`
 }
@@ -990,8 +990,8 @@ func callOllama(ctx context.Context, cfg Config, baseURL string, prompt string) 
 
 	return doRequest(req, func(data []byte) (string, *LLMUsage, error) {
 		var resp struct {
-			Response       string `json:"response"`
-			Error          string `json:"error"`
+			Response        string `json:"response"`
+			Error           string `json:"error"`
 			PromptEvalCount int    `json:"prompt_eval_count"`
 			EvalCount       int    `json:"eval_count"`
 		}

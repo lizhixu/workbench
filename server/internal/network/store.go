@@ -12,11 +12,11 @@ import (
 
 // NetworkConfig holds global overlay network settings (Headscale or Tailscale SaaS).
 type NetworkConfig struct {
-	ControlPlane      string    `json:"control_plane"`        // "headscale" or "tailscale"
-	ServerURL         string    `json:"server_url"`           // e.g. "https://headscale.example.com", empty for official SaaS
-	AuthKey           string    `json:"auth_key"`             // Pre-shared enrollment auth key
-	AcceptRoutes      bool      `json:"accept_routes"`        // Pass --accept-routes=true
-	AdvertiseExitNode bool      `json:"advertise_exit_node"`  // Allow advertising as exit node
+	ControlPlane      string    `json:"control_plane"`       // "headscale" or "tailscale"
+	ServerURL         string    `json:"server_url"`          // e.g. "https://headscale.example.com", empty for official SaaS
+	AuthKey           string    `json:"auth_key"`            // Pre-shared enrollment auth key
+	AcceptRoutes      bool      `json:"accept_routes"`       // Pass --accept-routes=true
+	AdvertiseExitNode bool      `json:"advertise_exit_node"` // Allow advertising as exit node
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
@@ -24,26 +24,26 @@ type NetworkConfig struct {
 type NodeStatus struct {
 	HostID       string    `json:"host_id"`
 	Installed    bool      `json:"installed"`
-	Online       bool      `json:"online"`       // Wireguard link state
-	IP           string    `json:"ip"`           // 100.x.y.z Tailscale IPv4
-	IPv6         string    `json:"ipv6"`         // Tailscale IPv6
-	NodeName     string    `json:"node_name"`    // FQDN or hostname registered in tailscale
-	Version      string    `json:"version"`      // tailscale client version
-	Direct       bool      `json:"direct"`       // Whether P2P direct link is established
-	DERP         string    `json:"derp"`         // Relay region, e.g. "DERP(tok)" or "Direct"
-	LatencyMS    float64   `json:"latency_ms"`   // Ping or relay latency
-	Subnets      []string  `json:"subnets"`      // Advertised or accepted subnets
+	Online       bool      `json:"online"`     // Wireguard link state
+	IP           string    `json:"ip"`         // 100.x.y.z Tailscale IPv4
+	IPv6         string    `json:"ipv6"`       // Tailscale IPv6
+	NodeName     string    `json:"node_name"`  // FQDN or hostname registered in tailscale
+	Version      string    `json:"version"`    // tailscale client version
+	Direct       bool      `json:"direct"`     // Whether P2P direct link is established
+	DERP         string    `json:"derp"`       // Relay region, e.g. "DERP(tok)" or "Direct"
+	LatencyMS    float64   `json:"latency_ms"` // Ping or relay latency
+	Subnets      []string  `json:"subnets"`    // Advertised or accepted subnets
 	LastChecked  time.Time `json:"last_checked"`
 	ErrorMessage string    `json:"error_message,omitempty"`
 }
 
 // Store persists overlay network configurations and cached node status snapshots.
 type Store struct {
-	mu       sync.RWMutex
-	dataDir  string
-	log      *slog.Logger
-	config   NetworkConfig
-	nodes    map[string]NodeStatus // keyed by host_id
+	mu      sync.RWMutex
+	dataDir string
+	log     *slog.Logger
+	config  NetworkConfig
+	nodes   map[string]NodeStatus // keyed by host_id
 }
 
 type fileState struct {

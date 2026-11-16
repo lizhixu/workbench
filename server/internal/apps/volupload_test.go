@@ -173,7 +173,7 @@ func TestUploadRestoreBaseURLRequiresTrustedHTTPURL(t *testing.T) {
 		}
 	}
 	for raw, want := range map[string]string{
-		"https://panel.example.com/": "https://panel.example.com",
+		"https://panel.example.com/":          "https://panel.example.com",
 		"http://panel.example.com:18789/base": "http://panel.example.com:18789/base",
 	} {
 		got, err := uploadRestoreBaseURL(raw)

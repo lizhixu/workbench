@@ -33,7 +33,7 @@ type AppTemplate struct {
 	ID            string     `json:"id"`
 	Name          string     `json:"name"`
 	Category      string     `json:"category"`
-	Icon          string     `json:"icon"`     // icon identifier
+	Icon          string     `json:"icon"` // icon identifier
 	Version       string     `json:"version"`
 	Description   string     `json:"description"`
 	Image         string     `json:"image"`

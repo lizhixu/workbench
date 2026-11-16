@@ -13,15 +13,15 @@ import (
 
 // OpsReport is a generated operational health report.
 type OpsReport struct {
-	ID          string         `json:"id"`
-	GeneratedAt time.Time      `json:"generated_at"`
-	Period      string         `json:"period"`       // e.g. "24h", "7d"
-	HostIDs     []string       `json:"host_ids"`     // scope
-	Summary     string         `json:"summary"`      // AI-written overview
-	HealthScore float64        `json:"health_score"` // 0-100
-	HostReports []HostReport   `json:"host_reports"`
-	Suggestions []string       `json:"suggestions"`
-	Model       string         `json:"model"`
+	ID          string       `json:"id"`
+	GeneratedAt time.Time    `json:"generated_at"`
+	Period      string       `json:"period"`       // e.g. "24h", "7d"
+	HostIDs     []string     `json:"host_ids"`     // scope
+	Summary     string       `json:"summary"`      // AI-written overview
+	HealthScore float64      `json:"health_score"` // 0-100
+	HostReports []HostReport `json:"host_reports"`
+	Suggestions []string     `json:"suggestions"`
+	Model       string       `json:"model"`
 }
 
 // HostReport is a per-host section of an ops report.

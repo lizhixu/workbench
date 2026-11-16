@@ -50,7 +50,7 @@ type Finding struct {
 	Severity   string `json:"severity"`   // critical / high / medium / low / info
 	Title      string `json:"title"`      // short description
 	Detail     string `json:"detail"`     // extended description
-	Suggestion string `json:"suggestion"`  // fix recommendation (may include commands)
+	Suggestion string `json:"suggestion"` // fix recommendation (may include commands)
 }
 
 // Handle processes a ScanRequest from the server.

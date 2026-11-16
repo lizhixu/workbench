@@ -37,12 +37,12 @@ type ImageMetadata struct {
 // systemEnvKeys are base-image bookkeeping variables that never matter to the
 // operator and are filtered out of the reported EnvVars.
 var systemEnvKeys = map[string]bool{
-	"PATH":          true,
-	"SSL_CERT_FILE": true,
-	"LANG":          true,
-	"LANGUAGE":      true,
-	"LC_ALL":        true,
-	"NODE_VERSION":  true,
+	"PATH":           true,
+	"SSL_CERT_FILE":  true,
+	"LANG":           true,
+	"LANGUAGE":       true,
+	"LC_ALL":         true,
+	"NODE_VERSION":   true,
 	"GOLANG_VERSION": true,
 }
 
@@ -69,11 +69,11 @@ type imageConfig struct {
 	OS           string `json:"os"`
 	Config       struct {
 		ExposedPorts map[string]json.RawMessage `json:"ExposedPorts"`
-		Env          []string                     `json:"Env"`
+		Env          []string                   `json:"Env"`
 		Volumes      map[string]json.RawMessage `json:"Volumes"`
-		Cmd          []string                     `json:"Cmd"`
-		Entrypoint   []string                     `json:"Entrypoint"`
-		WorkingDir   string                       `json:"WorkingDir"`
+		Cmd          []string                   `json:"Cmd"`
+		Entrypoint   []string                   `json:"Entrypoint"`
+		WorkingDir   string                     `json:"WorkingDir"`
 	} `json:"config"`
 }
 

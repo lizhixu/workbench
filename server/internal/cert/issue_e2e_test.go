@@ -411,13 +411,13 @@ func TestIssuePinnedDNS01SurfacesRealFailure(t *testing.T) {
 	}))
 	defer dnsMng.Close()
 
-		// Stub propagation check and min wait for fast test execution.
-		oldCheck := dns01AuthoritativeCheck
-		dns01AuthoritativeCheck = func(ctx context.Context, logf func(string, ...any), fqdn, want string) error { return nil }
-		defer func() { dns01AuthoritativeCheck = oldCheck }()
-		oldMinWait := dns01PropagationMinWait
-		dns01PropagationMinWait = 0
-		defer func() { dns01PropagationMinWait = oldMinWait }()
+	// Stub propagation check and min wait for fast test execution.
+	oldCheck := dns01AuthoritativeCheck
+	dns01AuthoritativeCheck = func(ctx context.Context, logf func(string, ...any), fqdn, want string) error { return nil }
+	defer func() { dns01AuthoritativeCheck = oldCheck }()
+	oldMinWait := dns01PropagationMinWait
+	dns01PropagationMinWait = 0
+	defer func() { dns01PropagationMinWait = oldMinWait }()
 
 	certPEM, _ := makeTestCertPEM(t)
 	fake := newFakeACME(t, certPEM, "")
@@ -450,13 +450,13 @@ func TestIssuePinnedDNS01SurfacesRealFailure(t *testing.T) {
 	if !strings.Contains(err.Error(), "dns-01") || !strings.Contains(err.Error(), "验证") {
 		t.Fatalf("error should identify the failed DNS-01 validation: %v", err)
 	}
-		fake.mu.Lock()
-		orders := fake.orders
-		fake.mu.Unlock()
-		if orders != 1 {
-			t.Fatalf("created %d CA orders, want exactly 1 (no doomed fallback order after a pinned mechanism fails)", orders)
-		}
+	fake.mu.Lock()
+	orders := fake.orders
+	fake.mu.Unlock()
+	if orders != 1 {
+		t.Fatalf("created %d CA orders, want exactly 1 (no doomed fallback order after a pinned mechanism fails)", orders)
 	}
+}
 
 type fakeBatchAuthz struct {
 	idType     string

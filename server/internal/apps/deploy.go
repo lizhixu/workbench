@@ -779,16 +779,16 @@ func (e *Engine) deploySingleContainer(ctx context.Context, hub *rpc.Hub, app *A
 			runArgs = append(runArgs, "-p", fmt.Sprintf("%d:%d", pm.Host, pm.Container))
 		}
 	}
-		for _, v := range app.Volumes {
-			runArgs = append(runArgs, "-v", shellQuote(v))
-		}
-		runArgs = append(runArgs, "--label", shellQuote("watchman.app="+app.ID))
-		// All interpolated values are shell-quoted: container names, env values
-		// and image refs all originate from user input (spaces would otherwise
-		// break `docker run`, metacharacters would inject commands — and the
-		// audit log would not reflect what actually ran).
-		runCmd := fmt.Sprintf("docker rm -f %s 2>/dev/null; docker run -d --name %s --restart unless-stopped %s %s %s",
-			shellQuote(nextName), shellQuote(nextName), strings.Join(envArgs, " "), strings.Join(runArgs, " "), shellQuote(imageRef))
+	for _, v := range app.Volumes {
+		runArgs = append(runArgs, "-v", shellQuote(v))
+	}
+	runArgs = append(runArgs, "--label", shellQuote("watchman.app="+app.ID))
+	// All interpolated values are shell-quoted: container names, env values
+	// and image refs all originate from user input (spaces would otherwise
+	// break `docker run`, metacharacters would inject commands — and the
+	// audit log would not reflect what actually ran).
+	runCmd := fmt.Sprintf("docker rm -f %s 2>/dev/null; docker run -d --name %s --restart unless-stopped %s %s %s",
+		shellQuote(nextName), shellQuote(nextName), strings.Join(envArgs, " "), strings.Join(runArgs, " "), shellQuote(imageRef))
 	logBuf.WriteString("$ start replacement container\n")
 	if cancelled() {
 		return
@@ -977,36 +977,36 @@ func (e *Engine) finishDeploySuccess(app *Application, dep *Deployment, commit, 
 		})
 		return
 	}
-		e.store.UpdateApp(app.ID, func(a *Application) error {
-			a.CurrentCommit = commit
-			if imageRef != "" {
-				a.Image = imageRef
-			}
-			if container != "" {
-				a.ContainerName = container
-			}
-			a.LastDeployAt = now
-			return nil
-		})
-		// The cached app pointer predates the update above, and a purge may have
-		// run while this deploy was finishing: re-read before any relay action so
-		// a deleted app never recreates its forwarder behind purge's back.
-		fresh, ok := e.store.GetApp(app.ID)
-		if !ok {
-			logBuf.WriteString("\nmesh-forward: 应用在部署期间已被删除，跳过中继创建\n")
-			e.log.Info("deployment succeeded but app was removed; skipping mesh forwarder", "app", app.ID)
-			return
+	e.store.UpdateApp(app.ID, func(a *Application) error {
+		a.CurrentCommit = commit
+		if imageRef != "" {
+			a.Image = imageRef
 		}
-		if fresh.MeshForwardEnabled && fresh.MeshForwardHostID != "" && fresh.MeshForwardEntryPort > 0 {
-			// A failed relay must not fail the deploy itself (the
-			// container is live), but the WARN is already in the log.
-			_ = e.syncMeshForwarder(fresh, logBuf)
-		} else if fresh.MeshForwardHostID != "" {
-			if err := e.cleanMeshForwarder(fresh.MeshForwardHostID, fresh.ID); err != nil {
-				logBuf.WriteString(fmt.Sprintf("WARN: 清理组网中继容器失败: %v\n", err))
-			}
+		if container != "" {
+			a.ContainerName = container
 		}
-		e.log.Info("deployment succeeded", "app", app.ID, "commit", commit, "deployment", dep.ID)
+		a.LastDeployAt = now
+		return nil
+	})
+	// The cached app pointer predates the update above, and a purge may have
+	// run while this deploy was finishing: re-read before any relay action so
+	// a deleted app never recreates its forwarder behind purge's back.
+	fresh, ok := e.store.GetApp(app.ID)
+	if !ok {
+		logBuf.WriteString("\nmesh-forward: 应用在部署期间已被删除，跳过中继创建\n")
+		e.log.Info("deployment succeeded but app was removed; skipping mesh forwarder", "app", app.ID)
+		return
+	}
+	if fresh.MeshForwardEnabled && fresh.MeshForwardHostID != "" && fresh.MeshForwardEntryPort > 0 {
+		// A failed relay must not fail the deploy itself (the
+		// container is live), but the WARN is already in the log.
+		_ = e.syncMeshForwarder(fresh, logBuf)
+	} else if fresh.MeshForwardHostID != "" {
+		if err := e.cleanMeshForwarder(fresh.MeshForwardHostID, fresh.ID); err != nil {
+			logBuf.WriteString(fmt.Sprintf("WARN: 清理组网中继容器失败: %v\n", err))
+		}
+	}
+	e.log.Info("deployment succeeded", "app", app.ID, "commit", commit, "deployment", dep.ID)
 }
 
 func (e *Engine) fail(app *Application, dep *Deployment, logBuf *logBuffer, msg string) {

@@ -30,12 +30,12 @@ const (
 
 // Entry is one saved command in the library.
 type Entry struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Shell       string    `json:"shell"`
-	Content     string    `json:"content"`
-	Description string    `json:"description"`
-	Tags        []string  `json:"tags,omitempty"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Shell       string   `json:"shell"`
+	Content     string   `json:"content"`
+	Description string   `json:"description"`
+	Tags        []string `json:"tags,omitempty"`
 	// Owner is the username that created the entry. Empty means "shared" —
 	// a built-in or admin-published command visible to everyone.
 	Owner     string    `json:"owner,omitempty"`

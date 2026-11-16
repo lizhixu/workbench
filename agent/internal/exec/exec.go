@@ -28,14 +28,14 @@ type Sender interface {
 // policy. These catch catastrophically destructive commands even if the
 // control server policy is disabled or bypassed.
 var localHighRiskPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`rm\s+-[rfRF]+\s+/(\s|$)`),         // rm -rf /
-	regexp.MustCompile(`rm\s+-[rfRF]+\s+/\*`),             // rm -rf /*
-	regexp.MustCompile(`mkfs\.`),                           // mkfs.<fs>
+	regexp.MustCompile(`rm\s+-[rfRF]+\s+/(\s|$)`),           // rm -rf /
+	regexp.MustCompile(`rm\s+-[rfRF]+\s+/\*`),               // rm -rf /*
+	regexp.MustCompile(`mkfs\.`),                            // mkfs.<fs>
 	regexp.MustCompile(`dd\s+if=.*of=/dev/(sd|nvme|hd|vd)`), // dd to disk
-	regexp.MustCompile(`>\s*/dev/sd[a-z]`),                 // overwrite disk
-	regexp.MustCompile(`:\s*\(\)\s*\{\s*:\|:\&\s*\}\s*;`), // fork bomb
-	regexp.MustCompile(`chmod\s+-R\s+777\s+/\s*$`),        // chmod -R 777 /
-	regexp.MustCompile(`kill\s+-9\s+-1`),                   // kill all
+	regexp.MustCompile(`>\s*/dev/sd[a-z]`),                  // overwrite disk
+	regexp.MustCompile(`:\s*\(\)\s*\{\s*:\|:\&\s*\}\s*;`),   // fork bomb
+	regexp.MustCompile(`chmod\s+-R\s+777\s+/\s*$`),          // chmod -R 777 /
+	regexp.MustCompile(`kill\s+-9\s+-1`),                    // kill all
 }
 
 // checkLocalPolicy returns a non-empty reason string when the command matches

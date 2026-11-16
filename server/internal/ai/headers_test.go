@@ -23,7 +23,7 @@ func TestCallOpenAICustomHeaders(t *testing.T) {
 		Headers: map[string]string{
 			"X-Custom-Key":  "custom-value",
 			"Authorization": "ApiKey override-value",
-			"  ":           "blank-key-ignored",
+			"  ":            "blank-key-ignored",
 			"X-Empty":       "   ",
 		},
 	}

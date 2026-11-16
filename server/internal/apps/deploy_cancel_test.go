@@ -221,22 +221,22 @@ func TestForceRedeploy(t *testing.T) {
 		t.Errorf("expected 200 with force=true, got %d: %s", w.Code, w.Body.String())
 	}
 
-		// Old deployment context must be cancelled
-		if ctx1.Err() == nil {
-			t.Errorf("expected old deployment context to be cancelled")
-		}
-		oldDep, _ := store.GetDeployment(app.ID, dep1.ID)
-		if oldDep.Status != DeployCancelled {
-			t.Errorf("expected old deployment to be cancelled, got %s", oldDep.Status)
-		}
-
-		// Wait for the async second deployment to complete (fails fast due to offline agent)
-		// before TempDir is unlinked, preventing Windows file lock cleanup errors.
-		deadline := time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) {
-			if !engine.IsRunning(app.ID) {
-				break
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
+	// Old deployment context must be cancelled
+	if ctx1.Err() == nil {
+		t.Errorf("expected old deployment context to be cancelled")
 	}
+	oldDep, _ := store.GetDeployment(app.ID, dep1.ID)
+	if oldDep.Status != DeployCancelled {
+		t.Errorf("expected old deployment to be cancelled, got %s", oldDep.Status)
+	}
+
+	// Wait for the async second deployment to complete (fails fast due to offline agent)
+	// before TempDir is unlinked, preventing Windows file lock cleanup errors.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !engine.IsRunning(app.ID) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

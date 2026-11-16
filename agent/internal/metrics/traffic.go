@@ -53,8 +53,8 @@ type trafficState struct {
 
 // trafficTracker accumulates monthly traffic with restart-safe correction.
 type trafficTracker struct {
-	path     string // state file location ("" disables persistence)
-	resetDay int    // billing cycle reset day-of-month (1..28)
+	path     string          // state file location ("" disables persistence)
+	resetDay int             // billing cycle reset day-of-month (1..28)
 	allow    map[string]bool // interface allowlist; nil/empty = all non-loopback
 	st       trafficState
 }

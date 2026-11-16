@@ -94,4 +94,3 @@ func TestDoUpgrade_RejectsCorruptBinary(t *testing.T) {
 		t.Fatalf("expected binary validation error in progress messages, got: %+v", sender.messages)
 	}
 }
-

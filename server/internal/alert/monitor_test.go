@@ -277,10 +277,10 @@ func TestMonitorMaintenanceExpiry(t *testing.T) {
 	if got := len(store.ListEvents(100)); got != 1 {
 		t.Fatalf("expected offline alert once maintenance expired, got %d events", got)
 	}
-		if mon.InMaintenance("h1") {
-			t.Error("InMaintenance should report false after the window expired")
-		}
+	if mon.InMaintenance("h1") {
+		t.Error("InMaintenance should report false after the window expired")
 	}
+}
 
 func TestMonitorHostSpecificTrafficAlert(t *testing.T) {
 	tmp := t.TempDir()

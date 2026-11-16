@@ -17,10 +17,10 @@ import (
 // S3Target represents one S3-compatible storage destination.
 type S3Target struct {
 	ID             string    `json:"id"`
-	Name           string    `json:"name"`           // e.g. "Cloudflare R2" or "公司内网 MinIO"
-	Provider       string    `json:"provider"`       // "r2" | "minio" | "aws" | "aliyun" | "tencent" | "custom"
-	Endpoint       string    `json:"endpoint"`       // e.g. "https://xxx.r2.cloudflarestorage.com"
-	Region         string    `json:"region"`         // e.g. "auto" or "us-east-1"
+	Name           string    `json:"name"`     // e.g. "Cloudflare R2" or "公司内网 MinIO"
+	Provider       string    `json:"provider"` // "r2" | "minio" | "aws" | "aliyun" | "tencent" | "custom"
+	Endpoint       string    `json:"endpoint"` // e.g. "https://xxx.r2.cloudflarestorage.com"
+	Region         string    `json:"region"`   // e.g. "auto" or "us-east-1"
 	Bucket         string    `json:"bucket"`
 	Prefix         string    `json:"prefix,omitempty"` // e.g. "backups/"
 	AccessKey      string    `json:"access_key"`

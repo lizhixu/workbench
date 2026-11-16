@@ -32,8 +32,8 @@ type OAuthConfig struct {
 // RepositoryDTO represents a GitHub repository exposed to the UI selector.
 type RepositoryDTO struct {
 	ID            int64     `json:"id"`
-	Name          string    `json:"name"`           // e.g. "my-repo"
-	FullName      string    `json:"full_name"`      // e.g. "octocat/my-repo"
+	Name          string    `json:"name"`      // e.g. "my-repo"
+	FullName      string    `json:"full_name"` // e.g. "octocat/my-repo"
 	Private       bool      `json:"private"`
 	HTMLURL       string    `json:"html_url"`
 	CloneURL      string    `json:"clone_url"`

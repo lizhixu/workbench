@@ -32,7 +32,7 @@ func TestServeSharedHTTP01Scope(t *testing.T) {
 		t.Fatalf("HEAD handling: ok=%v code=%d", ok, w.Code)
 	}
 	for _, tc := range []struct{ method, path string }{
-		{http.MethodPost, "/.well-known/acme-challenge/tok-1"}, // only GET/HEAD
+		{http.MethodPost, "/.well-known/acme-challenge/tok-1"},  // only GET/HEAD
 		{http.MethodGet, "/.well-known/acme-challenge/"},        // empty token
 		{http.MethodGet, "/.well-known/acme-challenge/a/b"},     // nested path
 		{http.MethodGet, "/.well-known/acme-challenge/unknown"}, // unregistered

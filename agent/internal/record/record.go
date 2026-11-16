@@ -16,14 +16,15 @@ import (
 // Recorder writes asciinema cast v2 output to a file.
 //
 // Cast v2 format:
-//   line 1: {"version":2,"width":W,"height":H,"timestamp":T,"env":{"SHELL":...}}
-//   line N: [elapsed_sec, "o", "output_data"]
+//
+//	line 1: {"version":2,"width":W,"height":H,"timestamp":T,"env":{"SHELL":...}}
+//	line N: [elapsed_sec, "o", "output_data"]
 type Recorder struct {
-	mu       sync.Mutex
-	file     *os.File
-	writer   *bufio.Writer
-	start    time.Time
-	closed   bool
+	mu     sync.Mutex
+	file   *os.File
+	writer *bufio.Writer
+	start  time.Time
+	closed bool
 }
 
 // New creates a Recorder writing to path. Header is written immediately.
@@ -42,9 +43,9 @@ func New(path string, cols, rows int) (*Recorder, error) {
 	r := &Recorder{file: f, writer: w, start: time.Now()}
 
 	header := map[string]any{
-		"version":  2,
-		"width":    cols,
-		"height":   rows,
+		"version":   2,
+		"width":     cols,
+		"height":    rows,
 		"timestamp": time.Now().Unix(),
 		"env": map[string]string{
 			"SHELL": os.Getenv("SHELL"),

@@ -113,9 +113,9 @@ func buildDockerInstall(hc hostPlanContext) *TaskPlanResponse {
 			Probe:       true,
 		},
 		{
-			Title:       "更新软件源索引",
-			Description: "确保包管理器索引最新，避免依赖下载失败",
-			Command:     pkgUpdateCmd(hc),
+			Title:           "更新软件源索引",
+			Description:     "确保包管理器索引最新，避免依赖下载失败",
+			Command:         pkgUpdateCmd(hc),
 			ContinueOnError: true,
 		},
 		{
@@ -135,10 +135,10 @@ func buildDockerInstall(hc hostPlanContext) *TaskPlanResponse {
 			Probe:       true,
 		},
 		{
-			Title:       "运行 hello-world 验证",
-			Description: "拉取并运行官方测试镜像，确认容器可正常创建",
-			Command:     "docker run --rm hello-world",
-			Probe:       true,
+			Title:           "运行 hello-world 验证",
+			Description:     "拉取并运行官方测试镜像，确认容器可正常创建",
+			Command:         "docker run --rm hello-world",
+			Probe:           true,
 			ContinueOnError: true,
 		},
 	}
@@ -360,4 +360,3 @@ func buildLargeFiles(hc hostPlanContext) *TaskPlanResponse {
 		Steps:   steps,
 	}
 }
-

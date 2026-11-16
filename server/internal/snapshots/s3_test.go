@@ -83,13 +83,13 @@ func TestS3TargetStore(t *testing.T) {
 
 	// Add target
 	t1 := &S3Target{
-		Name:           "Cloudflare R2",
-		Provider:       "r2",
-		Endpoint:       "https://account.r2.cloudflarestorage.com",
-		Bucket:         "watchman-backup",
-		AccessKey:      "ak123",
-		SecretKey:      "sk123",
-		IsDefault:      true,
+		Name:      "Cloudflare R2",
+		Provider:  "r2",
+		Endpoint:  "https://account.r2.cloudflarestorage.com",
+		Bucket:    "watchman-backup",
+		AccessKey: "ak123",
+		SecretKey: "sk123",
+		IsDefault: true,
 	}
 	if err := s.PutS3Target(t1); err != nil {
 		t.Fatalf("PutS3Target: %v", err)

@@ -19,7 +19,7 @@ type ScanJob struct {
 	ID            string    `json:"id"`
 	HostID        string    `json:"host_id"`
 	Hostname      string    `json:"hostname"`
-	Type          string    `json:"type"` // baseline / intrusion / vuln
+	Type          string    `json:"type"`   // baseline / intrusion / vuln
 	Status        string    `json:"status"` // running / completed / failed
 	StartedAt     time.Time `json:"started_at"`
 	FinishedAt    time.Time `json:"finished_at,omitempty"`

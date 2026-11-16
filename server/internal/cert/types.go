@@ -173,11 +173,11 @@ func ValidateAccountContact(directoryURL, email string) error {
 
 // ACMEAccount defines an authorized ACME identity at a Certificate Authority.
 type ACMEAccount struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	ProviderID   string    `json:"provider_id"` // "letsencrypt" | "zerossl" | "google" | "sslcom" | "custom"
-	DirectoryURL string    `json:"directory_url"`
-	Email        string    `json:"email"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	ProviderID   string `json:"provider_id"` // "letsencrypt" | "zerossl" | "google" | "sslcom" | "custom"
+	DirectoryURL string `json:"directory_url"`
+	Email        string `json:"email"`
 	// External Account Binding (EAB), required by ZeroSSL, Google, SSL.com.
 	EABKeyID   string    `json:"eab_key_id,omitempty"`
 	EABHMACKey string    `json:"eab_hmac_key,omitempty"` // stored 0600 on server, masked in public views

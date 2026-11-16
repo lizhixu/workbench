@@ -78,11 +78,11 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	readRG.GET("/apps/:id/deployments/:depID", h.getDeployment)
 	readRG.POST("/apps/:id/deployments/:depID/diagnose", h.diagnoseDeployment)
 	readRG.GET("/apps/:id/status", h.appStatus)
-		// App volume backup/restore: archive listing and download are reads (the
-		// download 302s to a pre-signed S3 GET).
-		readRG.GET("/apps/:id/volume-backups", h.listVolumeBackups)
-		readRG.GET("/apps/:id/volume-backups/:archiveID/download", h.downloadVolumeBackup)
-		readRG.GET("/apps/:id/volumes", h.getAppVolumes)
+	// App volume backup/restore: archive listing and download are reads (the
+	// download 302s to a pre-signed S3 GET).
+	readRG.GET("/apps/:id/volume-backups", h.listVolumeBackups)
+	readRG.GET("/apps/:id/volume-backups/:archiveID/download", h.downloadVolumeBackup)
+	readRG.GET("/apps/:id/volumes", h.getAppVolumes)
 
 	// Image / repository metadata probing: read-only ground-truth fetchers used
 	// by the create-form auto-fill hints and the AI app assistant. No state is
@@ -163,13 +163,13 @@ type createAppReq struct {
 	Ports          []PortMapping     `json:"ports"`
 	Volumes        []string          `json:"volumes"`
 	HealthcheckURL string            `json:"healthcheck_url"`
-		ContainerName  string            `json:"container_name"`
-		// Mesh Forwarding (TCP Relay via an entry host)
-		MeshForwardEnabled    bool   `json:"mesh_forward_enabled"`
-		MeshForwardHostID     string `json:"mesh_forward_host_id"`
-		MeshForwardEntryPort  int    `json:"mesh_forward_entry_port"`
-		MeshForwardTargetPort int    `json:"mesh_forward_target_port"`
-	}
+	ContainerName  string            `json:"container_name"`
+	// Mesh Forwarding (TCP Relay via an entry host)
+	MeshForwardEnabled    bool   `json:"mesh_forward_enabled"`
+	MeshForwardHostID     string `json:"mesh_forward_host_id"`
+	MeshForwardEntryPort  int    `json:"mesh_forward_entry_port"`
+	MeshForwardTargetPort int    `json:"mesh_forward_target_port"`
+}
 
 func (r *createAppReq) validate() error {
 	if strings.TrimSpace(r.Name) == "" {
@@ -193,11 +193,11 @@ func (r *createAppReq) validate() error {
 		if strings.TrimSpace(r.Image) == "" {
 			return fmt.Errorf("镜像地址不能为空")
 		}
-		case "template":
-			if strings.TrimSpace(r.TemplateID) == "" {
-				return fmt.Errorf("必须选择应用模板")
-			}
-		case "git":
+	case "template":
+		if strings.TrimSpace(r.TemplateID) == "" {
+			return fmt.Errorf("必须选择应用模板")
+		}
+	case "git":
 		if strings.TrimSpace(r.RepoURL) == "" {
 			return fmt.Errorf("Git 仓库地址不能为空")
 		}
@@ -213,11 +213,11 @@ func (r *createAppReq) validate() error {
 			return fmt.Errorf("环境变量名与值都不能为空")
 		}
 	}
-		for _, pm := range r.Ports {
-			if pm.Host <= 0 || pm.Host > 65535 || pm.Container <= 0 || pm.Container > 65535 {
-				return fmt.Errorf("端口映射非法: %d:%d", pm.Host, pm.Container)
-			}
+	for _, pm := range r.Ports {
+		if pm.Host <= 0 || pm.Host > 65535 || pm.Container <= 0 || pm.Container > 65535 {
+			return fmt.Errorf("端口映射非法: %d:%d", pm.Host, pm.Container)
 		}
+	}
 	if r.MeshForwardEnabled {
 		if err := validateMeshForward(r.HostID, r.MeshForwardEnabled, r.MeshForwardHostID, r.MeshForwardEntryPort, r.MeshForwardTargetPort); err != nil {
 			return err
@@ -277,18 +277,18 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 		return
 	}
 
-		if req.MeshForwardEnabled {
-			if h.reg.Hub(req.MeshForwardHostID) == nil {
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "组网转发入口主机 Agent 不在线"})
-				return
-			}
-			if err := h.meshForwardConflict("", req.MeshForwardHostID, req.MeshForwardEntryPort); err != nil {
-				c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-				return
-			}
+	if req.MeshForwardEnabled {
+		if h.reg.Hub(req.MeshForwardHostID) == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "组网转发入口主机 Agent 不在线"})
+			return
 		}
+		if err := h.meshForwardConflict("", req.MeshForwardHostID, req.MeshForwardEntryPort); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+	}
 
-		srcType := req.SourceType
+	srcType := req.SourceType
 	if srcType == "" {
 		srcType = "git"
 	}
@@ -300,38 +300,38 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 			buildType = "dockerfile"
 		}
 	}
-		containerName := firstNonEmpty(req.ContainerName, "watchman-app-"+strings.ReplaceAll(strings.TrimSpace(req.Name), " ", "-"))
-		image := strings.TrimSpace(req.Image)
+	containerName := firstNonEmpty(req.ContainerName, "watchman-app-"+strings.ReplaceAll(strings.TrimSpace(req.Name), " ", "-"))
+	image := strings.TrimSpace(req.Image)
 
-		app := &Application{
-			ID:                    "app_" + randomToken(8),
-			Name:                  strings.TrimSpace(req.Name),
-			HostID:                req.HostID,
-			SourceType:            srcType,
-			RepoURL:               strings.TrimSpace(req.RepoURL),
-			Branch:                firstNonEmpty(req.Branch, "main"),
-			AuthVaultID:           req.AuthVaultID,
-			AutoDeploy:            req.AutoDeploy,
-			WebhookToken:          randomToken(16),
-			BuildType:             buildType,
-			Dockerfile:            firstNonEmpty(req.Dockerfile, "Dockerfile"),
-			BuildContext:          firstNonEmpty(req.BuildContext, "."),
-			BuildTimeout:          req.BuildTimeout,
-			ComposeContent:        req.ComposeContent,
-			Image:                 image,
-			TemplateID:            req.TemplateID,
-			TemplateParams:        req.TemplateParams,
-			EnvVars:               req.EnvVars,
-			MeshForwardEnabled:    req.MeshForwardEnabled,
-			MeshForwardHostID:     req.MeshForwardHostID,
-			MeshForwardEntryPort:  req.MeshForwardEntryPort,
-			MeshForwardTargetPort: req.MeshForwardTargetPort,
-			Ports:                 req.Ports,
-			Volumes:               req.Volumes,
-			HealthcheckURL:        req.HealthcheckURL,
-			ContainerName:         containerName,
-			CreatedAt:             time.Now(),
-		}
+	app := &Application{
+		ID:                    "app_" + randomToken(8),
+		Name:                  strings.TrimSpace(req.Name),
+		HostID:                req.HostID,
+		SourceType:            srcType,
+		RepoURL:               strings.TrimSpace(req.RepoURL),
+		Branch:                firstNonEmpty(req.Branch, "main"),
+		AuthVaultID:           req.AuthVaultID,
+		AutoDeploy:            req.AutoDeploy,
+		WebhookToken:          randomToken(16),
+		BuildType:             buildType,
+		Dockerfile:            firstNonEmpty(req.Dockerfile, "Dockerfile"),
+		BuildContext:          firstNonEmpty(req.BuildContext, "."),
+		BuildTimeout:          req.BuildTimeout,
+		ComposeContent:        req.ComposeContent,
+		Image:                 image,
+		TemplateID:            req.TemplateID,
+		TemplateParams:        req.TemplateParams,
+		EnvVars:               req.EnvVars,
+		MeshForwardEnabled:    req.MeshForwardEnabled,
+		MeshForwardHostID:     req.MeshForwardHostID,
+		MeshForwardEntryPort:  req.MeshForwardEntryPort,
+		MeshForwardTargetPort: req.MeshForwardTargetPort,
+		Ports:                 req.Ports,
+		Volumes:               req.Volumes,
+		HealthcheckURL:        req.HealthcheckURL,
+		ContainerName:         containerName,
+		CreatedAt:             time.Now(),
+	}
 
 	// If AutoDeploy is enabled for a GitHub repository and the Git Provider is connected,
 	// automatically register the push webhook on the repository via GitHub API.
@@ -1081,28 +1081,28 @@ func (h *AppHandlers) containerAction(c *gin.Context, op string) {
 		c.JSON(http.StatusConflict, gin.H{"error": "应用尚未部署过"})
 		return
 	}
-		res, err := execOnAgent(hub, "app-ctl-"+randomToken(4), "docker "+op+" "+shellQuote(container), 60)
-		if err != nil {
-			c.JSON(http.StatusGatewayTimeout, gin.H{"error": err.Error()})
-			return
-		}
-		resp := gin.H{"ok": res.GetExitCode() == 0, "output": string(res.GetStdout())}
-		if app.MeshForwardEnabled && app.MeshForwardHostID != "" {
-			fwdHub := h.reg.Hub(app.MeshForwardHostID)
-			if fwdHub == nil {
-				resp["relay_warning"] = "组网转发入口主机离线，中继容器未同步操作"
-			} else {
-				fwdContainer := "watchman-fwd-" + app.ID
-				fres, ferr := execOnAgent(fwdHub, "fwd-ctl-"+randomToken(4), "docker "+op+" "+shellQuote(fwdContainer), 30)
-				switch {
-				case ferr != nil:
-					resp["relay_warning"] = "中继容器 " + op + " 失败: " + ferr.Error()
-				case fres.GetExitCode() != 0:
-					resp["relay_warning"] = fmt.Sprintf("中继容器 %s 失败(exit %d): %s", op, fres.GetExitCode(), strings.TrimSpace(string(fres.GetStderr())))
-				}
+	res, err := execOnAgent(hub, "app-ctl-"+randomToken(4), "docker "+op+" "+shellQuote(container), 60)
+	if err != nil {
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": err.Error()})
+		return
+	}
+	resp := gin.H{"ok": res.GetExitCode() == 0, "output": string(res.GetStdout())}
+	if app.MeshForwardEnabled && app.MeshForwardHostID != "" {
+		fwdHub := h.reg.Hub(app.MeshForwardHostID)
+		if fwdHub == nil {
+			resp["relay_warning"] = "组网转发入口主机离线，中继容器未同步操作"
+		} else {
+			fwdContainer := "watchman-fwd-" + app.ID
+			fres, ferr := execOnAgent(fwdHub, "fwd-ctl-"+randomToken(4), "docker "+op+" "+shellQuote(fwdContainer), 30)
+			switch {
+			case ferr != nil:
+				resp["relay_warning"] = "中继容器 " + op + " 失败: " + ferr.Error()
+			case fres.GetExitCode() != 0:
+				resp["relay_warning"] = fmt.Sprintf("中继容器 %s 失败(exit %d): %s", op, fres.GetExitCode(), strings.TrimSpace(string(fres.GetStderr())))
 			}
 		}
-		c.JSON(http.StatusOK, resp)
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (h *AppHandlers) listDeployments(c *gin.Context) {

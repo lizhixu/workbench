@@ -277,9 +277,11 @@ export interface DockerInstallResult {
 // installDocker runs the server-side one-click Docker install script on the
 // host. The script is defined on the server, not sent by the client, so the
 // command that actually runs cannot be tampered with from the browser.
+// The timeout must exceed the server-side exec budget (600s): the script may
+// walk several docker-ce mirrors before the official fallback.
 export function installDocker(hostId: string) {
   return unwrap<DockerInstallResult>(
-    http.post(`/hosts/${hostId}/docker/install-script`, {}, { timeout: 330000 }),
+    http.post(`/hosts/${hostId}/docker/install-script`, {}, { timeout: 630000 }),
   )
 }
 

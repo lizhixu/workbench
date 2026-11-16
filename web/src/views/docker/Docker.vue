@@ -436,7 +436,7 @@ async function pullImage() {
 
 async function startInstallDocker() {
   installing.value = true
-  installOutput.value = '>>> 正在下发服务端内置的 Docker 一键安装脚本 (curl -fsSL https://get.docker.com | sh)...\n'
+  installOutput.value = '>>> 正在下发服务端内置的 Docker 一键安装脚本（优先使用国内 docker-ce 镜像源，全部不可用时回退官方脚本）...\n'
   try {
     const res = await installDocker(hostId)
     if (res.ok) {
@@ -780,7 +780,7 @@ onMounted(() => {
       class="docker-alert"
     >
       <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 4px">
-        <span v-if="canInstall">当前主机可能尚未安装 Docker 引擎或守护进程未启动。点击右侧按钮可通过自动化脚本一键安装配置官方 Docker 环境。</span>
+        <span v-if="canInstall">当前主机可能尚未安装 Docker 引擎或守护进程未启动。点击右侧按钮可通过自动化脚本一键安装配置 Docker 环境（国内镜像源优先，官方源兜底）。</span>
         <span v-else>当前主机可能尚未安装 Docker 引擎或守护进程未启动。安装需要管理员或运维角色，请联系管理员处理。</span>
         <NButton
           v-if="canInstall"

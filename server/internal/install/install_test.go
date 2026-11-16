@@ -124,3 +124,64 @@ func TestInstallScriptIgnoresForwardedProto(t *testing.T) {
 		t.Fatalf("direct TLS: script does not contain https server URL")
 	}
 }
+
+func TestResolveGRPCHost(t *testing.T) {
+	cases := []struct{ serverURL, override, want string }{
+		{"https://www.wx1.us.ci", "", "www.wx1.us.ci:9090"},
+		{"http://10.0.0.5:18789", "", "10.0.0.5:9090"},
+		{"https://www.wx1.us.ci", "192.255.178.173", "192.255.178.173:9090"},
+		{"https://www.wx1.us.ci", "192.255.178.173:9090", "192.255.178.173:9090"},
+		{"https://www.wx1.us.ci", "direct.example.com:19090", "direct.example.com:19090"},
+		{"https://www.wx1.us.ci", "  192.255.178.173  ", "192.255.178.173:9090"},
+		{"https://www.wx1.us.ci", "[::1]:9090", "[::1]:9090"},
+	}
+	for _, tc := range cases {
+		if got := resolveGRPCHost(tc.serverURL, tc.override); got != tc.want {
+			t.Errorf("resolveGRPCHost(%q, %q) = %q, want %q", tc.serverURL, tc.override, got, tc.want)
+		}
+	}
+}
+
+func TestInstallScriptUsesGRPCHostOverride(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := NewHandler(nil, "")
+	h.GRPCHostOverride = func() string { return "192.255.178.173" }
+	engine := gin.New()
+	h.RegisterRoutes(engine)
+
+	for _, osType := range []string{"linux", "windows"} {
+		req := httptest.NewRequest("GET", "http://www.wx1.us.ci/install?os_type="+osType+"&token=<redacted>", nil)
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s install script: got status %d, want 200", osType, w.Code)
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, "192.255.178.173:9090") {
+			t.Fatalf("%s install script does not use the grpc override", osType)
+		}
+		if strings.Contains(body, "www.wx1.us.ci:9090") {
+			t.Fatalf("%s install script still derives grpc from the proxied panel domain", osType)
+		}
+		// The script must fail loudly at install time when the control
+		// plane is unreachable, instead of leaving a retrying agent.
+		if !strings.Contains(body, "cannot reach control plane") {
+			t.Fatalf("%s install script lacks the connectivity pre-check", osType)
+		}
+		if osType == "linux" && !strings.Contains(body, `GRPC_PROBE_HOST="${WATCHMAN_GRPC%:*}"`) {
+			t.Fatalf("linux install script probe host split is malformed (%% escaping)")
+		}
+	}
+
+	// Without an override the script keeps deriving from the panel URL.
+	h.GRPCHostOverride = nil
+	req := httptest.NewRequest("GET", "http://10.0.0.5:18789/install?token=<redacted>", nil)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("install script: got status %d, want 200", w.Code)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `WATCHMAN_GRPC="10.0.0.5:9090"`) {
+		t.Fatalf("install script without override does not derive grpc from the panel URL")
+	}
+}

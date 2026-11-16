@@ -128,6 +128,34 @@ func TestValidationRules(t *testing.T) {
 	}
 }
 
+func TestAgentGRPCHostValidation(t *testing.T) {
+	s := newTestStore(t)
+	valid := []string{"", "192.255.178.173", "192.255.178.173:9090", "direct.example.com", "direct.example.com:19090", "[::1]:9090"}
+	for _, v := range valid {
+		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{"agent.grpc_host": raw(t, v)}); err != nil {
+			t.Errorf("agent.grpc_host rejected valid value %q: %v", v, err)
+		}
+		if got := s.AgentGRPCHost(); got != strings.TrimSpace(v) {
+			t.Errorf("AgentGRPCHost() = %q, want %q", got, strings.TrimSpace(v))
+		}
+	}
+	invalid := []string{
+		"https://192.255.178.173:9090",
+		"192.255.178.173:0",
+		"192.255.178.173:65536",
+		"192.255.178.173:abc",
+		"192.255.178.173:",
+		"direct.example.com/foo",
+		"::1",
+		"bad_host!",
+	}
+	for _, v := range invalid {
+		if err := s.SetMany(ScopeSystem, "", map[string]json.RawMessage{"agent.grpc_host": raw(t, v)}); err == nil {
+			t.Errorf("agent.grpc_host accepted invalid value %q", v)
+		}
+	}
+}
+
 func TestEmptyFallsBackToDefault(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.SetMany(ScopeUser, "alice", map[string]json.RawMessage{
@@ -273,6 +301,7 @@ func TestSchemaAndEffective(t *testing.T) {
 		"security.panel_ssl_enabled", "security.panel_ssl_mode", "security.panel_ssl_cert_id",
 		"security.panel_ssl_cert_pem", "security.panel_ssl_key_pem", "security.panel_force_https",
 		"certs.auto_renew_days", "certs.expiry_reminder_days",
+		"agent.grpc_host",
 	} {
 		found := false
 		for _, e := range sysSchema {

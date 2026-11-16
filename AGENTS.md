@@ -1067,7 +1067,7 @@ Agent internal/shell
   3. 服务持久化注册：
      - Linux：安装至 `/opt/watchman/watchman-agent`，注册 `watchman-agent.service` systemd 服务并开机自启；
      - Windows：安装至 `C:\Program Files\Watchman\watchman-agent.exe`，注册名为 `WatchmanAgent` 的计划任务开机启动；
-  4. 携带参数启动：`-server <server-ip:9090> -token <enroll_token> [-upgrade-pubkey <pubkey>]`；
+  4. 携带参数启动：`-server <server-ip:9090> -token <enroll_token> [-upgrade-pubkey <pubkey>]`；其中 `-server` 地址默认由面板对外地址推导（面板域名或访问 IP）+ `:9090`，面板域名走 Cloudflare 等不转发 9090 的代理时新 Agent 连不上控制面、注册失败（安装时表现为反复 `open stream` 超时重试）；系统设置 `agent.grpc_host`（系统设置 → 安装部署，仅管理员）可指定直连地址（如 `192.255.178.173`，裸主机名默认 `:9090`），安装脚本即用它生成 `-server` 参数，保存即时生效、无需重启；安装脚本启动后还会对该地址做 5 秒 TCP 连通性预检，不通只打印 WARNING、不中断安装（Agent 本身仍会继续重试）。
   5. Agent 首次向控制端 gRPC 端口发起 `RegisterRequest` 换取长期凭证 `auth_token` 并持久化到 `agent-state.json`，随后立即清空 `enroll_token` 进入稳定心跳和监控上报状态。
 
 ### B.6.4 控制端命令行参数与运行时配置清单

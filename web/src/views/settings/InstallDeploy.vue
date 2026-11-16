@@ -5,12 +5,15 @@ import {
   NSpace,
   NButton,
   NIcon,
+  NInput,
   NSpin,
   NTag,
   useMessage,
 } from 'naive-ui'
-import { DownloadOutline, CubeOutline } from '@vicons/ionicons5'
+import { DownloadOutline, CubeOutline, LinkOutline } from '@vicons/ionicons5'
 import { enroll } from '../../api/hosts'
+import { SETTING_KEYS, getSystemSettings, saveSystemSettings } from '../../api/settings'
+import { useAuthStore } from '../../stores/auth'
 import { copyToClipboard } from '../../utils/clipboard'
 import OsLogo from '../../components/common/OsLogo.vue'
 
@@ -23,6 +26,49 @@ const enrollToken = ref('')
 // <TOKEN> 占位命令，避免令牌未加载完时闪现未生成态。
 const tokenLoading = ref(true)
 const osType = ref('linux')
+
+// Agent 直连接入地址（仅管理员可见）：空表示跟随面板地址；面板域名走
+// Cloudflare 等不转发 9090 的代理时填服务端直连地址。
+const auth = useAuthStore()
+const isAdmin = computed(() => auth.role === 'admin')
+const grpcHost = ref('')
+const grpcSaving = ref(false)
+const grpcLoaded = ref(false)
+
+const effectiveGrpc = computed(() => {
+  const v = grpcHost.value.trim()
+  if (v) {
+    return v.includes(':') ? v : `${v}:9090`
+  }
+  if (typeof window !== 'undefined') {
+    return `${window.location.hostname}:9090`
+  }
+  return 'localhost:9090'
+})
+
+async function loadGrpcHost() {
+  if (!isAdmin.value) return
+  try {
+    const res = await getSystemSettings()
+    grpcHost.value = String(res.data?.[SETTING_KEYS.agentGRPCHost] ?? '')
+  } catch {
+    // 加载失败不阻塞安装命令展示
+  } finally {
+    grpcLoaded.value = true
+  }
+}
+
+async function saveGrpcHost() {
+  grpcSaving.value = true
+  try {
+    await saveSystemSettings({ [SETTING_KEYS.agentGRPCHost]: grpcHost.value.trim() })
+    message.success('已保存，新安装的 Agent 将使用该地址回连')
+  } catch (e: any) {
+    message.error(e.message || '保存失败')
+  } finally {
+    grpcSaving.value = false
+  }
+}
 
 const serverHost = computed(() => {
   if (typeof window !== 'undefined') {
@@ -70,6 +116,7 @@ async function copyCmd() {
 
 onMounted(() => {
   genToken()
+  loadGrpcHost()
 })
 </script>
 
@@ -155,6 +202,24 @@ onMounted(() => {
           <span class="muted">或手动查看安装脚本: </span>
           <a :href="installScriptUrl" target="_blank" class="script-link">{{ installScriptUrl }}</a>
         </div>
+      </NSpace>
+    </NCard>
+
+    <NCard v-if="isAdmin" :bordered="false">
+      <template #header>
+        <span style="font-size: 16px; font-weight: 700">
+          <NIcon style="vertical-align: middle; margin-right: 6px"><LinkOutline /></NIcon>
+          Agent 直连接入地址
+        </span>
+      </template>
+      <NSpin v-if="!grpcLoaded" size="small" class="token-loading" />
+      <NSpace v-else vertical :size="12">
+        <div class="muted">安装脚本里 Agent 回连控制面的地址。留空则跟随面板地址（域名或访问 IP）+ :9090；面板域名走 Cloudflare 等不转发 9090 的代理时，在此填服务端直连地址，之后新安装的 Agent 才会注册成功。已安装的 Agent 不受影响，需手动改服务单元或重装。</div>
+        <NSpace :size="8" align="center">
+          <NInput v-model:value="grpcHost" placeholder="例如 192.255.178.173（留空跟随面板地址）" clearable style="width: 320px" />
+          <NButton type="primary" :loading="grpcSaving" @click="saveGrpcHost">保存</NButton>
+        </NSpace>
+        <div class="muted">当前安装脚本将使用的地址：<code>{{ effectiveGrpc }}</code></div>
       </NSpace>
     </NCard>
 

@@ -45,6 +45,10 @@ export const SETTING_KEYS = {
   // 对外 URL（Agent 安装/升级、Git webhook、卷恢复、组网 endpoint）都按它
   // 推导，未绑定则使用访问时的 IP。
   panelDomain: 'security.panel_domain',
+  // Agent 直连接入地址 (system scope, admin only): '' = follow the panel
+  // address; set to a direct host[:port] when the panel domain sits behind
+  // a proxy that does not forward :9090.
+  agentGRPCHost: 'agent.grpc_host',
   // Panel SSL / HTTPS (system scope)
   panelSSLEnabled: 'security.panel_ssl_enabled',
   panelSSLMode: 'security.panel_ssl_mode',

@@ -42,6 +42,11 @@ type Handler struct {
 	// UpgradePubKey is the hex Ed25519 public key agents should pin
 	// (-upgrade-pubkey) to verify self-upgrade signatures. Empty disables.
 	UpgradePubKey string
+
+	// GRPCHostOverride, when non-nil, returns the admin-configured direct
+	// address agents should dial (agent.grpc_host). Empty means derive
+	// from the panel URL as before.
+	GRPCHostOverride func() string
 }
 
 // NewHandler creates an install handler. binDir should contain files like
@@ -86,6 +91,22 @@ func extractGrpcHost(serverURL string) string {
 	return net.JoinHostPort(host, "9090")
 }
 
+// resolveGRPCHost picks the gRPC address baked into install scripts: the
+// admin-configured direct address wins; otherwise derive host:9090 from the
+// panel URL. A bare host gets the default 9090 port.
+func resolveGRPCHost(serverURL, override string) string {
+	if o := strings.TrimSpace(override); o != "" {
+		if h, p, err := net.SplitHostPort(o); err == nil {
+			if p == "" {
+				return net.JoinHostPort(h, "9090")
+			}
+			return o
+		}
+		return net.JoinHostPort(o, "9090")
+	}
+	return extractGrpcHost(serverURL)
+}
+
 // installScript returns a shell script that installs the agent on the target host.
 func (h *Handler) installScript(c *gin.Context) {
 	osType := c.DefaultQuery("os_type", "linux")
@@ -112,11 +133,15 @@ func (h *Handler) installScript(c *gin.Context) {
 	}
 
 	var script string
+	grpcOverride := ""
+	if h.GRPCHostOverride != nil {
+		grpcOverride = h.GRPCHostOverride()
+	}
 	switch osType {
 	case "linux":
-		script = linuxInstallScript(serverURL, token, h.UpgradePubKey)
+		script = linuxInstallScript(serverURL, token, h.UpgradePubKey, grpcOverride)
 	case "windows":
-		script = windowsInstallScript(serverURL, token, h.UpgradePubKey)
+		script = windowsInstallScript(serverURL, token, h.UpgradePubKey, grpcOverride)
 	default:
 		c.String(http.StatusBadRequest, "unsupported os_type: %s (use linux or windows)", osType)
 		return
@@ -476,8 +501,8 @@ func (h *Handler) agentBinary(c *gin.Context) {
 // linuxInstallScript generates a bash install script for Linux agents.
 // upgradePubKey (hex) is passed to the agent as -upgrade-pubkey so it
 // verifies self-upgrade signatures; empty disables.
-func linuxInstallScript(serverURL, token, upgradePubKey string) string {
-	grpcHost := extractGrpcHost(serverURL)
+func linuxInstallScript(serverURL, token, upgradePubKey, grpcHostOverride string) string {
+	grpcHost := resolveGRPCHost(serverURL, grpcHostOverride)
 	pubkeyFlag := ""
 	if upgradePubKey != "" {
 		pubkeyFlag = " -upgrade-pubkey " + upgradePubKey
@@ -584,6 +609,19 @@ else
   echo ">>> Agent started in background."
 fi
 
+# Connectivity pre-check: fail loudly at install time if the agent cannot
+# reach the control plane (e.g. panel domain behind a proxy that does not
+# forward :9090). Never aborts the install: the agent keeps retrying and
+# the operator can still fix the address afterwards.
+GRPC_PROBE_HOST="${WATCHMAN_GRPC%%:*}"
+GRPC_PROBE_PORT="${WATCHMAN_GRPC##*:}"
+if [ "$GRPC_PROBE_HOST" = "$GRPC_PROBE_PORT" ]; then GRPC_PROBE_PORT="9090"; fi
+if timeout 5 bash -c "cat < /dev/null > /dev/tcp/${GRPC_PROBE_HOST}/${GRPC_PROBE_PORT}" 2>/dev/null; then
+  echo ">>> Control plane reachable at ${WATCHMAN_GRPC}"
+else
+  echo ">>> WARNING: cannot reach control plane at ${WATCHMAN_GRPC} — the agent will keep retrying but never register. Check the address (a panel domain behind a proxy may not forward :9090; set agent.grpc_host to a direct address in Settings → 安装部署)."
+fi
+
 echo ""
 echo "✅ Watchman Agent installed successfully!"
 echo "   Server: ${WATCHMAN_SERVER}"
@@ -597,8 +635,8 @@ echo "The agent will auto-register with the control server and appear in the hos
 // windowsInstallScript generates a PowerShell install script for Windows agents.
 // upgradePubKey (hex) is passed to the agent as -upgrade-pubkey so it
 // verifies self-upgrade signatures; empty disables.
-func windowsInstallScript(serverURL, token, upgradePubKey string) string {
-	grpcHost := extractGrpcHost(serverURL)
+func windowsInstallScript(serverURL, token, upgradePubKey, grpcHostOverride string) string {
+	grpcHost := resolveGRPCHost(serverURL, grpcHostOverride)
 	pubkeyArg := ""
 	if upgradePubKey != "" {
 		pubkeyArg = " -upgrade-pubkey " + upgradePubKey
@@ -649,6 +687,21 @@ Register-ScheduledTask -TaskName "WatchmanAgent" -Action $action -Trigger $trigg
 
 Write-Host ">>> Starting agent..."
 Start-ScheduledTask -TaskName "WatchmanAgent"
+
+# Connectivity pre-check: fail loudly at install time if the agent cannot
+# reach the control plane (e.g. panel domain behind a proxy that does not
+# forward :9090). Never aborts the install: the agent keeps retrying and
+# the operator can still fix the address afterwards.
+$grpcTestHost = $WatchmanGrpc
+$grpcTestPort = 9090
+if ($WatchmanGrpc -match '^\[(.+)\]:(\d+)$') { $grpcTestHost = $Matches[1]; $grpcTestPort = [int]$Matches[2] }
+elseif ($WatchmanGrpc -match '^([^:]+):(\d+)$') { $grpcTestHost = $Matches[1]; $grpcTestPort = [int]$Matches[2] }
+$grpcReachable = Test-NetConnection -ComputerName $grpcTestHost -Port $grpcTestPort -WarningAction SilentlyContinue -InformationLevel Quiet
+if ($grpcReachable) {
+    Write-Host ">>> Control plane reachable at $WatchmanGrpc"
+} else {
+    Write-Host ">>> WARNING: cannot reach control plane at $WatchmanGrpc — the agent will keep retrying but never register. Check the address (a panel domain behind a proxy may not forward :9090; set agent.grpc_host to a direct address in Settings → 安装部署)."
+}
 
 Write-Host ""
 Write-Host "✅ Watchman Agent installed successfully!"

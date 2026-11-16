@@ -629,6 +629,7 @@ func main() {
 	installHandler := install.NewHandler(reg, "bin")
 	installHandler.UpgradePubKey = api.UpgradePubKeyHex
 	installHandler.ManifestPath = *manifestPath
+	installHandler.GRPCHostOverride = settingsStore.AgentGRPCHost
 	installHandler.RegisterRoutes(hr)
 	// Allow up to 21000MB for the application volume backup upload-scan
 	// route (up to 10 files at the 2GB per-file cap, plus multipart

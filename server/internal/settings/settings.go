@@ -37,6 +37,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -201,6 +202,14 @@ var Definitions = []Definition{
 	// 到期前 N 天经告警中心提醒一次。短期证书两侧都按有效期 1/3 自适应收紧（取较小者）。
 	{Key: "certs.auto_renew_days", Scope: ScopeSystem, Kind: KindInt, Title: "证书自动续期提前天数", Default: DefaultCertRenewDays, Min: MinCertDays, Max: MaxCertDays, DefaultOnEmpty: true},
 	{Key: "certs.expiry_reminder_days", Scope: ScopeSystem, Kind: KindInt, Title: "手动证书到期提醒提前天数", Default: DefaultCertRenewDays, Min: MinCertDays, Max: MaxCertDays, DefaultOnEmpty: true},
+
+	// Agent 接入（system 域，管理员专属）：
+	// 安装脚本里 Agent 回连控制面的 gRPC 地址。默认空表示跟随面板对外地址
+	// （面板域名或访问 IP）+ :9090；面板域名走 Cloudflare 等不转发 9090 的
+	// 代理时，填服务端直连地址（如 192.255.178.173 或直连域名），安装脚本
+	// 即用该地址生成 -server 参数；保存即时生效，无需重启。
+	{Key: "agent.grpc_host", Scope: ScopeSystem, Kind: KindString, Title: "Agent 直连接入地址", Default: "",
+		MaxLen: 253, Validate: validateAgentGRPCHost},
 }
 
 // validateAbsPath accepts an empty value (OS default applies) or an absolute
@@ -266,6 +275,45 @@ func validateDomainName(v any) error {
 		}
 	}
 	return nil
+}
+
+// validateAgentGRPCHost accepts an empty value (follow the panel address)
+// or a host / host:port agents dial directly: no scheme, no path, valid
+// hostname or IP, optional port 1-65535. IPv6 must be bracketed with a port
+// ([::1]:9090); a bare IPv6 literal is rejected as ambiguous.
+func validateAgentGRPCHost(v any) error {
+	s, _ := v.(string)
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	if strings.Contains(s, "://") || strings.Contains(s, "/") {
+		return errors.New("Agent 直连接入地址不能包含协议头或路径（如 192.255.178.173 或 direct.example.com:9090）")
+	}
+	if len(s) > 253 {
+		return errors.New("Agent 直连接入地址长度不能超过 253 个字符")
+	}
+	host := s
+	if strings.Contains(s, ":") {
+		h, p, err := net.SplitHostPort(s)
+		if err != nil {
+			return errors.New("Agent 直连接入地址格式不正确（如 192.255.178.173 或 direct.example.com:9090，IPv6 请用 [::1]:9090 形式）")
+		}
+		if p == "" {
+			return errors.New("Agent 直连接入地址端口不能为空")
+		}
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
+			return errors.New("Agent 直连接入地址端口必须在 1~65535 之间")
+		}
+		host = h
+	}
+	if host == "" {
+		return errors.New("Agent 直连接入地址主机名不能为空")
+	}
+	if net.ParseIP(host) != nil {
+		return nil
+	}
+	return validateDomainName(host)
 }
 
 // validateTimezone accepts an empty value (follow the server OS timezone) or
@@ -942,6 +990,14 @@ func (s *Store) PanelSecurity() PanelSecurityConfig {
 	s.decode(ScopeSystem, "", "security.panel_ssl_key_pem", &p.SSLKeyPEM)
 	s.decode(ScopeSystem, "", "security.panel_force_https", &p.ForceHTTPS)
 	return p
+}
+
+// AgentGRPCHost returns the admin-configured direct address agents dial
+// ("" = follow the panel address, see agent.grpc_host).
+func (s *Store) AgentGRPCHost() string {
+	var v string
+	s.decode(ScopeSystem, "", "agent.grpc_host", &v)
+	return strings.TrimSpace(v)
 }
 
 // JoinBetaProgram returns whether the user has opted into the pre-release beta program.

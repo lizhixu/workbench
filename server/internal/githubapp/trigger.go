@@ -12,5 +12,5 @@ type TriggerResult struct {
 // the apps package, which owns the deployment engine; this package only
 // owns the GitHub App protocol side.
 type PushTrigger interface {
-	TriggerPush(repoFullName, branch string) []TriggerResult
+	TriggerPush(ev *PushEvent) []TriggerResult
 }

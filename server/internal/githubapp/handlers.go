@@ -382,7 +382,7 @@ func (h *Handlers) webhookPush(c *gin.Context, body []byte) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "部署触发器未初始化"})
 		return
 	}
-	results := h.trigger.TriggerPush(ev.RepoFullName, branch)
+	results := h.trigger.TriggerPush(ev)
 	var triggered, skipped []TriggerResult
 	for _, r := range results {
 		if r.Skipped != "" {

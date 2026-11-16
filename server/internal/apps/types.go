@@ -20,14 +20,21 @@ type Application struct {
 	TemplateParams map[string]string `json:"template_params,omitempty"`
 
 	// Git link configuration (SourceType == "git").
-	RepoURL            string `json:"repo_url,omitempty"`
-	Branch             string `json:"branch,omitempty"`
-	AuthVaultID        string `json:"auth_vault_id,omitempty"` // vault credential: git token / deploy key
-	AutoDeploy         bool   `json:"auto_deploy"`
-	WebhookToken       string `json:"webhook_token,omitempty"` // secret path segment for /apps/webhook/:token
-	WebhookAutoManaged bool   `json:"webhook_auto_managed,omitempty"`
-	GitHubHookID       int64  `json:"github_hook_id,omitempty"`
-	WebhookError       string `json:"webhook_error,omitempty"`
+	RepoURL     string `json:"repo_url,omitempty"`
+	Branch      string `json:"branch,omitempty"`
+	AuthVaultID string `json:"auth_vault_id,omitempty"` // vault credential: git token / deploy key
+	AutoDeploy  bool   `json:"auto_deploy"`
+	// WatchPaths limits push-triggered auto-deploy to changes under these
+	// repo-relative directory prefixes (or exact file paths). Empty watches
+	// everything (the pre-existing behavior). Only the GitHub App and
+	// per-repo webhook push paths consult it; manual deploy/upgrade always
+	// run. A push whose delivery carries no file list deploys as before
+	// (fail-open) instead of being judged by an incomplete list.
+	WatchPaths         []string `json:"watch_paths,omitempty"`
+	WebhookToken       string   `json:"webhook_token,omitempty"` // secret path segment for /apps/webhook/:token
+	WebhookAutoManaged bool     `json:"webhook_auto_managed,omitempty"`
+	GitHubHookID       int64    `json:"github_hook_id,omitempty"`
+	WebhookError       string   `json:"webhook_error,omitempty"`
 
 	// Build configuration.
 	BuildType      string `json:"build_type,omitempty"`    // "dockerfile" | "compose"

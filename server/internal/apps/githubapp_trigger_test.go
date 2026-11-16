@@ -40,7 +40,7 @@ func TestGitHubAppTriggerPush(t *testing.T) {
 	starter := &fakeStarter{running: map[string]bool{}}
 	trigger := &GitHubAppTrigger{Apps: &fakeAppLister{apps: apps}, Starter: starter}
 
-	results := trigger.TriggerPush("acme/web", "main")
+	results := trigger.TriggerPush(pushEvent("acme/web", "main"))
 	if len(results) != 3 {
 		t.Fatalf("expected 3 repo-matched results, got %d: %+v", len(results), results)
 	}
@@ -62,7 +62,7 @@ func TestGitHubAppTriggerPush(t *testing.T) {
 	}
 
 	// Branch mismatch: main push must not trigger the staging app.
-	results = trigger.TriggerPush("acme/web", "staging")
+	results = trigger.TriggerPush(pushEvent("acme/web", "staging"))
 	if len(results) != 3 {
 		t.Fatalf("expected 3 results on staging push, got %d", len(results))
 	}
@@ -77,7 +77,7 @@ func TestGitHubAppTriggerPush(t *testing.T) {
 
 	// In-progress deployment blocks a second trigger.
 	starter.running["a1"] = true
-	results = trigger.TriggerPush("acme/web", "main")
+	results = trigger.TriggerPush(pushEvent("acme/web", "main"))
 	for _, r := range results {
 		if r.AppID == "a1" && r.Skipped == "" {
 			t.Errorf("a1 should skip while a deployment is running, got %+v", r)
@@ -85,17 +85,78 @@ func TestGitHubAppTriggerPush(t *testing.T) {
 	}
 
 	// Unknown repo triggers nothing.
-	if results := trigger.TriggerPush("acme/unknown", "main"); len(results) != 0 {
+	if results := trigger.TriggerPush(pushEvent("acme/unknown", "main")); len(results) != 0 {
 		t.Fatalf("unknown repo should trigger nothing, got %+v", results)
 	}
 
 	// Starter failure surfaces as a skip, not a panic.
 	starter.running = map[string]bool{}
 	starter.failErr = errors.New("engine busy")
-	results = trigger.TriggerPush("acme/web", "main")
+	results = trigger.TriggerPush(pushEvent("acme/web", "main"))
 	for _, r := range results {
 		if r.AppID == "a1" && r.Skipped != "engine busy" {
 			t.Errorf("a1 failure should surface as skip, got %+v", r)
 		}
+	}
+}
+
+// pushEvent builds a push delivery for tests: a branch push with a known
+// (possibly empty) changed-file list.
+func pushEvent(repo, branch string) *githubapp.PushEvent {
+	return &githubapp.PushEvent{
+		RepoFullName:      repo,
+		Ref:               "refs/heads/" + branch,
+		ChangedPathsKnown: true,
+	}
+}
+
+func TestGitHubAppTriggerWatchPaths(t *testing.T) {
+	apps := []*Application{
+		{ID: "w1", Name: "web", RepoURL: "https://github.com/acme/web.git", Branch: "main", AutoDeploy: true, WatchPaths: []string{"apps/web"}},
+		{ID: "w2", Name: "api", RepoURL: "https://github.com/acme/web.git", Branch: "main", AutoDeploy: true, WatchPaths: []string{"apps/api", "docker-compose.yml"}},
+	}
+	starter := &fakeStarter{running: map[string]bool{}}
+	trigger := &GitHubAppTrigger{Apps: &fakeAppLister{apps: apps}, Starter: starter}
+	byID := func(results []githubapp.TriggerResult) map[string]githubapp.TriggerResult {
+		m := map[string]githubapp.TriggerResult{}
+		for _, r := range results {
+			m[r.AppID] = r
+		}
+		return m
+	}
+
+	// Push touching only apps/web: w1 deploys, w2 skips.
+	ev := pushEvent("acme/web", "main")
+	ev.ChangedPaths = []string{"apps/web/src/index.ts", "README.md"}
+	res := byID(trigger.TriggerPush(ev))
+	if res["w1"].DeploymentID == "" {
+		t.Errorf("w1 should deploy on watched-path push, got %+v", res["w1"])
+	}
+	if res["w2"].Skipped != "no watched paths changed" {
+		t.Errorf("w2 should skip an untouched push, got %+v", res["w2"])
+	}
+	if len(starter.started) != 1 || starter.started[0].ID != "w1" {
+		t.Fatalf("only w1 should start, got %v", starter.started)
+	}
+
+	// Push touching the shared compose file: w2 deploys, w1 skips.
+	starter.started = nil
+	ev.ChangedPaths = []string{"docker-compose.yml"}
+	res = byID(trigger.TriggerPush(ev))
+	if res["w2"].DeploymentID == "" {
+		t.Errorf("w2 should deploy on compose-file push, got %+v", res["w2"])
+	}
+	if res["w1"].Skipped != "no watched paths changed" {
+		t.Errorf("w1 should skip a compose-only push, got %+v", res["w1"])
+	}
+
+	// Unknown file list (truncated / provider without lists): fail-open,
+	// both deploy as before.
+	starter.started = nil
+	ev.ChangedPaths = nil
+	ev.ChangedPathsKnown = false
+	res = byID(trigger.TriggerPush(ev))
+	if res["w1"].DeploymentID == "" || res["w2"].DeploymentID == "" {
+		t.Errorf("unknown file list should deploy both, got %+v", res)
 	}
 }

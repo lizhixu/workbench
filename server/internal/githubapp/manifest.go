@@ -92,6 +92,14 @@ type PushEvent struct {
 	Ref            string
 	RepoFullName   string
 	InstallationID int64
+	// ChangedPaths lists the repo-relative files touched by the push
+	// (added/removed/modified across its commits). ChangedPathsKnown is
+	// false when the delivery carried no file lists — a provider that
+	// omits them, or a push whose commits array GitHub truncated at its
+	// 20-commit cap — and the caller must then deploy as before instead
+	// of judging the push by an incomplete list.
+	ChangedPaths      []string
+	ChangedPathsKnown bool
 }
 
 // Branch returns the pushed branch name ("refs/heads/main" -> "main").
@@ -130,7 +138,59 @@ func ParsePushEvent(body []byte) (*PushEvent, error) {
 	if payload.Installation != nil {
 		ev.InstallationID = payload.Installation.ID
 	}
+	ev.ChangedPaths, ev.ChangedPathsKnown = ExtractChangedPaths(body)
 	return ev, nil
+}
+
+// maxPushCommitsInPayload is GitHub's documented cap on the commits array
+// of a push delivery: larger pushes arrive with the list truncated, so a
+// full-looking array of this size cannot prove which files changed.
+const maxPushCommitsInPayload = 20
+
+// ExtractChangedPaths collects the repo-relative files touched by a push
+// delivery from its commits' added/removed/modified lists. known is false
+// when the payload carried no file lists (the commits key is absent, the
+// commits carry no added/removed/modified keys — e.g. GitLab-style
+// payloads — or the array hit GitHub's truncation cap); the caller must
+// then deploy as before instead of skipping on an incomplete list. A
+// present-but-empty commits array is a positive statement that nothing
+// changed, so it reports known with no paths.
+func ExtractChangedPaths(body []byte) (paths []string, known bool) {
+	var payload struct {
+		Commits *[]struct {
+			Added    *[]string `json:"added"`
+			Removed  *[]string `json:"removed"`
+			Modified *[]string `json:"modified"`
+		} `json:"commits"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Commits == nil {
+		return nil, false
+	}
+	commits := *payload.Commits
+	if len(commits) >= maxPushCommitsInPayload {
+		return nil, false
+	}
+	if len(commits) == 0 {
+		return nil, true
+	}
+	seen := map[string]bool{}
+	for _, c := range commits {
+		for _, list := range []*[]string{c.Added, c.Removed, c.Modified} {
+			if list == nil {
+				continue
+			}
+			known = true
+			for _, p := range *list {
+				p = strings.TrimSpace(p)
+				if p == "" || seen[p] {
+					continue
+				}
+				seen[p] = true
+				paths = append(paths, p)
+			}
+		}
+	}
+	return paths, known
 }
 
 // NormalizeRepoURL reduces any GitHub remote form to a lowercase

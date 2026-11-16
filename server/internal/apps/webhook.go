@@ -3,10 +3,13 @@ package apps
 import (
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+
+	"watchman/server/internal/githubapp"
 )
 
 // webhook handles Git provider push events. Authentication is the per-app
@@ -57,6 +60,23 @@ func (h *AppHandlers) handleWebhook(c *gin.Context, token string) {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "skipped": true,
 			"reason": "branch does not match " + app.Branch})
 		return
+	}
+
+	// Watch paths are the last gate, after the branch match: a push that
+	// touches none of the watched directories/files does not deploy.
+	// Providers that do not send file lists (and GitHub pushes truncated
+	// at the 20-commit cap) report unknown, and the push deploys as
+	// before instead of being silently dropped.
+	if len(app.WatchPaths) > 0 {
+		changed, known := githubapp.ExtractChangedPaths(body)
+		if known && !WatchPathsMatch(app.WatchPaths, changed) {
+			c.JSON(http.StatusOK, gin.H{"ok": true, "skipped": true,
+				"reason": "no watched paths changed"})
+			return
+		}
+		if !known {
+			slog.Info("watch_paths 已配置但本次推送未携带变更文件清单，照常部署", "app", app.ID)
+		}
 	}
 
 	if h.engine.IsRunning(app.ID) {

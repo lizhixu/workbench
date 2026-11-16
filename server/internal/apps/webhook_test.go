@@ -117,3 +117,64 @@ func TestSameBranchTolerantCompare(t *testing.T) {
 		}
 	}
 }
+
+func TestWebhookWatchPaths(t *testing.T) {
+	r, s, e := newWebhookRouter(t)
+	watched := &Application{
+		ID: "app_watch", Name: "watched", HostID: "h1",
+		RepoURL: "https://github.com/example/repo.git",
+		Branch:  "main", AutoDeploy: true,
+		WebhookToken: "tokwatch", WatchPaths: []string{"apps/web"},
+		CreatedAt: time.Now(),
+	}
+	if err := s.PutApp(watched); err != nil {
+		t.Fatal(err)
+	}
+	deployments := func() int {
+		_, total := s.ListDeployments("app_watch", 0, 10)
+		return total
+	}
+	waitSettled := func(want int) {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if deployments() == want && !e.IsRunning("app_watch") {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	post := func(body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/apps/webhook/tokwatch", strings.NewReader(body)))
+		return w
+	}
+
+	// Push touching a watched path deploys.
+	w := post(`{"ref":"refs/heads/main","commits":[{"added":["apps/web/src/index.ts"]}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("watched-path push failed: code=%d body=%s", w.Code, w.Body.String())
+	}
+	waitSettled(1)
+	if deployments() != 1 {
+		t.Fatalf("watched-path push should deploy, got %d records", deployments())
+	}
+
+	// Push touching nothing watched is skipped, with no new record.
+	w = post(`{"ref":"refs/heads/main","commits":[{"modified":["README.md"]}]}`)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "no watched paths changed") {
+		t.Fatalf("untouched push should be skipped: code=%d body=%s", w.Code, w.Body.String())
+	}
+	if deployments() != 1 {
+		t.Fatalf("untouched push must not deploy, got %d records", deployments())
+	}
+
+	// Push without a file list deploys (fail-open).
+	w = post(`{"ref":"refs/heads/main","head_commit":{"id":"abc123"}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("no-list push failed: code=%d body=%s", w.Code, w.Body.String())
+	}
+	waitSettled(2)
+	if deployments() != 2 {
+		t.Fatalf("no-list push should deploy (fail-open), got %d records", deployments())
+	}
+}

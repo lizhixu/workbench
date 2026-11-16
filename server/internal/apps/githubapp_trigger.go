@@ -1,6 +1,7 @@
 package apps
 
 import (
+	"log/slog"
 	"strings"
 
 	"watchman/server/internal/githubapp"
@@ -27,7 +28,8 @@ type GitHubAppTrigger struct {
 	Starter DeploymentStarter
 }
 
-func (t *GitHubAppTrigger) TriggerPush(repoFullName, branch string) []githubapp.TriggerResult {
+func (t *GitHubAppTrigger) TriggerPush(ev *githubapp.PushEvent) []githubapp.TriggerResult {
+	branch := ev.Branch()
 	var results []githubapp.TriggerResult
 	for _, app := range t.Apps.ListApps() {
 		// Only github.com remotes can match a GitHub push: a bare
@@ -36,7 +38,7 @@ func (t *GitHubAppTrigger) TriggerPush(repoFullName, branch string) []githubapp.
 		if !strings.Contains(strings.ToLower(app.RepoURL), "github.com") {
 			continue
 		}
-		if githubapp.NormalizeRepoURL(app.RepoURL) != strings.ToLower(repoFullName) {
+		if githubapp.NormalizeRepoURL(app.RepoURL) != strings.ToLower(ev.RepoFullName) {
 			continue
 		}
 		res := githubapp.TriggerResult{AppID: app.ID, AppName: app.Name}
@@ -45,9 +47,17 @@ func (t *GitHubAppTrigger) TriggerPush(repoFullName, branch string) []githubapp.
 			res.Skipped = "auto deploy disabled for this app"
 		case !sameBranch(branch, app.Branch):
 			res.Skipped = "branch does not match " + app.Branch
+		case len(app.WatchPaths) > 0 && ev.ChangedPathsKnown && !WatchPathsMatch(app.WatchPaths, ev.ChangedPaths):
+			res.Skipped = "no watched paths changed"
 		case t.Starter.IsRunning(app.ID):
 			res.Skipped = "another deployment is already running"
 		default:
+			// Fail-open: a delivery without a usable file list cannot
+			// prove the watch paths were untouched, so the push deploys
+			// as before instead of being silently dropped.
+			if len(app.WatchPaths) > 0 && !ev.ChangedPathsKnown {
+				slog.Info("watch_paths 已配置但本次推送未携带变更文件清单，照常部署", "app", app.ID, "repo", ev.RepoFullName)
+			}
 			dep, err := t.Starter.StartDeployment(app, "github-app", "github-app")
 			if err != nil {
 				res.Skipped = err.Error()

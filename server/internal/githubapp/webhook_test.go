@@ -11,12 +11,12 @@ import (
 )
 
 type fakePushTrigger struct {
-	calls   [][2]string
+	calls   []*PushEvent
 	results []TriggerResult
 }
 
-func (f *fakePushTrigger) TriggerPush(repo, branch string) []TriggerResult {
-	f.calls = append(f.calls, [2]string{repo, branch})
+func (f *fakePushTrigger) TriggerPush(ev *PushEvent) []TriggerResult {
+	f.calls = append(f.calls, ev)
 	return f.results
 }
 
@@ -70,7 +70,7 @@ func TestWebhookPushTriggersBranch(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if len(trigger.calls) != 1 || trigger.calls[0] != [2]string{"acme/web", "main"} {
+	if len(trigger.calls) != 1 || trigger.calls[0].RepoFullName != "acme/web" || trigger.calls[0].Branch() != "main" {
 		t.Fatalf("trigger should run once for acme/web main, got %v", trigger.calls)
 	}
 	if !strings.Contains(w.Body.String(), "dep-1") {

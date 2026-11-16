@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -126,6 +127,93 @@ func TestParsePushEvent(t *testing.T) {
 	}
 	if _, err := ParsePushEvent([]byte(`{"ref":"refs/heads/main"}`)); err == nil {
 		t.Fatal("push without repository should fail")
+	}
+}
+
+func TestParsePushEventChangedPaths(t *testing.T) {
+	body := []byte(`{"ref":"refs/heads/main","repository":{"full_name":"Acme/Web"},` +
+		`"commits":[{"added":["apps/web/src/index.ts"],"modified":["README.md"],"removed":["apps/web/old.ts"]},` +
+		`{"added":["apps/api/main.go","README.md"]}]}`)
+	ev, err := ParsePushEvent(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ev.ChangedPathsKnown {
+		t.Fatal("commits with file lists should be known")
+	}
+	want := map[string]bool{
+		"apps/web/src/index.ts": true, "README.md": true,
+		"apps/web/old.ts": true, "apps/api/main.go": true,
+	}
+	if len(ev.ChangedPaths) != len(want) {
+		t.Fatalf("changed paths = %v, want %v", ev.ChangedPaths, want)
+	}
+	for _, p := range ev.ChangedPaths {
+		if !want[p] {
+			t.Errorf("unexpected changed path %q", p)
+		}
+	}
+}
+
+func TestExtractChangedPaths(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string
+		wantKnown bool
+		want      []string
+	}{
+		{
+			name:      "no commits key",
+			body:      `{"ref":"refs/heads/main"}`,
+			wantKnown: false,
+		},
+		{
+			name:      "gitlab-style commits without file lists",
+			body:      `{"ref":"refs/heads/main","commits":[{"id":"abc","message":"hi"}]}`,
+			wantKnown: false,
+		},
+		{
+			name:      "empty commits array is a positive empty",
+			body:      `{"ref":"refs/heads/main","commits":[]}`,
+			wantKnown: true,
+			want:      nil,
+		},
+		{
+			name:      "empty file lists are still known",
+			body:      `{"ref":"refs/heads/main","commits":[{"added":[],"removed":[],"modified":[]}]}`,
+			wantKnown: true,
+			want:      nil,
+		},
+		{
+			name:      "merges added/removed/modified and dedups",
+			body:      `{"ref":"refs/heads/main","commits":[{"added":["a/x","b/y"],"modified":["a/x"],"removed":["c/z"]}]}`,
+			wantKnown: true,
+			want:      []string{"a/x", "b/y", "c/z"},
+		},
+	}
+	for _, tc := range cases {
+		got, known := ExtractChangedPaths([]byte(tc.body))
+		if known != tc.wantKnown {
+			t.Errorf("%s: known = %v, want %v", tc.name, known, tc.wantKnown)
+		}
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: paths = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// 20 commits hit GitHub's truncation cap: the list may be
+	// incomplete, so it must report unknown.
+	var b strings.Builder
+	b.WriteString(`{"ref":"refs/heads/main","commits":[`)
+	for i := 0; i < 20; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"added":["f%d"]}`, i)
+	}
+	b.WriteString(`]}`)
+	if _, known := ExtractChangedPaths([]byte(b.String())); known {
+		t.Error("20-commit push should report unknown (truncated)")
 	}
 }
 

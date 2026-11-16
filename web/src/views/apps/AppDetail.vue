@@ -3,7 +3,7 @@ import { computed, h, nextTick, onActivated, onDeactivated, onMounted, onUnmount
 import { useRoute, useRouter } from 'vue-router'
 import {
   NAlert, NButton, NCard, NCheckbox, NCheckboxGroup, NCode, NCollapse, NCollapseItem, NDataTable, NDescriptions, NDescriptionsItem,
-  NEmpty, NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPagination, NPopconfirm, NPopover, NRadio, NRadioGroup,
+  NDynamicInput, NEmpty, NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPagination, NPopconfirm, NPopover, NRadio, NRadioGroup,
   NSelect, NSpace, NSpin, NSwitch, NTabPane, NTabs, NUpload,
   NTag, useMessage,
 } from 'naive-ui'
@@ -842,6 +842,7 @@ const editForm = ref({
   healthcheck_url: '',
   ports: [] as { host: number | null; container: number | null; bind_scope: 'public' | 'mesh' }[],
   volumes_text: '',
+  watch_paths: [] as string[],
 })
 
 function openEdit() {
@@ -856,6 +857,7 @@ function openEdit() {
       bind_scope: (p.bind_scope === 'mesh' ? 'mesh' : 'public') as 'public' | 'mesh',
     })),
     volumes_text: (app.value.volumes ?? []).join('\n'),
+    watch_paths: [...(app.value.watch_paths ?? [])],
   }
   showEdit.value = true
 }
@@ -892,6 +894,10 @@ function buildEditPatch() {
     .map((l) => l.trim())
     .filter((l) => l.length > 0)
   if (JSON.stringify(volumes) !== JSON.stringify(cur.volumes ?? [])) patch.volumes = volumes
+  if (cur.source_type === 'git' && cur.auto_deploy) {
+    const watchPaths = editForm.value.watch_paths.map((p) => p.trim()).filter((p) => p.length > 0)
+    if (JSON.stringify(watchPaths) !== JSON.stringify(cur.watch_paths ?? [])) patch.watch_paths = watchPaths
+  }
   return patch
 }
 
@@ -3063,6 +3069,9 @@ onUnmounted(() => {
                 </NButton>
               </div>
             </NAlert>
+            <div v-if="app.auto_deploy && (app.watch_paths ?? []).length" style="margin-top: 10px; font-size: 13px">
+              仅监听目录变更：<span class="mono">{{ (app.watch_paths ?? []).join('、') }}</span>
+            </div>
           </div>
         </NTabPane>
 
@@ -4294,6 +4303,12 @@ onUnmounted(() => {
             :autosize="{ minRows: 2, maxRows: 5 }"
             placeholder="/opt/data:/data"
           />
+        </NFormItem>
+        <NFormItem v-if="app?.source_type === 'git' && app?.auto_deploy" label="监听目录">
+          <NDynamicInput v-model:value="editForm.watch_paths" placeholder="仓库相对目录或文件，如 apps/web" :min="0" />
+          <template #feedback>
+            <span class="field-hint tip-hint">只监听所填目录或文件下的变更；留空时任意推送都触发部署</span>
+          </template>
         </NFormItem>
       </NForm>
       <NAlert v-if="editIsDeployed" type="warning" :show-icon="false" style="margin-bottom: 12px">

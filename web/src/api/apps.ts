@@ -30,6 +30,8 @@ export interface AppEntity {
   branch?: string
   auth_vault_id?: string
   auto_deploy: boolean
+  /** 监听目录：仅 push 触发的自动部署参考；空 = 监听全部目录 */
+  watch_paths?: string[]
   webhook_token?: string
   webhook_auto_managed?: boolean
   github_hook_id?: number
@@ -91,6 +93,7 @@ export interface AppCreateRequest {
   branch?: string
   auth_vault_id?: string
   auto_deploy?: boolean
+  watch_paths?: string[]
   build_type?: 'dockerfile' | 'compose'
   dockerfile?: string
   build_context?: string

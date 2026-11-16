@@ -151,6 +151,7 @@ type createAppReq struct {
 	Branch         string            `json:"branch"`
 	AuthVaultID    string            `json:"auth_vault_id"`
 	AutoDeploy     bool              `json:"auto_deploy"`
+	WatchPaths     []string          `json:"watch_paths"`
 	BuildType      string            `json:"build_type"`
 	Dockerfile     string            `json:"dockerfile"`
 	BuildContext   string            `json:"build_context"`
@@ -223,6 +224,14 @@ func (r *createAppReq) validate() error {
 			return err
 		}
 	}
+	if len(r.WatchPaths) > 0 && srcType != "git" {
+		return fmt.Errorf("监听目录仅适用于 Git 来源应用")
+	}
+	normalized, err := NormalizeWatchPaths(r.WatchPaths)
+	if err != nil {
+		return err
+	}
+	r.WatchPaths = normalized
 	return nil
 }
 
@@ -312,6 +321,7 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 		Branch:                firstNonEmpty(req.Branch, "main"),
 		AuthVaultID:           req.AuthVaultID,
 		AutoDeploy:            req.AutoDeploy,
+		WatchPaths:            req.WatchPaths,
 		WebhookToken:          randomToken(16),
 		BuildType:             buildType,
 		Dockerfile:            firstNonEmpty(req.Dockerfile, "Dockerfile"),
@@ -404,11 +414,12 @@ func (h *AppHandlers) repoCoveredByGitHubApp(repoURL string) bool {
 // host_id, source_type and container_name stay immutable here (moving an app
 // to another host is a redeploy, not an edit).
 type updateAppReq struct {
-	Name        *string `json:"name"`
-	RepoURL     *string `json:"repo_url"`
-	Branch      *string `json:"branch"`
-	AuthVaultID *string `json:"auth_vault_id"`
-	AutoDeploy  *bool   `json:"auto_deploy"`
+	Name        *string   `json:"name"`
+	RepoURL     *string   `json:"repo_url"`
+	Branch      *string   `json:"branch"`
+	AuthVaultID *string   `json:"auth_vault_id"`
+	AutoDeploy  *bool     `json:"auto_deploy"`
+	WatchPaths  *[]string `json:"watch_paths"`
 
 	BuildType      *string `json:"build_type"`
 	Dockerfile     *string `json:"dockerfile"`
@@ -474,6 +485,18 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 				return
 			}
 		}
+	}
+	if req.WatchPaths != nil {
+		if oldApp.SourceType != "git" && len(*req.WatchPaths) > 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "监听目录仅适用于 Git 来源应用"})
+			return
+		}
+		normalized, err := NormalizeWatchPaths(*req.WatchPaths)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		*req.WatchPaths = normalized
 	}
 
 	// Mesh-forward rules are validated on the EFFECTIVE config (stored values
@@ -546,6 +569,9 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 		}
 		if req.AutoDeploy != nil {
 			a.AutoDeploy = *req.AutoDeploy
+		}
+		if req.WatchPaths != nil {
+			a.WatchPaths = *req.WatchPaths
 		}
 		// Explicit "" / 0 clears: the pipeline re-applies its defaults
 		// (Dockerfile, "." context, 900s timeout) for empty values, so

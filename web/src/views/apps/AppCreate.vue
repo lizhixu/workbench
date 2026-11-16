@@ -2,7 +2,7 @@
 import { computed, onActivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  NAlert, NAvatar, NButton, NCard, NCollapse, NCollapseItem, NForm, NFormItem, NGi, NGrid, NIcon, NInput, NInputNumber,
+  NAlert, NAvatar, NButton, NCard, NCollapse, NCollapseItem, NDynamicInput, NForm, NFormItem, NGi, NGrid, NIcon, NInput, NInputNumber,
   NRadio, NRadioButton, NRadioGroup, NSelect, NSpace, NSwitch, NTag, useMessage,
 } from 'naive-ui'
 import {
@@ -173,6 +173,8 @@ const form = reactive({
   branch: 'main',
   auth_vault_id: null as string | null,
   auto_deploy: true,
+  // 监听目录：只监听所填目录/文件下的变更；留空监听全部目录
+  watch_paths: [] as string[],
   build_type: 'dockerfile' as 'dockerfile' | 'compose',
   dockerfile: 'Dockerfile',
   build_context: '.',
@@ -1404,6 +1406,7 @@ async function submit() {
       branch: isGit ? form.branch.trim() || 'main' : undefined,
       auth_vault_id: isGit ? form.auth_vault_id || undefined : undefined,
       auto_deploy: isGit ? form.auto_deploy : false,
+      watch_paths: isGit ? form.watch_paths : undefined,
       build_type: isCompose ? 'compose' : isGit ? form.build_type : undefined,
       compose_content: isCompose ? form.compose_content : undefined,
       dockerfile: isGit ? form.dockerfile.trim() || 'Dockerfile' : undefined,
@@ -1778,6 +1781,11 @@ onMounted(loadData)
               </NSpace>
             </div>
             <div class="hint">{{ autoDeployHint }}</div>
+            <div v-if="form.auto_deploy" class="watch-paths">
+              <div class="watch-paths-label">监听目录</div>
+              <NDynamicInput v-model:value="form.watch_paths" placeholder="仓库相对目录或文件，如 apps/web" :min="0" />
+              <div class="hint">只监听所填目录或文件下的变更；留空时任意推送都触发部署。</div>
+            </div>
           </div>
 
           <NFormItem label="目标主机" required>
@@ -2421,6 +2429,20 @@ onMounted(loadData)
   .hint {
     display: block;
     line-height: 1.6;
+  }
+
+  .watch-paths {
+    margin-top: 10px;
+
+    .watch-paths-label {
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    .hint {
+      margin-top: 6px;
+    }
   }
 }
 

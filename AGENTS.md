@@ -81,7 +81,7 @@
 - **容器终端**：一键进入容器 shell。
 - **镜像管理**：镜像名称、ID、大小、创建时间、使用状态（使用中/未使用，按是否被任意容器引用，含已停止容器）；支持删除单个、批量删除、清除悬空镜像；深度清理带磁盘占用预览（已停止容器、未使用镜像/网络、构建缓存，可选同时清理未使用卷），应用中心纳管的已停止容器（含 -prev 回滚容器）受保护不删除。
 - **系统清理**：主机详情「系统清理」页签（与 Docker 页签并列）。先预览每类可回收量（APT 缓存、journal 日志、临时文件、旧日志），勾选后确认执行，分项回显每步回收量；仅 Debian/Ubuntu（按 /etc/os-release 判定），其余系统直接提示不支持；执行为高危审计操作，5 分钟超时。apt autoremove 不在 v1 范围内。
-- **一键安装 Docker**：若主机未安装 Docker，控制端可一键为其安装。
+- **一键安装 Docker**：若主机未安装 Docker，控制端可一键为其安装。**安装源不再单依赖官方脚本**：`POST /hosts/:id/docker/install-script` 内置脚本按「国内 docker-ce 镜像源优先 → `get.docker.com` 兜底」顺序执行，因境内主机常常连 `get.docker.com` 都无法解析，单一官方源会让按钮必然失败。镜像源依次尝试阿里云 `mirrors.aliyun.com/docker-ce`、华为云 `mirrors.huaweicloud.com/docker-ce`、清华 TUNA `mirrors.tuna.tsinghua.edu.cn/docker-ce`，每个源按 `/etc/os-release` 的 `ID` 选路：Ubuntu/Debian 走 apt（`gpg` + `sources.list.d/docker.list`，codename 取 `VERSION_CODENAME`/`UBUNTU_CODENAME`，架构取 `dpkg --print-architecture`），CentOS/RHEL/Fedora 走 dnf/yum（直接取镜像的 `docker-ce.repo`），Rocky/AlmaLinux 映射到 `centos` 子树（镜像不单独发布 rocky/almalinux 目录，centos 与之 ABI 兼容），Alpine 走发行版仓库 `apk add docker docker-cli-compose`。安装包集合为 `docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin`，老仓库缺少插件包时回退只装核心三个；apt/yum 失败会清掉本次写入的源文件，避免污染宿主机后续 `apt-get update`。下载优先 `curl`、缺失时回退 `wget` 并带连接/总时长上限。全部镜像与官方源都不可达时以非零退出码结束并给出可操作文案（曾出现 `curl` 失败后脚本仍继续执行 `systemctl`/`docker` 导致假性「安装完成」，现安装后强制执行 `command -v docker` 校验）。脚本内含 systemd 与 sysvinit 双启动路径（`systemctl enable --now docker` 失败回退 `service docker start`）。执行超时为 600 秒（多源逐个尝试需要更长预算），前端请求超时同步放宽为 630 秒。
 
 ### 3.5 在线终端（Web Terminal）
 

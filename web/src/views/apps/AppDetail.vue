@@ -1251,7 +1251,7 @@ async function startInstallDockerFromPrompt() {
   if (!app.value) return
   installingDocker.value = true
   dockerInstallDone.value = null
-  dockerInstallOutput.value = '>>> 正在下发服务端内置的 Docker 一键安装脚本 (curl -fsSL https://get.docker.com | sh)...\n'
+  dockerInstallOutput.value = '>>> 正在下发服务端内置的 Docker 一键安装脚本（优先使用国内 docker-ce 镜像源，全部不可用时回退官方脚本）...\n'
   try {
     const res = await installDocker(app.value.host_id)
     if (res.ok) {
@@ -4207,9 +4207,9 @@ onUnmounted(() => {
           <p class="docker-install-lead">
             本次部署在前置检查就失败了：目标主机上没有 Docker，无法拉起任何容器。是否立即为该主机安装 Docker？
           </p>
-          <div class="docker-install-cmd"><code>curl -fsSL https://get.docker.com | sh</code></div>
+          <div class="docker-install-cmd"><code>国内 docker-ce 镜像源优先，get.docker.com 兜底</code></div>
           <p class="docker-install-hint">
-            将执行服务端内置的官方一键安装脚本，依赖网络下载，通常需要 1~3 分钟。
+            将执行服务端内置的一键安装脚本：依次尝试阿里云 / 华为云 / 清华源，全部不可用时回退官方脚本。依赖网络下载，通常需要 1~3 分钟。
           </p>
         </template>
         <template v-else>

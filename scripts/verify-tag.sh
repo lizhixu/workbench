@@ -82,9 +82,38 @@ if [ -n "$COMMIT_SUBJECT" ] && [ "$FIRST_LINE" = "$COMMIT_SUBJECT" ]; then
   fail "$TAG 附注首行与指向 commit 的 subject 完全相同，疑似直接把提交信息当作版本说明"
 fi
 
-# 6. 至少命中一个 changelog 分段或条目，防止随意堆砌几行文字
-if ! printf '%s' "$MSG" | grep -qE '^(### |- |\* )'; then
-  fail "$TAG 附注没有可识别的变更条目（缺少 '### Added' 之类的分段或 '- ' 列表）"
+# 6. 附注必须是「版本级分段清单」（AGENTS.md B.6.5 第 2 节）：
+#    首行 release: <tag>、至少一个受支持的 ### 分段标题、每段至少一条 "- " 条目。
+#    只堆几条 "- " 而不分段同样不合规——此前仅要求「分段或条目」二者之一，
+#    导致无分段标题的散列清单也能过闸，Release 正文缺乏 Added/Changed/Fixed/
+#    Security 的语义分类。
+FIRST_LINE="$(printf '%s\n' "$MSG" | head -1)"
+EXPECT_FIRST="release: ${TAG}"
+if [ "$FIRST_LINE" != "$EXPECT_FIRST" ]; then
+  fail "$TAG 附注首行必须是「${EXPECT_FIRST}」，当前为「${FIRST_LINE}」"
+fi
+
+SECTION_RE='^### (Breaking Changes|Added|Changed|Fixed|Security)$'
+if ! printf '%s\n' "$MSG" | grep -qE "$SECTION_RE"; then
+  fail "$TAG 附注缺少分段标题（需至少一个：### Breaking Changes / ### Added / ### Changed / ### Fixed / ### Security）
+  只有 '- ' 条目而没有分段同样不合规，见 AGENTS.md B.6.5 第 2 节。
+  若 notes 文件里明明有 '### ' 分段却是现在这个报错，原因是 git tag 默认 --cleanup=strip
+  把 '#' 开头的行当注释删掉了。修复：git tag -d $TAG && git tag -a $TAG -F notes-$TAG.md --cleanup=verbatim"
+fi
+
+# 每个出现的分段标题下必须至少有一条 "- " 条目（空段应省略而不是留标题）
+if ! printf '%s\n' "$MSG" | awk -v re="$SECTION_RE" '
+  $0 ~ re { in_sec = 1; found = 0; sec = $0; next }
+  /^### /  { if (in_sec && !found) { print "empty:" sec; bad = 1 } in_sec = 0; next }
+  in_sec && /^- / { found = 1 }
+  END { if (in_sec && !found) { print "empty:" sec; bad = 1 } exit bad ? 1 : 0 }
+' >/dev/null; then
+  fail "$TAG 存在空的变更分段（有 ### 标题但没有任何 '- ' 条目），空段应直接省略"
+fi
+
+# 非分段内容里至少要有总述（首行之后的非空文本），防止「首行 + 空分段」凑数
+if [ "$(printf '%s\n' "$MSG" | sed -n '2,$p' | grep -cE '^[^[:space:]#-]' || true)" -eq 0 ]; then
+  fail "$TAG 附注缺少总述段（首行 release: 之后应有一段概括本版本主题的文字）"
 fi
 
 printf '✓ %s 校验通过（附注 %s 行）\n' "$TAG" "$LINE_COUNT"

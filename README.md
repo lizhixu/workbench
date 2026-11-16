@@ -194,15 +194,17 @@ npm run build         # 前端生产打包（输出至 web/dist/）
 - 发布完整套件包：`watchman-dist-<tag>-linux-<arch>.tar.gz`（内含完整二进制、manifest.json 与 install.sh，前端已 embed 进 server）；
 - 发布官方校验与清单：`manifest.json` 与 `CHECKSUMS.txt`。
 
-严禁使用裸 tag，必须编写包含详细变更的附注 tag：
+严禁使用裸 tag，必须编写包含详细变更的附注 tag（`--cleanup=verbatim` 不可省略，否则 `###` 分段标题会被 git 当注释删除）：
 ```bash
-git tag -a v0.1.0-beta.9 -m "release: v0.1.0-beta.9
+git tag -a v0.1.0-beta.9 --cleanup=verbatim -m "release: v0.1.0-beta.9
 
 ### Added
 - Release 页面直出免解压独立单二进制
 "
 git push origin v0.1.0-beta.9
 ```
+
+完整发版规则（tag 命名、附注结构、本地门禁与红线）见 [`AGENTS.md` §B.6.5](AGENTS.md)。
 
 ## 目录结构
 

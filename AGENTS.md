@@ -1132,27 +1132,83 @@ Agent internal/shell
 
 ### B.6.5 发版流程与 Release 管线（GitHub Actions + tag 驱动）
 
-版本唯一真相源是 git tag，**版本完全由官方 Release 提供，严禁任何自行决定或拼接版本的行为**。`internal/version` 的 `Version`/`Commit`/`BuildTime` 由构建时 ldflags 注入（见 `Makefile` 的 `LDFLAGS`）；`Get()` 取值优先级：ldflags 注入 > `debug.ReadBuildInfo()`（`go install` 装 tagged commit 时工具链自带）> `0.1.0-dev` 占位。任何本地部署、发布脚本或测试工具严禁擅自使用 commit hash 等拼接伪版本（如 `0.1.0-<hash>`）；未打 tag 的工作区一律视为开发态，升级管线权威基准必须来自官方 GitHub Releases 发布的 tarball 与 CI 生成的 `manifest.json`。
+> 本节是**发版 tag 规则的唯一权威事实源**：tag 命名、附注正文结构、本地门禁、CI 发布与红线全部以此为准。§B.6.6 只定义提交信息规范与 changelog 生成工具；§7 第 4 条仅为评审检查要点，不再重复细节。
 
-- **打 tag 即发版（严格附注变更说明，严禁裸 tag）**：
-  每次发布严禁创建和推送未包含说明信息的裸 tag（如仅 `git tag vX.Y.Z`）。必须使用带附注的 tag 并详细记录本次版本的变更描述（分为 Added / Changed / Fixed / Security 等清晰条目）：
-  ```bash
-  git tag -a v1.2.3 -m "release: v1.2.3
+**版本唯一真相源**：版本完全由官方 Release 提供，严禁任何自行决定或拼接版本的行为。`internal/version` 的 `Version`/`Commit`/`BuildTime` 由构建时 ldflags 注入（见 `Makefile` 的 `LDFLAGS`）；`Get()` 取值优先级：ldflags 注入 > `debug.ReadBuildInfo()`（`go install` 装 tagged commit 时工具链自带）> `0.1.0-dev` 占位。任何本地部署、发布脚本或测试工具严禁擅自使用 commit hash 等拼接伪版本（如 `0.1.0-<hash>`）；未打 tag 的工作区一律视为开发态，升级管线权威基准必须来自官方 GitHub Releases 发布的 tarball 与 CI 生成的 `manifest.json`。
 
-  ### Changed
-  - 主机详情页与主机列表清晰区分「已是最新」与「可升级」状态，最新版操作按钮平滑切换为「重装」
-  - 优化系统升级页面状态机，去除多余加载动画并即时捕获展示各主机升级失败详情
+#### 1. tag 命名与类型
 
-  ### Fixed
-  - 修复 Agent 升级遇到错误（如二进制占位）时状态机未即时释放的问题
-  "
-  git push origin v1.2.3
-  ```
-  GitHub Release notes 也必须同步保留上述详细变更清单，确保版本迭代历史 100% 透明可溯。
-- tag 规范：`v1.2.3` 为正式版；`v1.3.0-rc.1` / `v1.3.0-beta.1`（带 `-` 后缀）由 CI 自动标记为 pre-release。
+- **命名严格匹配 semver + `v` 前缀**：`v1.2.3` 为正式版；`v1.3.0-beta.1` / `v1.3.0-rc.1`（带 `-` 后缀）由 CI 自动标记为 pre-release。禁止 `v1.2`、`v1.2.3.4`、`v1.2.3+build`、`latest`、日期版本、commit hash 拼接。
 - **必须是附注 tag（annotated），严禁轻量 tag（事故根因）**：`git tag v1.2.3` 这类轻量 tag 在 `git tag -l --format='%(contents)'` 下会**静默退化为指向 commit 的 message**，而 CI 只判断附注是否非空，于是发出去的 Release 正文变成「最近一条提交的描述」，该版本其余变更全部丢失，`--generate-notes` 兜底也因正文非空而永不触发。历史遗留的轻量 tag：`v0.0.0-ci-test`、`v0.1.0-beta.2`、`v0.1.0-beta.5`、`v0.1.0-beta.6`（已发布 Release 不可变，保留原样，仅作已知异常记录）。
-- **发版前必须本地校验**：`make tag-check TAG=v0.2.0-beta.1`（等价于 `bash scripts/verify-tag.sh`）。校验四件事：命名严格匹配 semver、对象类型必须是 `tag`（非 `commit`）、附注非空且 ≥3 行、附注带可识别的变更条目。CI 在 `Verify release tag` 步骤执行同一脚本，不通过直接中止发布。
+- **版本号递增**：预发布序列在 `-beta.N` / `-rc.N` 上递增 N（从 1 开始，不跳号、不复用）；正式版按 §B.6.6 的 type→版本位映射决定 MINOR/PATCH（0.x 阶段 MAJOR 固定 0，破坏性变更升 MINOR）；已发布编号永不复用（见第 5 节红线）。
+
+#### 2. 附注 tag 正文规范（强制）
+
+tag 正文就是 GitHub Release 正文（CI 原样输出，不做二次编辑），必须同时包含以下三部分：
+
+1. **首行**：`release: <tag>`，与 tag 名完全一致；
+2. **总述**：空行后一段话，概括本版本主题与用户可感知的变化，不是提交列表的复述；
+3. **分段清单**：按固定顺序使用 `### Breaking Changes` / `### Added` / `### Changed` / `### Fixed` / `### Security`，空段省略；每段至少一条 `- ` 条目，条目以 `**scope**` 前缀（scope 词表见 §B.6.6），细节可缩进两空格续行。
+
+```markdown
+release: v1.2.3
+
+本次版本以主机升级体验为主：主机列表与详情页清晰区分「已是最新」与「可升级」，Agent 升级失败原因即时可见。
+
+### Changed
+- **hosts+upgrade** 主机详情页与主机列表清晰区分「已是最新」与「可升级」状态
+  最新版操作按钮平滑切换为「重装」；系统升级页面状态机去除多余加载动画。
+
+### Fixed
+- **upgrade** 修复 Agent 升级遇到错误（如二进制占位）时状态机未即时释放的问题
+```
+
+硬性要求：
+
+- 严禁裸 tag、空附注、单句附注，或直接把一条提交信息当版本说明；
+- **只有 `- ` 列表而没有分段标题同样不合规**：必须按上列五种标题分段枚举（门禁强制检查）；
+- **`git tag -a` 必须带 `--cleanup=verbatim`**：默认的 `--cleanup=strip` 会把 `#` 开头的行当注释删除，导致 `### Added` 等分段标题在附注里静默消失（`-m` 与 `-F` 两种写法都受影响；仅编辑器模式默认 `whitespace` 会保留）。这是「附注只有条目、没有分段」的机制性根因，历史事故；
+- 正文只写用户可感知的变化：`docs` / `test` / `build` / `ci` / `chore` 不进清单（`changelog.sh` 自动过滤），内部重构与纯格式化不写；
+- 破坏性变更单独置顶 `### Breaking Changes`，并同步决定版本位（§B.6.6）；
+- GitHub Release notes 与 tag 正文保持一致，确保版本迭代历史 100% 透明可溯。
+
+#### 3. 标准发版流程
+
+```bash
+# 0. 确认工作区干净、CI 绿、版本号已按第 1 节规则确定
+TAG=v0.2.0-beta.1
+
+# 1. 生成 changelog 并人工过一遍（删内部条目、补总述、按第 2 节校正分段）
+VERSION=$TAG bash scripts/changelog.sh "$(git describe --tags --abbrev=0)" > "notes-$TAG.md"
+#    有 make 的机器：make changelog SINCE=$(git describe --tags --abbrev=0) VERSION=$TAG > "notes-$TAG.md"
+
+# 2. 打附注 tag（-F 读文件，首行即 subject）
+#    必须带 --cleanup=verbatim：git tag 默认 --cleanup=strip 会把以 '#' 开头的
+#    行当注释静默删除，### Added/Changed/Fixed 等分段标题会全部消失（历史事故）。
+git tag -a "$TAG" -F "notes-$TAG.md" --cleanup=verbatim
+
+# 3. 本地门禁：命名 / 附注类型 / 附注完整性 / 分段结构
+bash scripts/verify-tag.sh "$TAG"        # 等价：make tag-check TAG=$TAG
+
+# 4. 推送触发 CI（校验失败就不要推）
+git push origin "$TAG"
+```
+
+`notes-*.md` 已加入 `.gitignore`，避免发版临时文件误入提交。Linux/macOS 首次克隆后若钩子提示无执行权限，执行 `chmod +x scripts/*.sh .githooks/commit-msg`。
+
+#### 4. 本地门禁与 CI
+
+- **发版前必须本地校验**：`make tag-check TAG=v0.2.0-beta.1`（等价于 `bash scripts/verify-tag.sh`）。校验四类：① 命名严格匹配 semver；② 对象类型必须是 `tag`（非 `commit`，远端 `refs/tags/<tag>^{}` peeled 行为权威，仅未推送时看本地 `git cat-file`）；③ 附注完整（非空、≥3 行、首行不等于指向 commit 的 subject）；④ 附注结构合规（首行 `release: <tag>`、含受支持的 `### ` 分段标题与至少一条 `- ` 条目）。CI 在 `Verify release tag` 步骤执行同一脚本，不通过直接中止发布。
 - **CI 必须拉取 tag 对象（二次事故）**：`actions/checkout@v4` 的 `fetch-tags` 默认为 `false`，即使 `fetch-depth: 0` 也不保证本地有 `refs/tags/<tag>`。缺少该 ref 时 `git cat-file -t` 会报 `Not a valid object name`、`git tag -l --format='%(contents)'` 返回空，校验会误判为轻量 tag 并使 Release 正文退化为自动生成。因此 checkout 必须显式配置 `fetch-tags: true`；`verify-tag.sh` 也会在 ref 缺失时先尝试从 origin 拉取，仍缺失则明确报「本地不存在 refs/tags/...」而不是误报轻量 tag。排查时不要只看「对象类型 unknown」就断定 tag 打错了，先确认 ref 是否存在。
+- **Release 正文不回退自动生成**：CI 读取附注正文原样作为 Release notes；附注为空直接失败，禁止回退 `--generate-notes`（会把问题掩盖成「最近一条提交」式正文）。
+
+#### 5. 红线与修复路径
+
+- **已发布 Release 的 tag 不可删除、不可移动、不可重打**；CI 失败时修复后打**下一个编号**，不复用同号 tag。
+- **未发布 Release 的 tag 允许修正**：本地尚未推送的，直接 `git tag -d <tag>` 后按第 2 节重写正文并重新 `git tag -a`；已推送但 CI 尚未创建 Release 的，可删除远端 tag（`git push origin :refs/tags/<tag>`）后重打；Release 一旦创建，即进入不可变红线，只能发下一条编号。
+- 历史遗留的轻量 tag 与本规范上线前的单句附注 tag 保留原样，仅记录为已知异常，不做追溯修改。
+
+#### 6. 发布管线与产物
 - 构建矩阵：server（linux amd64/arm64）+ agent（linux amd64/arm64、windows amd64）+ watchmanctl（linux amd64/arm64、windows amd64、darwin amd64/arm64），全部 `CGO_ENABLED=0` 静态编译。
 - **发布产物规范（双轨发布体系：独立单二进制 + 完整安装包）**：
   每次发布直出以下完整资产列表，满足直接运行与自动化安装双重需求：
@@ -1178,7 +1234,7 @@ Agent internal/shell
 
 ### B.6.6 提交规范（Conventional Commits）与变更日志生成
 
-Release 正文的**唯一数据源是本仓库的提交历史**：打版本 tag 时用 `scripts/changelog.sh` 把「上一个 tag..HEAD」之间的全部提交按 type 聚合成分段清单，写入附注 tag 正文，CI 原样输出到 GitHub Release。因此提交信息的规范性直接决定 Release notes 的完整性——**写坏的提交不会被人工补回，直接表现为该版本变更缺失**。
+Release 正文的**唯一数据源是本仓库的提交历史**：打版本 tag 时用 `scripts/changelog.sh` 把「上一个 tag..HEAD」之间的全部提交按 type 聚合成分段清单，写入附注 tag 正文，CI 原样输出到 GitHub Release。因此提交信息的规范性直接决定 Release notes 的完整性——**写坏的提交不会被人工补回，直接表现为该版本变更缺失**。tag 命名、附注正文结构与发版流程见 §B.6.5。
 
 - **格式**：`<type>(<scope>): <subject>`，后接可选 body 与 footer。
 - **type 白名单与去向映射**（其余一律视为不合规）：
@@ -1204,31 +1260,12 @@ Release 正文的**唯一数据源是本仓库的提交历史**：打版本 tag 
 **工具链（三件均已落地）**：
 
 1. `make hooks`：`git config core.hooksPath .githooks`，启用 `.githooks/commit-msg` 校验 type/scope/格式/subject 长度与句号。钩子随仓库版本化，换机器执行一次即可；**禁止 `--no-verify` 绕过**。
-2. `make changelog SINCE=v0.1.0-beta.24 VERSION=v0.2.0-beta.1`：输出带 `release:` 首行的五段式（Breaking Changes / Added / Changed / Fixed / Security）markdown，空段自动省略；`docs/test/build/ci/chore` 自动过滤，不合规提交原样落入 Changed 段（能看到，但应在源头修掉）。
-3. `make tag-check TAG=v0.2.0-beta.1`：发版门禁，见 §B.6.5。
+2. `make changelog SINCE=v0.1.0-beta.24 VERSION=v0.2.0-beta.1`：输出带 `release:` 首行的五段式（Breaking Changes / Added / Changed / Fixed / Security）markdown，空段自动省略；`docs/test/build/ci/chore` 自动过滤，不合规提交原样落入 Changed 段（能看到，但应在源头修掉）。**这是附注 tag 正文的生成器，不是最终成品**：必须按 §B.6.5 第 2 节人工校正（补总述、删内部条目、补 `**scope**` 前缀）。
+3. `make tag-check TAG=v0.2.0-beta.1`：发版门禁，见 §B.6.5 第 4 节。
 
-**标准发版流程**：
-
-```bash
-# 1. 生成 changelog 并人工过一遍（删掉不该给用户看的内部重构、补一句总述）
-TAG=v0.2.0-beta.1
-make changelog SINCE=$(git describe --tags --abbrev=0) VERSION=$TAG > "notes-$TAG.md"
-#    无 make 的机器等价写法：
-#    VERSION=$TAG bash scripts/changelog.sh "$(git describe --tags --abbrev=0)" > "notes-$TAG.md"
-
-# 2. 打附注 tag（-F 读文件，首行即 subject）
-git tag -a "$TAG" -F "notes-$TAG.md"
-
-# 3. 本地校验：命名 / 附注 tag / 附注完整性
-make tag-check TAG=$TAG          # 等价：bash scripts/verify-tag.sh "$TAG"
-
-# 4. 推送触发 CI（推送前校验失败就不要推）
-git push origin "$TAG"
-```
+**发版流程**：完整步骤（changelog 生成 → 附注 tag → 本地门禁 → 推送）与红线见 §B.6.5 第 3、5 节，此处不再重复。
 
 `notes-*.md` 已加入 `.gitignore`，避免发版临时文件误入提交。Linux/macOS 首次克隆后若钩子提示无执行权限，执行 `chmod +x scripts/*.sh .githooks/commit-msg`。
-
-**红线**：已发布 Release 的 tag 不可删除、不可移动、不可重打；CI 失败时修复后打**下一个编号**，不复用同号 tag。历史遗留的轻量 tag 与本规范上线前的单句附注 tag 保留原样，仅记录为已知异常，不做追溯修改。
 
 ## B.7 核心子系统架构与执行流转链路
 
@@ -1487,9 +1524,7 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 4. **版本权威性与唯一来源准则 (Release-Driven Authority)**：
    - **版本完全由官方 Release 提供，严禁任何自行决定或拼接行为**：系统所有组件（控制端 Server、被管端 Agent、升级清单 Manifest 等）的版本号唯一来源必须是 Git tag 触发的官方 GitHub Release（形如 `v1.2.3` 或 `v1.2.3-beta.1`）。
    - **绝对禁止私自捏造/拼接版本**：禁止在开发、部署或测试脚本中自行生成伪版本号（例如取本地 git commit hash 拼凑 `0.1.0-<hash>` 或任意自定义后缀）；未经 tag 发布的代码版本一律为开发环境占位（`0.1.0-dev`），线上与测试环境的升级验证必须且只能来源于官方 Release 产物与由 CI 生成的 `manifest.json`，确保版本链路 100% 可追溯。
-   - **严禁裸 tag，必须完整编写变更说明 (Changelog)**：创建 Git tag 时严禁使用无任何说明的裸 tag（如仅 `git tag v1.2.3`）。每次打 tag 发版必须使用附注 tag（`git tag -a vX.Y.Z -m "..."`），并在 tag message 与 GitHub Release notes 中详细枚举 Changed（行为变更/优化）、Fixed（缺陷修复）、Added（新增功能）、Security（安全修复）等内容，确保版本演进清晰透明、便于追踪定位。
-   - **必须区分附注 tag 与轻量 tag**：`git tag -a` 创建的是附注 tag（对象类型 `tag`），`git tag` 不带 `-a` 创建的是轻量 tag（对象类型 `commit`）。后者在 `%(contents)` 下会退化为指向 commit 的 message，导致 Release 正文显示「最近一条提交」而非版本汇总（已确认事故）。发版前后必须执行 `make tag-check TAG=<版本>`，详见 §B.6.5 与 §B.6.6。
-   - **提交信息即变更日志的数据源**：Release 正文由 `scripts/changelog.sh` 从提交历史聚合生成，提交信息必须符合 Conventional Commits（type/scope/subject 规范见 §B.6.6），执行 `make hooks` 启用本地校验；不合规提交会直接表现为该版本 Release notes 缺少对应条目。
+   - **打 tag 必须按 §B.6.5 执行**：附注 tag（严禁裸 tag / 轻量 tag）、首行 `release: <tag>`、总述 + `### Added/Changed/Fixed/Security` 分段枚举、本地 `make tag-check` 门禁，逐项要求与完整发版流程见 §B.6.5（唯一权威事实源），提交信息规范见 §B.6.6。
 
 5. **操作审计全覆盖 (Audit Coverage)**：
    - **所有改变系统/主机状态的写操作必须记审计**：凡是 `POST/PUT/PATCH/DELETE` 且会产生状态变更的 API（创建/更新/删除配置、启停/部署/回滚应用、签发/续期证书、文件增删改、执行命令、绑定解绑域名、授权变更、删除会话录像等），必须有一条审计记录（谁、何时、做了什么、目标对象、结果、风险等级）。

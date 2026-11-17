@@ -50,6 +50,7 @@ import { listNetworkNodes } from '../../api/network'
 import { listGroups, type HostGroup } from '../../api/groups'
 import { copyToClipboard } from '../../utils/clipboard'
 import { formatUpgradeStage } from '../../utils/upgrade'
+import { FALLBACK_RATES, getCnyRates, toCny, formatMoney, formatCny, type CnyRates } from '../../utils/exchangeRate'
 import type { Host } from '../../api/types'
 import type { NetworkNode } from '../../api/network'
 
@@ -260,6 +261,73 @@ function getExpiryDaysText(exp?: string): string {
   if (diffDays === 0) return '今天到期'
   return `剩 ${diffDays} 天`
 }
+
+// ---- 整页成本汇总（年化成本 + 剩余价值，统一换算为 CNY）----
+// 计费周期年化系数：月付×12、季付×4、半年付×2、年付×1、两年付÷2、三年付÷3；
+// 一次性 / 按量计费无法年化，不计入年化成本。
+const ANNUAL_FACTOR: Record<string, number> = {
+  '月付': 12, '季付': 4, '半年付': 2, '年付': 1, '两年付': 0.5, '三年付': 1 / 3,
+}
+// 计费周期天数（剩余价值 = 价格 × 剩余天数 ÷ 周期天数，剩余天数封顶为一个周期）。
+const CYCLE_DAYS: Record<string, number> = {
+  '月付': 30, '季付': 90, '半年付': 180, '年付': 365, '两年付': 730, '三年付': 1095,
+}
+
+// 汇率先用内置参考价即时出数，实时汇率到后再替换重算；实时接口不可用时保持参考价。
+const cnyRates = ref<CnyRates>(FALLBACK_RATES)
+
+const costSummary = computed(() => {
+  let annualCost = 0
+  let remainingValue = 0
+  let counted = 0
+  let excluded = 0
+  let noExpiry = 0
+  const annualByCur: Record<string, number> = {}
+  const remainingByCur: Record<string, number> = {}
+  for (const h of store.hosts) {
+    if (!hasPrice(h)) continue
+    const priceCny = toCny(Number(h.price), h.currency, cnyRates.value)
+    if (priceCny === null) { excluded++; continue }
+    const cur = (h.currency || 'CNY').toUpperCase()
+    const factor = ANNUAL_FACTOR[h.billing_cycle || '']
+    const cycleDays = CYCLE_DAYS[h.billing_cycle || '']
+    let inAny = false
+    if (factor !== undefined) {
+      annualCost += priceCny * factor
+      annualByCur[cur] = (annualByCur[cur] || 0) + Number(h.price) * factor
+      inAny = true
+    }
+    if (cycleDays !== undefined) {
+      if (!h.expires_at) {
+        noExpiry++
+      } else {
+        const remainDays = Math.ceil((new Date(h.expires_at).getTime() - Date.now()) / (1000 * 3600 * 24))
+        if (remainDays > 0) {
+          const frac = Math.min(remainDays, cycleDays) / cycleDays
+          remainingValue += priceCny * frac
+          remainingByCur[cur] = (remainingByCur[cur] || 0) + Number(h.price) * frac
+          inAny = true
+        }
+      }
+    }
+    if (inAny) counted++
+    else excluded++
+  }
+  const rateNote = cnyRates.value.live
+    ? `汇率 ${cnyRates.value.dateLabel}`
+    : '汇率离线（内置参考价）'
+  return {
+    annualCost,
+    remainingValue,
+    note: `已计价 ${counted} 台 · 未计入 ${excluded} 台 · ${rateNote}`,
+    tooltip: [
+      `年化成本（已换算为 CNY）：${Object.entries(annualByCur).map(([c, v]) => `${formatMoney(v, c)}/年`).join('、') || '—'}`,
+      `剩余价值（已换算为 CNY）：${Object.entries(remainingByCur).map(([c, v]) => formatMoney(v, c)).join('、') || '—'}`,
+      `一次性 / 按量计费不计入年化成本；无到期日的主机不计入剩余价值${noExpiry ? `（${noExpiry} 台）` : ''}。`,
+      rateNote,
+    ].join('\n'),
+  }
+})
 
 function goExec(host?: Host) {
   const query = host && typeof host === 'object' && host.id ? `?host_id=${host.id}` : ''
@@ -562,6 +630,8 @@ onMounted(() => {
   })
   loadGroups()
   loadNetworkNodes()
+  // 实时汇率到后替换内置参考价重算汇总；失败时静默保持参考价。
+  getCnyRates().then((r) => { cnyRates.value = r })
 })
 
 onUnmounted(() => {
@@ -579,6 +649,14 @@ onUnmounted(() => {
       <div class="header-left">
         <h2 class="page-title">主机列表</h2>
         <span v-if="listLoaded" class="total-count-text">共 {{ store.hosts.length }} 台主机</span>
+      </div>
+      <!-- 整页成本汇总：年化成本 + 剩余价值（统一换算为 CNY，悬停看分币种明细） -->
+      <div v-if="listLoaded" class="header-right">
+        <div class="cost-summary" :title="costSummary.tooltip">
+          <span class="cost-item">年化成本 <strong>¥{{ formatCny(costSummary.annualCost) }}</strong>/年</span>
+          <span class="cost-item">剩余价值 <strong>¥{{ formatCny(costSummary.remainingValue) }}</strong></span>
+          <span class="cost-note">{{ costSummary.note }}</span>
+        </div>
       </div>
     </div>
 
@@ -919,6 +997,32 @@ onUnmounted(() => {
       .total-count-text {
         font-size: 13px;
         color: var(--text-secondary);
+      }
+    }
+
+    // 整页成本汇总（年化成本 + 剩余价值，DESIGN.md §9.3 顶栏右侧汇总）
+    .header-right {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+
+      .cost-summary {
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+        font-size: 13px;
+        color: var(--text-secondary);
+        white-space: nowrap;
+
+        .cost-item strong {
+          color: var(--text-primary);
+          font-weight: 600;
+        }
+
+        .cost-note {
+          font-size: 12px;
+          color: var(--text-tertiary);
+        }
       }
     }
   }
@@ -1331,6 +1435,18 @@ onUnmounted(() => {
       .header-left {
         .total-count-text {
           font-size: 12px;
+        }
+      }
+
+      // 窄屏只保留汇总数字，隐藏说明文字
+      .header-right {
+        .cost-summary {
+          font-size: 12px;
+          gap: 8px;
+
+          .cost-note {
+            display: none;
+          }
         }
       }
     }

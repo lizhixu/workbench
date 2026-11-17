@@ -165,4 +165,16 @@ func TestResolveForwardUpstream(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error when no reachable IP is found, got nil")
 	}
+
+	// 5. IPv6 public IP is bracketed for socat
+	target, err = resolveForwardUpstream(6379, "", "", "2a13:9500:62:90::a", "fd00::1")
+	if err != nil || target != "[2a13:9500:62:90::a]:6379" {
+		t.Fatalf("expected [2a13:9500:62:90::a]:6379, got %q (err: %v)", target, err)
+	}
+
+	// 6. IPv6 internal IP is bracketed
+	target, err = resolveForwardUpstream(6379, "", "", "", "fd00::1")
+	if err != nil || target != "[fd00::1]:6379" {
+		t.Fatalf("expected [fd00::1]:6379, got %q (err: %v)", target, err)
+	}
 }

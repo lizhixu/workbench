@@ -123,14 +123,16 @@ func isPrivateLAN(ip string) bool {
 	return strings.HasPrefix(ip, "172.") && is172Private(net.ParseIP(ip))
 }
 
-// getInternalIP reports the host's own IPv4 address, preferring a private LAN
-// address and ignoring container/VPN interfaces.
+// getInternalIP reports the host's own IP address, preferring a private LAN
+// address and ignoring container/VPN interfaces. IPv4 is preferred when
+// present; a host without any IPv4 address (e.g. IPv6-only) falls back to
+// its IPv6 address, preferring a ULA over a global unicast address.
 func getInternalIP() string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return ""
 	}
-	var privateAddrs, publicAddrs []string
+	var privateAddrs, publicAddrs, ulaAddrs, globalAddrs []string
 	for _, ifi := range ifaces {
 		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
 			continue
@@ -147,23 +149,39 @@ func getInternalIP() string {
 			if !ok || ipNet.IP.IsLoopback() || ipNet.IP.IsLinkLocalUnicast() {
 				continue
 			}
-			ip4 := ipNet.IP.To4()
-			if ip4 == nil {
+			if ip4 := ipNet.IP.To4(); ip4 != nil {
+				s := ip4.String()
+				if isPrivateLAN(s) {
+					privateAddrs = append(privateAddrs, s)
+				} else {
+					publicAddrs = append(publicAddrs, s)
+				}
 				continue
 			}
-			s := ip4.String()
-			if isPrivateLAN(s) {
-				privateAddrs = append(privateAddrs, s)
-			} else {
-				publicAddrs = append(publicAddrs, s)
+			// Pure IPv6 address (IPv4-mapped forms are handled above via
+			// To4). IsPrivate covers ULA (fc00::/7) here: link-local was
+			// already skipped, and multicast is never an internal address.
+			if ipNet.IP.IsMulticast() {
+				continue
+			}
+			s := ipNet.IP.String()
+			if ipNet.IP.IsPrivate() {
+				ulaAddrs = append(ulaAddrs, s)
+			} else if ipNet.IP.IsGlobalUnicast() {
+				globalAddrs = append(globalAddrs, s)
 			}
 		}
 	}
-	if len(privateAddrs) > 0 {
-		return privateAddrs[0]
-	}
-	if len(publicAddrs) > 0 {
-		return publicAddrs[0]
+	return chooseInternalIP(privateAddrs, publicAddrs, ulaAddrs, globalAddrs)
+}
+
+// chooseInternalIP picks the reported internal address: private IPv4, then
+// public IPv4, then IPv6 ULA, then global unicast IPv6.
+func chooseInternalIP(privateAddrs, publicAddrs, ulaAddrs, globalAddrs []string) string {
+	for _, bucket := range [][]string{privateAddrs, publicAddrs, ulaAddrs, globalAddrs} {
+		if len(bucket) > 0 {
+			return bucket[0]
+		}
 	}
 	return ""
 }

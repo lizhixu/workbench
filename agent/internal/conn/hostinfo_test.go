@@ -42,3 +42,22 @@ func TestGetInternalIPReturnsSomething(t *testing.T) {
 		t.Skip("当前环境没有可用的非回环网卡，跳过")
 	}
 }
+
+func TestChooseInternalIP(t *testing.T) {
+	cases := []struct {
+		name                             string
+		private4, public4, ula6, global6 []string
+		want                             string
+	}{
+		{"prefers private IPv4", []string{"10.0.0.5"}, []string{"1.2.3.4"}, []string{"fd00::1"}, []string{"2001:db8::1"}, "10.0.0.5"},
+		{"falls back to public IPv4", nil, []string{"1.2.3.4"}, []string{"fd00::1"}, []string{"2001:db8::1"}, "1.2.3.4"},
+		{"IPv6-only prefers ULA", nil, nil, []string{"fd00::1"}, []string{"2001:db8::1"}, "fd00::1"},
+		{"IPv6-only falls back to global unicast", nil, nil, nil, []string{"2001:db8::1"}, "2001:db8::1"},
+		{"nothing returns empty", nil, nil, nil, nil, ""},
+	}
+	for _, tc := range cases {
+		if got := chooseInternalIP(tc.private4, tc.public4, tc.ula6, tc.global6); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

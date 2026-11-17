@@ -1390,18 +1390,21 @@ func (h *ProxyHandler) defaultUpstream(app *Application, mode, gatewayHostID str
 //   - 组网：both ends carry a mesh IP → the app host's 100.x;
 //   - 直连：otherwise the app host's public IP, then its internal IP.
 //
+// The address is built with net.JoinHostPort, so an IPv6 host is bracketed
+// ([2001:db8::1]:8080) for nginx proxy_pass; a bare "2a13:...:8080" would be
+// an invalid proxy_pass target.
 // 127.0.0.1 is deliberately never returned (it would point at the gateway
 // itself and blackhole traffic); when nothing resolves the caller must ask the
 // user for an explicit Upstream.
 func resolveGatewayUpstream(port int, appMesh, gwMesh, appPublicIP, appInternalIP string) (string, error) {
 	if appMesh != "" && gwMesh != "" {
-		return fmt.Sprintf("%s:%d", appMesh, port), nil
+		return net.JoinHostPort(appMesh, strconv.Itoa(port)), nil
 	}
 	if appPublicIP != "" {
-		return fmt.Sprintf("%s:%d", appPublicIP, port), nil
+		return net.JoinHostPort(appPublicIP, strconv.Itoa(port)), nil
 	}
 	if appInternalIP != "" {
-		return fmt.Sprintf("%s:%d", appInternalIP, port), nil
+		return net.JoinHostPort(appInternalIP, strconv.Itoa(port)), nil
 	}
 	return "", fmt.Errorf("无法确定网关到应用主机的上游地址：应用主机未加入异地组网，且没有可用的公网/内网 IP；请在应用详情「域名与反代」手动填写 Upstream")
 }

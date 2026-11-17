@@ -52,6 +52,18 @@ func TestResolveGatewayUpstream(t *testing.T) {
 			want: "10.0.0.5:8080",
 		},
 		{
+			name:    "IPv6 public IP is bracketed for nginx",
+			appMesh: "", gwMesh: "",
+			appPublicIP: "2a13:9500:62:90::a", appInternalIP: "10.0.0.5",
+			want: "[2a13:9500:62:90::a]:8080",
+		},
+		{
+			name:    "IPv6 internal IP is bracketed",
+			appMesh: "", gwMesh: "",
+			appPublicIP: "", appInternalIP: "fd00::1",
+			want: "[fd00::1]:8080",
+		},
+		{
 			name:    "nothing resolvable errors instead of 127.0.0.1",
 			appMesh: "", gwMesh: "",
 			appPublicIP: "", appInternalIP: "",

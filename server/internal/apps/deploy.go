@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1435,15 +1436,19 @@ func (e *Engine) resolveMeshForwardTarget(app *Application) (string, error) {
 // resolveForwardUpstream picks the entry host -> app host upstream:
 //   - 组网: both ends carry a mesh IP -> the app host's 100.x:port;
 //   - 直连: otherwise the app host's public IP, then its internal IP.
+//
+// The address is built with net.JoinHostPort, so an IPv6 host is bracketed
+// ([2001:db8::1]:8080) for the socat "TCP:" target; a bare "2a13:...:8080"
+// would be an invalid socat address.
 func resolveForwardUpstream(port int, appMesh, entryMesh, appPublicIP, appInternalIP string) (string, error) {
 	if appMesh != "" && entryMesh != "" {
-		return fmt.Sprintf("%s:%d", appMesh, port), nil
+		return net.JoinHostPort(appMesh, strconv.Itoa(port)), nil
 	}
 	if appPublicIP != "" {
-		return fmt.Sprintf("%s:%d", appPublicIP, port), nil
+		return net.JoinHostPort(appPublicIP, strconv.Itoa(port)), nil
 	}
 	if appInternalIP != "" {
-		return fmt.Sprintf("%s:%d", appInternalIP, port), nil
+		return net.JoinHostPort(appInternalIP, strconv.Itoa(port)), nil
 	}
 	return "", fmt.Errorf("无法确定入口主机到应用主机的转发目标地址：应用主机未加入异地组网，且没有可用的公网/内网 IP")
 }

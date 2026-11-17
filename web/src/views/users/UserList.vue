@@ -91,9 +91,9 @@ const columns = computed<DataTableColumns<UserRecord>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 200,
+    width: 220,
     render: (u) =>
-      h(NSpace, { size: 4, wrapItem: false }, {
+      h(NSpace, { size: 4, wrap: false, wrapItem: false }, {
         default: () => [
           isAdmin()
             ? h(NButton, { size: 'small', quaternary: true, onClick: () => openReset(u.username) }, {
@@ -217,7 +217,7 @@ onMounted(() => {
         :bordered="false"
         size="small"
         :row-key="(u: UserRecord) => u.id"
-        :scroll-x="760"
+        :scroll-x="780"
       >
         <template #empty>
           <NEmpty description="暂无用户" />

@@ -98,9 +98,9 @@ const columns = computed<DataTableColumns<HostGroup>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 260,
+    width: 290,
     render: (g) =>
-      h(NSpace, { size: 4, wrapItem: false }, {
+      h(NSpace, { size: 4, wrap: false, wrapItem: false }, {
         default: () => [
           h(NButton, { size: 'small', quaternary: true, onClick: () => openHosts(g) }, {
             icon: () => h(NIcon, { component: ServerOutline }),

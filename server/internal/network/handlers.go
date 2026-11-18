@@ -855,12 +855,17 @@ func (h *Handlers) runExecWithTimeout(hub *rpc.Hub, cmd, shell string, timeoutSe
 	resultCh := make(chan *agentpb.ExecResult, 1)
 
 	hub.SetRespHandler(execID, func(msg *agentpb.AgentMessage) {
-		hub.SetRespHandler(execID, nil)
-		if msg != nil {
-			resultCh <- msg.GetExecResult()
-		} else {
+		if msg == nil {
+			hub.SetRespHandler(execID, nil)
 			resultCh <- nil
+			return
 		}
+		if msg.GetExecResult() == nil {
+			// Streaming chunk (ExecOutput): not the result; keep waiting.
+			return
+		}
+		hub.SetRespHandler(execID, nil)
+		resultCh <- msg.GetExecResult()
 	})
 
 	hub.Send(&agentpb.ServerMessage{
@@ -871,6 +876,9 @@ func (h *Handlers) runExecWithTimeout(hub *rpc.Hub, cmd, shell string, timeoutSe
 				Command:    cmd,
 				IsScript:   false,
 				TimeoutSec: int32(timeoutSec),
+				// Network probes (tailscale status/ping) may stay
+				// silent; stall detection is off by design.
+				StallTimeoutSec: 0,
 			},
 		},
 	})

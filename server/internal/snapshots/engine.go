@@ -525,12 +525,17 @@ func parseArchiveMeta(stdout []byte) (int64, string) {
 func execOnAgent(hub *rpc.Hub, execID string, command string, timeoutSec int32) (*agentpb.ExecResult, error) {
 	resultCh := make(chan *agentpb.ExecResult, 1)
 	hub.SetRespHandler(execID, func(msg *agentpb.AgentMessage) {
-		hub.SetRespHandler(execID, nil)
-		if msg != nil {
-			resultCh <- msg.GetExecResult()
-		} else {
+		if msg == nil {
+			hub.SetRespHandler(execID, nil)
 			resultCh <- nil
+			return
 		}
+		if msg.GetExecResult() == nil {
+			// Streaming chunk (ExecOutput): not the result; keep waiting.
+			return
+		}
+		hub.SetRespHandler(execID, nil)
+		resultCh <- msg.GetExecResult()
 	})
 	hub.Send(&agentpb.ServerMessage{
 		Payload: &agentpb.ServerMessage_Exec{
@@ -539,6 +544,10 @@ func execOnAgent(hub *rpc.Hub, execID string, command string, timeoutSec int32) 
 				Command:    command,
 				IsScript:   true,
 				TimeoutSec: timeoutSec,
+				// Snapshot jobs run tar/curl transfers that are
+				// legitimately silent for minutes; stall detection
+				// stays off here (only the deploy engine opts in).
+				StallTimeoutSec: 0,
 			},
 		},
 	})

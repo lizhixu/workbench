@@ -1,6 +1,7 @@
 package apps
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 	"testing"
@@ -35,6 +36,14 @@ func TestTerminalGuardFailKeepsCancelled(t *testing.T) {
 	engine, store, app, dep := newTerminalTestEngine(t)
 	// Simulate a cancel that already finalized the record (probe-cancel
 	// path): fail() afterwards must not overwrite it or drop CancelledBy.
+	// Register the running entry so fail() actually runs its write path
+	// (without it the cancel-owns-terminal guard skips the write and the
+	// test below would pass vacuously).
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := engine.registerRunning(app.ID, &activeDeployment{depID: dep.ID, cancel: cancel}); err != nil {
+		t.Fatalf("registerRunning: %v", err)
+	}
 	_ = store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
 		d.Status = DeployCancelled
 		d.CancelledBy = "operator_bob"
@@ -55,6 +64,15 @@ func TestTerminalGuardFailKeepsCancelled(t *testing.T) {
 
 func TestTerminalGuardCancelKeepsFailed(t *testing.T) {
 	engine, store, app, dep := newTerminalTestEngine(t)
+	// fail() only runs for an in-flight deployment: register the running
+	// entry the way StartDeployment does, or the cancel-owns-terminal
+	// guard in fail() skips the write entirely (a missing entry means
+	// CancelDeployment already claimed the record).
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := engine.registerRunning(app.ID, &activeDeployment{depID: dep.ID, cancel: cancel}); err != nil {
+		t.Fatalf("registerRunning: %v", err)
+	}
 	engine.fail(app, dep, &logBuffer{}, "构建失败")
 	engine.cleanupCancelled(app, dep, nil, "", "", &logBuffer{})
 	got, _ := store.GetDeployment(app.ID, dep.ID)

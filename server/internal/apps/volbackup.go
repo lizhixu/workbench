@@ -867,7 +867,7 @@ func (e *Engine) cleanupHostPaths(hub *rpc.Hub, paths ...string) {
 	if hub == nil {
 		return
 	}
-	if _, err := execOnAgent(hub, "volclean-"+randomToken(4), volumeRemoveScript(paths), 60); err != nil {
+	if _, err := execOnAgent(nil, hub, "volclean-"+randomToken(4), volumeRemoveScript(paths), 60, deployStallSec, nil); err != nil {
 		e.log.Warn("volume staging cleanup failed", "paths", paths, "err", err)
 	}
 }
@@ -891,7 +891,7 @@ func (e *Engine) backupAppVolume(hub *rpc.Hub, app *Application, spec, note stri
 		// Named volume: resolve its host-side mountpoint first so the record
 		// shows a real path and a missing volume fails loudly here rather than
 		// deep inside a long tar.
-		res, err := execOnAgent(hub, "volpath-"+randomToken(4), volumeResolveMountpointScript(src), 30)
+		res, err := execOnAgent(nil, hub, "volpath-"+randomToken(4), volumeResolveMountpointScript(src), 30, deployStallSec, nil)
 		if err != nil {
 			return nil, fmt.Errorf("查询 Docker 卷 %s 挂载点失败: %v", src, err)
 		}
@@ -926,7 +926,7 @@ func (e *Engine) backupAppVolume(hub *rpc.Hub, app *Application, spec, note stri
 		}
 	}
 
-	res, err := execOnAgent(hub, "volbk-"+arch.ID, volumeBackupScript(hostDir, staging), volumeS3OpTimeout)
+	res, err := execOnAgent(nil, hub, "volbk-"+arch.ID, volumeBackupScript(hostDir, staging), volumeS3OpTimeout, 0, nil)
 	if err != nil {
 		e.failVolumeArchive(hub, arch, staging, err.Error())
 		return arch, fmt.Errorf("备份执行失败: %v", err)
@@ -957,7 +957,7 @@ func (e *Engine) backupAppVolume(hub *rpc.Hub, app *Application, spec, note stri
 		e.failVolumeArchive(hub, arch, staging, "生成 S3 上传地址失败: "+err.Error())
 		return arch, fmt.Errorf("生成 S3 上传地址失败: %v", err)
 	}
-	upRes, upErr := execOnAgent(hub, "volup-"+arch.ID, volumeUploadScript(staging, putURL), volumeS3OpTimeout)
+	upRes, upErr := execOnAgent(nil, hub, "volup-"+arch.ID, volumeUploadScript(staging, putURL), volumeS3OpTimeout, 0, nil)
 	// The staged tar has served its purpose whether or not the upload worked.
 	e.cleanupHostPaths(hub, staging)
 	if upErr != nil {
@@ -1166,7 +1166,7 @@ func (e *Engine) runBackupAppSnapshot(app *Application, opts BackupSnapshotOptio
 		tarPath = arch.StoragePath
 	}
 
-	res, err := execOnAgent(hub, "volbk-"+arch.ID, volumeMultiBackupScript(pkgDir, tarPath, string(manifestJSON), items), volumeS3OpTimeout)
+	res, err := execOnAgent(nil, hub, "volbk-"+arch.ID, volumeMultiBackupScript(pkgDir, tarPath, string(manifestJSON), items), volumeS3OpTimeout, 0, nil)
 	if err != nil {
 		e.failVolumeArchive(hub, arch, staging, err.Error())
 		if isLocal {
@@ -1203,7 +1203,7 @@ func (e *Engine) runBackupAppSnapshot(app *Application, opts BackupSnapshotOptio
 			e.failVolumeArchive(hub, arch, staging, "生成 S3 上传地址失败: "+err.Error())
 			return arch, fmt.Errorf("生成 S3 上传地址失败: %v", err)
 		}
-		upRes, upErr := execOnAgent(hub, "volup-"+arch.ID, volumeUploadScript(staging, putURL), volumeS3OpTimeout)
+		upRes, upErr := execOnAgent(nil, hub, "volup-"+arch.ID, volumeUploadScript(staging, putURL), volumeS3OpTimeout, 0, nil)
 		e.cleanupHostPaths(hub, staging)
 		if upErr != nil {
 			e.failVolumeArchive(hub, arch, "", "上传归档到 S3 失败: "+upErr.Error())
@@ -1341,7 +1341,7 @@ func (e *Engine) pruneVolumeArchives(hub *rpc.Hub, appID, spec string, keep int)
 	for _, a := range stale {
 		if a.StorageTarget == StorageTargetLocal {
 			if hub != nil && a.StoragePath != "" {
-				_, _ = execOnAgent(hub, "volrm-"+a.ID, "rm -f "+shellQuote(a.StoragePath), 30)
+				_, _ = execOnAgent(nil, hub, "volrm-"+a.ID, "rm -f "+shellQuote(a.StoragePath), 30, deployStallSec, nil)
 			}
 		} else {
 			err := e.deleteVolumeObject(a)
@@ -1407,7 +1407,7 @@ func (e *Engine) resolveRestoreVolumeDir(hub *rpc.Hub, app *Application, arch *V
 	}
 	// Named volume: re-resolve the mountpoint instead of trusting the
 	// recorded path — the volume may have been deleted and recreated.
-	res, err := execOnAgent(hub, "volpath-"+randomToken(4), volumeResolveMountpointScript(src), 30)
+	res, err := execOnAgent(nil, hub, "volpath-"+randomToken(4), volumeResolveMountpointScript(src), 30, deployStallSec, nil)
 	if err != nil {
 		return "", fmt.Errorf("查询 Docker 卷 %s 挂载点失败: %v", src, err)
 	}
@@ -1481,7 +1481,7 @@ func (e *Engine) resolveRestoreDestinations(hub *rpc.Hub, app *Application, arch
 					src, _, _, _ := parseVolumeSpec(item.VolumeSpec)
 					if src != "" && hub != nil {
 						cmd := fmt.Sprintf(`docker volume create %s >/dev/null 2>&1 || true; docker volume inspect --format '{{.Mountpoint}}' %s`, shellQuote(src), shellQuote(src))
-						res, err := execOnAgent(hub, "volres-"+randomToken(4), cmd, 30)
+						res, err := execOnAgent(nil, hub, "volres-"+randomToken(4), cmd, 30, deployStallSec, nil)
 						if err == nil && res.GetExitCode() == 0 {
 							destDir = strings.TrimSpace(string(res.GetStdout()))
 						}
@@ -1517,7 +1517,7 @@ func (e *Engine) resolveRestoreDestinations(hub *rpc.Hub, app *Application, arch
 						} else {
 							if hub != nil {
 								cmd := fmt.Sprintf(`docker volume create %s >/dev/null 2>&1 || true; docker volume inspect --format '{{.Mountpoint}}' %s`, shellQuote(src), shellQuote(src))
-								res, err := execOnAgent(hub, "volres-"+randomToken(4), cmd, 30)
+								res, err := execOnAgent(nil, hub, "volres-"+randomToken(4), cmd, 30, deployStallSec, nil)
 								if err == nil && res.GetExitCode() == 0 {
 									destDir = strings.TrimSpace(string(res.GetStdout()))
 								}
@@ -1787,7 +1787,7 @@ func (e *Engine) runRestoreUploadedBatch(app *Application, items []*uploadedRest
 func (e *Engine) pullRestoreStaging(hub *rpc.Hub, app *Application, arch *VolumeArchive, downloadURL, expectedSHA, dlFail string) (staging string, downloaded bool, err error) {
 	if arch.StorageTarget == StorageTargetLocal {
 		if expectedSHA != "" {
-			shaRes, shaErr := execOnAgent(hub, "volsha-"+arch.ID, volumeSHA256Script(arch.StoragePath), 120)
+			shaRes, shaErr := execOnAgent(nil, hub, "volsha-"+arch.ID, volumeSHA256Script(arch.StoragePath), 120, 0, nil)
 			if shaErr != nil || shaRes.GetExitCode() != 0 {
 				return "", false, fmt.Errorf("本地归档文件校验失败: %v", shaErr)
 			}
@@ -1803,7 +1803,7 @@ func (e *Engine) pullRestoreStaging(hub *rpc.Hub, app *Application, arch *Volume
 		e.cleanupHostPaths(hub, staging)
 		return "", false, ferr
 	}
-	dlRes, dlErr := execOnAgent(hub, "voldl-"+arch.ID, volumeDownloadScript(downloadURL, staging), volumeS3OpTimeout)
+	dlRes, dlErr := execOnAgent(nil, hub, "voldl-"+arch.ID, volumeDownloadScript(downloadURL, staging), volumeS3OpTimeout, 0, nil)
 	if dlErr != nil {
 		return fail(fmt.Errorf("%s: %v", dlFail, dlErr))
 	}
@@ -1815,7 +1815,7 @@ func (e *Engine) pullRestoreStaging(hub *rpc.Hub, app *Application, arch *Volume
 		return fail(fmt.Errorf("%s", msg))
 	}
 	if expectedSHA != "" {
-		shaRes, shaErr := execOnAgent(hub, "volsha-"+arch.ID, volumeSHA256Script(staging), 120)
+		shaRes, shaErr := execOnAgent(nil, hub, "volsha-"+arch.ID, volumeSHA256Script(staging), 120, 0, nil)
 		if shaErr != nil {
 			return fail(fmt.Errorf("校验下载归档失败: %v", shaErr))
 		}
@@ -1823,7 +1823,7 @@ func (e *Engine) pullRestoreStaging(hub *rpc.Hub, app *Application, arch *Volume
 			return fail(fmt.Errorf("归档校验失败：SHA256 不匹配（期望 %s，实际 %s）", expectedSHA, got))
 		}
 	} else {
-		probeRes, probeErr := execOnAgent(hub, "volprobe-"+arch.ID, volumeTarProbeScript(staging), 120)
+		probeRes, probeErr := execOnAgent(nil, hub, "volprobe-"+arch.ID, volumeTarProbeScript(staging), 120, 0, nil)
 		if probeErr != nil {
 			return fail(fmt.Errorf("校验上传文件失败: %v", probeErr))
 		}
@@ -1843,7 +1843,7 @@ func (e *Engine) pullRestoreStaging(hub *rpc.Hub, app *Application, arch *Volume
 func (e *Engine) execRestoreTargets(hub *rpc.Hub, app *Application, arch *VolumeArchive, staging string, cleanRestore bool, targets []RestoreTarget) error {
 	safetyDir := volumeSafetyPath(app.ID, arch.ID)
 	script := volumeMultiRestoreScript(staging, safetyDir, cleanRestore, targets)
-	res, rerr := execOnAgent(hub, "volre-"+arch.ID, script, volumeS3OpTimeout)
+	res, rerr := execOnAgent(nil, hub, "volre-"+arch.ID, script, volumeS3OpTimeout, 0, nil)
 	if rerr != nil {
 		return fmt.Errorf("恢复执行失败: %v", rerr)
 	}
@@ -1944,7 +1944,7 @@ func (e *Engine) deleteAppVolumeArchive(app *Application, arch *VolumeArchive) e
 	}
 	if arch.StorageTarget == StorageTargetLocal {
 		if hub := e.volumeHub(app); hub != nil && arch.StoragePath != "" {
-			_, _ = execOnAgent(hub, "volrm-"+arch.ID, "rm -f "+shellQuote(arch.StoragePath), 30)
+			_, _ = execOnAgent(nil, hub, "volrm-"+arch.ID, "rm -f "+shellQuote(arch.StoragePath), 30, deployStallSec, nil)
 		}
 	} else {
 		err := e.deleteVolumeObject(arch)
@@ -2021,7 +2021,7 @@ func (e *Engine) PurgeVolumeArchives(app *Application) error {
 	}
 	if hub := e.volumeHub(app); hub != nil {
 		dir := volumeStagingDir(app.ID)
-		res, err := execOnAgent(hub, "volpurge-"+randomToken(4), "rm -rf "+shellQuote(dir), 60)
+		res, err := execOnAgent(nil, hub, "volpurge-"+randomToken(4), "rm -rf "+shellQuote(dir), 60, deployStallSec, nil)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("清理数据卷暂存目录失败: %v", err)

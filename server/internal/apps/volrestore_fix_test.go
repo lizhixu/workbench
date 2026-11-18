@@ -2,6 +2,7 @@ package apps
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -189,7 +190,7 @@ type fakeRestoreAgent struct {
 	sawStop  atomic.Bool
 }
 
-func (f *fakeRestoreAgent) exec(_ *rpc.Hub, _ string, command string, _ int32) (*agentpb.ExecResult, error) {
+func (f *fakeRestoreAgent) exec(_ context.Context, _ *rpc.Hub, _ string, command string, _, _ int32, _ *logBuffer) (*agentpb.ExecResult, error) {
 	switch {
 	case strings.HasPrefix(command, "sha256sum "):
 		// volumeSHA256Script: sha256sum '<path>' | awk '{print $1}'

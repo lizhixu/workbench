@@ -522,7 +522,7 @@ func (e *Engine) DiscoverAppVolumes(app *Application) ([]DiscoveredVolume, error
 		var dynErr error
 		if hub != nil {
 			proj := composeProjectName(app.ID)
-			res, err := execOnAgent(hub, "voldisc-"+randomToken(4), composeDiscoverScript(proj), 30)
+			res, err := execOnAgent(nil, hub, "voldisc-"+randomToken(4), composeDiscoverScript(proj), 30, 0, nil)
 			if err == nil && res.GetExitCode() == 0 {
 				disc = parseComposeDiscoverOutput(res.GetStdout())
 			} else if err != nil {
@@ -563,7 +563,7 @@ func (e *Engine) DiscoverAppVolumes(app *Application) ([]DiscoveredVolume, error
 		if !volumeIsBindMount(src) {
 			volType = "volume"
 			if hub != nil {
-				res, err := execOnAgent(hub, "volpath-"+randomToken(4), volumeResolveMountpointScript(src), 15)
+				res, err := execOnAgent(nil, hub, "volpath-"+randomToken(4), volumeResolveMountpointScript(src), 15, 0, nil)
 				if err == nil && res.GetExitCode() == 0 {
 					if mp := strings.TrimSpace(string(res.GetStdout())); mp != "" {
 						hostDir = mp
@@ -592,7 +592,7 @@ func (e *Engine) IsAppRunning(hub *rpc.Hub, app *Application) (bool, error) {
 	if isComposeApp(app) {
 		proj := composeProjectName(app.ID)
 		cmd := fmt.Sprintf(`docker ps --filter %s --filter "status=running" -q`, shellQuote("label=com.docker.compose.project="+proj))
-		res, err := execOnAgent(hub, "volst-"+randomToken(4), cmd, 30)
+		res, err := execOnAgent(nil, hub, "volst-"+randomToken(4), cmd, 30, 0, nil)
 		if err != nil {
 			return false, err
 		}
@@ -608,7 +608,7 @@ func (e *Engine) IsAppRunning(hub *rpc.Hub, app *Application) (bool, error) {
 	if container == "" {
 		return false, nil
 	}
-	res, err := execOnAgent(hub, "volst-"+randomToken(4), volumeContainerStateScript(container), 30)
+	res, err := execOnAgent(nil, hub, "volst-"+randomToken(4), volumeContainerStateScript(container), 30, 0, nil)
 	if err != nil {
 		return false, err
 	}
@@ -627,7 +627,7 @@ func (e *Engine) PauseApp(hub *rpc.Hub, app *Application) error {
 		proj := composeProjectName(app.ID)
 		cmd := fmt.Sprintf(`CIDS=$(docker ps --filter %s --filter "status=running" -q); if [ -n "$CIDS" ]; then docker pause $CIDS; fi`,
 			shellQuote("label=com.docker.compose.project="+proj))
-		res, err := execOnAgent(hub, "volpause-"+randomToken(4), cmd, 60)
+		res, err := execOnAgent(nil, hub, "volpause-"+randomToken(4), cmd, 60, 0, nil)
 		if err != nil {
 			return fmt.Errorf("暂停 Compose 容器失败: %v", err)
 		}
@@ -641,7 +641,7 @@ func (e *Engine) PauseApp(hub *rpc.Hub, app *Application) error {
 	if container == "" {
 		return nil
 	}
-	res, err := execOnAgent(hub, "volpause-"+randomToken(4), "docker pause "+shellQuote(container), 60)
+	res, err := execOnAgent(nil, hub, "volpause-"+randomToken(4), "docker pause "+shellQuote(container), 60, 0, nil)
 	if err != nil {
 		return fmt.Errorf("暂停应用容器失败: %v", err)
 	}
@@ -660,7 +660,7 @@ func (e *Engine) UnpauseApp(hub *rpc.Hub, app *Application) error {
 		proj := composeProjectName(app.ID)
 		cmd := fmt.Sprintf(`CIDS=$(docker ps --filter %s --filter "status=paused" -q); if [ -n "$CIDS" ]; then docker unpause $CIDS; fi`,
 			shellQuote("label=com.docker.compose.project="+proj))
-		res, err := execOnAgent(hub, "volunpause-"+randomToken(4), cmd, 60)
+		res, err := execOnAgent(nil, hub, "volunpause-"+randomToken(4), cmd, 60, 0, nil)
 		if err != nil {
 			return fmt.Errorf("恢复 Compose 容器运行失败: %v", err)
 		}
@@ -674,7 +674,7 @@ func (e *Engine) UnpauseApp(hub *rpc.Hub, app *Application) error {
 	if container == "" {
 		return nil
 	}
-	res, err := execOnAgent(hub, "volunpause-"+randomToken(4), "docker unpause "+shellQuote(container), 60)
+	res, err := execOnAgent(nil, hub, "volunpause-"+randomToken(4), "docker unpause "+shellQuote(container), 60, 0, nil)
 	if err != nil {
 		return fmt.Errorf("恢复应用容器运行失败: %v", err)
 	}
@@ -698,7 +698,7 @@ func (e *Engine) StopApp(hub *rpc.Hub, app *Application) error {
 		} else {
 			cmd = fmt.Sprintf("docker compose -f %s -p %s stop", shellQuote(composeFile), shellQuote(proj))
 		}
-		res, err := execOnAgent(hub, "volstop-"+randomToken(4), cmd, 180)
+		res, err := execOnAgent(nil, hub, "volstop-"+randomToken(4), cmd, 180, 0, nil)
 		if err != nil {
 			return fmt.Errorf("停止 Compose 服务失败: %v", err)
 		}
@@ -706,7 +706,7 @@ func (e *Engine) StopApp(hub *rpc.Hub, app *Application) error {
 			// Fallback: stop by label if compose file wasn't present
 			fallback := fmt.Sprintf(`CIDS=$(docker ps --filter %s -q); if [ -n "$CIDS" ]; then docker stop $CIDS; fi`,
 				shellQuote("label=com.docker.compose.project="+proj))
-			fres, ferr := execOnAgent(hub, "volstop-fb-"+randomToken(4), fallback, 120)
+			fres, ferr := execOnAgent(nil, hub, "volstop-fb-"+randomToken(4), fallback, 120, 0, nil)
 			if ferr != nil || fres.GetExitCode() != 0 {
 				return fmt.Errorf("停止 Compose 容器失败: %s", string(res.GetStderr()))
 			}
@@ -718,7 +718,7 @@ func (e *Engine) StopApp(hub *rpc.Hub, app *Application) error {
 	if container == "" {
 		return nil
 	}
-	res, err := execOnAgent(hub, "volstop-"+randomToken(4), "docker stop "+shellQuote(container), 300)
+	res, err := execOnAgent(nil, hub, "volstop-"+randomToken(4), "docker stop "+shellQuote(container), 300, 0, nil)
 	if err != nil {
 		return fmt.Errorf("停止应用容器失败: %v", err)
 	}
@@ -742,7 +742,7 @@ func (e *Engine) StartApp(hub *rpc.Hub, app *Application) error {
 		} else {
 			cmd = fmt.Sprintf("docker compose -f %s -p %s start", shellQuote(composeFile), shellQuote(proj))
 		}
-		res, err := execOnAgent(hub, "volstart-"+randomToken(4), cmd, 180)
+		res, err := execOnAgent(nil, hub, "volstart-"+randomToken(4), cmd, 180, 0, nil)
 		if err != nil {
 			return fmt.Errorf("启动 Compose 服务失败: %v", err)
 		}
@@ -754,7 +754,7 @@ func (e *Engine) StartApp(hub *rpc.Hub, app *Application) error {
 			} else {
 				upCmd = fmt.Sprintf("docker compose -f %s -p %s up -d --remove-orphans", shellQuote(composeFile), shellQuote(proj))
 			}
-			upRes, upErr := execOnAgent(hub, "volup-"+randomToken(4), upCmd, 180)
+			upRes, upErr := execOnAgent(nil, hub, "volup-"+randomToken(4), upCmd, 180, 0, nil)
 			if upErr != nil || upRes.GetExitCode() != 0 {
 				return fmt.Errorf("启动 Compose 容器失败: %s", string(res.GetStderr()))
 			}
@@ -766,7 +766,7 @@ func (e *Engine) StartApp(hub *rpc.Hub, app *Application) error {
 	if container == "" {
 		return nil
 	}
-	res, err := execOnAgent(hub, "volstart-"+randomToken(4), "docker start "+shellQuote(container), 120)
+	res, err := execOnAgent(nil, hub, "volstart-"+randomToken(4), "docker start "+shellQuote(container), 120, 0, nil)
 	if err != nil {
 		return fmt.Errorf("启动应用容器失败: %v", err)
 	}

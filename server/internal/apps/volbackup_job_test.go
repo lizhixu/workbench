@@ -1,6 +1,7 @@
 package apps
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -38,7 +39,7 @@ func TestComposeVolumeBackupJobLifecycle(t *testing.T) {
 				"CONTAINER_MOUNT|web|bind||/var/run/docker.sock|/var/run/docker.sock|true\n"
 			backups, uploads := 0, 0
 			prev := execOnAgent
-			execOnAgent = func(_ *rpc.Hub, id, command string, _ int32) (*agentpb.ExecResult, error) {
+			execOnAgent = func(_ context.Context, _ *rpc.Hub, id, command string, _, _ int32, _ *logBuffer) (*agentpb.ExecResult, error) {
 				switch {
 				case strings.HasPrefix(id, "voldisc-"):
 					if !strings.Contains(command, composeProjectName(app.ID)) {
@@ -192,7 +193,7 @@ func TestResolveAppVolumeSourcesAndDiscoveryErrors(t *testing.T) {
 	registerMigrateTestAgent(t, reg, "h1", "linux")
 	e.reg = reg
 	prev := execOnAgent
-	execOnAgent = func(_ *rpc.Hub, _, _ string, _ int32) (*agentpb.ExecResult, error) {
+	execOnAgent = func(_ context.Context, _ *rpc.Hub, _, _ string, _, _ int32, _ *logBuffer) (*agentpb.ExecResult, error) {
 		return nil, fmt.Errorf("discovery unavailable")
 	}
 	t.Cleanup(func() { execOnAgent = prev })

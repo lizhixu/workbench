@@ -1205,6 +1205,12 @@ func (h *Hub) handleAgentMessage(msg *agentpb.AgentMessage) error {
 	case *agentpb.AgentMessage_ExecResult:
 		h.dispatchResp(p.ExecResult.GetExecId(), msg)
 		return nil
+	case *agentpb.AgentMessage_ExecOutput:
+		// Streaming exec output: routed to the same handler as the final
+		// result, keyed by exec_id. dispatchResp never deletes the
+		// handler, so chunks keep flowing until the ExecResult arrives.
+		h.dispatchResp(p.ExecOutput.GetExecId(), msg)
+		return nil
 	case *agentpb.AgentMessage_Metrics:
 		h.mu.Lock()
 		h.lastMetrics = p.Metrics

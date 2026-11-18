@@ -1,6 +1,7 @@
 package apps
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -26,7 +27,7 @@ type fakeUpgradeAgent struct {
 	pullFail bool
 }
 
-func (f *fakeUpgradeAgent) exec(hub *rpc.Hub, execID, command string, timeoutSec int32) (*agentpb.ExecResult, error) {
+func (f *fakeUpgradeAgent) exec(_ context.Context, hub *rpc.Hub, execID, command string, timeoutSec, stallSec int32, _ *logBuffer) (*agentpb.ExecResult, error) {
 	f.mu.Lock()
 	f.cmds = append(f.cmds, command)
 	f.mu.Unlock()

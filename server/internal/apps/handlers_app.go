@@ -1107,7 +1107,7 @@ func (h *AppHandlers) containerAction(c *gin.Context, op string) {
 		c.JSON(http.StatusConflict, gin.H{"error": "应用尚未部署过"})
 		return
 	}
-	res, err := execOnAgent(hub, "app-ctl-"+randomToken(4), "docker "+op+" "+shellQuote(container), 60)
+	res, err := execOnAgent(nil, hub, "app-ctl-"+randomToken(4), "docker "+op+" "+shellQuote(container), 60, 0, nil)
 	if err != nil {
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": err.Error()})
 		return
@@ -1119,7 +1119,7 @@ func (h *AppHandlers) containerAction(c *gin.Context, op string) {
 			resp["relay_warning"] = "组网转发入口主机离线，中继容器未同步操作"
 		} else {
 			fwdContainer := "watchman-fwd-" + app.ID
-			fres, ferr := execOnAgent(fwdHub, "fwd-ctl-"+randomToken(4), "docker "+op+" "+shellQuote(fwdContainer), 30)
+			fres, ferr := execOnAgent(nil, fwdHub, "fwd-ctl-"+randomToken(4), "docker "+op+" "+shellQuote(fwdContainer), 30, 0, nil)
 			switch {
 			case ferr != nil:
 				resp["relay_warning"] = "中继容器 " + op + " 失败: " + ferr.Error()
@@ -1193,8 +1193,8 @@ func (h *AppHandlers) appStatus(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"data": resp})
 		return
 	}
-	res, err := execOnAgent(hub, "app-stat-"+randomToken(4),
-		fmt.Sprintf("docker inspect --format '{{.State.Status}}|{{.State.StartedAt}}' %s 2>/dev/null || echo 'missing'", shellQuote(container)), 20)
+	res, err := execOnAgent(nil, hub, "app-stat-"+randomToken(4),
+		fmt.Sprintf("docker inspect --format '{{.State.Status}}|{{.State.StartedAt}}' %s 2>/dev/null || echo 'missing'", shellQuote(container)), 20, 0, nil)
 	if err != nil {
 		resp["state"] = "unknown"
 		c.JSON(http.StatusOK, gin.H{"data": resp})

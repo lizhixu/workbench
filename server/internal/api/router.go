@@ -1127,6 +1127,10 @@ func (h *handlers) execCommand(c *gin.Context) {
 			resultCh <- nil
 			return
 		}
+		if msg.GetExecResult() == nil {
+			// Streaming chunk (ExecOutput): not the result; keep waiting.
+			return
+		}
 		resultCh <- msg.GetExecResult()
 	})
 
@@ -1138,6 +1142,10 @@ func (h *handlers) execCommand(c *gin.Context) {
 				Command:    body.Command,
 				IsScript:   body.IsScript,
 				TimeoutSec: body.Timeout,
+				// Stall detection stays off here: an ad-hoc command may
+				// legitimately stay silent for minutes, and only the
+				// wall-clock timeout bounds it.
+				StallTimeoutSec: 0,
 			},
 		},
 	})
@@ -1258,12 +1266,17 @@ func (h *handlers) batchExec(c *gin.Context) {
 		execID := randomToken(8)
 		hidCopy := hid
 		hub.SetRespHandler(execID, func(msg *agentpb.AgentMessage) {
-			hub.SetRespHandler(execID, nil)
 			if msg == nil {
+				hub.SetRespHandler(execID, nil)
 				done <- result{HostID: hidCopy, Error: "agent disconnected"}
 				return
 			}
 			r := msg.GetExecResult()
+			if r == nil {
+				// Streaming chunk (ExecOutput): not the result; keep waiting.
+				return
+			}
+			hub.SetRespHandler(execID, nil)
 			done <- result{
 				HostID:   hidCopy,
 				ExitCode: r.GetExitCode(),
@@ -1279,6 +1292,10 @@ func (h *handlers) batchExec(c *gin.Context) {
 					Shell:      body.Shell,
 					Command:    body.Command,
 					TimeoutSec: body.Timeout,
+					// Ad-hoc commands may stay silent legitimately; only
+					// the wall-clock timeout bounds them (see the
+					// single-exec endpoint above).
+					StallTimeoutSec: 0,
 				},
 			},
 		})
@@ -1862,12 +1879,17 @@ func (h *handlers) dockerGetMirrors(c *gin.Context) {
 	execID := randomToken(8)
 	resultCh := make(chan *agentpb.ExecResult, 1)
 	hub.SetRespHandler(execID, func(msg *agentpb.AgentMessage) {
-		hub.SetRespHandler(execID, nil)
-		if msg != nil {
-			resultCh <- msg.GetExecResult()
-		} else {
+		if msg == nil {
+			hub.SetRespHandler(execID, nil)
 			resultCh <- nil
+			return
 		}
+		if msg.GetExecResult() == nil {
+			// Streaming chunk (ExecOutput): not the result; keep waiting.
+			return
+		}
+		hub.SetRespHandler(execID, nil)
+		resultCh <- msg.GetExecResult()
 	})
 
 	hub.Send(&agentpb.ServerMessage{
@@ -1878,6 +1900,9 @@ func (h *handlers) dockerGetMirrors(c *gin.Context) {
 				Command:    cmd,
 				IsScript:   false,
 				TimeoutSec: 15,
+				// Short read-only probe; stall detection is off by
+				// design (only the deploy engine opts into it).
+				StallTimeoutSec: 0,
 			},
 		},
 	})
@@ -2000,12 +2025,17 @@ fi
 	execID := randomToken(8)
 	resultCh := make(chan *agentpb.ExecResult, 1)
 	hub.SetRespHandler(execID, func(msg *agentpb.AgentMessage) {
-		hub.SetRespHandler(execID, nil)
-		if msg != nil {
-			resultCh <- msg.GetExecResult()
-		} else {
+		if msg == nil {
+			hub.SetRespHandler(execID, nil)
 			resultCh <- nil
+			return
 		}
+		if msg.GetExecResult() == nil {
+			// Streaming chunk (ExecOutput): not the result; keep waiting.
+			return
+		}
+		hub.SetRespHandler(execID, nil)
+		resultCh <- msg.GetExecResult()
 	})
 
 	hub.Send(&agentpb.ServerMessage{
@@ -2016,6 +2046,9 @@ fi
 				Command:    cmd,
 				IsScript:   true,
 				TimeoutSec: 30,
+				// Short settings write; stall detection is off by
+				// design (only the deploy engine opts into it).
+				StallTimeoutSec: 0,
 			},
 		},
 	})

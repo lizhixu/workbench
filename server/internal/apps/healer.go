@@ -80,8 +80,8 @@ func (h *AutoHealer) sweep() {
 }
 
 func (h *AutoHealer) checkOne(hub *rpc.Hub, app *Application) {
-	res, err := execOnAgent(hub, "heal-chk-"+randomToken(4),
-		fmt.Sprintf("curl -s -o /dev/null -w '%%{http_code}' --max-time 5 %s", shellQuote(app.HealthcheckURL)), 10)
+	res, err := execOnAgent(nil, hub, "heal-chk-"+randomToken(4),
+		fmt.Sprintf("curl -s -o /dev/null -w '%%{http_code}' --max-time 5 %s", shellQuote(app.HealthcheckURL)), 10, 0, nil)
 
 	healthy := false
 	if err == nil && res.GetExitCode() == 0 {
@@ -111,8 +111,8 @@ func (h *AutoHealer) checkOne(hub *rpc.Hub, app *Application) {
 		h.failures[app.ID] = 0 // reset counter before restarting
 		h.log.Warn("triggering auto-healing restart for app", "app", app.ID, "container", app.ContainerName)
 		go func(targetHub *rpc.Hub, targetContainer string, targetAppID string) {
-			_, restartErr := execOnAgent(targetHub, "heal-rst-"+randomToken(4),
-				fmt.Sprintf("docker restart %s", shellQuote(targetContainer)), 60)
+			_, restartErr := execOnAgent(nil, targetHub, "heal-rst-"+randomToken(4),
+				fmt.Sprintf("docker restart %s", shellQuote(targetContainer)), 60, 0, nil)
 			if restartErr != nil {
 				h.log.Error("auto-healing restart failed", "app", targetAppID, "err", restartErr)
 			} else {

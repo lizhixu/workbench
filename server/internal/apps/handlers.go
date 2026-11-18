@@ -254,12 +254,17 @@ func (h *Handlers) installDockerScript(c *gin.Context) {
 	opID := "dk-inst-" + randomToken(4)
 	resultCh := make(chan *agentpb.ExecResult, 1)
 	hub.SetRespHandler(opID, func(msg *agentpb.AgentMessage) {
-		hub.SetRespHandler(opID, nil)
-		if msg != nil {
-			resultCh <- msg.GetExecResult()
-		} else {
+		if msg == nil {
+			hub.SetRespHandler(opID, nil)
 			resultCh <- nil
+			return
 		}
+		if msg.GetExecResult() == nil {
+			// Streaming chunk (ExecOutput): not the result; keep waiting.
+			return
+		}
+		hub.SetRespHandler(opID, nil)
+		resultCh <- msg.GetExecResult()
 	})
 
 	hub.Send(&agentpb.ServerMessage{
@@ -272,6 +277,9 @@ func (h *Handlers) installDockerScript(c *gin.Context) {
 				// fallback before giving up, so a slow link can legitimately
 				// take longer than the old single-source 300s budget.
 				TimeoutSec: 600,
+				// The install script downloads and compiles quietly for
+				// long stretches; stall detection must stay off here.
+				StallTimeoutSec: 0,
 			},
 		},
 	})

@@ -368,6 +368,17 @@ func (d *Dialer) handleServerMessage(msg *agentpb.ServerMessage) error {
 		d.execs.Handle(p.Exec)
 		return nil
 
+	// ExecCancel: the server wants a running exec stopped (the operator
+	// cancelled the deployment, or the server-side wait timed out). The
+	// manager kills the process group and reports "cancelled"; an
+	// unknown or already-finished exec is a no-op, not an error.
+	case *agentpb.ServerMessage_ExecCancel:
+		if d.execs == nil {
+			return fmt.Errorf("exec not available")
+		}
+		d.execs.Cancel(p.ExecCancel)
+		return nil
+
 	// Metrics.
 	case *agentpb.ServerMessage_MetricsQ:
 		if d.metrics == nil {

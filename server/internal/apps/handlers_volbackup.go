@@ -827,7 +827,7 @@ func (h *AppHandlers) commitVolumeUploadRestore(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("第 %d 份文件的挂载卷规格无效", i+1)})
 				return
 			}
-			res, merr := execOnAgent(hub, "volupath-"+randomToken(4), volumeResolveMountpointScript(src), 30)
+			res, merr := execOnAgent(nil, hub, "volupath-"+randomToken(4), volumeResolveMountpointScript(src), 30, 0, nil)
 			if merr != nil {
 				h.engine.releaseVolumeSlot(app.ID)
 				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "查询 Docker 卷挂载点失败"})

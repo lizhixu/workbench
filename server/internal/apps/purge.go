@@ -45,7 +45,7 @@ func (h *AppHandlers) purgeAppResources(app *Application) ([]string, error) {
 	// exec runs a command on the agent and returns trimmed stdout.
 	// ok=false means the command failed; the caller decides whether to warn.
 	exec := func(opID, cmd string, timeoutSec int32) (string, bool) {
-		res, err := execOnAgent(hub, opID, cmd, timeoutSec)
+		res, err := execOnAgent(nil, hub, opID, cmd, timeoutSec, 0, nil)
 		if err != nil {
 			return "", false
 		}
@@ -154,9 +154,9 @@ func (h *AppHandlers) purgeAppResources(app *Application) ([]string, error) {
 				warn("主机 %s 离线，代理配置未清理", hostID)
 				continue
 			}
-			_, _ = execOnAgent(phub, "purge-proxy-"+randomToken(4),
+			_, _ = execOnAgent(nil, phub, "purge-proxy-"+randomToken(4),
 				fmt.Sprintf("rm -f %s %s && docker exec %s nginx -s reload 2>/dev/null || true",
-					confPath, proxyCleanupCertGlob(app), nginxContainer), 30)
+					confPath, proxyCleanupCertGlob(app), nginxContainer), 30, 0, nil)
 		}
 	}
 
@@ -169,8 +169,8 @@ func (h *AppHandlers) purgeAppResources(app *Application) ([]string, error) {
 			warn("组网转发入口主机 %s 离线，中继容器未清理", app.MeshForwardHostID)
 		} else {
 			fwdContainer := "watchman-fwd-" + app.ID
-			_, _ = execOnAgent(fwdHub, "purge-fwd-"+randomToken(4),
-				"docker rm -f "+shellQuote(fwdContainer), 30)
+			_, _ = execOnAgent(nil, fwdHub, "purge-fwd-"+randomToken(4),
+				"docker rm -f "+shellQuote(fwdContainer), 30, 0, nil)
 		}
 	}
 

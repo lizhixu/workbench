@@ -447,8 +447,8 @@ func (h *ProxyHandler) unbindProxy(c *gin.Context) {
 			continue
 		}
 		h.pushMu.Lock()
-		res, err := execOnAgent(hub, "proxy-unbind-"+randomToken(4),
-			proxyUnbindScript(app, fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)), 30)
+		res, err := execOnAgent(nil, hub, "proxy-unbind-"+randomToken(4),
+			proxyUnbindScript(app, fmt.Sprintf("%s/watchman-%s.conf", proxyConfigDir, app.ID)), 30, 0, nil)
 		h.pushMu.Unlock()
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("主机 %s 反代配置清理失败：%v", hostID, err))
@@ -819,7 +819,7 @@ func (h *ProxyHandler) removeProxyFiles(agentHub *rpc.Hub, confPath string, doma
 			shellQuote(fmt.Sprintf("%s/%s.crt", proxyCertDir, d)),
 			shellQuote(fmt.Sprintf("%s/%s.key", proxyCertDir, d)))
 	}
-	_, _ = execOnAgent(agentHub, "proxy-rollback-"+randomToken(4), "rm -f "+strings.Join(args, " "), 30)
+	_, _ = execOnAgent(nil, agentHub, "proxy-rollback-"+randomToken(4), "rm -f "+strings.Join(args, " "), 30, 0, nil)
 }
 
 // removeProxyCertFiles deletes only cert/key files for the given bindings
@@ -837,7 +837,7 @@ func (h *ProxyHandler) removeProxyCertFiles(agentHub *rpc.Hub, bindings []Domain
 	if len(args) == 0 {
 		return nil
 	}
-	res, err := execOnAgent(agentHub, "proxy-cert-clean-"+randomToken(4), "rm -f "+strings.Join(args, " "), 30)
+	res, err := execOnAgent(nil, agentHub, "proxy-cert-clean-"+randomToken(4), "rm -f "+strings.Join(args, " "), 30, 0, nil)
 	if err != nil {
 		return err
 	}
@@ -879,15 +879,15 @@ func (h *ProxyHandler) cleanupProxyHost(hostID, appID string, bindings []DomainB
 	}
 	h.pushMu.Lock()
 	defer h.pushMu.Unlock()
-	res, err := execOnAgent(hub, "proxy-clean-"+randomToken(4), "rm -f "+strings.Join(args, " "), 30)
+	res, err := execOnAgent(nil, hub, "proxy-clean-"+randomToken(4), "rm -f "+strings.Join(args, " "), 30, 0, nil)
 	if err != nil {
 		return fmt.Errorf("主机 %s 旧反代文件删除失败：%v", hostID, err)
 	}
 	if res.GetExitCode() != 0 {
 		return fmt.Errorf("主机 %s 旧反代文件删除失败（exit %d）", hostID, res.GetExitCode())
 	}
-	res, err = execOnAgent(hub, "proxy-clean-reload-"+randomToken(4),
-		fmt.Sprintf("docker exec %s nginx -s reload 2>&1", nginxContainer), 30)
+	res, err = execOnAgent(nil, hub, "proxy-clean-reload-"+randomToken(4),
+		fmt.Sprintf("docker exec %s nginx -s reload 2>&1", nginxContainer), 30, 0, nil)
 	if err != nil {
 		return fmt.Errorf("主机 %s 旧 vhost 文件已删除，但 nginx reload 未成功，旧配置在重载前仍会继续生效：%v", hostID, err)
 	}
@@ -1153,7 +1153,7 @@ func proxyContainerHealthy(out string) bool {
 // missing/broken containers are rebuilt. Callers hold pushMu so a rebuild
 // never races an in-flight cert/conf push or reload.
 func (h *ProxyHandler) ensureProxyNginx(agentHub *rpc.Hub) error {
-	res, err := execOnAgent(agentHub, "proxy-ensure-check-"+randomToken(4), proxyEnsureCheckScript(), 30)
+	res, err := execOnAgent(nil, agentHub, "proxy-ensure-check-"+randomToken(4), proxyEnsureCheckScript(), 30, 0, nil)
 	if err != nil {
 		return fmt.Errorf("反代容器检查失败: %w", err)
 	}
@@ -1170,7 +1170,7 @@ func (h *ProxyHandler) ensureProxyNginx(agentHub *rpc.Hub) error {
 		// attempt that would fail the same way.
 		return classifyEnsureError(res.GetExitCode(), string(res.GetStdout()), string(res.GetStderr()))
 	}
-	res, err = execOnAgent(agentHub, "proxy-ensure-run-"+randomToken(4), proxyEnsureRunScript(), 300)
+	res, err = execOnAgent(nil, agentHub, "proxy-ensure-run-"+randomToken(4), proxyEnsureRunScript(), 300, 0, nil)
 	if err != nil {
 		return fmt.Errorf("反代容器重建失败: %w", err)
 	}
@@ -1243,7 +1243,7 @@ func (h *ProxyHandler) reloadNginx(agentHub *rpc.Hub) error {
 	script := fmt.Sprintf(
 		`docker exec %[1]s nginx -t 2>&1 && docker exec %[1]s nginx -s reload 2>&1`,
 		nginxContainer)
-	res, err := execOnAgent(agentHub, "proxy-reload-"+randomToken(4), script, 30)
+	res, err := execOnAgent(nil, agentHub, "proxy-reload-"+randomToken(4), script, 30, 0, nil)
 	if err != nil {
 		return fmt.Errorf("%w: %w", errReloadTimeout, err)
 	}

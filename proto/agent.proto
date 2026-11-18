@@ -32,6 +32,7 @@ message AgentMessage {
     ScanProgress scan_progress = 9; // (P3)
     UpgradeProgress upgrade_progress = 10; // (P3)
     CleanupEvent cleanup = 13; // system cleanup result
+    ExecOutput exec_output = 14; // streaming exec output chunk (see ExecOutput)
     TunnelData tunnel_data = 11; // reverse TCP tunnel payload (agent -> server)
     TunnelClose tunnel_close = 12; // reverse TCP tunnel teardown (agent -> server)
     Ack ack = 99;
@@ -61,6 +62,7 @@ message ServerMessage {
     TunnelClose tunnel_close = 19;
     UninstallRequest uninstall = 15; // ask agent to uninstall itself
     ConfigUpdate config_update = 20; // push per-host runtime config to a connected agent
+    ExecCancel exec_cancel = 22; // cancel a running exec (see ExecCancel)
   }
 }
 
@@ -203,6 +205,13 @@ message ExecRequest {
   string command = 3; // single command or script body
   bool is_script = 4;
   int32 timeout_sec = 5;
+  // stall_timeout_sec is the stall budget in seconds: if the command
+  // produces no stdout/stderr output for this long, the agent kills the
+  // whole process group and reports "stalled: no output for <N>s". 0
+  // disables stall detection (only the wall-clock timeout_sec applies);
+  // callers use 0 for commands that may legitimately stay silent for a
+  // long time (e.g. tar/curl transfers, ad-hoc user scripts).
+  int32 stall_timeout_sec = 6;
 }
 
 message ExecResult {
@@ -212,6 +221,23 @@ message ExecResult {
   bytes stderr = 4;
   int64 duration_ms = 5;
   string error = 6;
+}
+
+// ExecOutput streams one exec's output to the server while the command is
+// still running, in the same order the command produced it. Chunks are
+// batched (~200ms or 4KB); the final ExecResult still carries the complete
+// stdout/stderr, so a chunk is never the only copy of the output.
+message ExecOutput {
+  string exec_id = 1;
+  bytes chunk = 2;
+  string stream = 3; // "stdout" or "stderr"
+}
+
+// ExecCancel asks the agent to stop a running exec. The agent kills the
+// whole process group and replies with an ExecResult whose error is
+// "cancelled". Cancelling an unknown or already-finished exec is a no-op.
+message ExecCancel {
+  string exec_id = 1;
 }
 
 // ---- Metrics ---------------------------------------------------------

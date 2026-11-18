@@ -189,8 +189,8 @@ func (e *Engine) PrecheckMigration(app *Application, targetHostID string) (*Migr
 		resp.Warnings = append(resp.Warnings, "目标主机为 Windows 系统,暂不支持容器反代与迁移")
 	}
 
-	if res, err := execOnAgent(targetHub, "mig-pre-docker-"+randomToken(4),
-		"command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1", 15); err == nil && res.GetExitCode() == 0 {
+	if res, err := execOnAgent(nil, targetHub, "mig-pre-docker-"+randomToken(4),
+		"command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1", 15, deployStallSec, nil); err == nil && res.GetExitCode() == 0 {
 		resp.DockerRunning = true
 	} else {
 		resp.Warnings = append(resp.Warnings, "目标主机 Docker 未安装或未运行")
@@ -220,7 +220,7 @@ func detectPortConflicts(hub *rpc.Hub, ports []PortMapping) []int {
 	script := fmt.Sprintf(`for p in %s; do
   if (ss -tuln 2>/dev/null || netstat -tuln 2>/dev/null) | grep -q ":$p "; then echo $p; fi
 done`, strings.Join(portStrs, " "))
-	res, err := execOnAgent(hub, "mig-pre-ports-"+randomToken(4), script, 15)
+	res, err := execOnAgent(nil, hub, "mig-pre-ports-"+randomToken(4), script, 15, deployStallSec, nil)
 	if err != nil || res.GetExitCode() != 0 {
 		return nil
 	}
@@ -401,7 +401,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 			if app.SourceType == "raw_compose" {
 				restartCmd = fmt.Sprintf("docker compose -f %s -p %s up -d", shellQuote(composePath), shellQuote("watchman-"+app.ID))
 			}
-			restartRes, restartErr := execOnAgent(sourceHub, "mig-rb-start-"+randomToken(4), restartCmd, 90)
+			restartRes, restartErr := execOnAgent(context.Background(), sourceHub, "mig-rb-start-"+randomToken(4), restartCmd, 90, deployStallSec, nil)
 			if restartErr != nil || restartRes.GetExitCode() != 0 {
 				issues = append(issues, fmt.Sprintf("源主机容器重启失败: %v", firstErr(restartErr, restartRes)))
 				logBuf.WriteString(fmt.Sprintf("WARN: 重启源主机容器失败: %v\n", firstErr(restartErr, restartRes)))
@@ -420,7 +420,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 				cleanCmd = fmt.Sprintf("cd %s && docker compose -f %s -p %s down 2>/dev/null || true",
 					shellQuote(repoDir), shellQuote(gitComposeFile(app)), shellQuote("watchman-"+app.ID))
 			}
-			cleanRes, cleanErr := execOnAgent(targetHub, "mig-rb-clean-"+randomToken(4), cleanCmd, 60)
+			cleanRes, cleanErr := execOnAgent(context.Background(), targetHub, "mig-rb-clean-"+randomToken(4), cleanCmd, 60, deployStallSec, nil)
 			if cleanErr != nil || cleanRes.GetExitCode() != 0 {
 				issues = append(issues, fmt.Sprintf("目标主机残留清理失败: %v", firstErr(cleanErr, cleanRes)))
 				logBuf.WriteString(fmt.Sprintf("WARN: 清理目标主机残留容器失败: %v\n", firstErr(cleanErr, cleanRes)))
@@ -435,7 +435,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 				if len(mv.files) == 0 {
 					continue
 				}
-				volRes, volErr := execOnAgent(targetHub, "mig-rb-vol-"+randomToken(4), volumeFileCleanupScript(mv), 120)
+				volRes, volErr := execOnAgent(context.Background(), targetHub, "mig-rb-vol-"+randomToken(4), volumeFileCleanupScript(mv), 120, deployStallSec, nil)
 				if volErr != nil || volRes.GetExitCode() != 0 {
 					volFail := firstErr(volErr, volRes)
 					issues = append(issues, fmt.Sprintf("目标卷数据清理失败(%s): %v", mv.tgtDir, volFail))
@@ -487,7 +487,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 				cleanCmd = fmt.Sprintf("cd %s && docker compose -f %s -p %s down 2>/dev/null || true",
 					shellQuote(repoDir), shellQuote(gitComposeFile(app)), shellQuote("watchman-"+app.ID))
 			}
-			_, _ = execOnAgent(targetHub, "mig-gone-clean-"+randomToken(4), cleanCmd, 60)
+			_, _ = execOnAgent(context.Background(), targetHub, "mig-gone-clean-"+randomToken(4), cleanCmd, 60, deployStallSec, nil)
 			// Best-effort cleanup of volume files this run already
 			// unpacked onto the target: the app record is gone, so
 			// nothing will ever consume them. Files whose tar listing
@@ -497,7 +497,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 				if len(mv.files) == 0 {
 					continue
 				}
-				if _, err := execOnAgent(targetHub, "mig-gone-vol-"+randomToken(4), volumeFileCleanupScript(mv), 120); err != nil {
+				if _, err := execOnAgent(context.Background(), targetHub, "mig-gone-vol-"+randomToken(4), volumeFileCleanupScript(mv), 120, deployStallSec, nil); err != nil {
 					logBuf.WriteString(fmt.Sprintf("WARN: 应用已删除但清理目标卷数据失败(%s): %v\n", mv.tgtDir, err))
 				}
 			}
@@ -513,7 +513,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 	// ---- Stage 1: quiesce the source container so the volume snapshot is
 	// consistent (no writes racing the tar).
 	if sourceHub != nil {
-		st, stErr := execOnAgent(sourceHub, "mig-src-state-"+randomToken(4), volumeContainerStateScript(container), 15)
+		st, stErr := execOnAgent(ctx, sourceHub, "mig-src-state-"+randomToken(4), volumeContainerStateScript(container), 15, deployStallSec, nil)
 		// A failed probe must fail closed: proceeding to tar while the
 		// source keeps writing would pack a torn snapshot. (A clean
 		// STOPPED answer only means there is nothing to stop.)
@@ -534,7 +534,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 			// A failed stop breaks the snapshot-consistency guarantee the
 			// whole migration rests on: fail and roll back instead of
 			// packing a torn snapshot while the source keeps writing.
-			stopRes, stopErr := execOnAgent(sourceHub, "mig-src-stop-"+randomToken(4), stopCmd, 90)
+			stopRes, stopErr := execOnAgent(ctx, sourceHub, "mig-src-stop-"+randomToken(4), stopCmd, 90, deployStallSec, nil)
 			if stopErr != nil || stopRes.GetExitCode() != 0 {
 				failRollback("停止源主机容器失败: %v", firstErr(stopErr, stopRes))
 				return
@@ -579,7 +579,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 			srcStaging := volumeStagingPath(app.ID, migID)
 			s3Key := volumeObjectKey(target, app.ID, migID)
 
-			res, err := execOnAgent(sourceHub, "mig-tar-"+migID, volumeBackupScript(srcDir, srcStaging), volumeS3OpTimeout)
+			res, err := execOnAgent(ctx, sourceHub, "mig-tar-"+migID, volumeBackupScript(srcDir, srcStaging), volumeS3OpTimeout, 0, nil)
 			if err != nil || res.GetExitCode() != 0 {
 				e.cleanupHostPaths(sourceHub, srcStaging)
 				cerr := fmt.Errorf("打包卷数据失败(%s): %v", src, firstErr(err, res))
@@ -594,7 +594,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 				failRollback("生成 S3 上传地址失败: %v", err)
 				return
 			}
-			upRes, upErr := execOnAgent(sourceHub, "mig-up-"+migID, volumeUploadScript(srcStaging, putURL), volumeS3OpTimeout)
+			upRes, upErr := execOnAgent(ctx, sourceHub, "mig-up-"+migID, volumeUploadScript(srcStaging, putURL), volumeS3OpTimeout, 0, nil)
 			e.cleanupHostPaths(sourceHub, srcStaging)
 			if upErr != nil || upRes.GetExitCode() != 0 {
 				e.dropS3Object(s3c, s3Key)
@@ -618,7 +618,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 				return
 			}
 			tStaging := volumeRestorePath(app.ID, migID)
-			dlRes, dlErr := execOnAgent(targetHub, "mig-dl-"+migID, volumeDownloadScript(getURL, tStaging), volumeS3OpTimeout)
+			dlRes, dlErr := execOnAgent(ctx, targetHub, "mig-dl-"+migID, volumeDownloadScript(getURL, tStaging), volumeS3OpTimeout, 0, nil)
 			if dlErr != nil || dlRes.GetExitCode() != 0 {
 				e.cleanupHostPaths(targetHub, tStaging)
 				e.dropS3Object(s3c, s3Key)
@@ -627,7 +627,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 				return
 			}
 
-			sumRes, sumErr := execOnAgent(targetHub, "mig-sha-"+migID, volumeSHA256Script(tStaging), 120)
+			sumRes, sumErr := execOnAgent(ctx, targetHub, "mig-sha-"+migID, volumeSHA256Script(tStaging), 120, 0, nil)
 			tSha := strings.TrimSpace(string(sumRes.GetStdout()))
 			if sumErr != nil || sumRes.GetExitCode() != 0 {
 				e.cleanupHostPaths(targetHub, tStaging)
@@ -658,7 +658,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 			// A failed listing only degrades rollback cleanup for this
 			// volume; the unpack itself still proceeds.
 			var members []string
-			if listRes, listErr := execOnAgent(targetHub, "mig-list-"+migID, fmt.Sprintf("tar -tzf %s", shellQuote(tStaging)), 120); listErr == nil && listRes.GetExitCode() == 0 {
+			if listRes, listErr := execOnAgent(ctx, targetHub, "mig-list-"+migID, fmt.Sprintf("tar -tzf %s", shellQuote(tStaging)), 120, deployStallSec, nil); listErr == nil && listRes.GetExitCode() == 0 {
 				members = parseTarMembers(string(listRes.GetStdout()))
 			} else {
 				logBuf.WriteString(fmt.Sprintf("WARN: 无法列出卷 %s 的归档成员，回滚时无法清理该卷\n", src))
@@ -666,7 +666,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 
 			unpack := fmt.Sprintf("set -e\nmkdir -p %s\ntar -C %s -xzf %s",
 				shellQuote(tgtDir), shellQuote(tgtDir), shellQuote(tStaging))
-			unRes, unErr := execOnAgent(targetHub, "mig-unpack-"+migID, unpack, volumeS3OpTimeout)
+			unRes, unErr := execOnAgent(ctx, targetHub, "mig-unpack-"+migID, unpack, volumeS3OpTimeout, 0, nil)
 			e.cleanupHostPaths(targetHub, tStaging)
 			e.dropS3Object(s3c, s3Key)
 			if unErr != nil || unRes.GetExitCode() != 0 {
@@ -769,7 +769,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 				shellQuote(repoDir), shellQuote(gitComposeFile(app)), shellQuote("watchman-"+app.ID))
 		}
 		logBuf.WriteString("$ 清理源主机容器(保留宿主数据目录)\n")
-		if _, err := execOnAgent(sourceHub, "mig-src-clean-"+randomToken(4), cleanCmd, 90); err != nil {
+		if _, err := execOnAgent(context.Background(), sourceHub, "mig-src-clean-"+randomToken(4), cleanCmd, 90, deployStallSec, nil); err != nil {
 			logBuf.WriteString(fmt.Sprintf("WARN: 清理源主机容器失败: %v\n", err))
 		} else {
 			logBuf.WriteString("[CLEAN] 源主机容器已清理,数据目录严格保留\n")
@@ -791,7 +791,7 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 func (e *Engine) deployOnTargetHost(ctx context.Context, hub *rpc.Hub, app *Application, dep *Deployment, logBuf *logBuffer, container string) error {
 	buildTimeout := app.BuildTimeout
 	if buildTimeout <= 0 {
-		buildTimeout = 900
+		buildTimeout = 1800
 	}
 
 	switch app.SourceType {
@@ -802,7 +802,7 @@ func (e *Engine) deployOnTargetHost(ctx context.Context, hub *rpc.Hub, app *Appl
 		b64 := base64.StdEncoding.EncodeToString([]byte(app.ComposeContent))
 		writeScript := fmt.Sprintf(`mkdir -p %s && echo %s | base64 -d > %s`,
 			shellQuote(appDir), shellQuote(b64), shellQuote(composePath))
-		if res, err := execOnAgent(hub, "mig-write-compose-"+randomToken(4), writeScript, 30); err != nil || res.GetExitCode() != 0 {
+		if res, err := execOnAgent(ctx, hub, "mig-write-compose-"+randomToken(4), writeScript, 30, deployStallSec, nil); err != nil || res.GetExitCode() != 0 {
 			return fmt.Errorf("写入 Compose 配置失败: %v", firstErr(err, res))
 		}
 		upCmd := fmt.Sprintf("docker compose -f %s -p %s up -d --remove-orphans", shellQuote(composePath), shellQuote("watchman-"+app.ID))
@@ -810,11 +810,10 @@ func (e *Engine) deployOnTargetHost(ctx context.Context, hub *rpc.Hub, app *Appl
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		res, err := execOnAgent(hub, "mig-compose-up-"+randomToken(4), upCmd, buildTimeout)
+		res, err := execOnAgent(ctx, hub, "mig-compose-up-"+randomToken(4), upCmd, buildTimeout, deployStallSec, logBuf)
 		if err != nil {
 			return fmt.Errorf("Docker Compose 启动失败: %v", err)
 		}
-		logBuf.WriteResult(res, nil, res.GetStderr())
 		if res.GetExitCode() != 0 {
 			return fmt.Errorf("Docker Compose 启动失败 (exit %d)", res.GetExitCode())
 		}
@@ -871,7 +870,7 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	res, err := execOnAgent(hub, "mig-git-"+randomToken(4), fetchScript, 300)
+	res, err := execOnAgent(ctx, hub, "mig-git-"+randomToken(4), fetchScript, 1800, deployStallSec, nil)
 	if err != nil {
 		return fmt.Errorf("代码拉取失败: %v", err)
 	}
@@ -897,12 +896,11 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		res, err = execOnAgent(hub, "mig-compose-up-"+randomToken(4),
-			fmt.Sprintf("cd %s && %s", shellQuote(repoDir), upCmd), buildTimeout)
+		res, err = execOnAgent(ctx, hub, "mig-compose-up-"+randomToken(4),
+			fmt.Sprintf("cd %s && %s", shellQuote(repoDir), upCmd), buildTimeout, deployStallSec, logBuf)
 		if err != nil {
 			return fmt.Errorf("Docker Compose 部署失败: %v", err)
 		}
-		logBuf.WriteResult(res, nil, res.GetStderr())
 		if res.GetExitCode() != 0 {
 			return fmt.Errorf("Docker Compose 部署失败 (exit %d)", res.GetExitCode())
 		}
@@ -934,12 +932,11 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	res, err = execOnAgent(hub, "mig-build-"+randomToken(4),
-		fmt.Sprintf("cd %s && %s", shellQuote(repoDir), buildCmd), buildTimeout)
+	res, err = execOnAgent(ctx, hub, "mig-build-"+randomToken(4),
+		fmt.Sprintf("cd %s && %s", shellQuote(repoDir), buildCmd), buildTimeout, deployStallSec, logBuf)
 	if err != nil {
 		return fmt.Errorf("Docker 构建失败: %v", err)
 	}
-	logBuf.WriteResult(res, nil, res.GetStderr())
 	if res.GetExitCode() != 0 {
 		return fmt.Errorf("Docker 构建失败 (exit %d)", res.GetExitCode())
 	}
@@ -962,7 +959,7 @@ func (e *Engine) runContainerOnTarget(ctx context.Context, hub *rpc.Hub, app *Ap
 	}
 	meshIP := ""
 	if needsMesh {
-		meshIP = e.resolveMeshIP(hub, app.HostID, logBuf)
+		meshIP = e.resolveMeshIP(ctx, hub, app.HostID, logBuf)
 	}
 	for _, pm := range app.Ports {
 		if pm.BindScope == "mesh" && meshIP != "" {
@@ -982,11 +979,10 @@ func (e *Engine) runContainerOnTarget(ctx context.Context, hub *rpc.Hub, app *Ap
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	res, err := execOnAgent(hub, "mig-run-"+randomToken(4), runCmd, 120)
+	res, err := execOnAgent(ctx, hub, "mig-run-"+randomToken(4), runCmd, 600, deployStallSec, logBuf)
 	if err != nil {
 		return fmt.Errorf("启动容器失败: %v", err)
 	}
-	logBuf.WriteResult(res, nil, res.GetStderr())
 	if res.GetExitCode() != 0 {
 		return fmt.Errorf("启动容器失败 (exit %d)", res.GetExitCode())
 	}
@@ -1010,7 +1006,7 @@ func resolveVolumeDir(hub *rpc.Hub, src string) (string, error) {
 	if volumeIsBindMount(src) {
 		return src, nil
 	}
-	res, err := execOnAgent(hub, "mig-vol-mp-"+randomToken(4), volumeResolveMountpointScript(src), 30)
+	res, err := execOnAgent(nil, hub, "mig-vol-mp-"+randomToken(4), volumeResolveMountpointScript(src), 30, deployStallSec, nil)
 	if err != nil {
 		return "", err
 	}
@@ -1029,13 +1025,13 @@ func resolveVolumeDir(hub *rpc.Hub, src string) (string, error) {
 // are created. Returns the host directory to unpack into.
 func ensureVolumeDir(hub *rpc.Hub, src string) (string, error) {
 	if volumeIsBindMount(src) {
-		if _, err := execOnAgent(hub, "mig-mkdir-"+randomToken(4), fmt.Sprintf("mkdir -p %s", shellQuote(src)), 30); err != nil {
+		if _, err := execOnAgent(nil, hub, "mig-mkdir-"+randomToken(4), fmt.Sprintf("mkdir -p %s", shellQuote(src)), 30, deployStallSec, nil); err != nil {
 			return "", err
 		}
 		return src, nil
 	}
 	script := fmt.Sprintf("docker volume create %s >/dev/null && %s", shellQuote(src), volumeResolveMountpointScript(src))
-	res, err := execOnAgent(hub, "mig-vol-create-"+randomToken(4), script, 30)
+	res, err := execOnAgent(nil, hub, "mig-vol-create-"+randomToken(4), script, 30, deployStallSec, nil)
 	if err != nil {
 		return "", err
 	}

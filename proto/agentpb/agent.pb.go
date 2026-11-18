@@ -37,6 +37,7 @@ type AgentMessage struct {
 	//	*AgentMessage_ScanProgress
 	//	*AgentMessage_UpgradeProgress
 	//	*AgentMessage_Cleanup
+	//	*AgentMessage_ExecOutput
 	//	*AgentMessage_TunnelData
 	//	*AgentMessage_TunnelClose
 	//	*AgentMessage_Ack
@@ -181,6 +182,15 @@ func (x *AgentMessage) GetCleanup() *CleanupEvent {
 	return nil
 }
 
+func (x *AgentMessage) GetExecOutput() *ExecOutput {
+	if x != nil {
+		if x, ok := x.Payload.(*AgentMessage_ExecOutput); ok {
+			return x.ExecOutput
+		}
+	}
+	return nil
+}
+
 func (x *AgentMessage) GetTunnelData() *TunnelData {
 	if x != nil {
 		if x, ok := x.Payload.(*AgentMessage_TunnelData); ok {
@@ -256,6 +266,10 @@ type AgentMessage_Cleanup struct {
 	Cleanup *CleanupEvent `protobuf:"bytes,13,opt,name=cleanup,proto3,oneof"` // system cleanup result
 }
 
+type AgentMessage_ExecOutput struct {
+	ExecOutput *ExecOutput `protobuf:"bytes,14,opt,name=exec_output,json=execOutput,proto3,oneof"` // streaming exec output chunk (see ExecOutput)
+}
+
 type AgentMessage_TunnelData struct {
 	TunnelData *TunnelData `protobuf:"bytes,11,opt,name=tunnel_data,json=tunnelData,proto3,oneof"` // reverse TCP tunnel payload (agent -> server)
 }
@@ -290,6 +304,8 @@ func (*AgentMessage_UpgradeProgress) isAgentMessage_Payload() {}
 
 func (*AgentMessage_Cleanup) isAgentMessage_Payload() {}
 
+func (*AgentMessage_ExecOutput) isAgentMessage_Payload() {}
+
 func (*AgentMessage_TunnelData) isAgentMessage_Payload() {}
 
 func (*AgentMessage_TunnelClose) isAgentMessage_Payload() {}
@@ -321,6 +337,7 @@ type ServerMessage struct {
 	//	*ServerMessage_TunnelClose
 	//	*ServerMessage_Uninstall
 	//	*ServerMessage_ConfigUpdate
+	//	*ServerMessage_ExecCancel
 	Payload       isServerMessage_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -543,6 +560,15 @@ func (x *ServerMessage) GetConfigUpdate() *ConfigUpdate {
 	return nil
 }
 
+func (x *ServerMessage) GetExecCancel() *ExecCancel {
+	if x != nil {
+		if x, ok := x.Payload.(*ServerMessage_ExecCancel); ok {
+			return x.ExecCancel
+		}
+	}
+	return nil
+}
+
 type isServerMessage_Payload interface {
 	isServerMessage_Payload()
 }
@@ -627,6 +653,10 @@ type ServerMessage_ConfigUpdate struct {
 	ConfigUpdate *ConfigUpdate `protobuf:"bytes,20,opt,name=config_update,json=configUpdate,proto3,oneof"` // push per-host runtime config to a connected agent
 }
 
+type ServerMessage_ExecCancel struct {
+	ExecCancel *ExecCancel `protobuf:"bytes,22,opt,name=exec_cancel,json=execCancel,proto3,oneof"` // cancel a running exec (see ExecCancel)
+}
+
 func (*ServerMessage_Register) isServerMessage_Payload() {}
 
 func (*ServerMessage_Heartbeat) isServerMessage_Payload() {}
@@ -666,6 +696,8 @@ func (*ServerMessage_TunnelClose) isServerMessage_Payload() {}
 func (*ServerMessage_Uninstall) isServerMessage_Payload() {}
 
 func (*ServerMessage_ConfigUpdate) isServerMessage_Payload() {}
+
+func (*ServerMessage_ExecCancel) isServerMessage_Payload() {}
 
 type RegisterRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -1592,14 +1624,21 @@ func (x *FileChunk) GetSha256() string {
 }
 
 type ExecRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ExecId        string                 `protobuf:"bytes,1,opt,name=exec_id,json=execId,proto3" json:"exec_id,omitempty"`
-	Shell         string                 `protobuf:"bytes,2,opt,name=shell,proto3" json:"shell,omitempty"`     // bash / sh / cmd / powershell
-	Command       string                 `protobuf:"bytes,3,opt,name=command,proto3" json:"command,omitempty"` // single command or script body
-	IsScript      bool                   `protobuf:"varint,4,opt,name=is_script,json=isScript,proto3" json:"is_script,omitempty"`
-	TimeoutSec    int32                  `protobuf:"varint,5,opt,name=timeout_sec,json=timeoutSec,proto3" json:"timeout_sec,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	ExecId     string                 `protobuf:"bytes,1,opt,name=exec_id,json=execId,proto3" json:"exec_id,omitempty"`
+	Shell      string                 `protobuf:"bytes,2,opt,name=shell,proto3" json:"shell,omitempty"`     // bash / sh / cmd / powershell
+	Command    string                 `protobuf:"bytes,3,opt,name=command,proto3" json:"command,omitempty"` // single command or script body
+	IsScript   bool                   `protobuf:"varint,4,opt,name=is_script,json=isScript,proto3" json:"is_script,omitempty"`
+	TimeoutSec int32                  `protobuf:"varint,5,opt,name=timeout_sec,json=timeoutSec,proto3" json:"timeout_sec,omitempty"`
+	// stall_timeout_sec is the stall budget in seconds: if the command
+	// produces no stdout/stderr output for this long, the agent kills the
+	// whole process group and reports "stalled: no output for <N>s". 0
+	// disables stall detection (only the wall-clock timeout_sec applies);
+	// callers use 0 for commands that may legitimately stay silent for a
+	// long time (e.g. tar/curl transfers, ad-hoc user scripts).
+	StallTimeoutSec int32 `protobuf:"varint,6,opt,name=stall_timeout_sec,json=stallTimeoutSec,proto3" json:"stall_timeout_sec,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ExecRequest) Reset() {
@@ -1663,6 +1702,13 @@ func (x *ExecRequest) GetIsScript() bool {
 func (x *ExecRequest) GetTimeoutSec() int32 {
 	if x != nil {
 		return x.TimeoutSec
+	}
+	return 0
+}
+
+func (x *ExecRequest) GetStallTimeoutSec() int32 {
+	if x != nil {
+		return x.StallTimeoutSec
 	}
 	return 0
 }
@@ -1751,6 +1797,117 @@ func (x *ExecResult) GetError() string {
 	return ""
 }
 
+// ExecOutput streams one exec's output to the server while the command is
+// still running, in the same order the command produced it. Chunks are
+// batched (~200ms or 4KB); the final ExecResult still carries the complete
+// stdout/stderr, so a chunk is never the only copy of the output.
+type ExecOutput struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ExecId        string                 `protobuf:"bytes,1,opt,name=exec_id,json=execId,proto3" json:"exec_id,omitempty"`
+	Chunk         []byte                 `protobuf:"bytes,2,opt,name=chunk,proto3" json:"chunk,omitempty"`
+	Stream        string                 `protobuf:"bytes,3,opt,name=stream,proto3" json:"stream,omitempty"` // "stdout" or "stderr"
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExecOutput) Reset() {
+	*x = ExecOutput{}
+	mi := &file_agent_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExecOutput) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExecOutput) ProtoMessage() {}
+
+func (x *ExecOutput) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExecOutput.ProtoReflect.Descriptor instead.
+func (*ExecOutput) Descriptor() ([]byte, []int) {
+	return file_agent_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ExecOutput) GetExecId() string {
+	if x != nil {
+		return x.ExecId
+	}
+	return ""
+}
+
+func (x *ExecOutput) GetChunk() []byte {
+	if x != nil {
+		return x.Chunk
+	}
+	return nil
+}
+
+func (x *ExecOutput) GetStream() string {
+	if x != nil {
+		return x.Stream
+	}
+	return ""
+}
+
+// ExecCancel asks the agent to stop a running exec. The agent kills the
+// whole process group and replies with an ExecResult whose error is
+// "cancelled". Cancelling an unknown or already-finished exec is a no-op.
+type ExecCancel struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ExecId        string                 `protobuf:"bytes,1,opt,name=exec_id,json=execId,proto3" json:"exec_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExecCancel) Reset() {
+	*x = ExecCancel{}
+	mi := &file_agent_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExecCancel) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExecCancel) ProtoMessage() {}
+
+func (x *ExecCancel) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExecCancel.ProtoReflect.Descriptor instead.
+func (*ExecCancel) Descriptor() ([]byte, []int) {
+	return file_agent_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *ExecCancel) GetExecId() string {
+	if x != nil {
+		return x.ExecId
+	}
+	return ""
+}
+
 type MetricsSample struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	AgentId   string                 `protobuf:"bytes,1,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
@@ -1788,7 +1945,7 @@ type MetricsSample struct {
 
 func (x *MetricsSample) Reset() {
 	*x = MetricsSample{}
-	mi := &file_agent_proto_msgTypes[16]
+	mi := &file_agent_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1800,7 +1957,7 @@ func (x *MetricsSample) String() string {
 func (*MetricsSample) ProtoMessage() {}
 
 func (x *MetricsSample) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[16]
+	mi := &file_agent_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1813,7 +1970,7 @@ func (x *MetricsSample) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetricsSample.ProtoReflect.Descriptor instead.
 func (*MetricsSample) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{16}
+	return file_agent_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *MetricsSample) GetAgentId() string {
@@ -1995,7 +2152,7 @@ type ProbeResult struct {
 
 func (x *ProbeResult) Reset() {
 	*x = ProbeResult{}
-	mi := &file_agent_proto_msgTypes[17]
+	mi := &file_agent_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2007,7 +2164,7 @@ func (x *ProbeResult) String() string {
 func (*ProbeResult) ProtoMessage() {}
 
 func (x *ProbeResult) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[17]
+	mi := &file_agent_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2020,7 +2177,7 @@ func (x *ProbeResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProbeResult.ProtoReflect.Descriptor instead.
 func (*ProbeResult) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{17}
+	return file_agent_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ProbeResult) GetLatencyMs() float64 {
@@ -2048,7 +2205,7 @@ type Mount struct {
 
 func (x *Mount) Reset() {
 	*x = Mount{}
-	mi := &file_agent_proto_msgTypes[18]
+	mi := &file_agent_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2060,7 +2217,7 @@ func (x *Mount) String() string {
 func (*Mount) ProtoMessage() {}
 
 func (x *Mount) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[18]
+	mi := &file_agent_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2073,7 +2230,7 @@ func (x *Mount) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Mount.ProtoReflect.Descriptor instead.
 func (*Mount) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{18}
+	return file_agent_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *Mount) GetPath() string {
@@ -2110,7 +2267,7 @@ type SysInfoQuery struct {
 
 func (x *SysInfoQuery) Reset() {
 	*x = SysInfoQuery{}
-	mi := &file_agent_proto_msgTypes[19]
+	mi := &file_agent_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2122,7 +2279,7 @@ func (x *SysInfoQuery) String() string {
 func (*SysInfoQuery) ProtoMessage() {}
 
 func (x *SysInfoQuery) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[19]
+	mi := &file_agent_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2135,7 +2292,7 @@ func (x *SysInfoQuery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SysInfoQuery.ProtoReflect.Descriptor instead.
 func (*SysInfoQuery) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{19}
+	return file_agent_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *SysInfoQuery) GetKind() string {
@@ -2170,7 +2327,7 @@ type MetricsQuery struct {
 
 func (x *MetricsQuery) Reset() {
 	*x = MetricsQuery{}
-	mi := &file_agent_proto_msgTypes[20]
+	mi := &file_agent_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2182,7 +2339,7 @@ func (x *MetricsQuery) String() string {
 func (*MetricsQuery) ProtoMessage() {}
 
 func (x *MetricsQuery) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[20]
+	mi := &file_agent_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2195,7 +2352,7 @@ func (x *MetricsQuery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetricsQuery.ProtoReflect.Descriptor instead.
 func (*MetricsQuery) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{20}
+	return file_agent_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *MetricsQuery) GetLive() bool {
@@ -2223,7 +2380,7 @@ type SysInfoSnapshot struct {
 
 func (x *SysInfoSnapshot) Reset() {
 	*x = SysInfoSnapshot{}
-	mi := &file_agent_proto_msgTypes[21]
+	mi := &file_agent_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2235,7 +2392,7 @@ func (x *SysInfoSnapshot) String() string {
 func (*SysInfoSnapshot) ProtoMessage() {}
 
 func (x *SysInfoSnapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[21]
+	mi := &file_agent_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2248,7 +2405,7 @@ func (x *SysInfoSnapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SysInfoSnapshot.ProtoReflect.Descriptor instead.
 func (*SysInfoSnapshot) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{21}
+	return file_agent_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *SysInfoSnapshot) GetKind() string {
@@ -2296,7 +2453,7 @@ type DockerOp struct {
 
 func (x *DockerOp) Reset() {
 	*x = DockerOp{}
-	mi := &file_agent_proto_msgTypes[22]
+	mi := &file_agent_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2308,7 +2465,7 @@ func (x *DockerOp) String() string {
 func (*DockerOp) ProtoMessage() {}
 
 func (x *DockerOp) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[22]
+	mi := &file_agent_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2321,7 +2478,7 @@ func (x *DockerOp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DockerOp.ProtoReflect.Descriptor instead.
 func (*DockerOp) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{22}
+	return file_agent_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *DockerOp) GetOpId() string {
@@ -2371,7 +2528,7 @@ type DockerEvent struct {
 
 func (x *DockerEvent) Reset() {
 	*x = DockerEvent{}
-	mi := &file_agent_proto_msgTypes[23]
+	mi := &file_agent_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2383,7 +2540,7 @@ func (x *DockerEvent) String() string {
 func (*DockerEvent) ProtoMessage() {}
 
 func (x *DockerEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[23]
+	mi := &file_agent_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2396,7 +2553,7 @@ func (x *DockerEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DockerEvent.ProtoReflect.Descriptor instead.
 func (*DockerEvent) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{23}
+	return file_agent_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *DockerEvent) GetOpId() string {
@@ -2439,7 +2596,7 @@ type CleanupRequest struct {
 
 func (x *CleanupRequest) Reset() {
 	*x = CleanupRequest{}
-	mi := &file_agent_proto_msgTypes[24]
+	mi := &file_agent_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2451,7 +2608,7 @@ func (x *CleanupRequest) String() string {
 func (*CleanupRequest) ProtoMessage() {}
 
 func (x *CleanupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[24]
+	mi := &file_agent_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2464,7 +2621,7 @@ func (x *CleanupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CleanupRequest.ProtoReflect.Descriptor instead.
 func (*CleanupRequest) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{24}
+	return file_agent_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *CleanupRequest) GetCleanupId() string {
@@ -2497,7 +2654,7 @@ type CleanupEvent struct {
 
 func (x *CleanupEvent) Reset() {
 	*x = CleanupEvent{}
-	mi := &file_agent_proto_msgTypes[25]
+	mi := &file_agent_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2509,7 +2666,7 @@ func (x *CleanupEvent) String() string {
 func (*CleanupEvent) ProtoMessage() {}
 
 func (x *CleanupEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[25]
+	mi := &file_agent_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2522,7 +2679,7 @@ func (x *CleanupEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CleanupEvent.ProtoReflect.Descriptor instead.
 func (*CleanupEvent) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{25}
+	return file_agent_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *CleanupEvent) GetCleanupId() string {
@@ -2564,7 +2721,7 @@ type ScanRequest struct {
 
 func (x *ScanRequest) Reset() {
 	*x = ScanRequest{}
-	mi := &file_agent_proto_msgTypes[26]
+	mi := &file_agent_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2576,7 +2733,7 @@ func (x *ScanRequest) String() string {
 func (*ScanRequest) ProtoMessage() {}
 
 func (x *ScanRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[26]
+	mi := &file_agent_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2589,7 +2746,7 @@ func (x *ScanRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanRequest.ProtoReflect.Descriptor instead.
 func (*ScanRequest) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{26}
+	return file_agent_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *ScanRequest) GetScanId() string {
@@ -2626,7 +2783,7 @@ type ScanProgress struct {
 
 func (x *ScanProgress) Reset() {
 	*x = ScanProgress{}
-	mi := &file_agent_proto_msgTypes[27]
+	mi := &file_agent_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2638,7 +2795,7 @@ func (x *ScanProgress) String() string {
 func (*ScanProgress) ProtoMessage() {}
 
 func (x *ScanProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[27]
+	mi := &file_agent_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2651,7 +2808,7 @@ func (x *ScanProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanProgress.ProtoReflect.Descriptor instead.
 func (*ScanProgress) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{27}
+	return file_agent_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *ScanProgress) GetScanId() string {
@@ -2703,7 +2860,7 @@ type UpgradeRequest struct {
 
 func (x *UpgradeRequest) Reset() {
 	*x = UpgradeRequest{}
-	mi := &file_agent_proto_msgTypes[28]
+	mi := &file_agent_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2715,7 +2872,7 @@ func (x *UpgradeRequest) String() string {
 func (*UpgradeRequest) ProtoMessage() {}
 
 func (x *UpgradeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[28]
+	mi := &file_agent_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2728,7 +2885,7 @@ func (x *UpgradeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpgradeRequest.ProtoReflect.Descriptor instead.
 func (*UpgradeRequest) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{28}
+	return file_agent_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *UpgradeRequest) GetVersion() string {
@@ -2770,7 +2927,7 @@ type UpgradeProgress struct {
 
 func (x *UpgradeProgress) Reset() {
 	*x = UpgradeProgress{}
-	mi := &file_agent_proto_msgTypes[29]
+	mi := &file_agent_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2782,7 +2939,7 @@ func (x *UpgradeProgress) String() string {
 func (*UpgradeProgress) ProtoMessage() {}
 
 func (x *UpgradeProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[29]
+	mi := &file_agent_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2795,7 +2952,7 @@ func (x *UpgradeProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpgradeProgress.ProtoReflect.Descriptor instead.
 func (*UpgradeProgress) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{29}
+	return file_agent_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *UpgradeProgress) GetStage() string {
@@ -2831,7 +2988,7 @@ type UninstallRequest struct {
 
 func (x *UninstallRequest) Reset() {
 	*x = UninstallRequest{}
-	mi := &file_agent_proto_msgTypes[30]
+	mi := &file_agent_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2843,7 +3000,7 @@ func (x *UninstallRequest) String() string {
 func (*UninstallRequest) ProtoMessage() {}
 
 func (x *UninstallRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[30]
+	mi := &file_agent_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2856,7 +3013,7 @@ func (x *UninstallRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UninstallRequest.ProtoReflect.Descriptor instead.
 func (*UninstallRequest) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{30}
+	return file_agent_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *UninstallRequest) GetRemoveData() bool {
@@ -2878,7 +3035,7 @@ type MaintenanceNotice struct {
 
 func (x *MaintenanceNotice) Reset() {
 	*x = MaintenanceNotice{}
-	mi := &file_agent_proto_msgTypes[31]
+	mi := &file_agent_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2890,7 +3047,7 @@ func (x *MaintenanceNotice) String() string {
 func (*MaintenanceNotice) ProtoMessage() {}
 
 func (x *MaintenanceNotice) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[31]
+	mi := &file_agent_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2903,7 +3060,7 @@ func (x *MaintenanceNotice) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MaintenanceNotice.ProtoReflect.Descriptor instead.
 func (*MaintenanceNotice) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{31}
+	return file_agent_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *MaintenanceNotice) GetReason() string {
@@ -2934,7 +3091,7 @@ type Ack struct {
 
 func (x *Ack) Reset() {
 	*x = Ack{}
-	mi := &file_agent_proto_msgTypes[32]
+	mi := &file_agent_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2946,7 +3103,7 @@ func (x *Ack) String() string {
 func (*Ack) ProtoMessage() {}
 
 func (x *Ack) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[32]
+	mi := &file_agent_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2959,7 +3116,7 @@ func (x *Ack) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ack.ProtoReflect.Descriptor instead.
 func (*Ack) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{32}
+	return file_agent_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *Ack) GetOk() bool {
@@ -3001,7 +3158,7 @@ type TunnelOpen struct {
 
 func (x *TunnelOpen) Reset() {
 	*x = TunnelOpen{}
-	mi := &file_agent_proto_msgTypes[33]
+	mi := &file_agent_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3013,7 +3170,7 @@ func (x *TunnelOpen) String() string {
 func (*TunnelOpen) ProtoMessage() {}
 
 func (x *TunnelOpen) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[33]
+	mi := &file_agent_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3026,7 +3183,7 @@ func (x *TunnelOpen) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TunnelOpen.ProtoReflect.Descriptor instead.
 func (*TunnelOpen) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{33}
+	return file_agent_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *TunnelOpen) GetTunnelId() string {
@@ -3060,7 +3217,7 @@ type TunnelData struct {
 
 func (x *TunnelData) Reset() {
 	*x = TunnelData{}
-	mi := &file_agent_proto_msgTypes[34]
+	mi := &file_agent_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3072,7 +3229,7 @@ func (x *TunnelData) String() string {
 func (*TunnelData) ProtoMessage() {}
 
 func (x *TunnelData) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[34]
+	mi := &file_agent_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3085,7 +3242,7 @@ func (x *TunnelData) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TunnelData.ProtoReflect.Descriptor instead.
 func (*TunnelData) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{34}
+	return file_agent_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *TunnelData) GetTunnelId() string {
@@ -3111,7 +3268,7 @@ type TunnelClose struct {
 
 func (x *TunnelClose) Reset() {
 	*x = TunnelClose{}
-	mi := &file_agent_proto_msgTypes[35]
+	mi := &file_agent_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3123,7 +3280,7 @@ func (x *TunnelClose) String() string {
 func (*TunnelClose) ProtoMessage() {}
 
 func (x *TunnelClose) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[35]
+	mi := &file_agent_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3136,7 +3293,7 @@ func (x *TunnelClose) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TunnelClose.ProtoReflect.Descriptor instead.
 func (*TunnelClose) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{35}
+	return file_agent_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *TunnelClose) GetTunnelId() string {
@@ -3161,7 +3318,7 @@ type OperatorMessage struct {
 
 func (x *OperatorMessage) Reset() {
 	*x = OperatorMessage{}
-	mi := &file_agent_proto_msgTypes[36]
+	mi := &file_agent_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3173,7 +3330,7 @@ func (x *OperatorMessage) String() string {
 func (*OperatorMessage) ProtoMessage() {}
 
 func (x *OperatorMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[36]
+	mi := &file_agent_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3186,7 +3343,7 @@ func (x *OperatorMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OperatorMessage.ProtoReflect.Descriptor instead.
 func (*OperatorMessage) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{36}
+	return file_agent_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *OperatorMessage) GetPayload() isOperatorMessage_Payload {
@@ -3272,7 +3429,7 @@ type OperatorOpen struct {
 
 func (x *OperatorOpen) Reset() {
 	*x = OperatorOpen{}
-	mi := &file_agent_proto_msgTypes[37]
+	mi := &file_agent_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3284,7 +3441,7 @@ func (x *OperatorOpen) String() string {
 func (*OperatorOpen) ProtoMessage() {}
 
 func (x *OperatorOpen) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[37]
+	mi := &file_agent_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3297,7 +3454,7 @@ func (x *OperatorOpen) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OperatorOpen.ProtoReflect.Descriptor instead.
 func (*OperatorOpen) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{37}
+	return file_agent_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *OperatorOpen) GetHostId() string {
@@ -3339,7 +3496,7 @@ type OperatorOpenAck struct {
 
 func (x *OperatorOpenAck) Reset() {
 	*x = OperatorOpenAck{}
-	mi := &file_agent_proto_msgTypes[38]
+	mi := &file_agent_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3351,7 +3508,7 @@ func (x *OperatorOpenAck) String() string {
 func (*OperatorOpenAck) ProtoMessage() {}
 
 func (x *OperatorOpenAck) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[38]
+	mi := &file_agent_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3364,7 +3521,7 @@ func (x *OperatorOpenAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OperatorOpenAck.ProtoReflect.Descriptor instead.
 func (*OperatorOpenAck) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{38}
+	return file_agent_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *OperatorOpenAck) GetOk() bool {
@@ -3397,7 +3554,7 @@ type OperatorData struct {
 
 func (x *OperatorData) Reset() {
 	*x = OperatorData{}
-	mi := &file_agent_proto_msgTypes[39]
+	mi := &file_agent_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3409,7 +3566,7 @@ func (x *OperatorData) String() string {
 func (*OperatorData) ProtoMessage() {}
 
 func (x *OperatorData) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[39]
+	mi := &file_agent_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3422,7 +3579,7 @@ func (x *OperatorData) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OperatorData.ProtoReflect.Descriptor instead.
 func (*OperatorData) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{39}
+	return file_agent_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *OperatorData) GetData() []byte {
@@ -3441,7 +3598,7 @@ type OperatorClose struct {
 
 func (x *OperatorClose) Reset() {
 	*x = OperatorClose{}
-	mi := &file_agent_proto_msgTypes[40]
+	mi := &file_agent_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3453,7 +3610,7 @@ func (x *OperatorClose) String() string {
 func (*OperatorClose) ProtoMessage() {}
 
 func (x *OperatorClose) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_proto_msgTypes[40]
+	mi := &file_agent_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3466,7 +3623,7 @@ func (x *OperatorClose) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OperatorClose.ProtoReflect.Descriptor instead.
 func (*OperatorClose) Descriptor() ([]byte, []int) {
-	return file_agent_proto_rawDescGZIP(), []int{40}
+	return file_agent_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *OperatorClose) GetReason() string {
@@ -3480,7 +3637,7 @@ var File_agent_proto protoreflect.FileDescriptor
 
 const file_agent_proto_rawDesc = "" +
 	"\n" +
-	"\vagent.proto\x12\x0ewatchman.agent\"\xf1\x06\n" +
+	"\vagent.proto\x12\x0ewatchman.agent\"\xb0\a\n" +
 	"\fAgentMessage\x12=\n" +
 	"\bregister\x18\x01 \x01(\v2\x1f.watchman.agent.RegisterRequestH\x00R\bregister\x129\n" +
 	"\theartbeat\x18\x02 \x01(\v2\x19.watchman.agent.HeartbeatH\x00R\theartbeat\x12;\n" +
@@ -3496,11 +3653,14 @@ const file_agent_proto_rawDesc = "" +
 	"\x10upgrade_progress\x18\n" +
 	" \x01(\v2\x1f.watchman.agent.UpgradeProgressH\x00R\x0fupgradeProgress\x128\n" +
 	"\acleanup\x18\r \x01(\v2\x1c.watchman.agent.CleanupEventH\x00R\acleanup\x12=\n" +
+	"\vexec_output\x18\x0e \x01(\v2\x1a.watchman.agent.ExecOutputH\x00R\n" +
+	"execOutput\x12=\n" +
 	"\vtunnel_data\x18\v \x01(\v2\x1a.watchman.agent.TunnelDataH\x00R\n" +
 	"tunnelData\x12@\n" +
 	"\ftunnel_close\x18\f \x01(\v2\x1b.watchman.agent.TunnelCloseH\x00R\vtunnelClose\x12'\n" +
 	"\x03ack\x18c \x01(\v2\x13.watchman.agent.AckH\x00R\x03ackB\t\n" +
-	"\apayload\"\xe4\t\n" +
+	"\apayload\"\xa3\n" +
+	"\n" +
 	"\rServerMessage\x12>\n" +
 	"\bregister\x18\x01 \x01(\v2 .watchman.agent.RegisterResponseH\x00R\bregister\x12<\n" +
 	"\theartbeat\x18\x02 \x01(\v2\x1c.watchman.agent.HeartbeatAckH\x00R\theartbeat\x12;\n" +
@@ -3526,7 +3686,9 @@ const file_agent_proto_rawDesc = "" +
 	"tunnelData\x12@\n" +
 	"\ftunnel_close\x18\x13 \x01(\v2\x1b.watchman.agent.TunnelCloseH\x00R\vtunnelClose\x12@\n" +
 	"\tuninstall\x18\x0f \x01(\v2 .watchman.agent.UninstallRequestH\x00R\tuninstall\x12C\n" +
-	"\rconfig_update\x18\x14 \x01(\v2\x1c.watchman.agent.ConfigUpdateH\x00R\fconfigUpdateB\t\n" +
+	"\rconfig_update\x18\x14 \x01(\v2\x1c.watchman.agent.ConfigUpdateH\x00R\fconfigUpdate\x12=\n" +
+	"\vexec_cancel\x18\x16 \x01(\v2\x1a.watchman.agent.ExecCancelH\x00R\n" +
+	"execCancelB\t\n" +
 	"\apayload\"\xa3\x03\n" +
 	"\x0fRegisterRequest\x12!\n" +
 	"\fenroll_token\x18\x01 \x01(\tR\venrollToken\x12\x19\n" +
@@ -3614,14 +3776,15 @@ const file_agent_proto_rawDesc = "" +
 	"\x04data\x18\x03 \x01(\fR\x04data\x12\x16\n" +
 	"\x06offset\x18\x04 \x01(\x03R\x06offset\x12\x10\n" +
 	"\x03eof\x18\x05 \x01(\bR\x03eof\x12\x16\n" +
-	"\x06sha256\x18\x06 \x01(\tR\x06sha256\"\x94\x01\n" +
+	"\x06sha256\x18\x06 \x01(\tR\x06sha256\"\xc0\x01\n" +
 	"\vExecRequest\x12\x17\n" +
 	"\aexec_id\x18\x01 \x01(\tR\x06execId\x12\x14\n" +
 	"\x05shell\x18\x02 \x01(\tR\x05shell\x12\x18\n" +
 	"\acommand\x18\x03 \x01(\tR\acommand\x12\x1b\n" +
 	"\tis_script\x18\x04 \x01(\bR\bisScript\x12\x1f\n" +
 	"\vtimeout_sec\x18\x05 \x01(\x05R\n" +
-	"timeoutSec\"\xa9\x01\n" +
+	"timeoutSec\x12*\n" +
+	"\x11stall_timeout_sec\x18\x06 \x01(\x05R\x0fstallTimeoutSec\"\xa9\x01\n" +
 	"\n" +
 	"ExecResult\x12\x17\n" +
 	"\aexec_id\x18\x01 \x01(\tR\x06execId\x12\x1b\n" +
@@ -3630,7 +3793,15 @@ const file_agent_proto_rawDesc = "" +
 	"\x06stderr\x18\x04 \x01(\fR\x06stderr\x12\x1f\n" +
 	"\vduration_ms\x18\x05 \x01(\x03R\n" +
 	"durationMs\x12\x14\n" +
-	"\x05error\x18\x06 \x01(\tR\x05error\"\xf9\x06\n" +
+	"\x05error\x18\x06 \x01(\tR\x05error\"S\n" +
+	"\n" +
+	"ExecOutput\x12\x17\n" +
+	"\aexec_id\x18\x01 \x01(\tR\x06execId\x12\x14\n" +
+	"\x05chunk\x18\x02 \x01(\fR\x05chunk\x12\x16\n" +
+	"\x06stream\x18\x03 \x01(\tR\x06stream\"%\n" +
+	"\n" +
+	"ExecCancel\x12\x17\n" +
+	"\aexec_id\x18\x01 \x01(\tR\x06execId\"\xf9\x06\n" +
 	"\rMetricsSample\x12\x19\n" +
 	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12\x0e\n" +
 	"\x02ts\x18\x02 \x01(\x03R\x02ts\x12\x1b\n" +
@@ -3785,7 +3956,7 @@ func file_agent_proto_rawDescGZIP() []byte {
 	return file_agent_proto_rawDescData
 }
 
-var file_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 44)
+var file_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 46)
 var file_agent_proto_goTypes = []any{
 	(*AgentMessage)(nil),      // 0: watchman.agent.AgentMessage
 	(*ServerMessage)(nil),     // 1: watchman.agent.ServerMessage
@@ -3803,34 +3974,36 @@ var file_agent_proto_goTypes = []any{
 	(*FileChunk)(nil),         // 13: watchman.agent.FileChunk
 	(*ExecRequest)(nil),       // 14: watchman.agent.ExecRequest
 	(*ExecResult)(nil),        // 15: watchman.agent.ExecResult
-	(*MetricsSample)(nil),     // 16: watchman.agent.MetricsSample
-	(*ProbeResult)(nil),       // 17: watchman.agent.ProbeResult
-	(*Mount)(nil),             // 18: watchman.agent.Mount
-	(*SysInfoQuery)(nil),      // 19: watchman.agent.SysInfoQuery
-	(*MetricsQuery)(nil),      // 20: watchman.agent.MetricsQuery
-	(*SysInfoSnapshot)(nil),   // 21: watchman.agent.SysInfoSnapshot
-	(*DockerOp)(nil),          // 22: watchman.agent.DockerOp
-	(*DockerEvent)(nil),       // 23: watchman.agent.DockerEvent
-	(*CleanupRequest)(nil),    // 24: watchman.agent.CleanupRequest
-	(*CleanupEvent)(nil),      // 25: watchman.agent.CleanupEvent
-	(*ScanRequest)(nil),       // 26: watchman.agent.ScanRequest
-	(*ScanProgress)(nil),      // 27: watchman.agent.ScanProgress
-	(*UpgradeRequest)(nil),    // 28: watchman.agent.UpgradeRequest
-	(*UpgradeProgress)(nil),   // 29: watchman.agent.UpgradeProgress
-	(*UninstallRequest)(nil),  // 30: watchman.agent.UninstallRequest
-	(*MaintenanceNotice)(nil), // 31: watchman.agent.MaintenanceNotice
-	(*Ack)(nil),               // 32: watchman.agent.Ack
-	(*TunnelOpen)(nil),        // 33: watchman.agent.TunnelOpen
-	(*TunnelData)(nil),        // 34: watchman.agent.TunnelData
-	(*TunnelClose)(nil),       // 35: watchman.agent.TunnelClose
-	(*OperatorMessage)(nil),   // 36: watchman.agent.OperatorMessage
-	(*OperatorOpen)(nil),      // 37: watchman.agent.OperatorOpen
-	(*OperatorOpenAck)(nil),   // 38: watchman.agent.OperatorOpenAck
-	(*OperatorData)(nil),      // 39: watchman.agent.OperatorData
-	(*OperatorClose)(nil),     // 40: watchman.agent.OperatorClose
-	nil,                       // 41: watchman.agent.RegisterResponse.ProbeTargetsEntry
-	nil,                       // 42: watchman.agent.ConfigUpdate.ProbeTargetsEntry
-	nil,                       // 43: watchman.agent.MetricsSample.ProbeResultsEntry
+	(*ExecOutput)(nil),        // 16: watchman.agent.ExecOutput
+	(*ExecCancel)(nil),        // 17: watchman.agent.ExecCancel
+	(*MetricsSample)(nil),     // 18: watchman.agent.MetricsSample
+	(*ProbeResult)(nil),       // 19: watchman.agent.ProbeResult
+	(*Mount)(nil),             // 20: watchman.agent.Mount
+	(*SysInfoQuery)(nil),      // 21: watchman.agent.SysInfoQuery
+	(*MetricsQuery)(nil),      // 22: watchman.agent.MetricsQuery
+	(*SysInfoSnapshot)(nil),   // 23: watchman.agent.SysInfoSnapshot
+	(*DockerOp)(nil),          // 24: watchman.agent.DockerOp
+	(*DockerEvent)(nil),       // 25: watchman.agent.DockerEvent
+	(*CleanupRequest)(nil),    // 26: watchman.agent.CleanupRequest
+	(*CleanupEvent)(nil),      // 27: watchman.agent.CleanupEvent
+	(*ScanRequest)(nil),       // 28: watchman.agent.ScanRequest
+	(*ScanProgress)(nil),      // 29: watchman.agent.ScanProgress
+	(*UpgradeRequest)(nil),    // 30: watchman.agent.UpgradeRequest
+	(*UpgradeProgress)(nil),   // 31: watchman.agent.UpgradeProgress
+	(*UninstallRequest)(nil),  // 32: watchman.agent.UninstallRequest
+	(*MaintenanceNotice)(nil), // 33: watchman.agent.MaintenanceNotice
+	(*Ack)(nil),               // 34: watchman.agent.Ack
+	(*TunnelOpen)(nil),        // 35: watchman.agent.TunnelOpen
+	(*TunnelData)(nil),        // 36: watchman.agent.TunnelData
+	(*TunnelClose)(nil),       // 37: watchman.agent.TunnelClose
+	(*OperatorMessage)(nil),   // 38: watchman.agent.OperatorMessage
+	(*OperatorOpen)(nil),      // 39: watchman.agent.OperatorOpen
+	(*OperatorOpenAck)(nil),   // 40: watchman.agent.OperatorOpenAck
+	(*OperatorData)(nil),      // 41: watchman.agent.OperatorData
+	(*OperatorClose)(nil),     // 42: watchman.agent.OperatorClose
+	nil,                       // 43: watchman.agent.RegisterResponse.ProbeTargetsEntry
+	nil,                       // 44: watchman.agent.ConfigUpdate.ProbeTargetsEntry
+	nil,                       // 45: watchman.agent.MetricsSample.ProbeResultsEntry
 }
 var file_agent_proto_depIdxs = []int32{
 	2,  // 0: watchman.agent.AgentMessage.register:type_name -> watchman.agent.RegisterRequest
@@ -3838,53 +4011,55 @@ var file_agent_proto_depIdxs = []int32{
 	8,  // 2: watchman.agent.AgentMessage.term_out:type_name -> watchman.agent.TerminalOutput
 	13, // 3: watchman.agent.AgentMessage.file_chunk:type_name -> watchman.agent.FileChunk
 	15, // 4: watchman.agent.AgentMessage.exec_result:type_name -> watchman.agent.ExecResult
-	16, // 5: watchman.agent.AgentMessage.metrics:type_name -> watchman.agent.MetricsSample
-	21, // 6: watchman.agent.AgentMessage.sysinfo:type_name -> watchman.agent.SysInfoSnapshot
-	23, // 7: watchman.agent.AgentMessage.docker:type_name -> watchman.agent.DockerEvent
-	27, // 8: watchman.agent.AgentMessage.scan_progress:type_name -> watchman.agent.ScanProgress
-	29, // 9: watchman.agent.AgentMessage.upgrade_progress:type_name -> watchman.agent.UpgradeProgress
-	25, // 10: watchman.agent.AgentMessage.cleanup:type_name -> watchman.agent.CleanupEvent
-	34, // 11: watchman.agent.AgentMessage.tunnel_data:type_name -> watchman.agent.TunnelData
-	35, // 12: watchman.agent.AgentMessage.tunnel_close:type_name -> watchman.agent.TunnelClose
-	32, // 13: watchman.agent.AgentMessage.ack:type_name -> watchman.agent.Ack
-	3,  // 14: watchman.agent.ServerMessage.register:type_name -> watchman.agent.RegisterResponse
-	6,  // 15: watchman.agent.ServerMessage.heartbeat:type_name -> watchman.agent.HeartbeatAck
-	7,  // 16: watchman.agent.ServerMessage.term_open:type_name -> watchman.agent.TerminalOpen
-	9,  // 17: watchman.agent.ServerMessage.term_in:type_name -> watchman.agent.TerminalInput
-	10, // 18: watchman.agent.ServerMessage.term_resize:type_name -> watchman.agent.TerminalResize
-	11, // 19: watchman.agent.ServerMessage.term_close:type_name -> watchman.agent.TerminalClose
-	12, // 20: watchman.agent.ServerMessage.file_op:type_name -> watchman.agent.FileOp
-	14, // 21: watchman.agent.ServerMessage.exec:type_name -> watchman.agent.ExecRequest
-	19, // 22: watchman.agent.ServerMessage.sysinfo_q:type_name -> watchman.agent.SysInfoQuery
-	20, // 23: watchman.agent.ServerMessage.metrics_q:type_name -> watchman.agent.MetricsQuery
-	22, // 24: watchman.agent.ServerMessage.docker_op:type_name -> watchman.agent.DockerOp
-	26, // 25: watchman.agent.ServerMessage.scan:type_name -> watchman.agent.ScanRequest
-	28, // 26: watchman.agent.ServerMessage.upgrade:type_name -> watchman.agent.UpgradeRequest
-	24, // 27: watchman.agent.ServerMessage.cleanup:type_name -> watchman.agent.CleanupRequest
-	31, // 28: watchman.agent.ServerMessage.maintenance:type_name -> watchman.agent.MaintenanceNotice
-	33, // 29: watchman.agent.ServerMessage.tunnel_open:type_name -> watchman.agent.TunnelOpen
-	34, // 30: watchman.agent.ServerMessage.tunnel_data:type_name -> watchman.agent.TunnelData
-	35, // 31: watchman.agent.ServerMessage.tunnel_close:type_name -> watchman.agent.TunnelClose
-	30, // 32: watchman.agent.ServerMessage.uninstall:type_name -> watchman.agent.UninstallRequest
-	4,  // 33: watchman.agent.ServerMessage.config_update:type_name -> watchman.agent.ConfigUpdate
-	41, // 34: watchman.agent.RegisterResponse.probe_targets:type_name -> watchman.agent.RegisterResponse.ProbeTargetsEntry
-	42, // 35: watchman.agent.ConfigUpdate.probe_targets:type_name -> watchman.agent.ConfigUpdate.ProbeTargetsEntry
-	18, // 36: watchman.agent.MetricsSample.mounts:type_name -> watchman.agent.Mount
-	43, // 37: watchman.agent.MetricsSample.probe_results:type_name -> watchman.agent.MetricsSample.ProbeResultsEntry
-	37, // 38: watchman.agent.OperatorMessage.open:type_name -> watchman.agent.OperatorOpen
-	38, // 39: watchman.agent.OperatorMessage.ack:type_name -> watchman.agent.OperatorOpenAck
-	39, // 40: watchman.agent.OperatorMessage.data:type_name -> watchman.agent.OperatorData
-	40, // 41: watchman.agent.OperatorMessage.close:type_name -> watchman.agent.OperatorClose
-	17, // 42: watchman.agent.MetricsSample.ProbeResultsEntry.value:type_name -> watchman.agent.ProbeResult
-	0,  // 43: watchman.agent.AgentService.Connect:input_type -> watchman.agent.AgentMessage
-	36, // 44: watchman.agent.OperatorService.Connect:input_type -> watchman.agent.OperatorMessage
-	1,  // 45: watchman.agent.AgentService.Connect:output_type -> watchman.agent.ServerMessage
-	36, // 46: watchman.agent.OperatorService.Connect:output_type -> watchman.agent.OperatorMessage
-	45, // [45:47] is the sub-list for method output_type
-	43, // [43:45] is the sub-list for method input_type
-	43, // [43:43] is the sub-list for extension type_name
-	43, // [43:43] is the sub-list for extension extendee
-	0,  // [0:43] is the sub-list for field type_name
+	18, // 5: watchman.agent.AgentMessage.metrics:type_name -> watchman.agent.MetricsSample
+	23, // 6: watchman.agent.AgentMessage.sysinfo:type_name -> watchman.agent.SysInfoSnapshot
+	25, // 7: watchman.agent.AgentMessage.docker:type_name -> watchman.agent.DockerEvent
+	29, // 8: watchman.agent.AgentMessage.scan_progress:type_name -> watchman.agent.ScanProgress
+	31, // 9: watchman.agent.AgentMessage.upgrade_progress:type_name -> watchman.agent.UpgradeProgress
+	27, // 10: watchman.agent.AgentMessage.cleanup:type_name -> watchman.agent.CleanupEvent
+	16, // 11: watchman.agent.AgentMessage.exec_output:type_name -> watchman.agent.ExecOutput
+	36, // 12: watchman.agent.AgentMessage.tunnel_data:type_name -> watchman.agent.TunnelData
+	37, // 13: watchman.agent.AgentMessage.tunnel_close:type_name -> watchman.agent.TunnelClose
+	34, // 14: watchman.agent.AgentMessage.ack:type_name -> watchman.agent.Ack
+	3,  // 15: watchman.agent.ServerMessage.register:type_name -> watchman.agent.RegisterResponse
+	6,  // 16: watchman.agent.ServerMessage.heartbeat:type_name -> watchman.agent.HeartbeatAck
+	7,  // 17: watchman.agent.ServerMessage.term_open:type_name -> watchman.agent.TerminalOpen
+	9,  // 18: watchman.agent.ServerMessage.term_in:type_name -> watchman.agent.TerminalInput
+	10, // 19: watchman.agent.ServerMessage.term_resize:type_name -> watchman.agent.TerminalResize
+	11, // 20: watchman.agent.ServerMessage.term_close:type_name -> watchman.agent.TerminalClose
+	12, // 21: watchman.agent.ServerMessage.file_op:type_name -> watchman.agent.FileOp
+	14, // 22: watchman.agent.ServerMessage.exec:type_name -> watchman.agent.ExecRequest
+	21, // 23: watchman.agent.ServerMessage.sysinfo_q:type_name -> watchman.agent.SysInfoQuery
+	22, // 24: watchman.agent.ServerMessage.metrics_q:type_name -> watchman.agent.MetricsQuery
+	24, // 25: watchman.agent.ServerMessage.docker_op:type_name -> watchman.agent.DockerOp
+	28, // 26: watchman.agent.ServerMessage.scan:type_name -> watchman.agent.ScanRequest
+	30, // 27: watchman.agent.ServerMessage.upgrade:type_name -> watchman.agent.UpgradeRequest
+	26, // 28: watchman.agent.ServerMessage.cleanup:type_name -> watchman.agent.CleanupRequest
+	33, // 29: watchman.agent.ServerMessage.maintenance:type_name -> watchman.agent.MaintenanceNotice
+	35, // 30: watchman.agent.ServerMessage.tunnel_open:type_name -> watchman.agent.TunnelOpen
+	36, // 31: watchman.agent.ServerMessage.tunnel_data:type_name -> watchman.agent.TunnelData
+	37, // 32: watchman.agent.ServerMessage.tunnel_close:type_name -> watchman.agent.TunnelClose
+	32, // 33: watchman.agent.ServerMessage.uninstall:type_name -> watchman.agent.UninstallRequest
+	4,  // 34: watchman.agent.ServerMessage.config_update:type_name -> watchman.agent.ConfigUpdate
+	17, // 35: watchman.agent.ServerMessage.exec_cancel:type_name -> watchman.agent.ExecCancel
+	43, // 36: watchman.agent.RegisterResponse.probe_targets:type_name -> watchman.agent.RegisterResponse.ProbeTargetsEntry
+	44, // 37: watchman.agent.ConfigUpdate.probe_targets:type_name -> watchman.agent.ConfigUpdate.ProbeTargetsEntry
+	20, // 38: watchman.agent.MetricsSample.mounts:type_name -> watchman.agent.Mount
+	45, // 39: watchman.agent.MetricsSample.probe_results:type_name -> watchman.agent.MetricsSample.ProbeResultsEntry
+	39, // 40: watchman.agent.OperatorMessage.open:type_name -> watchman.agent.OperatorOpen
+	40, // 41: watchman.agent.OperatorMessage.ack:type_name -> watchman.agent.OperatorOpenAck
+	41, // 42: watchman.agent.OperatorMessage.data:type_name -> watchman.agent.OperatorData
+	42, // 43: watchman.agent.OperatorMessage.close:type_name -> watchman.agent.OperatorClose
+	19, // 44: watchman.agent.MetricsSample.ProbeResultsEntry.value:type_name -> watchman.agent.ProbeResult
+	0,  // 45: watchman.agent.AgentService.Connect:input_type -> watchman.agent.AgentMessage
+	38, // 46: watchman.agent.OperatorService.Connect:input_type -> watchman.agent.OperatorMessage
+	1,  // 47: watchman.agent.AgentService.Connect:output_type -> watchman.agent.ServerMessage
+	38, // 48: watchman.agent.OperatorService.Connect:output_type -> watchman.agent.OperatorMessage
+	47, // [47:49] is the sub-list for method output_type
+	45, // [45:47] is the sub-list for method input_type
+	45, // [45:45] is the sub-list for extension type_name
+	45, // [45:45] is the sub-list for extension extendee
+	0,  // [0:45] is the sub-list for field type_name
 }
 
 func init() { file_agent_proto_init() }
@@ -3904,6 +4079,7 @@ func file_agent_proto_init() {
 		(*AgentMessage_ScanProgress)(nil),
 		(*AgentMessage_UpgradeProgress)(nil),
 		(*AgentMessage_Cleanup)(nil),
+		(*AgentMessage_ExecOutput)(nil),
 		(*AgentMessage_TunnelData)(nil),
 		(*AgentMessage_TunnelClose)(nil),
 		(*AgentMessage_Ack)(nil),
@@ -3929,8 +4105,9 @@ func file_agent_proto_init() {
 		(*ServerMessage_TunnelClose)(nil),
 		(*ServerMessage_Uninstall)(nil),
 		(*ServerMessage_ConfigUpdate)(nil),
+		(*ServerMessage_ExecCancel)(nil),
 	}
-	file_agent_proto_msgTypes[36].OneofWrappers = []any{
+	file_agent_proto_msgTypes[38].OneofWrappers = []any{
 		(*OperatorMessage_Open)(nil),
 		(*OperatorMessage_Ack)(nil),
 		(*OperatorMessage_Data)(nil),
@@ -3942,7 +4119,7 @@ func file_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_proto_rawDesc), len(file_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   44,
+			NumMessages:   46,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

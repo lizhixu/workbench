@@ -328,7 +328,7 @@ func (e *Engine) CancelDeployment(appID, operator string) bool {
 	})
 
 	if hub != nil && nextName != "" {
-		go e.removeContainer(hub, nextName)
+		go removeContainerFn(e, hub, nextName)
 	}
 
 	e.log.Info("deployment cancelled", "app", appID, "deployment", depID, "by", operator)
@@ -343,7 +343,7 @@ func (e *Engine) CancelDeployment(appID, operator string) bool {
 // the cancel and the username is stamped by the cancel handler instead).
 func (e *Engine) cleanupCancelled(app *Application, dep *Deployment, hub *rpc.Hub, nextName, operator string, logBuf *logBuffer) {
 	if hub != nil && nextName != "" {
-		e.removeContainer(hub, nextName)
+		removeContainerFn(e, hub, nextName)
 	}
 	now := time.Now()
 	finalLog := logBuf.String() + "\n[CANCELLED] 部署已被用户取消\n"
@@ -426,7 +426,7 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 		return
 	}
 	logBuf.WriteString("$ check docker availability\n")
-	if err := e.checkDockerReady(hub); err != nil {
+	if err := e.checkDockerReady(ctx, hub); err != nil {
 		fail("%v", err)
 		return
 	}
@@ -450,13 +450,13 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 	if dockerfile == "" {
 		dockerfile = "Dockerfile"
 	}
-	context := app.BuildContext
-	if context == "" {
-		context = "."
+	buildContext := app.BuildContext
+	if buildContext == "" {
+		buildContext = "."
 	}
 	buildTimeout := app.BuildTimeout
 	if buildTimeout <= 0 {
-		buildTimeout = 900
+		buildTimeout = 1800
 	}
 
 	// Branch for raw Docker Compose applications (online YAML editor):
@@ -480,7 +480,7 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 		if cancelled() {
 			return
 		}
-		if res, err := execOnAgent(hub, "write-compose-"+randomToken(4), writeScript, 30); err != nil || res.GetExitCode() != 0 {
+		if res, err := execOnAgent(ctx, hub, "write-compose-"+randomToken(4), writeScript, 30, deployStallSec, nil); err != nil || res.GetExitCode() != 0 {
 			fail("写入 Compose 配置文件失败: %v", err)
 			return
 		}
@@ -495,12 +495,11 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 			if cancelled() {
 				return
 			}
-			res, err := execOnAgent(hub, "compose-pull-"+randomToken(4), pullCmd, 300)
+			res, err := execOnAgent(ctx, hub, "compose-pull-"+randomToken(4), pullCmd, 1800, deployStallSec, logBuf)
 			if err != nil {
 				fail("拉取 Compose 镜像失败: %v", err)
 				return
 			}
-			logBuf.WriteResult(res, nil, res.GetStderr())
 			if res.GetExitCode() != 0 {
 				fail("拉取 Compose 镜像失败 (exit %d)", res.GetExitCode())
 				return
@@ -513,21 +512,25 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 		if cancelled() {
 			return
 		}
-		res, err := execOnAgent(hub, "compose-up-"+randomToken(4), composeCmd, buildTimeout)
+		res, err := execOnAgent(ctx, hub, "compose-up-"+randomToken(4), composeCmd, buildTimeout, deployStallSec, logBuf)
 		if err != nil {
-			fail("Docker Compose 启动失败: %v", err)
-			return
-		}
-		logBuf.WriteResult(res, nil, res.GetStderr())
-		if res.GetExitCode() != 0 {
+			if ctx.Err() == nil {
+				fail("Docker Compose 启动失败: %v", err)
+				return
+			}
+			// Cancelled mid-exec: execOnAgent already stopped the
+			// command on the agent, but a half-started stack may
+			// still be up. Fall through to the ctx.Err() teardown
+			// below instead of failing the (already cancelled) record.
+		} else if res.GetExitCode() != 0 {
 			fail("Docker Compose 启动失败 (exit %d)", res.GetExitCode())
 			return
 		}
 		// The app may have been deleted while `up` was running: do not
 		// leave an orphan stack behind a deleted record.
 		if _, ok := e.store.GetApp(app.ID); !ok {
-			downRes, downErr := execOnAgent(hub, "compose-down-"+randomToken(4),
-				fmt.Sprintf("docker compose -f %s -p %s down", shellQuote(composePath), shellQuote("watchman-"+app.ID)), 60)
+			downRes, downErr := execOnAgent(context.Background(), hub, "compose-down-"+randomToken(4),
+				fmt.Sprintf("docker compose -f %s -p %s down", shellQuote(composePath), shellQuote("watchman-"+app.ID)), 60, deployStallSec, nil)
 			if downErr != nil || downRes.GetExitCode() != 0 {
 				logBuf.WriteString(fmt.Sprintf("WARN: 应用已删除但清理 Compose 栈失败: %v\n", firstErr(downErr, downRes)))
 				fail("应用在部署期间已被删除，部署已中止；清理 Compose 栈失败，栈可能仍在运行，请手动执行 docker compose down 清理")
@@ -537,8 +540,9 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 			return
 		}
 		if ctx.Err() != nil {
-			// `compose up -d` cannot be interrupted mid-exec, so a cancel
-			// that landed during it leaves a live stack: tear it down
+			// `compose up -d` is interrupted mid-exec when the operator
+			// cancels (execOnAgent stops the command on the agent), but
+			// a half-started stack may still be up: tear it down
 			// before finalizing as cancelled, and say so loudly when the
 			// teardown itself fails instead of reporting a clean cancel.
 			downOK := e.cancelComposeStack(hub,
@@ -561,8 +565,12 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 			return
 		}
 		logBuf.WriteString("$ deploy pre-built image\n")
-		if dep.Trigger == TriggerUpgrade && app.Image != "" {
-			if !e.pullImage(hub, app.Image, logBuf, cancelled, fail) {
+		if app.Image != "" {
+			if dep.Trigger == TriggerUpgrade {
+				if !e.pullImage(ctx, hub, app.Image, logBuf, cancelled, fail) {
+					return
+				}
+			} else if !e.ensureImagePresent(ctx, hub, app.Image, logBuf, cancelled, fail) {
 				return
 			}
 		}
@@ -580,8 +588,12 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 			fail("解析应用模板失败: %v", err)
 			return
 		}
-		if dep.Trigger == TriggerUpgrade && app.Image != "" {
-			if !e.pullImage(hub, app.Image, logBuf, cancelled, fail) {
+		if app.Image != "" {
+			if dep.Trigger == TriggerUpgrade {
+				if !e.pullImage(ctx, hub, app.Image, logBuf, cancelled, fail) {
+					return
+				}
+			} else if !e.ensureImagePresent(ctx, hub, app.Image, logBuf, cancelled, fail) {
 				return
 			}
 		}
@@ -623,7 +635,7 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 	if cancelled() {
 		return
 	}
-	res, err := execOnAgent(hub, "git-env-"+randomToken(4), fetchScript, 300)
+	res, err := execOnAgent(ctx, hub, "git-env-"+randomToken(4), fetchScript, 1800, deployStallSec, nil)
 	if err != nil {
 		fail("代码拉取失败: %v", err)
 		return
@@ -665,20 +677,24 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 		if cancelled() {
 			return
 		}
-		res, err = execOnAgent(hub, "compose-up-"+randomToken(4),
-			fmt.Sprintf("cd %s && %s", shellQuote(repoDir), composeCmd), buildTimeout)
+		res, err = execOnAgent(ctx, hub, "compose-up-"+randomToken(4),
+			fmt.Sprintf("cd %s && %s", shellQuote(repoDir), composeCmd), buildTimeout, deployStallSec, logBuf)
 		if err != nil {
-			fail("Docker Compose 部署失败: %v", err)
-			return
-		}
-		logBuf.WriteResult(res, nil, res.GetStderr())
-		if res.GetExitCode() != 0 {
+			if ctx.Err() == nil {
+				fail("Docker Compose 部署失败: %v", err)
+				return
+			}
+			// Cancelled mid-exec: execOnAgent already stopped the
+			// command on the agent, but a half-started stack may
+			// still be up. Fall through to the ctx.Err() teardown
+			// below instead of failing the (already cancelled) record.
+		} else if res.GetExitCode() != 0 {
 			fail("Docker Compose 部署失败 (exit %d)", res.GetExitCode())
 			return
 		}
 		if _, ok := e.store.GetApp(app.ID); !ok {
-			downRes, downErr := execOnAgent(hub, "compose-down-"+randomToken(4),
-				fmt.Sprintf("cd %s && docker compose -f %s -p %s down", shellQuote(repoDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID)), 60)
+			downRes, downErr := execOnAgent(context.Background(), hub, "compose-down-"+randomToken(4),
+				fmt.Sprintf("cd %s && docker compose -f %s -p %s down", shellQuote(repoDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID)), 60, deployStallSec, nil)
 			if downErr != nil || downRes.GetExitCode() != 0 {
 				logBuf.WriteString(fmt.Sprintf("WARN: 应用已删除但清理 Compose 栈失败: %v\n", firstErr(downErr, downRes)))
 				fail("应用在部署期间已被删除，部署已中止；清理 Compose 栈失败，栈可能仍在运行，请手动执行 docker compose down 清理")
@@ -688,8 +704,9 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 			return
 		}
 		if ctx.Err() != nil {
-			// Same live-stack problem as the raw_compose branch: `up -d`
-			// already went live, so tear it down before finalizing.
+			// A cancel that landed during (or just after) `up -d` may
+			// leave a live or half-started stack: tear it down before
+			// finalizing, same as the raw_compose branch above.
 			downOK := e.cancelComposeStack(hub,
 				fmt.Sprintf("cd %s && docker compose -f %s -p %s down", shellQuote(repoDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID)), logBuf)
 			e.cleanupCancelled(app, dep, hub, "", "", logBuf)
@@ -706,18 +723,17 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 
 	// Standard Dockerfile build:
 	buildCmd := fmt.Sprintf("docker build -t %s -f %s %s",
-		shellQuote(imageRef), shellQuote(dockerfile), shellQuote(context))
+		shellQuote(imageRef), shellQuote(dockerfile), shellQuote(buildContext))
 	logBuf.WriteString("$ " + buildCmd + "\n")
 	if cancelled() {
 		return
 	}
-	res, err = execOnAgent(hub, "docker-build-"+randomToken(4),
-		fmt.Sprintf("cd %s && %s", shellQuote(repoDir), buildCmd), buildTimeout)
+	res, err = execOnAgent(ctx, hub, "docker-build-"+randomToken(4),
+		fmt.Sprintf("cd %s && %s", shellQuote(repoDir), buildCmd), buildTimeout, deployStallSec, logBuf)
 	if err != nil {
 		fail("Docker 构建失败: %v", err)
 		return
 	}
-	logBuf.WriteResult(res, nil, res.GetStderr())
 	if res.GetExitCode() != 0 {
 		fail("Docker 构建失败 (exit %d)", res.GetExitCode())
 		return
@@ -749,9 +765,29 @@ func (e *Engine) deploySingleContainer(ctx context.Context, hub *rpc.Hub, app *A
 	}
 	nextName := nextContainerName(container, dep.ID)
 
+	// stoppedOld tracks whether the live container was stopped by the
+	// stop-first step below. A cancel that lands after the stop must
+	// restart it: without that the app is left down with only a
+	// "cancelled" record to show for it. `docker start` on an
+	// already-running container is a harmless no-op, so a double
+	// restart (handler path + pipeline path) is safe.
+	stoppedOld := false
+
 	cancelled := func() bool {
 		if ctx.Err() == nil {
 			return false
+		}
+		if stoppedOld {
+			// Remove the replacement FIRST: it holds the host ports,
+			// so `docker start` of the old container would fail with
+			// "port is already allocated" while it is still there.
+			// (The docker-run error branch already does it in this
+			// order; the cancel path did it backwards and the restart
+			// never landed for port-bound apps.)
+			if hub != nil && nextName != "" {
+				removeContainerFn(e, hub, nextName)
+			}
+			e.restartOldContainer(hub, container, logBuf)
 		}
 		e.cleanupCancelled(app, dep, hub, nextName, "", logBuf)
 		return true
@@ -770,7 +806,55 @@ func (e *Engine) deploySingleContainer(ctx context.Context, hub *rpc.Hub, app *A
 		}
 	}
 	if needsMesh {
-		meshIP = e.resolveMeshIP(hub, app.HostID, logBuf)
+		meshIP = e.resolveMeshIP(ctx, hub, app.HostID, logBuf)
+	}
+
+	// Preflight: clear stale -next containers left by earlier failed runs
+	// and fail fast when a required host port is already held. Without
+	// this a timeout orphan keeps the port and every retry dies with a
+	// bare "port is already allocated" at the docker-run step.
+	if cancelled() {
+		return
+	}
+	stopOld, err := e.preflightSingleContainer(ctx, hub, app, container, meshIP, logBuf)
+	if err != nil {
+		fail("%v", err)
+		return
+	}
+
+	// Stop-first: when the live container still holds a required host
+	// port, the rolling replace cannot bind the same port while the old
+	// one runs. Stop it first (brief downtime), then start the
+	// replacement. The swap step below is unchanged: it renames the
+	// (now stopped) live container to -prev and the replacement to the
+	// live name. Any failure after the stop restarts the old container
+	// (rollbackNote, and the cancelled() closure above) so the app is
+	// never left down with a failed record to show for it.
+	if stopOld {
+		if cancelled() {
+			return
+		}
+		logBuf.WriteString("旧容器仍在运行并占用端口，先停止旧容器再启动新容器（短暂停机）\n")
+		if !e.stopOldContainer(ctx, hub, container, logBuf) {
+			fail("停止旧容器失败，部署已中止（旧容器仍在运行，端口未释放）")
+			return
+		}
+		stoppedOld = true
+	}
+
+	// rollbackNote restarts the live container after a stop-first deploy
+	// failed past the stop, and returns the suffix to append to the
+	// failure message. It must run before fail(): fail() snapshots the
+	// log buffer into the record at call time, so rollback lines written
+	// afterwards would never reach the UI.
+	rollbackNote := func() string {
+		if !stoppedOld {
+			return ""
+		}
+		if e.restartOldContainer(hub, container, logBuf) {
+			return "（旧容器已重新启动）"
+		}
+		return "（旧容器回滚启动失败，仍处于停止状态，请在 Docker 页手动启动）"
 	}
 
 	for _, pm := range app.Ports {
@@ -794,15 +878,35 @@ func (e *Engine) deploySingleContainer(ctx context.Context, hub *rpc.Hub, app *A
 	if cancelled() {
 		return
 	}
-	res, err := execOnAgent(hub, "docker-run-"+randomToken(4), runCmd, 120)
+	res, err := execOnAgent(ctx, hub, "docker-run-"+randomToken(4), runCmd, 600, deployStallSec, logBuf)
 	if err != nil {
-		fail("启动新容器失败: %v", err)
+		// The run can end without a container for three reasons: the
+		// agent-side command failed, the server-side wait expired, or
+		// the operator cancelled (execOnAgent already stopped the
+		// command on the agent via ExecCancel). In the first two cases
+		// a late-finishing `docker run` may still have created the
+		// -next container; in the third the container may exist too
+		// (the cancel landed after `docker run` started it). Remove
+		// it best-effort so the next retry does not hit "port is
+		// already allocated". The cleanup runs on a fresh context: it
+		// must still execute when the pipeline context is cancelled.
+		if _, cleanErr := execOnAgent(context.Background(), hub, "deploy-cleanup-"+randomToken(4), "docker rm -f "+shellQuote(nextName), 30, deployStallSec, nil); cleanErr != nil {
+			logBuf.WriteString(fmt.Sprintf("WARN: 启动失败后清理替换容器失败: %v\n", cleanErr))
+		}
+		fail("启动新容器失败: %v%s", err, rollbackNote())
 		return
 	}
-	logBuf.WriteResult(res, nil, res.GetStderr())
 	if res.GetExitCode() != 0 {
-		fail("启动新容器失败 (exit %d)", res.GetExitCode())
-		e.removeContainer(hub, nextName)
+		// Remove the replacement FIRST, same ordering as the cancel
+		// path and the run-error branch: it holds the host ports, so
+		// restarting the stopped old container would fail with "port
+		// is already allocated" while it is still there. Synchronous:
+		// removeContainer returns immediately when the agent stream
+		// is dead, so this cannot stall the engine slot the way the
+		// old async removal was meant to avoid.
+		removeContainerFn(e, hub, nextName)
+		note := rollbackNote()
+		fail("启动新容器失败 (exit %d)%s", res.GetExitCode(), note)
 		return
 	}
 	// The -next container now exists: record it so a later cancel can remove
@@ -821,8 +925,17 @@ func (e *Engine) deploySingleContainer(ctx context.Context, hub *rpc.Hub, app *A
 		if cancelled() {
 			return
 		}
-		fail("健康检查未通过，已保留旧版本容器")
-		e.removeContainer(hub, nextName)
+		// Remove the replacement FIRST: it holds the host ports, so
+		// restarting the stopped old container would fail with "port
+		// is already allocated" while it is still there. Synchronous
+		// for the same reason as the run-failure branch above.
+		removeContainerFn(e, hub, nextName)
+		note := rollbackNote()
+		if note == "" {
+			fail("健康检查未通过，已保留旧版本容器")
+		} else {
+			fail("健康检查未通过%s", note)
+		}
 		return
 	}
 
@@ -848,20 +961,35 @@ docker inspect --format '{{.State.Status}}' %[2]s`,
 	// The app may have been deleted while the replacement was built: never
 	// swap a container into place for a record that no longer exists.
 	if _, ok := e.store.GetApp(app.ID); !ok {
-		e.removeContainer(hub, nextName)
+		removeContainerFn(e, hub, nextName)
 		fail("应用在部署期间已被删除，部署已中止")
 		return
 	}
-	res, err = execOnAgent(hub, "docker-swap-"+randomToken(4), swapCmd, 60)
+	res, err = execOnAgent(ctx, hub, "docker-swap-"+randomToken(4), swapCmd, 60, deployStallSec, logBuf)
 	if err != nil {
-		fail("容器切换失败: %v", err)
+		if ctx.Err() != nil {
+			// Cancelled mid-swap: the script may have renamed the
+			// live container aside already. Put it back (and restart
+			// it) before finalizing as cancelled, or the app is left
+			// down with only a "cancelled" record to show for it.
+			e.rollbackSwap(hub, container, nextName, logBuf)
+			cancelled()
+			return
+		}
+		fail("容器切换失败: %v%s", err, e.swapRollbackNote(hub, container, nextName, logBuf))
 		return
 	}
-	logBuf.WriteResult(res, nil, res.GetStderr())
 	if res.GetExitCode() != 0 {
-		fail("容器切换失败 (exit %d)", res.GetExitCode())
+		fail("容器切换失败 (exit %d)%s", res.GetExitCode(), e.swapRollbackNote(hub, container, nextName, logBuf))
 		return
 	}
+
+	// The live name now belongs to the replacement: a cancel landing
+	// after this point must not "restart" it as if it were the old one.
+	// (With stop-first the old container was already stopped before the
+	// run; the swap script still renames it to -prev, keeping it around
+	// for inspection, and the next deploy drops it.)
+	stoppedOld = false
 
 	// Step 6: prune old image tags built by Watchman (keep the newest 5 for
 	// rollback). Only images we built (watchman-app-*) are touched — never
@@ -875,7 +1003,7 @@ docker inspect --format '{{.State.Status}}' %[2]s`,
 			repo = repo[:i]
 		}
 		pruneCmd := fmt.Sprintf(`docker images %[1]s --format '{{.CreatedAt}}|{{.Tag}}' | sort -r | cut -d'|' -f2- | grep -v '^latest$' | tail -n +6 | while read t; do docker rmi %[1]s:$$t 2>/dev/null; done`, shellQuote(repo))
-		if _, err := execOnAgent(hub, "docker-prune-"+randomToken(4), pruneCmd, 60); err != nil {
+		if _, err := execOnAgent(ctx, hub, "docker-prune-"+randomToken(4), pruneCmd, 60, deployStallSec, nil); err != nil {
 			e.log.Warn("image prune failed", "err", err, "app", app.ID)
 		}
 	}
@@ -890,13 +1018,265 @@ docker inspect --format '{{.State.Status}}' %[2]s`,
 	e.finishDeploySuccess(app, dep, dep.CommitHash, imageRef, container, logBuf)
 }
 
+// publishedPort is one host-side port binding reported by `docker ps`:
+// ip is the bind address ("0.0.0.0"/"::" = wildcard) and port the host port.
+type publishedPort struct {
+	ip   string
+	port int
+}
+
+// parseDockerPsPorts parses `docker ps -a --format '{{.Names}} {{.Ports}}'`
+// output into container names and, per container, its published host ports.
+// Unpublished ports ("33060/tcp") and stopped containers (empty Ports)
+// contribute no bindings.
+func parseDockerPsPorts(out string) (names []string, bindings map[string][]publishedPort) {
+	bindings = map[string][]publishedPort{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name, ports, _ := strings.Cut(line, " ")
+		names = append(names, name)
+		for _, tok := range strings.Split(strings.TrimSpace(ports), ",") {
+			tok = strings.TrimSpace(tok)
+			left, _, ok := strings.Cut(tok, "->")
+			if !ok {
+				continue
+			}
+			i := strings.LastIndex(left, ":")
+			if i < 0 {
+				continue
+			}
+			p, err := strconv.Atoi(left[i+1:])
+			if err != nil {
+				continue
+			}
+			bindings[name] = append(bindings[name], publishedPort{ip: left[:i], port: p})
+		}
+	}
+	return names, bindings
+}
+
+// portBindingConflicts reports whether a new bind of newIP:newPort would be
+// refused because held already occupies that host port. A wildcard bind on
+// either side (0.0.0.0 / ::) covers every address; otherwise the IPs must
+// be equal. Two different specific IPs may share one host port.
+func portBindingConflicts(newIP string, newPort int, held publishedPort) bool {
+	if held.port != newPort {
+		return false
+	}
+	if newIP == "" {
+		newIP = "0.0.0.0"
+	}
+	if newIP == "0.0.0.0" || newIP == "::" || held.ip == "0.0.0.0" || held.ip == "::" {
+		return true
+	}
+	return held.ip == newIP
+}
+
+// preflightSingleContainer runs before a single-container deploy starts:
+// it removes stale -next containers left by earlier failed runs of this
+// app, fails fast when a required host port is already held by a foreign
+// container, and reports (stopOld) when the port is held by this app's own
+// live container — that case is not a failure: the caller stops the old
+// container first (stop-first) and then starts the replacement. The sweep
+// prefix is exact (`<container>-next-dep_`, see nextContainerName), so the
+// live container and the -prev rollback are never touched. A preflight
+// transport failure is fail-open with a WARN: docker-run stays the final
+// arbiter, and a flaky agent must not mask the real error.
+func (e *Engine) preflightSingleContainer(ctx context.Context, hub *rpc.Hub, app *Application, container, meshIP string, logBuf *logBuffer) (stopOld bool, err error) {
+	res, err := execOnAgent(ctx, hub, "deploy-preflight-"+randomToken(4), "docker ps -a --format '{{.Names}} {{.Ports}}'", 30, deployStallSec, nil)
+	if err != nil {
+		logBuf.WriteString(fmt.Sprintf("WARN: 部署前预检失败（%v），继续部署\n", err))
+		return false, nil
+	}
+	if res.GetExitCode() != 0 {
+		logBuf.WriteString(fmt.Sprintf("WARN: 部署前预检失败 (exit %d)，继续部署\n", res.GetExitCode()))
+		return false, nil
+	}
+	names, bindings := parseDockerPsPorts(string(res.GetStdout()))
+
+	// 1. Sweep stale -next containers from earlier failed runs.
+	sweepPrefix := container + "-next-dep_"
+	for _, name := range names {
+		if !strings.HasPrefix(name, sweepPrefix) {
+			continue
+		}
+		rmRes, rmErr := execOnAgent(ctx, hub, "deploy-sweep-"+randomToken(4), "docker rm -f "+shellQuote(name), 30, deployStallSec, nil)
+		if rmErr != nil || rmRes.GetExitCode() != 0 {
+			logBuf.WriteString(fmt.Sprintf("WARN: 清理上次失败残留的容器 %s 失败: %v\n", name, firstErr(rmErr, rmRes)))
+			continue
+		}
+		logBuf.WriteString(fmt.Sprintf("已清理上次失败残留的容器 %s\n", name))
+		// The container is gone: it no longer holds any port.
+		delete(bindings, name)
+	}
+
+	// 2. Fail fast on host ports already held by a running container.
+	// A swept orphan is gone by now; anything still listed genuinely
+	// holds the port.
+	for _, pm := range app.Ports {
+		if pm.Host <= 0 {
+			continue
+		}
+		newIP := "0.0.0.0"
+		if pm.BindScope == "mesh" && meshIP != "" {
+			newIP = meshIP
+		}
+		for name, held := range bindings {
+			for _, h := range held {
+				if !portBindingConflicts(newIP, pm.Host, h) {
+					continue
+				}
+				if strings.HasPrefix(name, sweepPrefix) {
+					return false, fmt.Errorf("端口 %d 仍被上次失败残留的容器 %s 占用（清理失败），请在 Docker 页手动移除该容器后重试", pm.Host, name)
+				}
+				if name == container {
+					// The live container holds the port: not a failure.
+					// The caller stops it first, then starts the
+					// replacement (stop-first). Keep scanning: a foreign
+					// holder on another port must still fail fast.
+					stopOld = true
+					continue
+				}
+				return false, fmt.Errorf("端口 %d 已被容器 %s 占用（不是本应用的容器），请先移除该容器或更换端口后重试", pm.Host, name)
+			}
+		}
+	}
+	return stopOld, nil
+}
+
+// stopOldContainer stops the live container so the replacement can bind
+// its host ports (stop-first). Returns false when the container is still
+// running afterwards; a container that vanished in the meantime (operator
+// removed it) counts as stopped — the port is free either way. The -t 30
+// grace gives databases time for a clean shutdown instead of the 10s
+// default SIGKILL.
+func (e *Engine) stopOldContainer(ctx context.Context, hub *rpc.Hub, container string, logBuf *logBuffer) bool {
+	res, err := execOnAgent(ctx, hub, "deploy-stop-old-"+randomToken(4), "docker stop -t 30 "+shellQuote(container), 60, deployStallSec, nil)
+	if err == nil && res.GetExitCode() == 0 {
+		return true
+	}
+	logBuf.WriteString(fmt.Sprintf("WARN: 停止旧容器失败: %v\n", firstErr(err, res)))
+	// Distinguish "container is gone" (fine) from "still running" (the
+	// port is still held, starting the replacement would collide).
+	stateRes, stateErr := execOnAgent(ctx, hub, "deploy-stop-check-"+randomToken(4),
+		fmt.Sprintf("docker inspect --format '{{.State.Status}}' %s", shellQuote(container)), 15, deployStallSec, nil)
+	if stateErr != nil || stateRes.GetExitCode() != 0 {
+		logBuf.WriteString("旧容器已不存在，继续部署\n")
+		return true
+	}
+	if strings.TrimSpace(string(stateRes.GetStdout())) == "running" {
+		return false
+	}
+	return true
+}
+
+// restartOldContainer restarts the live container after a stop-first deploy
+// failed past the stop (or was cancelled there). Best effort: when the
+// restart itself fails the app is left down, and the log must say so
+// plainly instead of claiming a rollback happened.
+//
+// The restart runs on a fresh context, not the pipeline's: it is needed
+// precisely when the pipeline context is already cancelled, and a
+// cancelled context would make the exec return before sending anything.
+func (e *Engine) restartOldContainer(hub *rpc.Hub, container string, logBuf *logBuffer) bool {
+	res, err := execOnAgent(context.Background(), hub, "deploy-rollback-"+randomToken(4), "docker start "+shellQuote(container), 60, deployStallSec, nil)
+	if err != nil || res.GetExitCode() != 0 {
+		logBuf.WriteString(fmt.Sprintf("WARN: 回滚启动旧容器失败: %v（旧容器仍处于停止状态，请在 Docker 页手动启动 %s）\n", firstErr(err, res), container))
+		return false
+	}
+	logBuf.WriteString("已回滚：旧容器重新启动\n")
+	return true
+}
+
+// rollbackSwap restores the old container after a swap that failed (or
+// was cancelled) mid-script. The swap renames the live container to -prev
+// and stops it before renaming -next into place, so a failure between the
+// two renames leaves no container under the live name and the app down.
+// The replacement is removed FIRST: it holds the host ports, so starting
+// the old container would fail with "port is already allocated" while it
+// is still there. The restore script is then state-aware, so it is safe
+// to call on any swap failure:
+//   - live name exists but stopped (swap failed before the rename): start it.
+//   - live name missing, -prev exists (cut between the renames): rename it
+//     back and start it.
+//   - live name exists and running (swap actually completed, only the
+//     final inspect failed): no-op.
+//
+// It returns true when it restored a running container. Like
+// restartOldContainer it runs on a fresh context: a swap cancelled
+// mid-script needs the rollback most, and the pipeline context is dead
+// by then.
+func (e *Engine) rollbackSwap(hub *rpc.Hub, container, nextName string, logBuf *logBuffer) bool {
+	if hub != nil && nextName != "" {
+		removeContainerFn(e, hub, nextName)
+	}
+	script := fmt.Sprintf(`if docker inspect %[1]s >/dev/null 2>&1; then
+  if [ "$(docker inspect --format '{{.State.Status}}' %[1]s)" != "running" ]; then
+    docker start %[1]s >/dev/null && echo RESTORED_LIVE
+  fi
+elif docker inspect %[2]s >/dev/null 2>&1; then
+  docker rename %[2]s %[1]s && docker start %[1]s >/dev/null && echo RESTORED_PREV
+fi`,
+		shellQuote(container), shellQuote(container+"-prev"))
+	res, err := execOnAgent(context.Background(), hub, "deploy-swap-rollback-"+randomToken(4), script, 60, deployStallSec, nil)
+	if err != nil || res.GetExitCode() != 0 {
+		logBuf.WriteString(fmt.Sprintf("WARN: 切换失败后恢复旧容器失败: %v\n", firstErr(err, res)))
+		return false
+	}
+	switch strings.TrimSpace(string(res.GetStdout())) {
+	case "RESTORED_LIVE":
+		logBuf.WriteString("已回滚：旧容器重新启动\n")
+		return true
+	case "RESTORED_PREV":
+		logBuf.WriteString("已回滚：旧容器已从 -prev 恢复并重新启动\n")
+		return true
+	}
+	return false
+}
+
+// swapRollbackNote runs rollbackSwap after a failed swap and returns the
+// suffix to append to the failure message.
+func (e *Engine) swapRollbackNote(hub *rpc.Hub, container, nextName string, logBuf *logBuffer) string {
+	if e.rollbackSwap(hub, container, nextName, logBuf) {
+		return "（旧容器已恢复并重新启动）"
+	}
+	return ""
+}
+
+// ensureImagePresent pulls imageRef only when the target host does not
+// already have it. A plain `docker run` folds the pull into its own 600s
+// budget, so a first deploy of a large uncached image (mysql:8.0) times
+// out mid-pull and leaves an orphan -next container; pulling up front
+// with the 1800s budget keeps the run step fast. A cached image skips the
+// pull entirely, so an offline host with a local copy still deploys.
+func (e *Engine) ensureImagePresent(ctx context.Context, hub *rpc.Hub, imageRef string, logBuf *logBuffer, cancelled func() bool, fail func(string, ...any)) bool {
+	if cancelled() {
+		return false
+	}
+	script := fmt.Sprintf("docker image inspect %s >/dev/null 2>&1 || docker pull %s", shellQuote(imageRef), shellQuote(imageRef))
+	logBuf.WriteString("$ " + script + "\n")
+	res, err := execOnAgent(ctx, hub, "docker-pull-"+randomToken(4), script, 1800, deployStallSec, logBuf)
+	if err != nil {
+		fail("拉取镜像失败: %v", err)
+		return false
+	}
+	if res.GetExitCode() != 0 {
+		fail("拉取镜像失败 (exit %d)", res.GetExitCode())
+		return false
+	}
+	return true
+}
+
 // resolveMeshIP returns the host's current Tailscale IPv4 for mesh-scoped port
 // bindings. It probes the node live first (one exec round-trip) because the
 // cached NodeStatus.IP goes stale when the tailnet address changes outside
 // Watchman (e.g. `tailscale up --reset` re-registers the node and Headscale
 // reassigns its 100.x). The cache is only a fallback; an empty return means
 // "fall back to public binding".
-func (e *Engine) resolveMeshIP(hub *rpc.Hub, hostID string, logBuf *logBuffer) string {
+func (e *Engine) resolveMeshIP(ctx context.Context, hub *rpc.Hub, hostID string, logBuf *logBuffer) string {
 	if e.networkStore == nil {
 		logBuf.WriteString("WARN: 需要绑定异地组网，但 NetworkStore 未初始化，回退为公网绑定\n")
 		return ""
@@ -904,7 +1284,7 @@ func (e *Engine) resolveMeshIP(hub *rpc.Hub, hostID string, logBuf *logBuffer) s
 	// Live probe first: `tailscale ip -4` takes no arguments and is
 	// shell-agnostic (sh/bash/powershell/cmd), so no quoting concerns.
 	liveIP := ""
-	if res, err := execOnAgent(hub, "mesh-ip-"+randomToken(4), "tailscale ip -4", 15); err == nil && res != nil && res.GetExitCode() == 0 {
+	if res, err := execOnAgent(ctx, hub, "mesh-ip-"+randomToken(4), "tailscale ip -4", 15, deployStallSec, nil); err == nil && res != nil && res.GetExitCode() == 0 {
 		liveIP = parseIPv4(string(res.GetStdout()))
 	}
 	cached, ok := e.networkStore.GetNodeStatus(hostID)
@@ -1011,6 +1391,14 @@ func (e *Engine) finishDeploySuccess(app *Application, dep *Deployment, commit, 
 }
 
 func (e *Engine) fail(app *Application, dep *Deployment, logBuf *logBuffer, msg string) {
+	// CancelDeployment removes the running entry the moment it marks the
+	// record cancelled, so a missing entry means the operator already owns
+	// the terminal state: a pipeline goroutine that is still unwinding
+	// (e.g. an execOnAgent wait that just returned context.Canceled)
+	// must not overwrite it with a failure.
+	if !e.IsRunning(app.ID) {
+		return
+	}
 	now := time.Now()
 	finalLog := logBuf.String() + "\n[FAILED] " + msg + "\n"
 	_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
@@ -1029,14 +1417,18 @@ func (e *Engine) fail(app *Application, dep *Deployment, logBuf *logBuffer, msg 
 	e.log.Warn("deployment failed", "app", app.ID, "deployment", dep.ID, "err", msg)
 }
 
-// cancelComposeStack tears down a compose stack that went live while the
-// operator cancelled. `compose up -d` cannot be interrupted mid-exec, so a
-// cancel landing during it must bring the stack back down; otherwise the
-// record would say "cancelled" while the new stack keeps serving. It
-// returns false when the teardown itself failed — the caller must then say
-// so on the record instead of reporting a clean cancel.
+// cancelComposeStack tears down a compose stack that went live (or
+// half-started) while the operator cancelled. `compose up -d` is
+// interrupted mid-exec on cancel, so a cancel landing during it must
+// bring the stack back down; otherwise the record would say "cancelled"
+// while the new stack keeps serving. It returns false when the teardown
+// itself failed — the caller must then say so on the record instead of
+// reporting a clean cancel.
+//
+// The teardown runs on a fresh context, not the pipeline's: it is needed
+// precisely when the pipeline context is already cancelled.
 func (e *Engine) cancelComposeStack(hub *rpc.Hub, downCmd string, logBuf *logBuffer) bool {
-	res, err := execOnAgent(hub, "compose-down-"+randomToken(4), downCmd, 120)
+	res, err := execOnAgent(context.Background(), hub, "compose-down-"+randomToken(4), downCmd, 120, deployStallSec, nil)
 	if err != nil {
 		logBuf.WriteString(fmt.Sprintf("WARN: 取消后清理 Compose 栈失败: %v\n", err))
 		return false
@@ -1061,8 +1453,8 @@ func (e *Engine) probe(ctx context.Context, hub *rpc.Hub, app *Application, cont
 				return false
 			}
 			time.Sleep(5 * time.Second)
-			res, err := execOnAgent(hub, "probe-"+randomToken(4),
-				fmt.Sprintf("curl -s -o /dev/null -w '%%{http_code}' --max-time 5 %s", shellQuote(app.HealthcheckURL)), 15)
+			res, err := execOnAgent(ctx, hub, "probe-"+randomToken(4),
+				fmt.Sprintf("curl -s -o /dev/null -w '%%{http_code}' --max-time 5 %s", shellQuote(app.HealthcheckURL)), 15, deployStallSec, nil)
 			if err != nil {
 				logBuf.WriteString("probe transport error: " + err.Error() + "\n")
 				continue
@@ -1081,8 +1473,8 @@ func (e *Engine) probe(ctx context.Context, hub *rpc.Hub, app *Application, cont
 	if ctx.Err() != nil {
 		return false
 	}
-	res, err := execOnAgent(hub, "probe-"+randomToken(4),
-		fmt.Sprintf("docker inspect --format '{{.State.Status}}' %s", shellQuote(container)), 15)
+	res, err := execOnAgent(ctx, hub, "probe-"+randomToken(4),
+		fmt.Sprintf("docker inspect --format '{{.State.Status}}' %s", shellQuote(container)), 15, deployStallSec, nil)
 	if err != nil {
 		logBuf.WriteString("probe transport error: " + err.Error() + "\n")
 		return false
@@ -1146,22 +1538,47 @@ func (e *Engine) gitToken(app *Application) (string, error) {
 	return "", nil
 }
 
+// removeContainerFn is the seam tests use to observe container removals;
+// production always calls (*Engine).removeContainer. It exists because
+// removeContainer talks to the agent through hub.Send directly, so the
+// execOnAgent stub the tests use cannot see its commands.
+var removeContainerFn = (*Engine).removeContainer
+
 func (e *Engine) removeContainer(hub *rpc.Hub, name string) {
 	opID := "app-rm-" + randomToken(4)
 	done := make(chan struct{}, 1)
-	hub.SetRespHandler(opID, func(*agentpb.AgentMessage) {
+	hub.SetRespHandler(opID, func(msg *agentpb.AgentMessage) {
+		if msg == nil {
+			hub.SetRespHandler(opID, nil)
+			done <- struct{}{}
+			return
+		}
+		// Only the final ExecResult ends the wait: a streaming chunk
+		// (ExecOutput) from `docker rm -f` stderr must not.
+		if msg.GetExecResult() == nil {
+			return
+		}
 		hub.SetRespHandler(opID, nil)
 		done <- struct{}{}
 	})
-	hub.Send(&agentpb.ServerMessage{
+	// Send returning false means there is no live stream to the agent:
+	// the removal can never be answered, so waiting the full 30s for a
+	// result that cannot come would only stall the caller (the cancel
+	// path calls this synchronously). The preflight sweep on the next
+	// run is the backstop for a container left behind.
+	if !hub.Send(&agentpb.ServerMessage{
 		Payload: &agentpb.ServerMessage_Exec{
 			Exec: &agentpb.ExecRequest{
-				ExecId:     opID,
-				Command:    "docker rm -f " + shellQuote(name),
-				TimeoutSec: 30,
+				ExecId:          opID,
+				Command:         "docker rm -f " + shellQuote(name),
+				TimeoutSec:      30,
+				StallTimeoutSec: deployStallSec,
 			},
 		},
-	})
+	}) {
+		hub.SetRespHandler(opID, nil)
+		return
+	}
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):
@@ -1171,39 +1588,106 @@ func (e *Engine) removeContainer(hub *rpc.Hub, name string) {
 
 // ---- helpers ----------------------------------------------------------
 
+// deployStallSec is the stall budget (seconds of silence) the deploy
+// engine asks for on every exec: a step that stops talking for this long
+// is killed by the agent. Long silent transfers (tar/curl in volume and
+// migration steps) pass stall 0 instead — they are legitimately quiet for
+// minutes at a time.
+const deployStallSec = 120
+
+// sendExecCancel asks the agent to stop a running exec (whole process
+// group). Best-effort: the agent may already have finished, or be gone;
+// either way the caller still fails the step with its own error.
+func sendExecCancel(hub *rpc.Hub, execID string) {
+	if hub == nil {
+		return
+	}
+	hub.Send(&agentpb.ServerMessage{
+		Payload: &agentpb.ServerMessage_ExecCancel{
+			ExecCancel: &agentpb.ExecCancel{ExecId: execID},
+		},
+	})
+}
+
 // execOnAgent runs one command on the agent and waits for the result. It is
 // a variable (not a plain func) so tests can stub the agent round-trip;
 // production code always uses the default implementation below.
-var execOnAgent = func(hub *rpc.Hub, execID string, command string, timeoutSec int32) (*agentpb.ExecResult, error) {
+//
+// ctx is the caller's cancellation source (nil = no cancellation; the
+// wall-clock timeout still applies). When ctx is cancelled or the wait
+// times out, the agent is told to stop the exec with ExecCancel, so the
+// command really stops instead of becoming an orphan on the host.
+//
+// stallSec is the agent-side stall budget (0 = disabled). log receives
+// live output chunks as they arrive and the un-streamed tail when the
+// result lands (nil = the caller does not want the output in the log;
+// e.g. preflight probes, or steps whose output is redacted before
+// logging). Only callers that pass log may rely on the step's output
+// being in the log; callers that pass nil must log the result themselves
+// (usually via logBuf.WriteResult, e.g. the redacted git fetch).
+var execOnAgent = func(ctx context.Context, hub *rpc.Hub, execID string, command string, timeoutSec, stallSec int32, log *logBuffer) (*agentpb.ExecResult, error) {
+	if log != nil {
+		log.BeginStream()
+	}
 	resultCh := make(chan *agentpb.ExecResult, 1)
 	hub.SetRespHandler(execID, func(msg *agentpb.AgentMessage) {
-		hub.SetRespHandler(execID, nil)
-		if msg != nil {
-			resultCh <- msg.GetExecResult()
-		} else {
+		if msg == nil {
+			// The agent disconnected mid-exec: unblock the wait below.
+			hub.SetRespHandler(execID, nil)
 			resultCh <- nil
+			return
 		}
+		if out := msg.GetExecOutput(); out != nil {
+			// Streaming chunk: route it to the live log and keep
+			// waiting. The handler stays registered for later chunks
+			// and the final result.
+			if log != nil {
+				log.WriteChunk(out.GetStream(), out.GetChunk())
+			}
+			return
+		}
+		hub.SetRespHandler(execID, nil)
+		resultCh <- msg.GetExecResult()
 	})
 	hub.Send(&agentpb.ServerMessage{
 		Payload: &agentpb.ServerMessage_Exec{
 			Exec: &agentpb.ExecRequest{
-				ExecId:     execID,
-				Command:    command,
-				IsScript:   true,
-				TimeoutSec: timeoutSec,
+				ExecId:          execID,
+				Command:         command,
+				IsScript:        true,
+				TimeoutSec:      timeoutSec,
+				StallTimeoutSec: stallSec,
 			},
 		},
 	})
 	wait := time.Duration(timeoutSec)*time.Second + 30*time.Second
+	var ctxDone <-chan struct{}
+	if ctx != nil {
+		ctxDone = ctx.Done()
+	}
 	select {
 	case res := <-resultCh:
 		if res == nil {
 			return nil, fmt.Errorf("agent disconnected")
 		}
+		if log != nil {
+			log.WriteTail(res)
+		}
 		return res, nil
 	case <-time.After(wait):
+		// The agent stopped answering (or its result was lost). Tell it
+		// to stop the command so nothing keeps running on the host after
+		// the deployment already failed.
 		hub.SetRespHandler(execID, nil)
+		sendExecCancel(hub, execID)
 		return nil, fmt.Errorf("agent exec timeout")
+	case <-ctxDone:
+		// The pipeline was cancelled (operator cancel, or a step that
+		// gave up waiting). Same treatment: stop the command on the
+		// agent, then report the caller's cancellation.
+		hub.SetRespHandler(execID, nil)
+		sendExecCancel(hub, execID)
+		return nil, ctx.Err()
 	}
 }
 
@@ -1245,18 +1729,17 @@ func classifyDockerPreflight(exitCode int32) error {
 // touched, so a failed pull fails the deployment with the old container
 // still serving. Returns false when the caller must stop the pipeline
 // (fail() already recorded the reason).
-func (e *Engine) pullImage(hub *rpc.Hub, imageRef string, logBuf *logBuffer, cancelled func() bool, fail func(string, ...any)) bool {
+func (e *Engine) pullImage(ctx context.Context, hub *rpc.Hub, imageRef string, logBuf *logBuffer, cancelled func() bool, fail func(string, ...any)) bool {
 	if cancelled() {
 		return false
 	}
 	pullCmd := fmt.Sprintf("docker pull %s", shellQuote(imageRef))
 	logBuf.WriteString("$ " + pullCmd + "\n")
-	res, err := execOnAgent(hub, "docker-pull-"+randomToken(4), pullCmd, 300)
+	res, err := execOnAgent(ctx, hub, "docker-pull-"+randomToken(4), pullCmd, 1800, deployStallSec, logBuf)
 	if err != nil {
 		fail("拉取镜像失败: %v", err)
 		return false
 	}
-	logBuf.WriteResult(res, nil, res.GetStderr())
 	if res.GetExitCode() != 0 {
 		fail("拉取镜像失败 (exit %d)", res.GetExitCode())
 		return false
@@ -1267,8 +1750,8 @@ func (e *Engine) pullImage(hub *rpc.Hub, imageRef string, logBuf *logBuffer, can
 // checkDockerReady runs the preflight on the target host. A transport
 // failure (agent gone mid-check, exec timeout) is reported as-is — it is
 // not a Docker problem and must not be misclassified as one.
-func (e *Engine) checkDockerReady(hub *rpc.Hub) error {
-	res, err := execOnAgent(hub, "docker-preflight-"+randomToken(4), dockerPreflightScript(), 30)
+func (e *Engine) checkDockerReady(ctx context.Context, hub *rpc.Hub) error {
+	res, err := execOnAgent(ctx, hub, "docker-preflight-"+randomToken(4), dockerPreflightScript(), 30, deployStallSec, nil)
 	if err != nil {
 		return fmt.Errorf("Docker 可用性检查失败: %w", err)
 	}
@@ -1285,6 +1768,12 @@ func (e *Engine) checkDockerReady(hub *rpc.Hub) error {
 type logBuffer struct {
 	mu sync.Mutex
 	b  strings.Builder
+	// streamedOut/streamedErr count how many bytes of the current step's
+	// stdout/stderr already arrived as live ExecOutput chunks (see
+	// WriteChunk). WriteTail appends only the remainder, so the streamed
+	// bytes are never duplicated when the final ExecResult lands.
+	streamedOut int
+	streamedErr int
 }
 
 // forwarderImage is the OCI image for 组网转发 (source_type=forward) apps:
@@ -1300,10 +1789,79 @@ func (l *logBuffer) WriteString(s string) {
 	l.b.WriteString(s)
 }
 
+// BeginStream resets the streamed-byte counters for a new exec step. Call
+// it before execOnAgent starts a step whose chunks feed this buffer, so a
+// previous step's counts cannot swallow the next step's tail.
+func (l *logBuffer) BeginStream() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.streamedOut = 0
+	l.streamedErr = 0
+}
+
+// WriteChunk appends one live ExecOutput chunk to the log, in arrival
+// order. The deployment-log poller overlays this buffer, so the chunk is
+// visible in the panel within a poll cycle, long before the step ends.
+// The first stderr chunk is preceded by the same "[stderr]" marker
+// WriteResult uses, so the live view and the final snapshot read the same.
+func (l *logBuffer) WriteChunk(stream string, chunk []byte) {
+	if len(chunk) == 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if stream == "stderr" {
+		if l.streamedErr == 0 {
+			l.b.WriteString("[stderr]\n")
+		}
+		l.appendBounded(chunk)
+		l.streamedErr += len(chunk)
+		return
+	}
+	l.appendBounded(chunk)
+	l.streamedOut += len(chunk)
+}
+
+// WriteTail appends the part of the final ExecResult that did NOT arrive
+// as live chunks (the last partial batch, or the whole output when the
+// agent is too old to stream). It has the same shape as WriteResult and
+// resets the counters for the next step.
+func (l *logBuffer) WriteTail(res *agentpb.ExecResult) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := res.GetStdout()
+	errBytes := res.GetStderr()
+	// Chunks are a prefix of the final output by construction; clamp
+	// defensively so a miscount can never panic the pipeline.
+	if l.streamedOut > len(out) {
+		l.streamedOut = len(out)
+	}
+	if l.streamedErr > len(errBytes) {
+		l.streamedErr = len(errBytes)
+	}
+	if tail := out[l.streamedOut:]; len(tail) > 0 {
+		l.appendBounded(tail)
+		l.b.WriteByte('\n')
+	}
+	if tail := errBytes[l.streamedErr:]; len(tail) > 0 {
+		if l.streamedErr == 0 {
+			l.b.WriteString("[stderr]\n")
+		}
+		l.appendBounded(tail)
+		l.b.WriteByte('\n')
+	}
+	l.streamedOut = 0
+	l.streamedErr = 0
+}
+
 // WriteResult appends a step's stdout/stderr, redacted, bounded.
 func (l *logBuffer) WriteResult(res *agentpb.ExecResult, stdoutRedacted, stderr []byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// A step that streamed its output reports the tail through WriteTail
+	// instead; a direct WriteResult must not inherit stale counters.
+	l.streamedOut = 0
+	l.streamedErr = 0
 	out := stdoutRedacted
 	if out == nil {
 		out = res.GetStdout()
@@ -1495,7 +2053,7 @@ func (e *Engine) syncMeshForwarder(app *Application, logBuf *logBuffer) error {
 	if logBuf != nil {
 		logBuf.WriteString(fmt.Sprintf("$ deploy mesh forwarder on entry host %s (%d -> %s)\n", app.MeshForwardHostID, app.MeshForwardEntryPort, target))
 	}
-	res, err := execOnAgent(fwdHub, "fwd-run-"+randomToken(4), runCmd, 60)
+	res, err := execOnAgent(nil, fwdHub, "fwd-run-"+randomToken(4), runCmd, 60, deployStallSec, nil)
 	if err != nil {
 		if logBuf != nil {
 			logBuf.WriteString(fmt.Sprintf("WARN: 部署组网中继容器通信失败: %v\n", err))
@@ -1535,7 +2093,7 @@ func (e *Engine) cleanMeshForwarder(hostID, appID string) error {
 		return fmt.Errorf("组网转发入口主机 %s 离线", hostID)
 	}
 	fwdContainer := "watchman-fwd-" + appID
-	res, err := execOnAgent(fwdHub, "clean-fwd-"+randomToken(4), "docker rm -f "+shellQuote(fwdContainer), 30)
+	res, err := execOnAgent(nil, fwdHub, "clean-fwd-"+randomToken(4), "docker rm -f "+shellQuote(fwdContainer), 30, deployStallSec, nil)
 	if err != nil {
 		return err
 	}
@@ -1590,7 +2148,7 @@ func (e *Engine) SyncMeshForwarder(app *Application) (string, error) {
 		shellQuote(fmt.Sprintf("TCP-LISTEN:%d,fork,reuseaddr", app.MeshForwardEntryPort)),
 		shellQuote("TCP:"+target),
 	)
-	res, err := execOnAgent(fwdHub, "fwd-run-"+randomToken(4), runCmd, 60)
+	res, err := execOnAgent(nil, fwdHub, "fwd-run-"+randomToken(4), runCmd, 60, deployStallSec, nil)
 	if err != nil {
 		return "", fmt.Errorf("在中继主机执行部署失败: %w", err)
 	}

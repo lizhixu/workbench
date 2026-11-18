@@ -19,6 +19,7 @@ import { listHosts, setHostGroup } from '../../api/hosts'
 import type { Host, UserRecord } from '../../api/types'
 import { useAuthStore } from '../../stores/auth'
 import { useTablePagination } from '../../composables/useTablePagination'
+import { useIsMobile } from '../../composables/useIsMobile'
 import { fmtDateTime } from '../../utils/time'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
@@ -54,6 +55,17 @@ const hostsLoading = ref(false)
 const groupCount = computed(() => groups.value.length)
 const { pagination, resetPage } = useTablePagination({ pageSize: 20, rowCount: groupCount })
 
+const isMobile = useIsMobile()
+// 移动端隐藏次要列（上级分组/描述/创建时间），只留分组名称、计数与操作，
+// 横向滚动范围随之收窄（scroll-x 1000 → 640）。
+const visibleColumns = computed(() =>
+  isMobile.value
+    ? columns.value.filter((c) => 'key' in c && !['parent_id', 'description', 'created_at'].includes(c.key as string))
+    : columns.value,
+)
+// 移动端分页切紧凑形态（仅上一页/页码输入/下一页），避免每页条数选择器撑出视口。
+const tablePagination = computed(() => ({ ...pagination, simple: isMobile.value }))
+
 const roleOptions = [
   { label: '可操作 (operate)', value: 'operate' },
   { label: '只读 (view)', value: 'view' },
@@ -79,7 +91,7 @@ function groupNameById(id?: string): string {
 
 
 const columns = computed<DataTableColumns<HostGroup>>(() => [
-  { title: '分组名称', key: 'name', minWidth: 150, render: (g) => h('span', { class: 'group-name' }, g.name) },
+  { title: '分组名称', key: 'name', minWidth: 150, render: (g) => h('span', { class: 'group-name', title: g.name }, g.name) },
   { title: '上级分组', key: 'parent_id', width: 130, render: (g) => h('span', { class: 'muted' }, groupNameById(g.parent_id)) },
   { title: '描述', key: 'description', minWidth: 180, ellipsis: { tooltip: true }, render: (g) => h('span', { class: 'muted' }, g.description || '-') },
   {
@@ -300,7 +312,7 @@ onMounted(() => {
     <div class="group-toolbar">
       <h2 class="page-title">分组与权限</h2>
       <NSpace align="center" :size="12">
-        <span class="muted">共 {{ groupCount }} 个分组</span>
+        <span class="muted group-count-text">共 {{ groupCount }} 个分组</span>
         <NButton :loading="loading" @click="refresh">
           <template #icon><NIcon :component="RefreshOutline" /></template>
           刷新
@@ -315,14 +327,14 @@ onMounted(() => {
     <NCard :bordered="false" class="table-flex-fill">
       <NDataTable
         flex-height
-        :columns="columns"
+        :columns="visibleColumns"
         :data="groups"
-        :pagination="pagination"
+        :pagination="tablePagination"
         :loading="loading"
         :bordered="false"
         size="small"
         :row-key="(g: HostGroup) => g.id"
-        :scroll-x="1000"
+        :scroll-x="isMobile ? 640 : 1000"
       >
         <template #empty>
           <NEmpty description="暂无分组。创建分组后可关联主机并给用户授权，实现主机访问隔离。" />
@@ -379,7 +391,9 @@ onMounted(() => {
               description="该分组暂无授权用户。未被授权的用户默认可见全部主机。"
             />
             <!-- 单个分组的授权名单：条数天然有限，抽屉内不分页（AGENTS.md 8.2 例外） -->
-            <NTable v-else :single-line="false" size="small">
+            <!-- 授权抽屉 100vw 时表内 150px 角色下拉 + 时间列会撑出抽屉，包一层横向滚动 -->
+            <div v-else class="grants-table-wrap">
+            <NTable :single-line="false" size="small" style="min-width: 480px">
               <thead>
                 <tr>
                   <th>用户</th>
@@ -414,6 +428,7 @@ onMounted(() => {
                 </tr>
               </tbody>
             </NTable>
+            </div>
           </NSpace>
         </NSpin>
       </NDrawerContent>
@@ -428,7 +443,7 @@ onMounted(() => {
               <NEmpty v-if="!memberHosts.length" description="该分组还没有主机" size="small" />
               <div v-else class="host-rows">
                 <div v-for="hostItem in memberHosts" :key="hostItem.id" class="host-row">
-                  <span class="host-name">{{ hostItem.hostname }}</span>
+                  <span class="host-name" :title="hostItem.hostname">{{ hostItem.hostname }}</span>
                   <NTag size="tiny" :bordered="false" :type="hostItem.status === 'online' ? 'success' : 'default'">
                     {{ hostItem.status === 'online' ? '在线' : '离线' }}
                   </NTag>
@@ -449,7 +464,7 @@ onMounted(() => {
               <NEmpty v-if="!candidateHosts.length" description="没有可加入的主机" size="small" />
               <div v-else class="host-rows">
                 <div v-for="hostItem in candidateHosts" :key="hostItem.id" class="host-row">
-                  <span class="host-name">{{ hostItem.hostname }}</span>
+                  <span class="host-name" :title="hostItem.hostname">{{ hostItem.hostname }}</span>
                   <NTag v-if="hostItem.group" size="tiny" :bordered="false">{{ hostItem.group }}</NTag>
                   <NTag v-else size="tiny" :bordered="false" type="warning">未分组</NTag>
                   <NButton
@@ -494,6 +509,13 @@ onMounted(() => {
 .group-name,
 :deep(.group-name) {
   font-weight: 600;
+  // 长分组名单行省略不断字，全文走 title
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
 }
 .muted,
 :deep(.muted) {
@@ -524,6 +546,24 @@ onMounted(() => {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+}
+
+/* ===================== 移动端适配（≤768px） ===================== */
+@media (max-width: 768px) {
+  .group-view {
+    gap: 8px;
+  }
+  .group-toolbar {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  // 窄屏只留标题与操作按钮，隐藏计数文字
+  .group-count-text {
+    display: none;
+  }
+  .grants-table-wrap {
+    overflow-x: auto;
   }
 }
 </style>

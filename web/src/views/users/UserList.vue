@@ -12,6 +12,7 @@ import type { Role, UserRecord } from '../../api/types'
 import { listUsers, createUser, updateUserRole, deleteUser, resetPassword } from '../../api/users'
 import { useAuthStore } from '../../stores/auth'
 import { useTablePagination } from '../../composables/useTablePagination'
+import { useIsMobile } from '../../composables/useIsMobile'
 import { fmtDateTime } from '../../utils/time'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
@@ -31,6 +32,16 @@ const newPassword = ref('')
 
 const userCount = computed(() => users.value.length)
 const { pagination, resetPage } = useTablePagination({ pageSize: 20, rowCount: userCount })
+
+const isMobile = useIsMobile()
+// 移动端隐藏创建时间列，只留用户名、角色与操作，横向滚动范围随之收窄（scroll-x 780 → 600）。
+const visibleColumns = computed(() =>
+  isMobile.value
+    ? columns.value.filter((c) => 'key' in c && c.key !== 'created_at')
+    : columns.value,
+)
+// 移动端分页切紧凑形态（仅上一页/页码输入/下一页），避免每页条数选择器撑出视口。
+const tablePagination = computed(() => ({ ...pagination, simple: isMobile.value }))
 
 const roleOptions = [
   { label: '管理员 (admin)', value: 'admin' },
@@ -58,9 +69,9 @@ const columns = computed<DataTableColumns<UserRecord>>(() => [
     key: 'username',
     minWidth: 180,
     render: (u) =>
-      h(NSpace, { size: 6, align: 'center', wrapItem: false }, {
+      h(NSpace, { size: 6, align: 'center', wrap: false, wrapItem: false }, {
         default: () => [
-          h('span', { class: 'username-text' }, u.username),
+          h('span', { class: 'username-text', title: u.username }, u.username),
           u.username === auth.user?.username
             ? h(NTag, { size: 'tiny', type: 'info', round: true }, { default: () => '我' })
             : null,
@@ -195,7 +206,7 @@ onMounted(() => {
     <div class="user-toolbar">
       <h2 class="page-title">用户管理</h2>
       <NSpace align="center" :size="12">
-        <span class="muted">共 {{ userCount }} 个用户</span>
+        <span class="muted user-count-text">共 {{ userCount }} 个用户</span>
         <NButton @click="refresh" :loading="loading">
           <template #icon><NIcon :component="RefreshOutline" /></template>
           刷新
@@ -210,14 +221,14 @@ onMounted(() => {
     <NCard class="table-flex-fill">
       <NDataTable
         flex-height
-        :columns="columns"
+        :columns="visibleColumns"
         :data="users"
-        :pagination="pagination"
+        :pagination="tablePagination"
         :loading="loading"
         :bordered="false"
         size="small"
         :row-key="(u: UserRecord) => u.id"
-        :scroll-x="780"
+        :scroll-x="isMobile ? 600 : 780"
       >
         <template #empty>
           <NEmpty description="暂无用户" />
@@ -279,6 +290,11 @@ onMounted(() => {
 }
 :deep(.username-text) {
   font-weight: 600;
+  // 长用户名单行省略不断字（如 qa_weak_1788457002075），全文走 title
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .muted,
 :deep(.muted) {
@@ -290,5 +306,20 @@ onMounted(() => {
   margin: 0 !important;
   border-top: 1px solid var(--border-color);
   box-sizing: border-box;
+}
+
+/* ===================== 移动端适配（≤768px） ===================== */
+@media (max-width: 768px) {
+  .user-view {
+    gap: 8px;
+  }
+  .user-toolbar {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  // 窄屏只留标题与操作按钮，隐藏计数文字
+  .user-count-text {
+    display: none;
+  }
 }
 </style>

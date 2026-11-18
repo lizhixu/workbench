@@ -56,6 +56,7 @@ import { useSettingsStore } from '../../stores/settings'
 import { SETTING_KEYS } from '../../api/settings'
 import { useTablePagination } from '../../composables/useTablePagination'
 import { fmtDateTime } from '../../utils/time'
+import CodeEditor from '../common/CodeEditor.vue'
 
 const props = defineProps<{
   hostId: string
@@ -112,6 +113,11 @@ const editorOriginal = ref('')
 const editorLoading = ref(false)
 const editorSaving = ref(false)
 const editorReadOnly = ref(false)
+// 光标位置（行/列，1 起）：CodeEditor 的 cursor 事件回填，展示在编辑器状态栏。
+const editorCursor = ref({ line: 1, col: 1 })
+// 当前文件的语言展示名（CodeEditor 的 language 事件回填）与文件大小（字节）。
+const editorLanguage = ref('')
+const editorSize = ref(0)
 
 // Text files above this size are refused rather than loaded into the browser.
 const maxEditableSize = 2 * 1024 * 1024
@@ -125,6 +131,15 @@ const transferTitle = computed(() => {
 })
 
 const editorDirty = computed(() => editorContent.value !== editorOriginal.value)
+
+// 编辑器状态栏：行/列 · 语言 · 文件大小 · 未保存标记（语言未解析出时不占位）。
+const editorStatus = computed(() => {
+  const parts = [`行 ${editorCursor.value.line}，列 ${editorCursor.value.col}`]
+  if (editorLanguage.value) parts.push(editorLanguage.value)
+  parts.push(fmtSize(editorSize.value))
+  parts.push(editorDirty.value ? '有未保存的修改' : '内容与主机一致')
+  return parts.join(' · ')
+})
 
 function isPathCompatibleWithOS(path: string, isWin: boolean): boolean {
   if (!path) return false
@@ -447,6 +462,8 @@ async function openEditor(file: FileInfo, readOnly: boolean) {
   editorReadOnly.value = readOnly || !canWrite.value
   editorContent.value = ''
   editorOriginal.value = ''
+  editorLanguage.value = ''
+  editorSize.value = file.size
   showEditor.value = true
   editorLoading.value = true
   try {
@@ -845,7 +862,7 @@ onMounted(async () => {
       v-model:show="showEditor"
       preset="card"
       :title="editorPath"
-      style="width: 900px; max-width: 94vw"
+      style="width: 1100px; max-width: 94vw"
       :mask-closable="false"
       :on-close="closeEditor"
     >
@@ -855,17 +872,19 @@ onMounted(async () => {
           <NAlert v-if="editorReadOnly" type="warning" :bordered="false">
             只读模式：当前角色无写入权限，或该文件仅供预览。
           </NAlert>
-          <NInput
-            v-model:value="editorContent"
-            type="textarea"
-            class="editor-textarea"
-            :readonly="editorReadOnly"
-            :autosize="{ minRows: 18, maxRows: 26 }"
-            spellcheck="false"
-          />
+          <div class="editor-wrap">
+            <CodeEditor
+              v-model="editorContent"
+              :filename="editorPath"
+              :readonly="editorReadOnly"
+              @save="saveEditor"
+              @cursor="editorCursor = $event"
+              @language="editorLanguage = $event"
+            />
+          </div>
           <NSpace justify="space-between" align="center">
             <span class="editor-status">
-              {{ editorDirty ? '有未保存的修改' : '内容与主机一致' }}
+              {{ editorStatus }}
             </span>
             <NSpace>
               <NButton @click="closeEditor">关闭</NButton>
@@ -1053,10 +1072,9 @@ onMounted(async () => {
   flex-direction: column;
   gap: 12px;
 
-  .editor-textarea :deep(textarea) {
-    font-family: 'SFMono-Regular', Consolas, monospace;
-    font-size: 13px;
-    line-height: 1.6;
+  .editor-wrap {
+    height: min(68vh, 640px);
+    min-height: 300px;
   }
 
   .editor-status {

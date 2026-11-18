@@ -555,7 +555,7 @@ web/
   const rowCount = computed(() => rows.value.length)
   const { pagination, resetPage } = useTablePagination({ pageSize: 20, rowCount })
   ```
-  `rowCount` 用于**页码收敛**：删除某页末行或筛选条件收紧导致总行数变少时，页码自动被夹回最大有效页，杜绝「有数据却渲染成空白页」的缺陷；刷新、切页签或筛选条件变更时调用 `resetPage()` 回归第一页。
+  `rowCount` 用于**页码收敛**：删除某页末行或筛选条件收紧导致总行数变少时，页码自动被夹回最大有效页，杜绝「有数据却渲染成空白页」的缺陷；刷新、切页签或筛选条件变更时调用 `resetPage()` 回归第一页。自定义行列表（非 `NDataTable`，如异地组网）用独立 `NPagination` + 计算切片，分页条进全局 `.table-pagination-bar`，口径见 §9.20。
 
 #### 3. 验收口径与表格防错
 - **杜绝原生 `<NTable>` 承载不定长数据**：`NTable` 仅为静态 HTML 表格包装，无 `flex-height`、无固定表头与分页。数据表格必须使用 `NDataTable` + `columns` render 函数；单元格样式在 render 中生成时，scoped 样式必须使用 `:deep()` 穿透。
@@ -713,6 +713,7 @@ AI 助手页（`web/src/views/ai/AiChat.vue`）的输入区域采用现代化的
 - **页面纵向节奏**：两页根容器 `gap` 统一 12px。
 - **固定列宽必须锁死**：每个固定列宽的列（`flex: 0 0 <宽>px`）必须同时写 `min-width: 0`，抵消 flex item 默认的 `min-width: auto`（自动最小值 = 内容 min-content）。不写时，长内容会把列撑大、顶偏后面所有列：主机名 `instance-20260909-083055`（自然宽度 253px）实测把主机列表后续列顶偏 +30px、组网顶偏 +65～+96px，而 `.host-name` 上写好的省略号因列宽未受限全程不生效。主机名只在列内截断显示省略号，悬停看全名（已有 `title`）。
 - **组网节点域名与版本**：`.node-fqdn-box`（`flex: 1` 的 `.col-node` 内）同样遵循截断口径——域名 `.fqdn-text`（`flex: 1` + `min-width: 0` + 单行省略号，`title` 悬停看全名）、版本 `.ver-text`（`flex-shrink: 0` 不被挤掉）、外层 `.node-fqdn-box` 补 `min-width: 0`。此前两者均无截断，长域名换行两行、窄视口下溢出盖住后面的打洞通道与操作列。
+- **分页（自定义行列表不用 `NDataTable` 的 `pagination`）**：行列表数据全量在内存时走前端分页——独立 `NPagination` 嵌在卡片底部的全局 `.table-pagination-bar`（`flex-shrink: 0`，固定在列表下方），按计算切片渲染当前页（`filteredNodes.slice((page - 1) * pageSize, page * pageSize)`）；每页 20 条、可选 20/50/100；搜索/筛选变化回第一页，筛选收紧导致总行数变少时页码夹回最大有效页；`.node-list` 本身是数据区滚动容器（`flex: 1; min-height: 0; overflow-y: auto`），分页条不参与滚动；窄屏（≤768px）分页切 `simple` 紧凑形态（`useIsMobile`）。无数据时分页条不渲染。
 - **不对齐的边界**：第 5 列之后两页内容语义不同（主机列表是 IP/计费列，组网是节点域名弹性列/打洞通道/操作组），只保证左缘、右缘与前 5 列起点对齐，不强求后段列宽相同。
 
 ### 9.21 异步数据首载状态规范

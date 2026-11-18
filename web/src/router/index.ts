@@ -30,6 +30,8 @@ const routes: RouteRecordRaw[] = [
       { path: 'alerts', name: 'alerts', component: () => import('../views/alerts/AlertList.vue'), meta: { viewName: 'AlertList' } },
 	      { path: 'vault', name: 'vault', component: () => import('../views/vault/CredentialList.vue'), meta: { viewName: 'CredentialList' } },
 	      { path: 'network', name: 'network', component: () => import('../views/network/NetworkList.vue'), meta: { viewName: 'NetworkList' } },
+	      // 复数别名重定向：/networks 无匹配子路由时会渲染空白页，统一回到单数路由
+	      { path: 'networks', redirect: '/network' },
 	      { path: 'apps', name: 'apps', component: () => import('../views/apps/AppList.vue'), meta: { viewName: 'AppList' } },
 	      { path: 'apps/create', name: 'app-create', component: () => import('../views/apps/AppCreate.vue'), meta: { viewName: 'AppCreate' } },
 	      { path: 'apps/:id', name: 'app-detail', component: () => import('../views/apps/AppDetail.vue'), meta: { viewName: 'AppDetail' } },

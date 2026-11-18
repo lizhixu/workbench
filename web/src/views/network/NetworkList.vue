@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { onMounted, ref, computed } from 'vue'
+import { onMounted, ref, computed, watch } from 'vue'
 import {
   NButton, NSpace, NTag, NModal, NForm, NFormItem,
-  NInput, NSelect, NSwitch, useMessage, NIcon, NAlert, NPopconfirm, NText, NTooltip,
+  NInput, NSelect, NSwitch, useMessage, NIcon, NAlert, NPagination, NPopconfirm, NText, NTooltip,
   NSpin, NEmpty,
 } from 'naive-ui'
 import {
@@ -17,6 +17,7 @@ import {
   pingNetworkNode, type NetworkConfig, type NetworkNode, type PingResult,
 } from '../../api/network'
 import { copyToClipboard } from '../../utils/clipboard'
+import { useIsMobile } from '../../composables/useIsMobile'
 
 defineOptions({ name: 'NetworkList' })
 
@@ -94,6 +95,34 @@ const filteredNodes = computed(() => {
     (n.node_name && n.node_name.toLowerCase().includes(q))
   )
 })
+
+// 前端分页：组网节点全量已在内存，按 AGENTS.md §8.2 不定长列表必须分页。
+// 自定义行列表不用 NDataTable，分页条用独立 NPagination + 计算切片
+// （与审计会话列表 SessionList.vue 同款），数据区滚动、分页条固定在卡片底部。
+const isMobile = useIsMobile()
+const page = ref(1)
+const pageSize = ref(20)
+const pageSizes = [20, 50, 100]
+const pagedNodes = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return filteredNodes.value.slice(start, start + pageSize.value)
+})
+// 搜索/筛选变化回第一页
+watch([searchKeyword, statusFilter], () => {
+  page.value = 1
+})
+// 页码收敛：筛选收紧导致总行数变少时夹回最大有效页，杜绝空白页
+watch([() => filteredNodes.value.length, pageSize], ([count, size]) => {
+  const maxPage = Math.max(1, Math.ceil(count / size))
+  if (page.value > maxPage) page.value = maxPage
+})
+function handlePageChange(p: number) {
+  page.value = p
+}
+function handlePageSizeChange(size: number) {
+  pageSize.value = size
+  page.value = 1
+}
 
 async function copyText(text: string, label: string) {
   if (!text) return
@@ -373,7 +402,7 @@ onMounted(loadData)
 
       <div v-else class="node-list">
         <div
-          v-for="row in filteredNodes"
+          v-for="row in pagedNodes"
           :key="row.host_id"
           class="node-row"
         >
@@ -546,6 +575,18 @@ onMounted(loadData)
             </template>
           </div>
         </div>
+      </div>
+      <div v-if="filteredNodes.length > 0" class="table-pagination-bar">
+        <NPagination
+          :page="page"
+          :page-size="pageSize"
+          :item-count="filteredNodes.length"
+          :page-sizes="pageSizes"
+          :simple="isMobile"
+          show-size-picker
+          @update:page="handlePageChange"
+          @update:page-size="handlePageSizeChange"
+        />
       </div>
     </div>
 
@@ -873,7 +914,11 @@ onMounted(loadData)
     justify-content: center;
   }
 
+  // 数据区滚动：列表吃掉卡片剩余高度、内部滚动，分页条固定在卡片底部（见 DESIGN.md §9.4）。
   .node-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
     display: flex;
     flex-direction: column;
 

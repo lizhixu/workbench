@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { NAlert, NButton, NSpin, useMessage } from 'naive-ui'
 import { getHost } from '../../api/hosts'
@@ -13,6 +13,10 @@ import FileManagerPane from '../../components/host/FileManagerPane.vue'
 defineOptions({ name: 'FileManager' })
 
 const route = useRoute()
+const initialPath = computed(() => {
+  const p = route.query.path
+  return typeof p === 'string' && p.trim() ? p.trim() : undefined
+})
 const message = useMessage()
 const workspace = useWorkspaceStore()
 const settingsStore = useSettingsStore()
@@ -61,7 +65,7 @@ onMounted(async () => {
       <!-- 主机已取到才挂载面板，并把 os 传进去：面板不再为判 OS 另调一次
            getHost，挂载后直接进入文件列表加载态。 -->
       <div class="file-pane-wrap">
-        <FileManagerPane :host-id="host.id" :os="host.os" />
+        <FileManagerPane :host-id="host.id" :os="host.os" :initial-path="initialPath" />
       </div>
     </template>
     <template v-else>

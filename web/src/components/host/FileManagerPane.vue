@@ -39,6 +39,7 @@ import {
 } from '@vicons/ionicons5'
 import {
   fileList,
+  fileStat,
   fileMkdir,
   fileDownloadUrl,
   fileUpload,
@@ -59,6 +60,8 @@ import { fmtDateTime } from '../../utils/time'
 const props = defineProps<{
   hostId: string
   os?: string
+  /** 从应用挂载卷等入口直达某个目录：优先于设置里的默认路径。 */
+  initialPath?: string
 }>()
 
 const message = useMessage()
@@ -130,17 +133,33 @@ function isPathCompatibleWithOS(path: string, isWin: boolean): boolean {
   return isWin ? isWinFormat : isPosixFormat
 }
 
-function applyDefaultPath(custom: string) {
-  if (custom && isPathCompatibleWithOS(custom, isWindows.value)) {
-    currentPath.value = custom
-    pathInput.value = custom
-  } else if (isWindows.value && !isPathCompatibleWithOS(currentPath.value, true)) {
-    currentPath.value = 'C:\\'
-    pathInput.value = 'C:\\'
-  } else if (!isWindows.value && !isPathCompatibleWithOS(currentPath.value, false)) {
-    currentPath.value = '/root'
-    pathInput.value = '/root'
+// 未配 initialPath / 初始路径打不开时的回落路径：设置默认路径优先于 OS 默认。
+function defaultPath(): string {
+  const custom = settingsStore.getUserKey<string>(SETTING_KEYS.filesDefaultPath, '').trim()
+  if (custom && isPathCompatibleWithOS(custom, isWindows.value)) return custom
+  return isWindows.value ? 'C:\\' : '/root'
+}
+
+// 取父目录（与 goBack 同规则，抽出来供初始路径解析复用）。
+function parentDirOf(p: string): string {
+  const norm = p.replace(/\\/g, '/')
+  const isWin = isWindows.value || /^[a-zA-Z]:/.test(norm)
+  if (isWin) {
+    const driveMatch = norm.match(/^([a-zA-Z]:)/)
+    const drive = driveMatch ? driveMatch[1] : 'C:'
+    const sub = norm.slice(drive.length).split('/').filter(Boolean)
+    if (sub.length > 0) {
+      sub.pop()
+      return sub.length === 0 ? drive + '\\' : drive + '\\' + sub.join('\\')
+    }
+    return drive + '\\'
   }
+  const parts = norm.split('/').filter(Boolean)
+  if (parts.length > 1) {
+    parts.pop()
+    return '/' + parts.join('/')
+  }
+  return '/'
 }
 
 async function detectOS() {
@@ -163,17 +182,48 @@ async function detectOS() {
   }
 }
 
-async function load() {
+async function load(silent = false): Promise<string | null> {
   loading.value = true
   try {
     const data = await fileList(props.hostId, currentPath.value)
     files.value = data || []
     resetPage()
     pathInput.value = currentPath.value
+    return null
   } catch (e: any) {
-    message.error(e.message || '获取文件列表失败')
+    const msg = e.message || '获取文件列表失败'
+    if (!silent) message.error(msg)
+    return msg
   } finally {
     loading.value = false
+  }
+}
+
+// 初始进入的路径解析：单文件挂载（如 custom.cnf）自动进父目录；
+// 路径不存在或不可读时回落默认路径。只在进入时做一次，不影响手动导航。
+async function loadInitial() {
+  const firstError = await load(true)
+  if (firstError === null) return
+  try {
+    const st = await fileStat(props.hostId, currentPath.value)
+    if (st && st.is_dir === false) {
+      const parent = parentDirOf(currentPath.value)
+      if (parent && parent !== currentPath.value) {
+        currentPath.value = parent
+        pathInput.value = parent
+        if ((await load(true)) === null) return
+      }
+    }
+  } catch {
+    // stat 失败则继续回落默认路径
+  }
+  const fallback = defaultPath()
+  if (fallback !== currentPath.value) {
+    currentPath.value = fallback
+    pathInput.value = fallback
+    await load()
+  } else {
+    message.error(firstError)
   }
 }
 
@@ -193,33 +243,7 @@ function submitPathInput() {
 }
 
 function goBack() {
-  const p = currentPath.value.replace(/\\/g, '/')
-  const isWin = isWindows.value || /^[a-zA-Z]:/.test(p)
-
-  if (isWin) {
-    // Windows drive path like C:/Users/Administrator
-    const driveMatch = p.match(/^([a-zA-Z]:)/)
-    const drive = driveMatch ? driveMatch[1] : 'C:'
-    const sub = p.slice(drive.length).split('/').filter(Boolean)
-    if (sub.length > 0) {
-      sub.pop()
-      if (sub.length === 0) {
-        currentPath.value = drive + '\\'
-      } else {
-        currentPath.value = drive + '\\' + sub.join('\\')
-      }
-    } else {
-      currentPath.value = drive + '\\'
-    }
-  } else {
-    const parts = p.split('/').filter(Boolean)
-    if (parts.length > 1) {
-      parts.pop()
-      currentPath.value = '/' + parts.join('/')
-    } else {
-      currentPath.value = '/'
-    }
-  }
+  currentPath.value = parentDirOf(currentPath.value)
   load()
 }
 
@@ -620,24 +644,44 @@ const columns: DataTableColumns<FileInfo> = [
   },
 ]
 
+// 初始路径优先级：显式 initialPath > 设置默认路径 > OS 默认。
+async function initPathAndLoad() {
+  await detectOS()
+  await settingsStore.load()
+  const explicit = (props.initialPath || '').trim()
+  if (explicit && isPathCompatibleWithOS(explicit, isWindows.value)) {
+    currentPath.value = explicit
+    pathInput.value = explicit
+  } else {
+    currentPath.value = defaultPath()
+    pathInput.value = currentPath.value
+  }
+  await loadInitial()
+}
+
 watch(
   () => props.hostId,
   async () => {
     hostOs.value = ''
-    await detectOS()
-    const custom = settingsStore.getUserKey<string>(SETTING_KEYS.filesDefaultPath, '').trim()
-    applyDefaultPath(custom)
-    load()
+    await initPathAndLoad()
+  }
+)
+
+// 带 ?path= 再次进入已缓存的页面时，initialPath 变化即跳转（空值忽略，
+// 只作进入指令，不接管面板内的手动导航）。
+watch(
+  () => props.initialPath,
+  async (next, prev) => {
+    if (!next || next === prev || next === currentPath.value) return
+    if (!isPathCompatibleWithOS(next, isWindows.value)) return
+    currentPath.value = next
+    pathInput.value = next
+    await loadInitial()
   }
 )
 
 onMounted(async () => {
-  await detectOS()
-  // 通用设置里配了文件默认路径就优先用（但须与目标主机 OS 路径格式匹配）；留空或格式不兼容则沿用按 OS 的默认值。
-  await settingsStore.load()
-  const custom = settingsStore.getUserKey<string>(SETTING_KEYS.filesDefaultPath, '').trim()
-  applyDefaultPath(custom)
-  load()
+  await initPathAndLoad()
 })
 </script>
 
@@ -650,7 +694,7 @@ onMounted(async () => {
           <NButton secondary @click="goUp" title="返回上一级">
             <template #icon><NIcon><ArrowUpOutline /></NIcon></template>
           </NButton>
-          <NButton secondary @click="load" title="刷新">
+          <NButton secondary @click="() => load()" title="刷新">
             <template #icon><NIcon><RefreshOutline /></NIcon></template>
           </NButton>
         </NButtonGroup>

@@ -4,14 +4,14 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   NAlert, NButton, NCard, NCheckbox, NCheckboxGroup, NCode, NCollapse, NCollapseItem, NDataTable, NDescriptions, NDescriptionsItem,
   NDynamicInput, NEmpty, NForm, NFormItem, NIcon, NInput, NInputNumber, NModal, NPagination, NPopconfirm, NPopover, NRadio, NRadioGroup,
-  NSelect, NSpace, NSpin, NSwitch, NTabPane, NTabs, NUpload,
+  NSelect, NSpace, NSpin, NSwitch, NTabPane, NTabs, NTooltip, NUpload,
   NTag, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns, UploadCustomRequestOptions, UploadFileInfo } from 'naive-ui'
 import {
   AddOutline,
   ArrowBackOutline, ArrowUpCircleOutline, CloudUploadOutline, CopyOutline,
-  DownloadOutline, FolderOutline,
+  DownloadOutline, FolderOpenOutline, FolderOutline,
   GitCommitOutline, MoveOutline, PlayOutline, RefreshOutline, SparklesOutline, StopOutline,
   SwapHorizontalOutline, TerminalOutline, TrashOutline,
 } from '@vicons/ionicons5'
@@ -41,6 +41,7 @@ import { bothMeshed } from '../../utils/mesh'
 import { fmtDateTime } from '../../utils/time'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useAuthStore } from '../../stores/auth'
+import { useWorkspaceStore } from '../../stores/workspace'
 import OpsTunnelModal from '../../components/tunnels/OpsTunnelModal.vue'
 import AppMigrateModal from '../../components/apps/AppMigrateModal.vue'
 import AppRuntimeLogs from '../../components/apps/AppRuntimeLogs.vue'
@@ -54,6 +55,7 @@ const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const auth = useAuthStore()
+const workspace = useWorkspaceStore()
 
 const appId = computed(() => String(route.params.id ?? ''))
 const app = ref<AppEntity | null>(null)
@@ -2218,9 +2220,45 @@ const volumeColumns = computed<DataTableColumns<ParsedVolume>>(() => {
         r.mode === 'ro' ? '只读' : '读写',
       ),
     },
+    {
+      title: '操作', key: 'actions', width: 132,
+      render: (r) => {
+        // 能打开：宿主路径是绝对路径（bind 挂载与已发现的具名卷挂载点）；
+        // 仅卷名（具名卷未发现时）没有可打开的宿主路径，置灰并说明原因。
+        const openable = r.src.startsWith('/') || /^[A-Za-z]:[\\/]/.test(r.src)
+        const btn = h(
+          NButton,
+          { size: 'small', disabled: !openable, onClick: () => openVolumeInFiles(r) },
+          {
+            icon: () => h(NIcon, { component: FolderOpenOutline }),
+            default: () => '打开文件夹',
+          },
+        )
+        if (openable) return btn
+        return h(NTooltip, { trigger: 'hover' }, {
+          trigger: () => h('span', { style: 'display: inline-block' }, btn),
+          default: () => '该卷尚未发现宿主挂载点，容器启动后自动发现',
+        })
+      },
+    },
   )
   return cols
 })
+
+// 挂载卷表格「打开文件夹」：跳独立文件管理页并直达该卷的宿主目录。
+// 页签 path 不带 query（query 只作进入指令，面板内手动导航不回写）。
+function openVolumeInFiles(volume: ParsedVolume) {
+  const hostId = app.value?.host_id
+  if (!hostId) return
+  workspace.openTab({
+    key: `/files/${hostId}`,
+    title: appHostname.value || hostId,
+    path: `/files/${hostId}`,
+    closable: true,
+    viewName: 'FileManager',
+  })
+  router.push({ name: 'file-manager', params: { id: hostId }, query: { path: volume.src } })
+}
 
 const volArchiveColumns = computed<DataTableColumns<VolumeArchive>>(() => [
   { title: '创建时间', key: 'created_at', width: 180, render: (r) => h('span', { class: 'mono-font' }, formatTime(r.created_at)) },

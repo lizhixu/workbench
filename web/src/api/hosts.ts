@@ -101,6 +101,19 @@ export function fileRemove(hostId: string, path: string) {
   return unwrap<{ ok: boolean }>(http.delete(`/hosts/${hostId}/files`, { params: { path } }))
 }
 
+export function fileChmod(hostId: string, path: string, mode: number) {
+  return unwrap<{ ok: boolean }>(http.post(`/hosts/${hostId}/files/chmod`, { path, mode }))
+}
+
+// fileCompress archives path as <name>.tar.gz next to the source and returns
+// the archive path and size. The server waits up to 120s, so the HTTP
+// timeout is aligned a little above it.
+export function fileCompress(hostId: string, path: string) {
+  return unwrap<{ data: { archive: string; size: number } }>(
+    http.post(`/hosts/${hostId}/files/compress`, { path }, { timeout: 150000 }),
+  ).then((r) => r.data)
+}
+
 export function fileDownloadUrl(hostId: string, path: string) {
   const token = localStorage.getItem('watchman_token') || ''
   const tokParam = token ? `&token=${encodeURIComponent(token)}` : ''
@@ -124,6 +137,18 @@ export async function fileReadText(hostId: string, path: string) {
     timeout: 60000,
   })
   return typeof resp.data === 'string' ? resp.data : String(resp.data ?? '')
+}
+
+// fileReadHead fetches the first `length` bytes of a file (default 8KB) for
+// text/binary sniffing, so the editor can decide by content — not by
+// filename — whether the file is safe to open as text.
+export async function fileReadHead(hostId: string, path: string, length = 8192): Promise<Uint8Array> {
+  const resp = await http.get(`/hosts/${hostId}/files/content`, {
+    params: { path, offset: 0, length },
+    responseType: 'arraybuffer',
+    timeout: 30000,
+  })
+  return new Uint8Array(resp.data as ArrayBuffer)
 }
 
 // fileWriteText saves edited text back to the host, reusing the chunked upload

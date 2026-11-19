@@ -24,8 +24,10 @@ export function dedupeMountsByFilesystem(mounts: Mount[]): Mount[] {
   return out
 }
 
-// Disk capacity in binary units (KiB/MiB/GiB/TiB), matching df -h. Byte rates
-// and monthly traffic keep their decimal formatting.
+// Disk capacity in binary units, labelled GB/MB/KB/TB per Chinese cloud-vendor
+// console convention (Alibaba/Tencent/Huawei: "40GB ESSD", "2G memory" —
+// binary values under a GB label). Values match df -h. Byte rates and
+// monthly traffic keep their own formatting (see MetricsPane).
 export function formatDiskBytes(n: number, digits = 2): string {
   if (!n || isNaN(n)) return '0 B'
   if (n >= 1024 ** 4) return (n / 1024 ** 4).toFixed(digits) + ' TB'

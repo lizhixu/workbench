@@ -77,6 +77,8 @@ export const actionLabels: Record<string, string> = {
   file_mkdir: '新建目录',
   file_move: '移动/重命名文件',
   file_copy: '复制文件',
+  file_chmod: '修改文件权限',
+  file_compress: '压缩文件',
   file_remove: '删除文件',
   file_download: '下载文件',
   file_upload: '上传文件',

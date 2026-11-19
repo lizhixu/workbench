@@ -1,10 +1,15 @@
 package files
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +37,18 @@ func (s *capturingSender) acks() []*agentpb.Ack {
 	for _, m := range s.msgs {
 		if a := m.GetAck(); a != nil {
 			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func (s *capturingSender) chunks() []*agentpb.FileChunk {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*agentpb.FileChunk
+	for _, m := range s.msgs {
+		if c := m.GetFileChunk(); c != nil {
+			out = append(out, c)
 		}
 	}
 	return out
@@ -221,5 +238,218 @@ func TestWriteDigestMismatchDiscardsFile(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("corrupt file should have been removed, stat err = %v", err)
+	}
+}
+
+// readTarGz returns the entries of a .tar.gz archive: regular-file contents
+// by name plus the full name list (directories included).
+func readTarGz(t *testing.T, archive string) (map[string]string, []string) {
+	t.Helper()
+	f, err := os.Open(archive)
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	defer f.Close()
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	defer gr.Close()
+	tr := tar.NewReader(gr)
+	files := map[string]string{}
+	var names []string
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("tar next: %v", err)
+		}
+		names = append(names, hdr.Name)
+		if hdr.Typeflag == tar.TypeReg {
+			b, err := io.ReadAll(tr)
+			if err != nil {
+				t.Fatalf("read tar entry %s: %v", hdr.Name, err)
+			}
+			files[hdr.Name] = string(b)
+		}
+	}
+	return files, names
+}
+
+// compressResult runs one compress op and returns the archive path from the
+// single JSON chunk, or fails the test on an ack error.
+func compressResult(t *testing.T, m *Manager, sender *capturingSender, opID, path string) (string, int64) {
+	t.Helper()
+	runWithDeadline(t, "compress op", func() {
+		m.Handle(&agentpb.FileOp{OpId: opID, Op: "compress", Path: path})
+	})
+	if acks := sender.acks(); len(acks) != 0 {
+		t.Fatalf("compress acked instead of chunking: %+v", acks)
+	}
+	chunks := sender.chunks()
+	if len(chunks) != 1 {
+		t.Fatalf("want exactly 1 result chunk, got %d", len(chunks))
+	}
+	if !chunks[0].GetEof() {
+		t.Fatalf("result chunk must be the final one")
+	}
+	var res struct {
+		Archive string `json:"archive"`
+		Size    int64  `json:"size"`
+	}
+	if err := json.Unmarshal(chunks[0].GetData(), &res); err != nil {
+		t.Fatalf("result chunk is not JSON: %v", err)
+	}
+	if res.Archive == "" || res.Size <= 0 {
+		t.Fatalf("bad compress result: %+v", res)
+	}
+	return res.Archive, res.Size
+}
+
+func TestHandleChmodAppliesMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "perm.txt")
+	if err := os.WriteFile(path, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sender := &capturingSender{}
+	m := NewManager(nil)
+	m.SetSender(sender)
+
+	runWithDeadline(t, "chmod op", func() {
+		m.Handle(&agentpb.FileOp{OpId: "c1", Op: "chmod", Path: path, Mode: 0600})
+	})
+	acks := sender.acks()
+	if len(acks) != 1 || !acks[0].GetOk() {
+		t.Fatalf("chmod should ack ok, got %+v", acks)
+	}
+	if st, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	} else if st.Mode().Perm() != 0600 {
+		t.Errorf("mode after chmod = %o, want 600", st.Mode().Perm())
+	}
+}
+
+func TestHandleChmodRejectsBadModeAndMissingFile(t *testing.T) {
+	dir := t.TempDir()
+	sender := &capturingSender{}
+	m := NewManager(nil)
+	m.SetSender(sender)
+
+	runWithDeadline(t, "chmod with mode above 07777", func() {
+		m.Handle(&agentpb.FileOp{OpId: "c2", Op: "chmod", Path: filepath.Join(dir, "x"), Mode: 010000})
+	})
+	runWithDeadline(t, "chmod on a missing file", func() {
+		m.Handle(&agentpb.FileOp{OpId: "c3", Op: "chmod", Path: filepath.Join(dir, "nope"), Mode: 0644})
+	})
+	acks := sender.acks()
+	if len(acks) != 2 {
+		t.Fatalf("want 2 failing acks, got %+v", acks)
+	}
+	for i, a := range acks {
+		if a.GetOk() {
+			t.Errorf("ack %d should have failed", i)
+		}
+	}
+}
+
+func TestHandleCompressSingleFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sender := &capturingSender{}
+	m := NewManager(nil)
+	m.SetSender(sender)
+
+	archive, size := compressResult(t, m, sender, "z1", path)
+	if archive != filepath.Join(dir, "a.txt.tar.gz") {
+		t.Errorf("archive = %s, want %s", archive, filepath.Join(dir, "a.txt.tar.gz"))
+	}
+	if st, err := os.Stat(archive); err != nil || st.Size() != size {
+		t.Errorf("archive stat size = %v, want %d", st, size)
+	}
+	files, _ := readTarGz(t, archive)
+	if got, ok := files["a.txt"]; !ok || got != "hello" {
+		t.Errorf("archive content = %v, want a.txt=hello", files)
+	}
+}
+
+func TestHandleCompressDirectory(t *testing.T) {
+	dir := t.TempDir()
+	data := filepath.Join(dir, "data")
+	if err := os.MkdirAll(filepath.Join(data, "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "f.txt"), []byte("f"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "sub", "g.txt"), []byte("g"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sender := &capturingSender{}
+	m := NewManager(nil)
+	m.SetSender(sender)
+
+	archive, _ := compressResult(t, m, sender, "z2", data)
+	files, names := readTarGz(t, archive)
+	if files["data/f.txt"] != "f" || files["data/sub/g.txt"] != "g" {
+		t.Errorf("archive files = %v", files)
+	}
+	want := map[string]bool{"data/": true, "data/f.txt": true, "data/sub/": true, "data/sub/g.txt": true}
+	for _, n := range names {
+		delete(want, n)
+	}
+	if len(want) != 0 {
+		t.Errorf("missing archive entries: %v (have %v)", want, names)
+	}
+}
+
+func TestHandleCompressNameCollisionAppendsSuffix(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// A stale archive already occupies the natural name.
+	if err := os.WriteFile(filepath.Join(dir, "a.txt.tar.gz"), []byte("stale"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sender := &capturingSender{}
+	m := NewManager(nil)
+	m.SetSender(sender)
+
+	archive, _ := compressResult(t, m, sender, "z3", path)
+	if archive != filepath.Join(dir, "a.txt-1.tar.gz") {
+		t.Errorf("archive = %s, want a.txt-1.tar.gz", archive)
+	}
+}
+
+func TestHandleCompressRefusesRootAndMissingSource(t *testing.T) {
+	dir := t.TempDir()
+	sender := &capturingSender{}
+	m := NewManager(nil)
+	m.SetSender(sender)
+
+	runWithDeadline(t, "compress /", func() {
+		m.Handle(&agentpb.FileOp{OpId: "z4", Op: "compress", Path: "/"})
+	})
+	runWithDeadline(t, "compress a missing path", func() {
+		m.Handle(&agentpb.FileOp{OpId: "z5", Op: "compress", Path: filepath.Join(dir, "nope")})
+	})
+	acks := sender.acks()
+	if len(acks) != 2 {
+		t.Fatalf("want 2 failing acks, got %+v", acks)
+	}
+	for i, a := range acks {
+		if a.GetOk() {
+			t.Errorf("ack %d should have failed", i)
+		}
+	}
+	if acks[0].GetError() == "" || !strings.Contains(acks[0].GetError(), "根目录") {
+		t.Errorf("root compress error should mention 根目录, got %q", acks[0].GetError())
 	}
 }

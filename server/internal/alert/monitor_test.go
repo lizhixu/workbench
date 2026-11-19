@@ -303,8 +303,8 @@ func TestMonitorHostSpecificTrafficAlert(t *testing.T) {
 				Status:         "online",
 				TrafficLimitGB: 100,
 				Metrics: &agentpb.MetricsSample{
-					MonthRx: 48e9, // 48 decimal GB each way → 96% of quota: 80-tier only
-					MonthTx: 48e9,
+					MonthRx: 48 * (1 << 30), // 48 GB each way → 96% of quota: 80-tier only
+					MonthTx: 48 * (1 << 30),
 				},
 			},
 			{
@@ -314,8 +314,8 @@ func TestMonitorHostSpecificTrafficAlert(t *testing.T) {
 				TrafficLimitGB:  100,
 				TrafficCalcType: "out",
 				Metrics: &agentpb.MetricsSample{
-					MonthRx: 60e9,
-					MonthTx: 50e9, // 50% of quota → no event
+					MonthRx: 60 * (1 << 30),
+					MonthTx: 50 * (1 << 30), // 50% of quota → no event
 				},
 			},
 		},

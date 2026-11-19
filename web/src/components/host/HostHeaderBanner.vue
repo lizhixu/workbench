@@ -133,13 +133,16 @@ const distro = computed(() => props.host.distro || props.host.os || '')
 
 function formatMem(bytes?: number): string {
   if (!bytes || bytes <= 0) return '-'
-  // 口径与监控页 fmtBytes 一致：十进制 GB（AGENTS.md §3.11，1 GB = 1e9 B）。
-  const gb = bytes / 1e9
-  if (gb >= 1) {
-    return gb.toFixed(1) + ' GB'
+  // 内存按国内云厂商控制台口径：GB 标签、二进制数值（1 GB = 1024³ B），与
+  // free / 任务管理器看到的数值一致（阿里云/腾讯云/华为云控制台同样写 GB，
+  // 数值本身是二进制的）。小数位保留 2 位，与监控页 fmtMemBytes 一致，
+  // 总量在横幅、列表与监控页三处必须显示完全一致。
+  const gib = bytes / (1 << 30)
+  if (gib >= 1) {
+    return gib.toFixed(2) + ' GB'
   }
-  const mb = bytes / 1e6
-  return Math.round(mb) + ' MB'
+  const mib = bytes / (1 << 20)
+  return mib.toFixed(2) + ' MB'
 }
 
 const cpuCoresDisplay = computed(() => {
@@ -270,7 +273,7 @@ const trafficDisplay = computed(() => {
     usedBytes = h.month_rx || 0
     calcLabel = '入向'
   }
-  const usedGB = usedBytes / 1e9
+  const usedGB = usedBytes / (1 << 30)
   const pct = ((usedGB / h.traffic_limit_gb) * 100).toFixed(1)
   return `${usedGB.toFixed(1)} / ${h.traffic_limit_gb} GB (${pct}%, ${calcLabel})`
 })
@@ -278,8 +281,8 @@ const trafficDisplay = computed(() => {
 const trafficTooltip = computed(() => {
   const h = props.host
   if (!h.traffic_limit_gb) return ''
-  const rxGB = ((h.month_rx || 0) / 1e9).toFixed(2)
-  const txGB = ((h.month_tx || 0) / 1e9).toFixed(2)
+  const rxGB = ((h.month_rx || 0) / (1 << 30)).toFixed(2)
+  const txGB = ((h.month_tx || 0) / (1 << 30)).toFixed(2)
   return `本月入向: ${rxGB} GB | 本月出向: ${txGB} GB | 重置日: 每月 ${h.traffic_reset_day || 1} 号`
 })
 
@@ -345,7 +348,7 @@ const expiryTooltip = computed(() => {
             <span class="spec-value" :title="host.cpu_model ? `处理器型号: ${host.cpu_model}` : ''">{{ cpuCoresDisplay }}</span>
           </div>
           <div class="spec-row">
-            <span class="spec-label">内存</span>
+            <span class="spec-label">内存总量</span>
             <span class="spec-value">{{ formatMem(host.mem_total) }}</span>
           </div>
         </div>

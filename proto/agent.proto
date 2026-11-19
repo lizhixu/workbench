@@ -173,7 +173,7 @@ message TerminalClose {
 message FileOp {
   string op_id = 1;
   // op is one of: read, write, stat, list, mkdir, move, remove, copy,
-  // upload, download, resume.
+  // upload, download, resume, chmod, compress.
   string op = 2;
   string path = 3;
   int64 offset = 4;
@@ -186,6 +186,9 @@ message FileOp {
   // sha256 is the hex digest the finished write must match. Sent with the
   // initial write op; empty means the agent skips integrity verification.
   string sha256 = 11;
+  // mode carries the permission bits for op "chmod" (e.g. 0755, as an
+  // integer). It is ignored by every other op.
+  uint32 mode = 12;
 }
 
 message FileChunk {

@@ -1,17 +1,21 @@
 // Package files implements local file operations on the agent: list, stat,
-// read (chunked), write (chunked), mkdir, move, remove, copy.
+// read (chunked), write (chunked), mkdir, move, remove, copy, chmod and
+// compress (tar.gz archive next to the source).
 //
 // All operations are driven by FileOp messages from the server; results are
 // streamed back as FileChunk (for read/download) or Ack messages.
 package files
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -126,6 +130,10 @@ func (m *Manager) Handle(op *agentpb.FileOp) {
 		m.handleRemove(op)
 	case "copy":
 		m.handleCopy(op)
+	case "chmod":
+		m.handleChmod(op)
+	case "compress":
+		m.handleCompress(op)
 	case "download":
 		m.handleRead(op) // same as read, stream back chunks
 	case "upload":
@@ -491,6 +499,184 @@ func (m *Manager) handleCopy(op *agentpb.FileOp) {
 		return
 	}
 	m.ack(op.GetOpId(), true, "", "")
+}
+
+// handleChmod applies the permission bits carried in op.Mode (e.g. 0755).
+// Only the low 12 bits (setuid/setgid/sticky + rwxrwxrwx) are accepted; a
+// mode of 0 is valid (removes every permission). Windows has no Unix
+// permission bits — os.Chmod there only flips the readonly flag — so the
+// operation is refused outright instead of silently half-applying.
+func (m *Manager) handleChmod(op *agentpb.FileOp) {
+	if runtime.GOOS == "windows" {
+		m.ack(op.GetOpId(), false, "Windows 主机不支持修改文件权限", "")
+		return
+	}
+	mode := op.GetMode()
+	if mode > 07777 {
+		m.ack(op.GetOpId(), false, fmt.Sprintf("无效的权限值: %o", mode), "")
+		return
+	}
+	targetPath := normalizePath(op.GetPath())
+	if err := os.Chmod(targetPath, os.FileMode(mode)); err != nil {
+		m.ack(op.GetOpId(), false, err.Error(), "")
+		return
+	}
+	m.ack(op.GetOpId(), true, "", "")
+}
+
+// handleCompress archives a file or directory as <name>.tar.gz next to the
+// source (pure Go tar+gzip, so it works on Windows hosts too). When the
+// archive name is taken, -1/-2/... is appended. The result is one JSON chunk
+// {"archive": "<path>", "size": <bytes>}; failures are acked like list/stat.
+func (m *Manager) handleCompress(op *agentpb.FileOp) {
+	src := normalizePath(op.GetPath())
+	if isRootPath(src) {
+		m.ack(op.GetOpId(), false, "不能压缩根目录", "")
+		return
+	}
+	if _, err := os.Lstat(src); err != nil {
+		m.ack(op.GetOpId(), false, err.Error(), "")
+		return
+	}
+	out, archive, err := createArchiveFile(src)
+	if err != nil {
+		m.ack(op.GetOpId(), false, err.Error(), "")
+		return
+	}
+	if err := writeTarGz(src, archive, out); err != nil {
+		_ = out.Close()
+		_ = os.Remove(archive)
+		m.ack(op.GetOpId(), false, err.Error(), "")
+		return
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(archive)
+		m.ack(op.GetOpId(), false, err.Error(), "")
+		return
+	}
+	st, err := os.Stat(archive)
+	if err != nil {
+		m.ack(op.GetOpId(), false, err.Error(), "")
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"archive": archive,
+		"size":    st.Size(),
+	})
+	m.sendChunk(&agentpb.FileChunk{
+		OpId: op.GetOpId(),
+		Data: payload,
+		Eof:  true,
+	})
+}
+
+// isRootPath reports whether p is a filesystem root, which must never be
+// archived whole (it would try to tar /proc, /sys and the rest of the system).
+func isRootPath(p string) bool {
+	if p == "/" || p == `\` {
+		return true
+	}
+	if runtime.GOOS == "windows" && len(p) == 3 && p[1] == ':' && (p[2] == '\\' || p[2] == '/') {
+		return true
+	}
+	return false
+}
+
+// createArchiveFile opens <base>.tar.gz next to src with O_EXCL, appending
+// -1/-2/... when the name is taken. The O_EXCL create makes the pick atomic,
+// so two concurrent compresses of the same source land on different names.
+func createArchiveFile(src string) (*os.File, string, error) {
+	parent := filepath.Dir(src)
+	base := filepath.Base(src)
+	for i := 0; i < 100; i++ {
+		name := base + ".tar.gz"
+		if i > 0 {
+			name = fmt.Sprintf("%s-%d.tar.gz", base, i)
+		}
+		archive := filepath.Join(parent, name)
+		f, err := os.OpenFile(archive, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		if err == nil {
+			return f, archive, nil
+		}
+		if !os.IsExist(err) {
+			return nil, "", err
+		}
+	}
+	return nil, "", fmt.Errorf("已存在同名压缩包，请先删除旧的 %s.tar.gz", base)
+}
+
+// writeTarGz writes src (file or directory) into out as a gzipped tar.
+// Entries are named relative to src's parent, so extracting reproduces the
+// top-level name. Symlinks are stored as links (never followed); sockets,
+// devices and fifos are skipped; the archive file itself is never included.
+func writeTarGz(src, archive string, out *os.File) error {
+	gw := gzip.NewWriter(out)
+	tw := tar.NewWriter(gw)
+	parent := filepath.Dir(src)
+	walkErr := filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == archive {
+			return nil
+		}
+		info, err := d.Info() // Lstat info: WalkDir never follows symlinks.
+		if err != nil {
+			return err
+		}
+		mode := info.Mode()
+		isLink := mode&os.ModeSymlink != 0
+		if !mode.IsRegular() && !mode.IsDir() && !isLink {
+			return nil
+		}
+		rel, err := filepath.Rel(parent, path)
+		if err != nil {
+			return err
+		}
+		link := ""
+		if isLink {
+			link, err = os.Readlink(path)
+			if err != nil {
+				return err
+			}
+		}
+		hdr, err := tar.FileInfoHeader(info, link)
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(rel)
+		if info.IsDir() && !strings.HasSuffix(hdr.Name, "/") {
+			hdr.Name += "/"
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if mode.IsRegular() {
+			f, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(tw, f)
+			closeErr := f.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		_ = tw.Close()
+		_ = gw.Close()
+		return walkErr
+	}
+	if err := tw.Close(); err != nil {
+		_ = gw.Close()
+		return err
+	}
+	return gw.Close()
 }
 
 func (m *Manager) cleanupWrite(opID string) {

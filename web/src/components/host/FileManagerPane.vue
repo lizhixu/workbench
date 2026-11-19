@@ -10,6 +10,7 @@ import {
   NModal,
   NForm,
   NFormItem,
+  NCheckbox,
   useMessage,
   useDialog,
   NSpin,
@@ -32,6 +33,9 @@ import {
   EllipsisHorizontalOutline,
   CreateOutline,
   CopyOutline,
+  ClipboardOutline,
+  ArchiveOutline,
+  KeyOutline,
   ArrowForwardOutline,
   TrashOutline,
   EyeOutline,
@@ -46,7 +50,10 @@ import {
   fileMove,
   fileCopy,
   fileRemove,
+  fileChmod,
+  fileCompress,
   fileReadText,
+  fileReadHead,
   fileWriteText,
   getHost,
 } from '../../api/hosts'
@@ -56,6 +63,7 @@ import { useSettingsStore } from '../../stores/settings'
 import { SETTING_KEYS } from '../../api/settings'
 import { useTablePagination } from '../../composables/useTablePagination'
 import { fmtDateTime } from '../../utils/time'
+import { isTextContent, TEXT_SNIFF_BYTES } from '../../utils/fileText'
 import CodeEditor from '../common/CodeEditor.vue'
 
 const props = defineProps<{
@@ -352,9 +360,9 @@ async function handleUpload({ file }: { file: any }) {
 
 function fmtSize(n: number): string {
   if (!n) return '-'
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + ' GB'
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB'
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + ' KB'
+  if (n >= 1 << 30) return (n / (1 << 30)).toFixed(1) + ' GB'
+  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MB'
+  if (n >= 1 << 10) return (n / (1 << 10)).toFixed(1) + ' KB'
   return n + ' B'
 }
 
@@ -433,29 +441,166 @@ function confirmRemove(file: FileInfo) {
   })
 }
 
-// Extensions we are willing to open in the built-in text editor. Anything else
-// falls back to download so binaries never get mangled by a round trip.
-const textExtensions = [
-  'txt', 'log', 'conf', 'cfg', 'ini', 'env', 'json', 'yaml', 'yml', 'toml',
-  'xml', 'html', 'htm', 'css', 'scss', 'js', 'ts', 'jsx', 'tsx', 'vue',
-  'go', 'py', 'rb', 'php', 'java', 'kt', 'rs', 'c', 'h', 'cpp', 'hpp',
-  'sh', 'bash', 'zsh', 'ps1', 'bat', 'cmd', 'sql', 'md', 'csv', 'properties',
-  'service', 'gitignore', 'dockerfile', 'makefile',
+// ---- 编辑权限（chmod）-------------------------------------------------
+// 权限值以位表示（0–07777），复选框与八进制输入双向同步；弹窗打开时按行
+// 的 mode 字符串（如 "-rw-r--r--"）初始化，解析不出时按文件 0644 / 目录
+// 0755 回落。
+const showChmod = ref(false)
+const chmodTarget = ref<FileInfo | null>(null)
+const chmodPerm = ref(0o644)
+const chmodOctal = ref('644')
+const chmodBusy = ref(false)
+
+const chmodClasses = [
+  { label: '所有者', items: [{ bit: 0o400, label: '读取' }, { bit: 0o200, label: '写入' }, { bit: 0o100, label: '执行' }] },
+  { label: '所属组', items: [{ bit: 0o040, label: '读取' }, { bit: 0o020, label: '写入' }, { bit: 0o010, label: '执行' }] },
+  { label: '其他用户', items: [{ bit: 0o004, label: '读取' }, { bit: 0o002, label: '写入' }, { bit: 0o001, label: '执行' }] },
+  { label: '特殊权限', items: [{ bit: 0o4000, label: 'SetUID' }, { bit: 0o2000, label: 'SetGID' }, { bit: 0o1000, label: '粘滞位' }] },
 ]
 
-function isTextFile(name: string): boolean {
-  const lower = name.toLowerCase()
-  if (!lower.includes('.')) {
-    // Extension-less files that are conventionally text.
-    return ['dockerfile', 'makefile', 'readme', 'license', 'changelog'].includes(lower)
+function parseModeString(mode: string, isDir: boolean): number {
+  const fallback = isDir ? 0o755 : 0o644
+  if (!mode || mode.length < 10) return fallback
+  const s = mode.slice(1, 10)
+  const bit = [0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001]
+  let perm = 0
+  for (let i = 0; i < 9; i++) {
+    const ch = s[i]
+    if (ch === 'r' || ch === 'w' || ch === 'x' || ch === 's' || ch === 't') perm |= bit[i]
   }
-  const ext = lower.slice(lower.lastIndexOf('.') + 1)
-  return textExtensions.includes(ext)
+  if (s[2] === 's' || s[2] === 'S') perm |= 0o4000
+  if (s[5] === 's' || s[5] === 'S') perm |= 0o2000
+  if (s[8] === 't' || s[8] === 'T') perm |= 0o1000
+  return perm
+}
+
+// permString renders bits the way ls does ("rwxr-xr-x", setuid/setgid as s/S,
+// sticky as t/T); the modal preview only ever shows the applied value.
+function permString(perm: number): string {
+  const out: string[] = []
+  for (let cls = 0; cls < 3; cls++) {
+    const shift = 6 - cls * 3
+    const r = (perm >> (shift + 2)) & 1
+    const w = (perm >> (shift + 1)) & 1
+    const x = (perm >> shift) & 1
+    out.push(r ? 'r' : '-', w ? 'w' : '-')
+    if (cls === 0 && (perm & 0o4000)) out.push(x ? 's' : 'S')
+    else if (cls === 1 && (perm & 0o2000)) out.push(x ? 's' : 'S')
+    else if (cls === 2 && (perm & 0o1000)) out.push(x ? 't' : 'T')
+    else out.push(x ? 'x' : '-')
+  }
+  return out.join('')
+}
+
+function openChmod(file: FileInfo) {
+  chmodTarget.value = file
+  const perm = parseModeString(file.mode || '', file.is_dir)
+  chmodPerm.value = perm
+  chmodOctal.value = perm.toString(8)
+  showChmod.value = true
+}
+
+function toggleChmodBit(bit: number, checked: boolean) {
+  if (checked) chmodPerm.value |= bit
+  else chmodPerm.value &= ~bit
+  chmodOctal.value = chmodPerm.value.toString(8)
+}
+
+function onChmodOctalInput() {
+  const v = chmodOctal.value.trim()
+  if (!/^[0-7]{1,4}$/.test(v)) return
+  const n = parseInt(v, 8)
+  if (n >= 0 && n <= 0o7777) chmodPerm.value = n
+}
+
+async function submitChmod() {
+  const target = chmodTarget.value
+  if (!target) return
+  const v = chmodOctal.value.trim()
+  if (!/^[0-7]{1,4}$/.test(v)) {
+    message.warning('请输入 0–7777 之间的八进制权限值')
+    return
+  }
+  const mode = parseInt(v, 8)
+  chmodBusy.value = true
+  try {
+    await fileChmod(props.hostId, target.path, mode)
+    message.success(`权限已改为 ${v}`)
+    showChmod.value = false
+    await load()
+  } catch (e: any) {
+    message.error(e.message || '修改权限失败')
+  } finally {
+    chmodBusy.value = false
+  }
+}
+
+// ---- 复制路径 / 压缩 --------------------------------------------------
+// 复制路径是纯只读操作，所有角色可用；剪贴板 API 不可用时回落传统方式。
+async function copyPath(path: string) {
+  const done = () => message.success('已复制路径')
+  try {
+    await navigator.clipboard.writeText(path)
+    done()
+    return
+  } catch {
+    // 非安全上下文或无剪贴板权限时回落到传统方式
+  }
+  const ta = document.createElement('textarea')
+  ta.value = path
+  ta.style.position = 'fixed'
+  ta.style.opacity = '0'
+  document.body.appendChild(ta)
+  ta.select()
+  try {
+    document.execCommand('copy')
+    done()
+  } catch {
+    message.error('复制失败')
+  }
+  document.body.removeChild(ta)
+}
+
+// 压缩是非破坏性操作（只产生一个新文件），确认后直接执行；大目录可能要
+// 一两分钟，期间用常驻提示占位，服务端 120 秒未回则提示超时、后台继续压。
+function confirmCompress(file: FileInfo) {
+  dialog.info({
+    title: '压缩',
+    content: `将把 ${file.path} 压缩为同目录下的 ${file.name}.tar.gz（同名时自动加序号）。`,
+    positiveText: '压缩',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      const loadingMsg = message.loading('正在压缩…', { duration: 0 })
+      try {
+        const res = await fileCompress(props.hostId, file.path)
+        message.success(`已压缩为 ${res.archive}（${fmtSize(res.size)}）`)
+        await load()
+      } catch (e: any) {
+        message.error(e.message || '压缩失败')
+      } finally {
+        loadingMsg.destroy()
+      }
+    },
+  })
 }
 
 async function openEditor(file: FileInfo, readOnly: boolean) {
   if (file.size > maxEditableSize) {
     message.warning(`文件超过 ${fmtSize(maxEditableSize)}，请下载后查看`)
+    return
+  }
+  // Sniff the file's head before opening: the menu no longer filters by
+  // extension, so a binary file would otherwise load as mojibake and risk
+  // being mangled by a save round trip.
+  let head: Uint8Array
+  try {
+    head = await fileReadHead(props.hostId, file.path, TEXT_SNIFF_BYTES)
+  } catch (e: any) {
+    message.error(e.message || '读取文件失败')
+    return
+  }
+  if (!isTextContent(head)) {
+    message.error('该文件是二进制文件，无法在线预览/编辑，请下载后查看')
     return
   }
   editorPath.value = file.path
@@ -508,10 +653,13 @@ function closeEditor() {
 }
 
 // Row action menu: only the operations that make sense for the row's type and
-// the caller's role are offered.
+// the caller's role are offered. The preview/edit entry is offered for every
+// regular file within the size cap — whether the content is actually text is
+// decided by sniffing the file's head when it is opened, not by extension.
+// Copy-path is read-only, so viewers get it too; chmod/compress are writes.
 function rowMenuOptions(row: FileInfo) {
   const opts: any[] = []
-  if (!row.is_dir && isTextFile(row.name)) {
+  if (!row.is_dir) {
     opts.push({
       key: 'preview',
       label: canWrite.value ? '预览 / 编辑' : '预览',
@@ -521,10 +669,14 @@ function rowMenuOptions(row: FileInfo) {
   if (canWrite.value) {
     if (opts.length) opts.push({ key: 'd1', type: 'divider' })
     opts.push(
+      { key: 'chmod', label: '编辑权限', icon: () => h(NIcon, { component: KeyOutline }) },
+      { key: 'compress', label: '压缩', icon: () => h(NIcon, { component: ArchiveOutline }) },
+      { key: 'd2', type: 'divider' },
       { key: 'rename', label: '重命名', icon: () => h(NIcon, { component: CreateOutline }) },
       { key: 'move', label: '移动到…', icon: () => h(NIcon, { component: ArrowForwardOutline }) },
       { key: 'copy', label: '复制到…', icon: () => h(NIcon, { component: CopyOutline }) },
-      { key: 'd2', type: 'divider' },
+      { key: 'copy-path', label: '复制路径', icon: () => h(NIcon, { component: ClipboardOutline }) },
+      { key: 'd3', type: 'divider' },
       {
         key: 'remove',
         label: '删除',
@@ -532,6 +684,9 @@ function rowMenuOptions(row: FileInfo) {
         props: { style: 'color: #e88080' },
       },
     )
+  } else {
+    if (opts.length) opts.push({ key: 'd1', type: 'divider' })
+    opts.push({ key: 'copy-path', label: '复制路径', icon: () => h(NIcon, { component: ClipboardOutline }) })
   }
   return opts
 }
@@ -540,6 +695,15 @@ function handleRowMenu(key: string, row: FileInfo) {
   switch (key) {
     case 'preview':
       openEditor(row, !canWrite.value)
+      break
+    case 'chmod':
+      openChmod(row)
+      break
+    case 'compress':
+      confirmCompress(row)
+      break
+    case 'copy-path':
+      copyPath(row.path)
       break
     case 'rename':
       openTransfer(row, 'rename')
@@ -569,7 +733,16 @@ const columns: DataTableColumns<FileInfo> = [
         'div',
         {
           class: 'file-name-cell',
-          onClick: () => navigateInto(row),
+          // Directories navigate in; regular files open in the preview/editor
+          // (same as the menu's 预览 / 编辑, including the size cap and the
+          // text/binary sniff).
+          onClick: () => {
+            if (row.is_dir) {
+              navigateInto(row)
+            } else {
+              openEditor(row, !canWrite.value)
+            }
+          },
         },
         [
           h(
@@ -857,6 +1030,48 @@ onMounted(async () => {
       </div>
     </NModal>
 
+    <!-- 编辑权限 Modal -->
+    <NModal
+      v-model:show="showChmod"
+      preset="card"
+      title="编辑权限"
+      style="width: 440px"
+    >
+      <div class="chmod-modal-body">
+        <NAlert type="default" :bordered="false">
+          <div class="transfer-src">
+            路径：<code>{{ chmodTarget?.path }}</code>
+          </div>
+        </NAlert>
+        <NForm label-placement="top">
+          <NFormItem v-for="cls in chmodClasses" :key="cls.label" :label="cls.label">
+            <NSpace>
+              <NCheckbox
+                v-for="item in cls.items"
+                :key="item.bit"
+                :checked="!!(chmodPerm & item.bit)"
+                @update:checked="(v: boolean) => toggleChmodBit(item.bit, v)"
+              >
+                {{ item.label }}
+              </NCheckbox>
+            </NSpace>
+          </NFormItem>
+          <NFormItem label="八进制权限值">
+            <NInput v-model:value="chmodOctal" placeholder="例如 755" @input="onChmodOctalInput" />
+          </NFormItem>
+          <div class="chmod-preview">
+            当前权限：<code>{{ chmodPerm.toString(8) }}（{{ permString(chmodPerm) }}）</code>
+          </div>
+          <NSpace justify="end">
+            <NButton @click="showChmod = false">取消</NButton>
+            <NButton type="primary" :loading="chmodBusy" @click="submitChmod">
+              确定
+            </NButton>
+          </NSpace>
+        </NForm>
+      </div>
+    </NModal>
+
     <!-- 文本预览 / 编辑 Modal -->
     <NModal
       v-model:show="showEditor"
@@ -1053,6 +1268,32 @@ onMounted(async () => {
   }
 
   .transfer-hint {
+    font-size: 12px;
+    color: var(--text-tertiary);
+    margin-bottom: 12px;
+  }
+
+  code {
+    font-family: 'SFMono-Regular', Consolas, monospace;
+    color: #6366f1;
+    background: var(--code-box-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+}
+
+.chmod-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+
+  .transfer-src {
+    font-size: 13px;
+    color: var(--text-secondary);
+    word-break: break-all;
+  }
+
+  .chmod-preview {
     font-size: 12px;
     color: var(--text-tertiary);
     margin-bottom: 12px;

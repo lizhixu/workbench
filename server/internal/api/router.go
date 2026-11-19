@@ -210,11 +210,14 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	authed.GET("/hosts/:id/files", h.fileList)
 	authed.GET("/hosts/:id/files/stat", h.fileStat)
 	authed.GET("/hosts/:id/files/download", h.fileDownload)
+	authed.GET("/hosts/:id/files/content", h.fileContent)
 	// File operations on hosts are audited via the mutation middleware.
 	fileWrite := hostWrite.Group("", h.auditMutation())
 	fileWrite.POST("/hosts/:id/files/mkdir", h.fileMkdir)
 	fileWrite.POST("/hosts/:id/files/move", h.fileMove)
 	fileWrite.POST("/hosts/:id/files/copy", h.fileCopy)
+	fileWrite.POST("/hosts/:id/files/chmod", h.fileChmod)
+	fileWrite.POST("/hosts/:id/files/compress", h.fileCompress)
 	fileWrite.DELETE("/hosts/:id/files", h.fileRemove)
 	fileWrite.POST("/hosts/:id/files/upload", h.fileUpload)
 
@@ -2345,6 +2348,8 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodPost, "/api/v1/hosts/:id/files/mkdir", "file_mkdir", "host", "id", "", "新建目录"},
 		{http.MethodPost, "/api/v1/hosts/:id/files/move", "file_move", "host", "id", "", "移动/重命名文件"},
 		{http.MethodPost, "/api/v1/hosts/:id/files/copy", "file_copy", "host", "id", "", "复制文件"},
+		{http.MethodPost, "/api/v1/hosts/:id/files/chmod", "file_chmod", "host", "id", "", "修改文件权限"},
+		{http.MethodPost, "/api/v1/hosts/:id/files/compress", "file_compress", "host", "id", "", "压缩文件"},
 		{http.MethodDelete, "/api/v1/hosts/:id/files", "file_remove", "host", "id", audit.RiskHigh, "删除文件"},
 		{http.MethodPost, "/api/v1/hosts/:id/files/upload", "file_upload", "host", "id", "", "上传文件"},
 		// Security scan trigger: active probing on the host.

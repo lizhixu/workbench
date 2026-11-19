@@ -410,7 +410,7 @@ func (m *Monitor) checkHostTraffic(host HostInfo) {
 		calcDesc = "双向"
 	}
 
-	quotaBytes := quotaGB * 1e9 // decimal GB, matching the panel label and ISP billing
+	quotaBytes := quotaGB * (1 << 30) // binary GB (1 GB = 1024^3 B), matching the panel label and Alibaba's traffic-GB definition
 	pct := float64(used) / quotaBytes * 100
 
 	// We define two tiers: 100% (critical) and 80% (warning)
@@ -420,7 +420,7 @@ func (m *Monitor) checkHostTraffic(host HostInfo) {
 			if !m.store.isFiring(key) {
 				m.store.setFiring(key, true)
 				msg := fmt.Sprintf("主机 %s 本月流量(%s) %s 已达到配额 %s 的 %.1f%% (告警阈值 %.0f%%)",
-					host.Hostname, calcDesc, fmtGB(float64(used)/1e9), fmtGB(quotaGB), pct, threshold)
+					host.Hostname, calcDesc, fmtGB(float64(used)/(1<<30)), fmtGB(quotaGB), pct, threshold)
 				event := &Event{
 					ID:       randomID(),
 					RuleID:   "builtin-traffic-" + tierName,

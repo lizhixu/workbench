@@ -52,7 +52,7 @@ const taskTitle = computed(() => {
 })
 function bytes(n: number) {
   if (!n) return '0 B'
-  const units = ['B', 'KiB', 'MiB', 'GiB']
+  const units = ['B', 'KB', 'MB', 'GB']
   const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), 3)
   return `${(n / 1024 ** i).toFixed(i ? 1 : 0)} ${units[i]}`
 }
@@ -284,7 +284,7 @@ const columns = computed<DataTableColumns<BackupMeta>>(() => [
       <NFormItem v-if="restoreName" label="归档文件"><span class="archive-name">{{ restoreName }}</span></NFormItem>
       <NFormItem v-else label="备份归档" required>
         <NUpload v-model:file-list="fileList" :disabled="confirmed || submitting" :max="1" :default-upload="false" accept=".gz,.tgz,application/gzip"><NButton :disabled="confirmed || submitting">选择 .tar.gz 归档</NButton></NUpload>
-        <template #feedback><span class="field-hint tip-hint">上传上限 {{ bytes(maxUploadBytes) }}；恢复数据上限 64 GiB。先完整校验，重启后再应用。</span></template>
+        <template #feedback><span class="field-hint tip-hint">上传上限 {{ bytes(maxUploadBytes) }}；恢复数据上限 64 GB。先完整校验，重启后再应用。</span></template>
       </NFormItem>
       <NFormItem label="原服务器 Vault 密钥（仅旧归档需要）">
         <NInput

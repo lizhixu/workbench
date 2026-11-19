@@ -114,6 +114,9 @@ let resizeObserver: ResizeObserver | null = null
 // Realtime rolling cache (max 60 points)
 const realtimePoints = ref<MetricPoint[]>([])
 
+// 十进制（1 GB = 1e9 B）：只供磁盘吞吐速率用（阿里云监控 MBps 同款，
+// 字节/秒十进制）。内存见 fmtMemBytes，磁盘容量见 formatDiskBytes，
+// 月流量见 fmtTrafficBytes，三者都是 GB 标签、二进制数值。
 function fmtBytes(n: number): string {
   if (!n || isNaN(n)) return '0 B'
   if (n >= 1e9) return (n / 1e9).toFixed(2) + ' GB'
@@ -122,9 +125,38 @@ function fmtBytes(n: number): string {
   return n.toFixed(0) + ' B'
 }
 
+// 月流量：GB 标签、二进制数值（1 GB = 1024³ B，阿里云官方口径；见 AGENTS.md §3.11）。
+// 与配额「流量限制 (GB)」同一口径，百分比才对得上。
+function fmtTrafficBytes(n: number): string {
+  if (!n || isNaN(n)) return '0 B'
+  if (n >= 1 << 30) return (n / (1 << 30)).toFixed(2) + ' GB'
+  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(2) + ' MB'
+  if (n >= 1 << 10) return (n / (1 << 10)).toFixed(2) + ' KB'
+  return n.toFixed(0) + ' B'
+}
+
+// 内存（含 Swap）：GB 标签、二进制数值（1 GB = 1024³ B），与 free / 任务管理器
+// 看到的数值一致（国内云厂商控制台同样写 GB，数值本身是二进制的）。
+function fmtMemBytes(n: number): string {
+  if (!n || isNaN(n)) return '0 B'
+  if (n >= 1 << 30) return (n / (1 << 30)).toFixed(2) + ' GB'
+  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(2) + ' MB'
+  if (n >= 1 << 10) return (n / (1 << 10)).toFixed(2) + ' KB'
+  return n.toFixed(0) + ' B'
+}
 
 function fmtRate(n: number): string {
   return fmtBytes(n) + '/s'
+}
+
+// 网络速率：比特/秒（云厂商带宽口径，3M = 3 Mbps），十进制。入参仍是字节/秒。
+function fmtNetRate(n: number): string {
+  const bits = (n || 0) * 8
+  if (!bits || isNaN(bits)) return '0 bps'
+  if (bits >= 1e9) return (bits / 1e9).toFixed(2) + ' Gbps'
+  if (bits >= 1e6) return (bits / 1e6).toFixed(2) + ' Mbps'
+  if (bits >= 1e3) return (bits / 1e3).toFixed(1) + ' Kbps'
+  return Math.round(bits) + ' bps'
 }
 
 // 速率 y 轴：整条轴按「峰值」统一选单位再保留小数。fmtBytes 是按单个数值
@@ -140,6 +172,27 @@ function rateAxisFormatter(axisMax: number): (v: number) => string {
   const suffix = unit === 1e9 ? ' GB/s' : unit === 1e6 ? ' MB/s' : unit === 1e3 ? ' KB/s' : ' B/s'
   return (v: number) => {
     const scaled = v / unit
+    if (unit === 1) return Math.round(scaled).toString() + suffix
+    const digits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2
+    return scaled.toFixed(digits) + suffix
+  }
+}
+
+// 网络图 y 轴：与 rateAxisFormatter 同款逻辑，但刻度走比特/秒（Mbps），
+// 入参 axisMaxBytesPerSec 是字节/秒（与 series 数据同单位，yAxis.max
+// 与 interval 都按它算）；formatter 内部再把刻度值 ×8 换算成比特。
+// 这样 series 数据不用动，只改刻度单位。
+function netRateAxisMax(peakBytesPerSec: number): number {
+  // 留 10% 余量避免曲线贴顶；峰值极小时兜底到 1 KB/s，免得刻度全挤在 0 附近
+  return Math.max(1024, Math.ceil(peakBytesPerSec * 1.1))
+}
+
+function netRateAxisFormatter(axisMaxBytesPerSec: number): (v: number) => string {
+  const bitsMax = axisMaxBytesPerSec * 8
+  const unit = bitsMax >= 1e9 ? 1e9 : bitsMax >= 1e6 ? 1e6 : bitsMax >= 1e3 ? 1e3 : 1
+  const suffix = unit === 1e9 ? ' Gbps' : unit === 1e6 ? ' Mbps' : unit === 1e3 ? ' Kbps' : ' bps'
+  return (v: number) => {
+    const scaled = (v * 8) / unit
     if (unit === 1) return Math.round(scaled).toString() + suffix
     const digits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2
     return scaled.toFixed(digits) + suffix
@@ -301,7 +354,7 @@ function updateChartsWithPoints(points: MetricPoint[]) {
   if (memChart) {
     const opt: any = getBaseChartOption(
       '内存使用率',
-      `${fmtBytes(latest.mem_used)} / ${fmtBytes(latest.mem_total)} (${latest.mem_usage.toFixed(1)}%)`,
+      `${fmtMemBytes(latest.mem_used)} / ${fmtMemBytes(latest.mem_total)} (${latest.mem_usage.toFixed(1)}%)`,
       (v) => `${v}%`,
       100,
     )
@@ -309,7 +362,7 @@ function updateChartsWithPoints(points: MetricPoint[]) {
     opt.tooltip.formatter = (params: any[]) => {
       const idx = params[0]?.dataIndex ?? 0
       const pt = points[idx]
-      return `${fmtTime(pt.ts, true)}<br/>已用: ${fmtBytes(pt.mem_used)} / ${fmtBytes(pt.mem_total)}<br/>使用率: ${pt.mem_usage.toFixed(1)}%`
+      return `${fmtTime(pt.ts, true)}<br/>已用: ${fmtMemBytes(pt.mem_used)} / ${fmtMemBytes(pt.mem_total)}<br/>使用率: ${pt.mem_usage.toFixed(1)}%`
     }
     opt.series = [
       {
@@ -332,18 +385,18 @@ function updateChartsWithPoints(points: MetricPoint[]) {
 
   // 3. Network
   if (netChart) {
-    const netMax = rateAxisMax(points.reduce((m, p) => Math.max(m, p.net_rx, p.net_tx), 0))
+    const netMax = netRateAxisMax(points.reduce((m, p) => Math.max(m, p.net_rx, p.net_tx), 0))
     const opt: any = getBaseChartOption(
       '网络吞吐',
-      [`↓ ${fmtRate(latest.net_rx)}`, `↑ ${fmtRate(latest.net_tx)}`].join(METRIC_SEP),
-      rateAxisFormatter(netMax),
+      [`↓ ${fmtNetRate(latest.net_rx)}`, `↑ ${fmtNetRate(latest.net_tx)}`].join(METRIC_SEP),
+      netRateAxisFormatter(netMax),
       netMax,
     )
     opt.xAxis.data = times
     opt.tooltip.formatter = (params: any[]) => {
       const idx = params[0]?.dataIndex ?? 0
       const pt = points[idx]
-      return `${fmtTime(pt.ts, true)}<br/>↓ 下行: ${fmtRate(pt.net_rx)}<br/>↑ 上行: ${fmtRate(pt.net_tx)}`
+      return `${fmtTime(pt.ts, true)}<br/>↓ 下行: ${fmtNetRate(pt.net_rx)}<br/>↑ 上行: ${fmtNetRate(pt.net_tx)}`
     }
     opt.legend = {
       show: true,
@@ -742,7 +795,7 @@ watch(() => settings.themeMode, () => {
       <div class="stat-chip">
         <span class="chip-label">Swap</span>
         <span class="chip-value mono">
-          <template v-if="swapPct !== null">{{ fmtBytes(currentMetrics.swap_used ?? 0) }} / {{ fmtBytes(currentMetrics.swap_total ?? 0) }} ({{ swapPct.toFixed(1) }}%)</template>
+          <template v-if="swapPct !== null">{{ fmtMemBytes(currentMetrics.swap_used ?? 0) }} / {{ fmtMemBytes(currentMetrics.swap_total ?? 0) }} ({{ swapPct.toFixed(1) }}%)</template>
           <template v-else>未启用</template>
         </span>
       </div>
@@ -780,15 +833,15 @@ watch(() => settings.themeMode, () => {
       <div class="traffic-row">
         <div class="traffic-item">
           <span class="traffic-dir down">↓ 下行 (RX)</span>
-          <span class="traffic-value mono">{{ fmtBytes(currentMetrics.month_rx ?? 0) }}</span>
+          <span class="traffic-value mono">{{ fmtTrafficBytes(currentMetrics.month_rx ?? 0) }}</span>
         </div>
         <div class="traffic-item">
           <span class="traffic-dir up">↑ 上行 (TX)</span>
-          <span class="traffic-value mono">{{ fmtBytes(currentMetrics.month_tx ?? 0) }}</span>
+          <span class="traffic-value mono">{{ fmtTrafficBytes(currentMetrics.month_tx ?? 0) }}</span>
         </div>
         <div class="traffic-item">
           <span class="traffic-dir total">Σ 合计</span>
-          <span class="traffic-value mono">{{ fmtBytes((currentMetrics.month_rx ?? 0) + (currentMetrics.month_tx ?? 0)) }}</span>
+          <span class="traffic-value mono">{{ fmtTrafficBytes((currentMetrics.month_rx ?? 0) + (currentMetrics.month_tx ?? 0)) }}</span>
         </div>
       </div>
     </div>

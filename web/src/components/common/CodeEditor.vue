@@ -259,6 +259,9 @@ watch(
     border: 1px solid var(--border-color);
     border-radius: 6px;
     background-color: var(--bg-card);
+    /* 圆角裁剪：行号栏/选中行等内部背景是不带圆角的矩形，不裁会被方角
+       盖住编辑器圆角（深色下 one-dark 行号栏底色最明显）。 */
+    overflow: hidden;
   }
 
   :deep(.cm-editor.cm-focused) {

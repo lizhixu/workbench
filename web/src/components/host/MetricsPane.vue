@@ -10,6 +10,7 @@ import {
   NButton,
   NIcon,
   NEmpty,
+  NProgress,
 } from 'naive-ui'
 import { RefreshOutline } from '@vicons/ionicons5'
 // 按需引入 echarts：整包 import 会把地图、3D、所有图表类型都打进来，这里只用到
@@ -21,7 +22,7 @@ import { CanvasRenderer } from 'echarts/renderers'
 
 echarts.use([LineChart, GridComponent, TooltipComponent, TitleComponent, CanvasRenderer])
 import { getMetrics, getMetricsHistory, type MetricPoint } from '../../api/hosts'
-import type { Metrics, ProbeReading } from '../../api/types'
+import type { Metrics, Mount, ProbeReading } from '../../api/types'
 import { useSettingsStore } from '../../stores/settings'
 import { fmtDateTime, fmtTime as fmtTimeOfDay } from '../../utils/time'
 
@@ -47,6 +48,31 @@ const swapPct = computed(() => {
   const m = currentMetrics.value
   if (!m || !m.swap_total) return null
   return (m.swap_used ?? 0) / m.swap_total * 100
+})
+
+// Disk usage for the stats strip: aggregate all mounts except boot
+// partitions (/boot, /boot/efi), which are firmware partitions rather than
+// usable storage. Same idea as the Baota panel, which keeps system
+// partitions out of the headline disk figure.
+const diskMounts = computed(() => (currentMetrics.value?.mounts ?? []).filter((m) => m.path !== '/boot' && !m.path.startsWith('/boot/')))
+const diskTotal = computed(() => diskMounts.value.reduce((s, m) => s + (m.total || 0), 0))
+const diskUsed = computed(() => diskMounts.value.reduce((s, m) => s + (m.used || 0), 0))
+const diskPct = computed(() => {
+  const t = diskTotal.value
+  return t > 0 ? (diskUsed.value / t) * 100 : null
+})
+
+// Per-mount capacity list, fullest first so a nearly-full disk stands out.
+// Unlike the headline disk chip, this lists every mount the Agent reports
+// (including /boot/efi): hiding a partition here would hide a real problem.
+const mountPct = (m: Mount) => (m.total ? (m.used / m.total) * 100 : 0)
+const mountStatus = (m: Mount) => {
+  const p = mountPct(m)
+  return p >= 80 ? 'error' : p >= 60 ? 'warning' : 'success'
+}
+const sortedMounts = computed(() => {
+  const mounts = currentMetrics.value?.mounts ?? []
+  return [...mounts].sort((a, b) => mountPct(b) - mountPct(a))
 })
 
 // Load average color: warn when approaching/exceeding core count.
@@ -693,7 +719,7 @@ watch(() => settings.themeMode, () => {
 
     <NSpin v-if="loading && (!cpuChart || timeSpan !== 'realtime')" class="spin-box" />
 
-    <!-- 实时快捷指标条：负载 / Swap / 连接数 / 进程数 / CPU 型号 -->
+    <!-- 实时快捷指标条：负载 / Swap / 硬盘 / 连接数 / 进程数 / CPU 型号 -->
     <div v-if="currentMetrics" class="quick-stats-strip">
       <div class="stat-chip">
         <span class="chip-label">负载 (1/5/15m)</span>
@@ -706,6 +732,13 @@ watch(() => settings.themeMode, () => {
         <span class="chip-value mono">
           <template v-if="swapPct !== null">{{ fmtBytes(currentMetrics.swap_used ?? 0) }} / {{ fmtBytes(currentMetrics.swap_total ?? 0) }} ({{ swapPct.toFixed(1) }}%)</template>
           <template v-else>未启用</template>
+        </span>
+      </div>
+      <div class="stat-chip">
+        <span class="chip-label">硬盘</span>
+        <span class="chip-value mono">
+          <template v-if="diskPct !== null">{{ fmtBytes(diskUsed) }} / {{ fmtBytes(diskTotal) }} ({{ diskPct.toFixed(1) }}%)</template>
+          <template v-else>暂无数据</template>
         </span>
       </div>
       <div class="stat-chip">
@@ -746,6 +779,25 @@ watch(() => settings.themeMode, () => {
           <span class="traffic-value mono">{{ fmtBytes((currentMetrics.month_rx ?? 0) + (currentMetrics.month_tx ?? 0)) }}</span>
         </div>
       </div>
+    </div>
+
+    <!-- 挂载点容量：逐分区明细，最满的排在最前面 -->
+    <div v-if="currentMetrics && sortedMounts.length" class="mounts-card">
+      <div class="mounts-header">
+        <span class="mounts-title">挂载点容量</span>
+        <span class="mounts-hint">按使用率从高到低</span>
+      </div>
+      <NGrid cols="1 s:2" :x-gap="12" :y-gap="8" responsive="screen">
+        <NGridItem v-for="m in sortedMounts" :key="m.path">
+          <div class="mount-bar">
+            <div class="mount-label">{{ m.path }}</div>
+            <div class="mount-progress">
+              <NProgress :percentage="mountPct(m)" :status="mountStatus(m)" :show-indicator="false" :height="6" />
+              <div class="mount-info">{{ fmtBytes(m.used) }} / {{ fmtBytes(m.total) }} ({{ mountPct(m).toFixed(1) }}%)</div>
+            </div>
+          </div>
+        </NGridItem>
+      </NGrid>
     </div>
 
     <div v-show="!historyEmpty && (!loading || cpuChart)" class="grid-4-container">
@@ -900,6 +952,55 @@ watch(() => settings.themeMode, () => {
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+      }
+    }
+  }
+
+  .mounts-card {
+    background-color: var(--bg-card-subtle);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 10px 14px;
+    box-shadow: var(--shadow-sm);
+
+    .mounts-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+
+      .mounts-title {
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .mounts-hint {
+        font-size: 11px;
+        color: var(--text-secondary);
+      }
+    }
+
+    .mount-bar {
+      margin-bottom: 8px;
+
+      .mount-label {
+        font-size: 12px;
+        color: var(--text-secondary);
+        margin-bottom: 2px;
+      }
+
+      .mount-progress {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+
+        .mount-info {
+          font-size: 13px;
+          font-weight: 600;
+          color: var(--text-primary);
+          white-space: nowrap;
+        }
       }
     }
   }

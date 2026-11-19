@@ -60,8 +60,8 @@ onMounted(async () => {
     <h2 class="page-title">文件管理</h2>
     <NSpin v-if="loading" class="spin-center" />
     <template v-else-if="host">
-      <!-- 主机头部信息栏（与主机详情页同款） -->
-      <HostHeaderBanner :host="host" @refresh="load" />
+      <!-- 主机头部信息栏（与主机详情页同款）：文件管理默认收起规格区 -->
+      <HostHeaderBanner :host="host" :default-expanded="false" @refresh="load" />
       <!-- 主机已取到才挂载面板，并把 os 传进去：面板不再为判 OS 另调一次
            getHost，挂载后直接进入文件列表加载态。 -->
       <div class="file-pane-wrap">

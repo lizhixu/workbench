@@ -23,6 +23,12 @@ import { useAuthStore } from '../../stores/auth'
 
 const props = defineProps<{
   host: Host
+  /**
+   * 规格区默认是否展开；不传则默认展开。父级切换默认值时横幅回到
+   * 默认值（例如主机详情切进文件管理页签时收起、切出时展开）；同一
+   * 页签内用户手动点的展开/收起不受影响。
+   */
+  defaultExpanded?: boolean
 }>()
 const emit = defineEmits<{
   (e: 'refresh'): void
@@ -31,7 +37,11 @@ const emit = defineEmits<{
 const message = useMessage()
 const auth = useAuthStore()
 const isAdmin = computed(() => auth.role === 'admin')
-const expanded = ref(true)
+const expanded = ref(props.defaultExpanded ?? true)
+watch(
+  () => props.defaultExpanded ?? true,
+  (v) => { expanded.value = v },
+)
 const powering = ref(false)
 const upgrading = ref(false)
 const showBillingModal = ref(false)

@@ -180,8 +180,8 @@ onMounted(load)
   <div class="host-detail-layout">
     <NSpin v-if="loading" class="spin-center" />
     <template v-else-if="host">
-      <!-- 顶部固定主机 Header 横幅 -->
-      <HostHeaderBanner :host="host" @refresh="load" />
+      <!-- 顶部固定主机 Header 横幅：文件管理页签默认收起规格区，给文件列表让位置 -->
+      <HostHeaderBanner :host="host" :default-expanded="activeSubTab !== 'files'" @refresh="load" />
 
       <!-- 下部主内容区：左侧窄版二级 Icon 导航 + 右侧模块面板 -->
       <div class="detail-body-container">

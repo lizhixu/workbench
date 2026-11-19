@@ -13,6 +13,7 @@ import { chat, type CallTrace, type ChatMessage, type ChatResponse, type LLMUsag
 import AiCallTrace from '../../components/ai/AiCallTrace.vue'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { copyToClipboard } from '../../utils/clipboard'
+import { renderMarkdown } from '../../utils/markdown'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'AiChat' })
@@ -168,26 +169,9 @@ async function copyMsg(content: string) {
   }
 }
 
-// 仅覆盖 AI 回答中的加粗、行内代码、代码块与换行。
-// 需要标题/列表/链接时改用 utils/markdown.ts 的 renderMarkdown（AGENTS.md §8.11），
-// 迁移时传 codeBlockClass: 'chat-code-block'、inlineCodeClass: 'chat-inline-code' 保持现有样式。
-function renderMarkdown(text: string): string {
-  // Lightweight markdown rendering: code blocks, bold, line breaks.
-  let html = text
-    // Escape HTML
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    // Code blocks
-    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="chat-code-block">$2</pre>')
-    // Inline code
-    .replace(/`([^`]+)`/g, '<code class="chat-inline-code">$1</code>')
-    // Bold
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    // Line breaks
-    .replace(/\n/g, '<br>')
-  return html
-}
+// 消息内容走 utils/markdown.ts 的共享渲染（AGENTS.md §8.11、DESIGN.md §9.12）：
+// 标题/列表/表格/链接/引用/删除线全量支持，先转义 HTML 再解析，链接只放行
+// http(s)/mailto/锚点/站内路径。样式见下方 .markdown-body，与部署助手同款。
 
 onMounted(() => {
   workspace.openTab({
@@ -255,21 +239,24 @@ onBeforeUnmount(() => {
             <NIcon v-if="msg.role === 'user'" size="16"><ChatbubbleEllipsesOutline /></NIcon>
             <NIcon v-else size="16" color="#6366f1"><SparklesOutline /></NIcon>
           </div>
-          <div class="msg-bubble-wrap">
-            <div class="msg-content" v-html="renderMarkdown(msg.content)" />
+          <div class="msg-main">
+            <div class="msg-bubble-wrap">
+              <div class="msg-content markdown-body" v-html="renderMarkdown(msg.content)" />
+              <button
+                class="msg-copy-btn"
+                title="复制内容"
+                @click="copyMsg(msg.content)"
+              >
+                <NIcon size="14"><CopyOutline /></NIcon>
+              </button>
+            </div>
+            <!-- 调用过程置于每条对话下方（气泡之外）、默认折叠 -->
             <AiCallTrace
               v-if="msg.role === 'assistant' && msg.trace"
               :trace="msg.trace"
               :model="msg.model"
               :usage="msg.usage"
             />
-            <button
-              class="msg-copy-btn"
-              title="复制内容"
-              @click="copyMsg(msg.content)"
-            >
-              <NIcon size="14"><CopyOutline /></NIcon>
-            </button>
           </div>
         </div>
 
@@ -277,9 +264,13 @@ onBeforeUnmount(() => {
           <div class="msg-avatar">
             <NIcon size="16" color="#6366f1"><SparklesOutline /></NIcon>
           </div>
-          <div class="msg-content">
-            <NSpin size="small" />
-            <span class="typing-hint">正在思考...</span>
+          <div class="msg-main">
+            <div class="msg-bubble-wrap">
+              <div class="msg-content">
+                <NSpin size="small" />
+                <span class="typing-hint">正在思考...</span>
+              </div>
+            </div>
             <AiCallTrace :started-at="loadingStartedAt" />
           </div>
         </div>
@@ -370,7 +361,7 @@ onBeforeUnmount(() => {
   .chat-list {
     flex: 1;
     overflow-y: auto;
-    padding: 8px 4px;
+    padding: 8px 12px;
     display: flex;
     flex-direction: column;
     gap: 16px;
@@ -380,12 +371,16 @@ onBeforeUnmount(() => {
 
       .suggestions {
         display: flex;
-        flex-direction: column;
+        flex-direction: row;
+        flex-wrap: wrap;
         gap: 8px;
-        align-items: center;
+        justify-content: center;
+        max-width: 560px;
       }
 
       .suggestion-label {
+        width: 100%;
+        text-align: center;
         font-size: 13px;
         color: var(--text-secondary);
         margin-bottom: 4px;
@@ -396,9 +391,12 @@ onBeforeUnmount(() => {
   .chat-message {
     display: flex;
     gap: 10px;
-    max-width: 85%;
+    /* 助手消息占满屏幕；用户消息（右侧）按内容自适应，见 &.user */
 
     &.user {
+      /* 用户消息按内容自适应：行宽上限 85%、靠右对齐，
+         气泡只占内容宽度，不撑满行宽 */
+      max-width: 85%;
       align-self: flex-end;
       flex-direction: row-reverse;
 
@@ -410,6 +408,7 @@ onBeforeUnmount(() => {
         flex-direction: row-reverse;
 
         .msg-content {
+          flex: none;
           background: rgba(99, 102, 241, 0.1);
           border-color: rgba(99, 102, 241, 0.2);
         }
@@ -426,6 +425,14 @@ onBeforeUnmount(() => {
           background: var(--bg-card-subtle);
         }
       }
+    }
+
+    /* 气泡 + 下方调用过程的纵向列：气泡行（气泡与复制按钮）与调用过程上下排布 */
+    .msg-main {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
     }
 
     .msg-bubble-wrap {
@@ -469,6 +476,8 @@ onBeforeUnmount(() => {
     }
 
     .msg-content {
+      flex: 1;
+      min-width: 0;
       padding: 10px 14px;
       border-radius: 8px;
       border: 1px solid var(--border-color);
@@ -477,28 +486,176 @@ onBeforeUnmount(() => {
       color: var(--text-primary);
       word-break: break-word;
 
-      :deep(.chat-code-block) {
-        background: var(--code-box-bg);
-        padding: 8px 12px;
-        border-radius: 4px;
-        font-family: 'JetBrains Mono', Consolas, monospace;
-        font-size: 12px;
-        overflow-x: auto;
-        margin: 4px 0;
-      }
-
-      :deep(.chat-inline-code) {
-        background: var(--code-box-bg);
-        padding: 1px 4px;
-        border-radius: 3px;
-        font-family: 'JetBrains Mono', Consolas, monospace;
-        font-size: 12px;
-      }
-
       .typing-hint {
         margin-left: 8px;
         color: var(--text-secondary);
         font-size: 12px;
+      }
+    }
+  }
+
+  /* 消息气泡内的 Markdown 排版：与部署助手（AppAiAssistant.vue）的
+     .markdown-body 同款，只按本页 13px 正文字号微调。v-html 输出的元素
+     不带 scoped 标记，全部用 :deep() 下发；只用主题变量，不引入硬编码色。 */
+  .markdown-body {
+    white-space: normal;
+    word-break: break-word;
+
+    :deep(> :first-child) {
+      margin-top: 0;
+    }
+    :deep(> :last-child) {
+      margin-bottom: 0;
+    }
+
+    :deep(p) {
+      margin: 6px 0;
+      line-height: 1.65;
+    }
+
+    :deep(h4),
+    :deep(h5),
+    :deep(h6) {
+      margin: 10px 0 4px;
+      font-weight: 600;
+      color: var(--text-primary);
+      line-height: 1.4;
+    }
+
+    :deep(h4) {
+      font-size: 14px;
+    }
+    :deep(h5) {
+      font-size: 13px;
+    }
+    :deep(h6) {
+      font-size: 12.5px;
+    }
+
+    :deep(ul),
+    :deep(ol) {
+      margin: 6px 0;
+      padding-left: 18px;
+      line-height: 1.6;
+    }
+
+    :deep(li) {
+      margin: 3px 0;
+    }
+
+    :deep(strong) {
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    :deep(em) {
+      font-style: italic;
+    }
+
+    :deep(del) {
+      text-decoration: line-through;
+      opacity: 0.75;
+    }
+
+    :deep(a) {
+      color: var(--primary-color, #6366f1);
+      text-decoration: none;
+
+      &:hover {
+        text-decoration: underline;
+      }
+    }
+
+    :deep(blockquote) {
+      margin: 8px 0;
+      padding: 6px 10px;
+      border-left: 3px solid var(--primary-color, #6366f1);
+      background: rgba(99, 102, 241, 0.06);
+      border-radius: 0 4px 4px 0;
+      color: var(--text-secondary);
+      font-size: 12px;
+    }
+
+    :deep(hr) {
+      border: none;
+      border-top: 1px solid var(--border-color);
+      margin: 10px 0;
+    }
+
+    :deep(code.md-inline-code) {
+      padding: 1px 5px;
+      margin: 0 2px;
+      border-radius: 4px;
+      background: rgba(125, 125, 125, 0.12);
+      font-family: var(--font-family-mono, monospace);
+      font-size: 12px;
+      color: var(--text-primary);
+    }
+
+    :deep(pre.md-code-block) {
+      margin: 8px 0;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: var(--code-box-bg, rgba(0, 0, 0, 0.28));
+      border: 1px solid var(--code-border, var(--border-color));
+      overflow-x: auto;
+      font-family: var(--font-family-mono, monospace);
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--text-primary);
+      position: relative;
+
+      /* 语言标记贴在代码块右上角（renderMarkdown 已把语言写进 data-lang） */
+      &[data-lang]::before {
+        content: attr(data-lang);
+        position: absolute;
+        top: 4px;
+        right: 8px;
+        font-size: 10px;
+        text-transform: uppercase;
+        color: var(--text-secondary);
+        opacity: 0.7;
+        font-weight: 600;
+      }
+
+      code {
+        font-family: inherit;
+        font-size: inherit;
+        background: transparent;
+        padding: 0;
+        color: inherit;
+      }
+    }
+
+    :deep(.md-table-wrap) {
+      margin: 8px 0;
+      max-width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+    }
+
+    :deep(table.md-table) {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      line-height: 1.5;
+
+      th,
+      td {
+        padding: 5px 8px;
+        border: 1px solid var(--border-color);
+      }
+
+      th {
+        background: rgba(125, 125, 125, 0.08);
+        font-weight: 600;
+        color: var(--text-primary);
+        text-align: left;
+      }
+
+      tr:nth-child(even) td {
+        background: rgba(125, 125, 125, 0.03);
       }
     }
   }
@@ -634,11 +791,6 @@ onBeforeUnmount(() => {
       .page-title {
         font-size: 16px;
       }
-    }
-
-    /* 气泡加宽 + 代码块可横向滚动 */
-    .chat-message {
-      max-width: 94%;
     }
 
     .chat-input-area {

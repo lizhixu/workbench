@@ -316,7 +316,7 @@ onMounted(async () => {
           <AiCallTrace v-if="generating" :started-at="generatingStartedAt" />
 
           <NAlert v-if="fillError" type="error" :show-icon="true">{{ fillError }}</NAlert>
-          <AiCallTrace v-if="fillTrace" :trace="fillTrace" default-expanded />
+          <AiCallTrace v-if="fillTrace" :trace="fillTrace" />
 
           <div v-if="draftResult" class="draft-result">
             <div v-if="draftResult.explanation" class="explain-card">
@@ -349,7 +349,6 @@ onMounted(async () => {
               :trace="draftResult.trace"
               :model="draftResult.model"
               :usage="draftResult.usage"
-              default-expanded
             />
 
             <NAlert v-if="!hasDraftContent" type="default" :show-icon="false">
@@ -428,7 +427,7 @@ onMounted(async () => {
           </div>
 
           <NAlert v-if="chatError" type="error" :show-icon="true">{{ chatError }}</NAlert>
-          <AiCallTrace v-if="chatTrace" :trace="chatTrace" default-expanded />
+          <AiCallTrace v-if="chatTrace" :trace="chatTrace" />
 
           <div
             class="chat-resize-handle"

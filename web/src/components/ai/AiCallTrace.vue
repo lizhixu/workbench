@@ -1,5 +1,12 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue'
+import { NIcon } from 'naive-ui'
+import {
+  CheckmarkOutline,
+  ChevronDownOutline,
+  ChevronForwardOutline,
+  CloseOutline,
+} from '@vicons/ionicons5'
 import type { CallTrace, LLMUsage } from '../../api/ai'
 
 // Codex-style call timeline: the server measures each real stage of an AI
@@ -91,11 +98,14 @@ function toggleStep(key: string) {
       <button class="trace-head" type="button" @click="expanded = !expanded">
         <span class="trace-title">调用过程</span>
         <span class="trace-meta">
-          共耗时 {{ fmtDuration(trace.total_ms) }}
+          <span class="trace-total">共耗时 {{ fmtDuration(trace.total_ms) }}</span>
           <span v-if="model"> · {{ model }}</span>
           <span v-if="usageText"> · {{ usageText }}</span>
         </span>
-        <span class="trace-chevron">{{ expanded ? '▾' : '▸' }}</span>
+        <NIcon size="14" class="trace-chevron">
+          <ChevronDownOutline v-if="expanded" />
+          <ChevronForwardOutline v-else />
+        </NIcon>
       </button>
 
       <div v-if="expanded" class="trace-steps">
@@ -111,17 +121,27 @@ function toggleStep(key: string) {
             :disabled="!step.detail"
             @click="step.detail && toggleStep(step.key)"
           >
+            <span class="step-node">
+              <NIcon size="10">
+                <CheckmarkOutline v-if="step.status === 'done'" />
+                <CloseOutline v-else-if="step.status === 'failed'" />
+              </NIcon>
+            </span>
             <span class="step-label">{{ step.label }}</span>
             <span class="step-status">{{ statusText(step.status) }}</span>
             <span class="step-time">{{ fmtDuration(step.duration_ms) }}</span>
             <span v-if="step.detail" class="step-chevron">
-              {{ openStep === step.key ? '▾' : '▸' }}
+              <NIcon size="12">
+                <ChevronDownOutline v-if="openStep === step.key" />
+                <ChevronForwardOutline v-else />
+              </NIcon>
             </span>
           </button>
           <div v-if="step.detail && openStep === step.key" class="step-detail">
             {{ step.detail }}
           </div>
         </div>
+        <div v-if="trace.steps.length === 0" class="trace-empty">无步骤记录</div>
       </div>
     </div>
   </div>
@@ -176,13 +196,18 @@ function toggleStep(key: string) {
   align-items: center;
   gap: 8px;
   width: 100%;
-  padding: 0;
+  padding: 4px 6px;
   border: none;
+  border-radius: 6px;
   background: none;
   color: inherit;
   font-size: 12px;
   cursor: pointer;
   text-align: left;
+  transition: background-color 0.15s ease;
+}
+.trace-head:hover {
+  background: var(--bg-hover);
 }
 .trace-head:focus-visible,
 .step-main:focus-visible {
@@ -193,59 +218,135 @@ function toggleStep(key: string) {
 .trace-title {
   font-weight: 600;
   color: var(--text-primary);
+  flex-shrink: 0;
+}
+.trace-total {
+  font-weight: 600;
+  color: var(--text-primary);
 }
 .trace-meta {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.trace-chevron {
+  display: flex;
+  align-items: center;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+/* 时间线轨道：竖线连在各步骤节点中心（节点 16px，中心 x=8px，
+   线宽 2px 故 left=7px）；首尾各留 12px，不伸出第一个/最后一个节点。 */
 .trace-steps {
+  position: relative;
   margin-top: 8px;
-  border-left: 2px solid var(--border-color);
-  padding-left: 12px;
+}
+.trace-steps::before {
+  content: '';
+  position: absolute;
+  left: 7px;
+  top: 12px;
+  bottom: 12px;
+  width: 2px;
+  background: var(--border-color);
 }
 .trace-step {
+  position: relative;
   margin-bottom: 2px;
+}
+.trace-empty {
+  padding: 2px 0 2px 24px;
+  color: var(--text-secondary);
+  opacity: 0.8;
 }
 .step-main {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
-  padding: 0;
+  width: 100%;
+  padding: 2px 6px;
   border: none;
+  border-radius: 6px;
   background: none;
   color: inherit;
   font-size: 12px;
   cursor: pointer;
   text-align: left;
+  transition: background-color 0.15s ease;
 }
 .step-main:disabled {
   cursor: default;
 }
+.step-main:not(:disabled):hover {
+  background: var(--bg-hover);
+}
+.step-node {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--text-muted, #9ca3af);
+  color: #ffffff;
+}
+.trace-step.done .step-node {
+  background: #10b981;
+}
+.trace-step.failed .step-node {
+  background: #ef4444;
+}
 .step-label {
+  flex: 1;
+  min-width: 0;
   color: var(--text-primary);
 }
-.trace-step.failed .step-label,
-.trace-step.failed .step-status {
-  color: #ef4444;
-}
+/* 状态 pill：完成绿 / 失败红 / 其他中性灰，与面板徽章同款弱底色 */
 .step-status {
   font-size: 11px;
-  opacity: 0.8;
+  line-height: 1.4;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(125, 125, 125, 0.12);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.trace-step.done .step-status {
+  background: rgba(16, 185, 129, 0.12);
+  color: #10b981;
+}
+.trace-step.failed .step-status {
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
 }
 .step-time {
   font-variant-numeric: tabular-nums;
   opacity: 0.8;
+  flex-shrink: 0;
+}
+.step-chevron {
+  display: flex;
+  align-items: center;
+  color: var(--text-secondary);
+  flex-shrink: 0;
 }
 .step-detail {
-  margin: 4px 0 8px;
+  /* 与步骤文案左对齐（节点 16px + 间距 8px），等宽字体，超长时内部滚动 */
+  margin: 4px 0 8px 24px;
   padding: 8px 10px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: var(--bg-card-subtle);
   color: var(--text-primary);
+  font-family: var(--font-family-mono, monospace);
+  font-size: 11.5px;
+  line-height: 1.55;
   word-break: break-all;
   white-space: pre-wrap;
+  max-height: 240px;
+  overflow-y: auto;
 }
 </style>

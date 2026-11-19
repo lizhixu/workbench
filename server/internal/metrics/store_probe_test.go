@@ -140,3 +140,27 @@ func TestQueryHistoryProbeAbsent(t *testing.T) {
 		}
 	}
 }
+
+// Latest returns the most recent point within the last 24h, or false when
+// the host has no recent samples.
+func TestStoreLatest(t *testing.T) {
+	s := newTestStore(t)
+
+	if _, ok := s.Latest("h1"); ok {
+		t.Fatalf("Latest on empty store = ok, want false")
+	}
+
+	now := time.Now().Unix()
+	s.AddSample("h1", &agentpb.MetricsSample{Ts: now - 300, MonthRx: 100, MonthTx: 50})
+	s.AddSample("h1", &agentpb.MetricsSample{Ts: now - 60, MonthRx: 200, MonthTx: 80})
+	// An old point (outside the 24h window) must not win.
+	s.AddSample("h1", &agentpb.MetricsSample{Ts: now - 90000, MonthRx: 999, MonthTx: 999})
+
+	pt, ok := s.Latest("h1")
+	if !ok {
+		t.Fatalf("Latest = not ok, want ok")
+	}
+	if pt.Timestamp != now-60 || pt.MonthRx != 200 || pt.MonthTx != 80 {
+		t.Fatalf("Latest = %+v, want ts=%d month_rx=200 month_tx=80", pt, now-60)
+	}
+}

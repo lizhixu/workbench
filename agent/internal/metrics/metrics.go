@@ -176,8 +176,14 @@ func (m *Manager) collect() *agentpb.MetricsSample {
 	sample := &agentpb.MetricsSample{Ts: time.Now().Unix()}
 	now := time.Now()
 
-	// CPU usage (first call returns 0 / per-call; use percent over 1s window).
-	if percents, err := cpu.Percent(time.Second, false); err == nil && len(percents) > 0 {
+	// CPU usage, measured since the previous collection instead of over a
+	// fixed 1s window: cpu.Percent(1s) sleeps a full second, and this
+	// collection runs inside the agent's gRPC receive loop for one-shot
+	// metrics queries — at the panel's poll rate that sleep serialises the
+	// loop and starves every other server->agent round trip (sysinfo, files,
+	// docker, terminal) until its timeout. The first call after start
+	// returns 0; the background sampler refreshes the baseline every 30s.
+	if percents, err := cpu.Percent(0, false); err == nil && len(percents) > 0 {
 		sample.CpuUsage = percents[0]
 	}
 

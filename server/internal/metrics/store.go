@@ -327,6 +327,24 @@ func (s *Store) QueryHistory(hostID string, from, to int64, stepSec int) []Point
 	return result
 }
 
+// Latest returns the most recent persisted point for hostID (memory cache +
+// day files, last 24h), if any. Used to keep month-to-date traffic visible
+// while the agent is offline instead of reporting zero.
+func (s *Store) Latest(hostID string) (Point, bool) {
+	now := time.Now().Unix()
+	raw := s.loadRawPoints(hostID, now-86400, now)
+	if len(raw) == 0 {
+		return Point{}, false
+	}
+	latest := raw[0]
+	for _, pt := range raw[1:] {
+		if pt.Timestamp > latest.Timestamp {
+			latest = pt
+		}
+	}
+	return latest, true
+}
+
 func (s *Store) loadRawPoints(hostID string, from, to int64) []Point {
 	seen := make(map[int64]bool)
 	var out []Point

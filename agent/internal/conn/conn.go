@@ -379,12 +379,16 @@ func (d *Dialer) handleServerMessage(msg *agentpb.ServerMessage) error {
 		d.execs.Cancel(p.ExecCancel)
 		return nil
 
-	// Metrics.
+	// Metrics. Answered off the receive loop: a one-shot sample collects
+	// CPU/disk/network counters and must never serialise the loop behind
+	// the panel's poll rate — that starved sysinfo/files/docker/terminal
+	// round trips until their timeouts. The reply still travels the same
+	// hub sender, so the server's metrics-live handler receives it.
 	case *agentpb.ServerMessage_MetricsQ:
 		if d.metrics == nil {
 			return fmt.Errorf("metrics not available")
 		}
-		d.metrics.Handle(p.MetricsQ)
+		go d.metrics.Handle(p.MetricsQ)
 		return nil
 
 	// Runtime config pushed live by the server when the admin saves the
@@ -398,12 +402,15 @@ func (d *Dialer) handleServerMessage(msg *agentpb.ServerMessage) error {
 		d.metrics.SetResetDay(int(p.ConfigUpdate.GetTrafficResetDay()))
 		return nil
 
-	// SysInfo.
+	// SysInfo. Answered off the receive loop for the same reason as
+	// MetricsQ: a slow collection kind must not stall the loop and starve
+	// every other server->agent round trip. The reply still travels the
+	// hub sender; the server's 10s sysinfo timeout still bounds the wait.
 	case *agentpb.ServerMessage_SysinfoQ:
 		if d.sysinfo == nil {
 			return fmt.Errorf("sysinfo not available")
 		}
-		d.sysinfo.Handle(p.SysinfoQ)
+		go d.sysinfo.Handle(p.SysinfoQ)
 		return nil
 
 	// Docker.

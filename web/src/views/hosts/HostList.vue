@@ -166,11 +166,12 @@ function formatArch(arch?: string): string {
 
 function formatMem(bytes?: number): string {
   if (!bytes || bytes <= 0) return '-'
-  const gb = bytes / (1024 * 1024 * 1024)
+  // 口径与详情页/监控页一致：十进制 GB（AGENTS.md §3.11，1 GB = 1e9 B）。
+  const gb = bytes / 1e9
   if (gb >= 1) {
     return gb.toFixed(1) + ' GB'
   }
-  const mb = bytes / (1024 * 1024)
+  const mb = bytes / 1e6
   return Math.round(mb) + ' MB'
 }
 
@@ -234,15 +235,15 @@ function formatHostTraffic(h: Host): string {
   let used = (h.month_rx || 0) + (h.month_tx || 0)
   if (h.traffic_calc_type === 'out') used = h.month_tx || 0
   else if (h.traffic_calc_type === 'in') used = h.month_rx || 0
-  const usedGB = used / (1024 * 1024 * 1024)
+  const usedGB = used / 1e9
   const pct = Math.round((usedGB / h.traffic_limit_gb) * 100)
   return `${usedGB.toFixed(1)}G/${h.traffic_limit_gb}G (${pct}%)`
 }
 
 function getTrafficTooltip(h: Host): string {
   if (!h.traffic_limit_gb) return ''
-  const rxGB = ((h.month_rx || 0) / (1024 * 1024 * 1024)).toFixed(2)
-  const txGB = ((h.month_tx || 0) / (1024 * 1024 * 1024)).toFixed(2)
+  const rxGB = ((h.month_rx || 0) / 1e9).toFixed(2)
+  const txGB = ((h.month_tx || 0) / 1e9).toFixed(2)
   return `本月入向: ${rxGB} GB | 本月出向: ${txGB} GB | 重置日: 每月 ${h.traffic_reset_day || 1} 号`
 }
 

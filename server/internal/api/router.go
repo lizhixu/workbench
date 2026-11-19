@@ -2761,8 +2761,10 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 		Notes:              a.Notes,
 	}
 	// Surface the real OS uptime and latest metrics
+	live := false
 	if hub := h.reg.Hub(a.ID); hub != nil {
 		if m := hub.LastMetrics(); m != nil {
+			live = true
 			if m.GetUptime() > 0 {
 				dto.Uptime = m.GetUptime()
 			}
@@ -2778,6 +2780,15 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 			}
 		}
 	}
+	if !live && h.metrics != nil {
+		// Agent 离线或刚重连、尚无实时样本时，月流量不归零：回落到持久化
+		// 指标里最近一点的当月累计值。超过当前计费周期起点的旧点不用，
+		// 避免把上个月的用量算进这个月。
+		if pt, ok := h.metrics.Latest(a.ID); ok && pt.Timestamp >= monthCycleStart(a.TrafficResetDay, time.Now()).Unix() {
+			dto.MonthRx = pt.MonthRx
+			dto.MonthTx = pt.MonthTx
+		}
+	}
 	if upg := h.reg.GetAgentUpgrade(a.ID); upg != nil {
 		if upg.Stage != "error" {
 			dto.Upgrading = true
@@ -2787,6 +2798,27 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 		dto.UpgradeError = upg.Error
 	}
 	return dto
+}
+
+// monthCycleStart returns the start of the current billing cycle: the most
+// recent date whose day-of-month is resetDay (1..28, clamped), at 00:00
+// local time. When the reset day hasn't occurred yet this month, the cycle
+// started on that day last month.
+func monthCycleStart(resetDay int, now time.Time) time.Time {
+	if resetDay < 1 {
+		resetDay = 1
+	}
+	if resetDay > 28 {
+		resetDay = 28
+	}
+	loc := now.Location()
+	y, mo, d := now.Date()
+	if d >= resetDay {
+		return time.Date(y, mo, resetDay, 0, 0, 0, 0, loc)
+	}
+	prev := time.Date(y, mo, 1, 0, 0, 0, 0, loc).AddDate(0, -1, 0)
+	py, pmo, _ := prev.Date()
+	return time.Date(py, pmo, resetDay, 0, 0, 0, 0, loc)
 }
 
 // panelProbeTargets returns the per-carrier probe targets shown in the host

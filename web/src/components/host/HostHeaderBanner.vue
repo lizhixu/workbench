@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { NButton, NIcon, NPopconfirm, NSpin, useMessage } from 'naive-ui'
 import {
   PowerOutline,
@@ -69,22 +69,55 @@ const upgradeBtnTooltip = computed(() => {
   return '当前已是最新版，点击可重新下发覆盖安装'
 })
 
+// 组网 IP 只在挂载时查一次：若当时主机刚注册/重连、节点列表里尚未有本机，
+// 或请求恰逢服务端重启而失败，就会永久停留在「未连接」。查不到时重试
+// 几次，主机上线后也重新查一次。
+let tailscaleRetryTimer: ReturnType<typeof setTimeout> | null = null
+let tailscaleAttempts = 0
+
 async function fetchTailscaleIp() {
+  if (tailscaleRetryTimer) {
+    clearTimeout(tailscaleRetryTimer)
+    tailscaleRetryTimer = null
+  }
   try {
     const nodes = await listNetworkNodes()
     const found = nodes.find((n: NetworkNode) => n.host_id === props.host.id)
     if (found && found.online && found.ip) {
       tailscaleIp.value = found.ip
-    } else {
-      tailscaleIp.value = ''
+      tailscaleAttempts = 0
+      return
     }
+    tailscaleIp.value = ''
   } catch {
     tailscaleIp.value = ''
+  }
+  tailscaleAttempts += 1
+  if (tailscaleAttempts <= 3 && props.host.id) {
+    tailscaleRetryTimer = setTimeout(fetchTailscaleIp, 2000)
   }
 }
 
 onMounted(fetchTailscaleIp)
-watch(() => props.host.id, fetchTailscaleIp)
+onUnmounted(() => {
+  if (tailscaleRetryTimer) {
+    clearTimeout(tailscaleRetryTimer)
+    tailscaleRetryTimer = null
+  }
+})
+watch(
+  () => props.host.id,
+  () => {
+    tailscaleAttempts = 0
+    fetchTailscaleIp()
+  },
+)
+watch(() => props.host.status, (s) => {
+  if (s === 'online' && !tailscaleIp.value) {
+    tailscaleAttempts = 0
+    fetchTailscaleIp()
+  }
+})
 
 async function copyTailscaleIp() {
   if (!tailscaleIp.value) return
@@ -100,11 +133,12 @@ const distro = computed(() => props.host.distro || props.host.os || '')
 
 function formatMem(bytes?: number): string {
   if (!bytes || bytes <= 0) return '-'
-  const gb = bytes / (1024 * 1024 * 1024)
+  // 口径与监控页 fmtBytes 一致：十进制 GB（AGENTS.md §3.11，1 GB = 1e9 B）。
+  const gb = bytes / 1e9
   if (gb >= 1) {
     return gb.toFixed(1) + ' GB'
   }
-  const mb = bytes / (1024 * 1024)
+  const mb = bytes / 1e6
   return Math.round(mb) + ' MB'
 }
 

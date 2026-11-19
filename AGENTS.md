@@ -267,8 +267,9 @@
 
 - **内置监控项**：默认提供「主机上线」「主机离线」告警。
 - **月流量超额预警（内置，非规则）**：基于每台主机在「财务与规格」中配置的「流量限制 (GB)」与「月流量计算类型」（双向/仅上行/仅下行）自动判定：达到 80% 触发警告、达到 100% 触发严重告警（触发 ID 为 `builtin-traffic-80` / `builtin-traffic-100`），回落后自动标记解决。**不存在也不允许再创建 `traffic_high` 类型的告警规则**——流量配额是主机属性而非全局规则，告警中心的规则类型选项中已移除该项。未配置流量限制的主机不产生流量告警。
-  - 实现备注（流量计量重写）：Agent 按**网卡逐个**跟踪内核累计计数器的增量并落盘（`agent/internal/metrics/traffic.go`），**回环网卡（lo / Windows Loopback）不计入**；网卡消失（docker 网络删建、VPN 启停等）只丢弃其基线、**不再把剩余网卡的累计总量误作增量**（旧逻辑的幽灵流量 bug）；主机重启经 boot time 变化判定，当前计数器值即为重启后流量。docker/tailscale 等虚拟网卡仍会与其底层网卡重复计数同一报文——docker 重度主机可用 Agent 启动参数 `-traffic-ifaces=eth0` 把统计限定到外网网卡。
+  - 实现备注（流量计量重写）：Agent 按**网卡逐个**跟踪内核累计计数器的增量并落盘（`agent/internal/metrics/traffic.go`），**回环网卡（lo / Windows Loopback）不计入**；只计连续两次采样之间观测到的增量，**累计值本身永不直接计入**——主机重启（boot time 变化）与单网卡计数器回落时均只重建基线、本次采样计 0，杜绝误判重启把整机累计流量一次性计入当月；网卡消失（docker 网络删建、VPN 启停等）只丢弃其基线、**不再把剩余网卡的累计总量误作增量**（旧逻辑的幽灵流量 bug）。默认只统计承载默认路由的网卡（外网网卡），docker/tailscale 等虚拟网卡不再与其底层网卡重复计数同一报文；路由表读不到时回落全部非回环网卡，Agent 启动参数 `-traffic-ifaces=eth0` 可显式限定统计网卡。
   - **流量重置日**由面板「财务与规格」统一下发：`RegisterResponse.traffic_reset_day`（proto field 7）在每次 Agent（重）连时推送，Agent 经 `SetResetDay` 热应用并持久化，**面板保存后同时经 `ServerMessage.config_update`（field 20，`ConfigUpdate.traffic_reset_day`）对在线 Agent 即时下发**（`Registry.PushRuntimeConfig`，离线 Agent 下次重连兜底，见 §3.2 兼容说明）；取值范围统一为 1~28（server 侧 `SetAgentBilling` 同步钳制，前端输入框 `max=28`）。
+  - **月流量手动校正**：统计出错（如幻影累计）时，admin 在主机详情「资源监控」页「本月流量」卡片点「校正」，输入正确的下行/上行 GB（与卡片同一口径），面板经 `POST /api/v1/hosts/:id/traffic/correct` 下发 `ServerMessage.traffic_correct`（field 23，`TrafficCorrect`），Agent 经 `SetTrafficCorrection` 把 MonthRx/MonthTx 设为该值并落盘，之后只加新产生的增量。Agent 必须在线（离线返回 503，不谎报成功）；旧版 Agent 不认识该字段会静默忽略，校正按钮须等 Agent 升级后才生效。
   - **单位为二进制 GB**：配额换算与前后端展示统一按 `1<<30`（1 GB = 1024³ B，阿里云官方流量口径），与面板「流量限制 (GB)」标签一致（此前按十进制 `1e9`，差 7.4%）。
 - **到期续费提醒（内置，非规则）**：主机在「财务与规格」中配置了「到期时间」后，距到期不足 30 天时自动发起一次续费提醒（触发 ID `builtin-expiry-remind`，警告级别，走告警中心与 webhook 通知）；到期时间在 30 天以外的主机不提醒，续费（到期时间推后）后提醒自动解除，逾期未续保持提醒且不重复触发。
 - **证书到期提醒（内置，非规则）**：不会自动续期的证书（手动 DNS-01 两阶段签发的、手动上传的）在到期阈值内自动发起一次到期提醒（触发 ID `builtin-cert-expiry`，警告级别，走告警中心与 webhook 通知，告警可跳转证书中心）；提前天数可在「证书中心 → 证书时间设置」中配置（`certs.expiry_reminder_days`，默认 30 天，1~90）；阈值与自动续期缩放一致（`min(配置天数, 有效期/3)`）；证书被续期/替换（到期时间推后）或删除后提醒自动解除，逾期未处理保持提醒且不重复触发。手动 DNS-01 签发的证书不自动续期（续期走自动验证通道，与管理员选择手动的原因相悖）。
@@ -640,6 +641,7 @@ message ServerMessage {           // 控制端 → Agent
     DockerOp          docker_op = 11;  // Docker 操作下发
     ConfigUpdate      config_update=20; // 面板改配置后对在线 Agent 即时下发（重连兜底见 RegisterResponse）
     ExecCancel        exec_cancel=22;  // 取消在途 exec（见 ExecCancel）
+    TrafficCorrect    traffic_correct=23; // 手动校正月流量累计（见 TrafficCorrect）
   }
 }
 

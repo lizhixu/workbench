@@ -85,6 +85,18 @@ func (m *Manager) SetResetDay(day int) {
 	}
 }
 
+// SetTrafficCorrection applies a one-time panel-driven override of the
+// current cycle's monthly traffic totals (bytes), e.g. to repair a
+// corrupted total. Serialized with sampling via m.mu so a correction can
+// never race a sample's delta accumulation.
+func (m *Manager) SetTrafficCorrection(rx, tx uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.traffic != nil {
+		m.traffic.setCorrection(rx, tx)
+	}
+}
+
 // SetProbeTargets applies the per-carrier probe targets delivered by the
 // server in RegisterResponse (carrier -> "host[:port]"). An empty map
 // disables probing (old server); carriers map to empty values are skipped.
@@ -253,9 +265,10 @@ func (m *Manager) collect() *agentpb.MetricsSample {
 	}
 
 	// Network: per-interface cumulative counters. Loopback is excluded
-	// (host-internal traffic no ISP bills); an optional allowlist can
-	// restrict accounting to chosen interfaces (e.g. the external NIC on
-	// docker hosts, where one packet is counted on veth + bridge + NIC).
+	// (host-internal traffic no ISP bills); by default only the interfaces
+	// carrying the default route (the external NIC) are counted, so one
+	// packet is not counted on veth + bridge + NIC — an optional allowlist
+	// (-traffic-ifaces) overrides that selection.
 	if io, err := net.IOCounters(true); err == nil && len(io) > 0 {
 		samples := make(map[string]ifaceCounters, len(io))
 		var curRx, curTx uint64

@@ -63,6 +63,7 @@ message ServerMessage {
     UninstallRequest uninstall = 15; // ask agent to uninstall itself
     ConfigUpdate config_update = 20; // push per-host runtime config to a connected agent
     ExecCancel exec_cancel = 22; // cancel a running exec (see ExecCancel)
+    TrafficCorrect traffic_correct = 23; // one-time manual correction of the monthly traffic totals (see TrafficCorrect)
   }
 }
 
@@ -241,6 +242,19 @@ message ExecOutput {
 // "cancelled". Cancelling an unknown or already-finished exec is a no-op.
 message ExecCancel {
   string exec_id = 1;
+}
+
+// TrafficCorrect is a one-time panel-driven override of the agent's
+// monthly traffic totals (bytes). The agent sets MonthRx/MonthTx to these
+// values and persists them; later samples only add deltas observed after
+// the correction, so the corrected total keeps accumulating correctly.
+// It repairs a corrupted monthly total (e.g. a phantom add) without
+// editing the agent state file over SSH. An old agent that does not know
+// this message ignores it (unknown oneof field), so the panel only offers
+// the correction when the agent is new enough to apply it.
+message TrafficCorrect {
+  uint64 rx_bytes = 1; // monthly received bytes to set
+  uint64 tx_bytes = 2; // monthly transmitted bytes to set
 }
 
 // ---- Metrics ---------------------------------------------------------

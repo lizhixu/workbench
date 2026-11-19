@@ -48,6 +48,7 @@ func TestDeriveMutationActionCoverage(t *testing.T) {
 		{http.MethodPost, "/api/v1/hosts/:id/files/compress", "file_compress", "host", ""},
 		{http.MethodDelete, "/api/v1/hosts/:id/files", "file_remove", "host", audit.RiskHigh},
 		{http.MethodPost, "/api/v1/hosts/:id/scans", "scan_trigger", "host", ""},
+		{http.MethodPost, "/api/v1/hosts/:id/traffic/correct", "traffic_correct", "host", ""},
 		// Terminal.
 		{http.MethodDelete, "/api/v1/terminals/:sid", "terminal_close", "session", audit.RiskHigh},
 		// Backups.

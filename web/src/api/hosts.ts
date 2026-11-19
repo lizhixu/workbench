@@ -35,6 +35,15 @@ export function updateHostBilling(id: string, billing: HostBillingConfig) {
   return unwrap<{ ok: boolean }>(http.put(`/hosts/${id}/billing`, billing))
 }
 
+// One-time manual correction of the host's monthly traffic totals.
+// rxGB/txGB are binary GB (1 GB = 1024^3 B), the same unit the panel
+// displays. The agent must be online; an offline agent gets a 503.
+export function correctHostTraffic(id: string, rxGB: number, txGB: number) {
+  return unwrap<{ ok: boolean; month_rx: number; month_tx: number }>(
+    http.post(`/hosts/${id}/traffic/correct`, { rx_gb: rxGB, tx_gb: txGB }),
+  )
+}
+
 // ---- Terminal ----
 export interface TerminalSession {
   session_id: string

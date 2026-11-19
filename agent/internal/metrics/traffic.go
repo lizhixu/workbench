@@ -2,20 +2,37 @@
 //
 // Kernel NIC counters are cumulative since boot (or since the interface
 // appeared). This tracker folds consecutive per-interface counter deltas
-// into per-cycle totals that survive agent restarts. A host reboot is
-// detected via a change in boot time; in that case the current counter
-// values are exactly the traffic since boot. An interface that disappears
-// (docker network removed, VPN down, NIC unplugged, …) only drops its
-// baseline — its past traffic was already counted, and the surviving
-// interfaces' totals are never mistaken for a delta (that confusion was
-// the old phantom-add bug: any single counter decrease made the whole
-// cumulative total count as one sample's delta).
+// into per-cycle totals that survive agent restarts.
+//
+// The cardinal rule is that only traffic observed as a delta between two
+// consecutive samples is ever counted. A cumulative counter value is
+// never, by itself, added to the monthly total:
+//
+//   - A host reboot is detected via a change in boot time. The counters
+//     restarted, so the current values are traffic since boot — but how
+//     much of that flowed before the agent started sampling is unknowable,
+//     so the reboot sample is rebaselined and counts 0. Counting the full
+//     counters here was the phantom-add bug: a false reboot detection
+//     (e.g. a stale boot time in the persisted state) added the host's
+//     entire uptime traffic to the cycle in one sample.
+//   - A single interface's counter decrease (driver reload, interface
+//     recreated, …) likewise rebaselines that interface and counts 0 for
+//     the sample; the full current value is never added.
+//   - An interface that disappears (docker network removed, VPN down, NIC
+//     unplugged, …) only drops its baseline — its past traffic was already
+//     counted, and the surviving interfaces' totals are never mistaken
+//     for a delta (that confusion was the old phantom-add bug: any single
+//     counter decrease made the whole cumulative total count as one
+//     sample's delta).
 //
 // Loopback interfaces are excluded from accounting: they carry only
 // host-internal traffic (e.g. a local reverse proxy to 127.0.0.1) that
-// no ISP bills. An optional interface allowlist further restricts
-// accounting, e.g. to the external NIC on docker-heavy hosts where one
-// packet is counted on veth + bridge + physical NIC.
+// no ISP bills. By default only the interface(s) carrying the default
+// route (the external NIC) are counted, so one packet is not counted
+// several times on veth + bridge + physical NIC; an explicit interface
+// allowlist (-traffic-ifaces) overrides that selection, and when the
+// routing table cannot be read accounting falls back to all non-loopback
+// interfaces.
 //
 // The billing cycle resets monthly on a configurable day-of-month (1..28).
 // State is persisted as JSON next to the agent state file.
@@ -55,9 +72,18 @@ type trafficState struct {
 type trafficTracker struct {
 	path     string          // state file location ("" disables persistence)
 	resetDay int             // billing cycle reset day-of-month (1..28)
-	allow    map[string]bool // interface allowlist; nil/empty = all non-loopback
-	st       trafficState
+	allow    map[string]bool // interface allowlist; nil/empty = default-route interfaces
+	// defaultIfaces is the set of interfaces carrying the default route
+	// (external NICs), resolved once at startup when no allowlist is set;
+	// nil/empty means the routing table could not be read and accounting
+	// falls back to all non-loopback interfaces.
+	defaultIfaces map[string]bool
+	st            trafficState
 }
+
+// defaultRouteIfacesFunc resolves the interfaces carrying the default
+// route. It is a variable so tests can stub the routing table.
+var defaultRouteIfacesFunc = defaultRouteIfaces
 
 func newTrafficTracker(stateFile string, resetDay int, allowIfaces []string) *trafficTracker {
 	t := &trafficTracker{resetDay: clampResetDay(resetDay)}
@@ -68,6 +94,12 @@ func newTrafficTracker(stateFile string, resetDay int, allowIfaces []string) *tr
 				t.allow[n] = true
 			}
 		}
+	} else {
+		// No explicit allowlist: restrict to the external NIC(s) (the
+		// interfaces carrying the default route) so virtual interfaces
+		// (tailscale, docker bridge/veth, …) do not double-count the
+		// same packet. Nil/empty falls back to all non-loopback.
+		t.defaultIfaces = defaultRouteIfacesFunc()
 	}
 	if stateFile != "" {
 		t.path = filepath.Join(filepath.Dir(stateFile), "traffic-state.json")
@@ -99,16 +131,35 @@ func (t *trafficTracker) setResetDay(day int) {
 	t.save()
 }
 
+// setCorrection overrides the current cycle's monthly totals with the
+// panel-supplied values (e.g. to repair a corrupted total) and persists
+// them. Later samples only add deltas observed after the correction, so
+// the corrected total keeps accumulating correctly. The per-interface
+// baselines are left untouched: the next sample adds only the small delta
+// since the last sample, which is real traffic that flowed after the
+// previous sample.
+func (t *trafficTracker) setCorrection(rx, tx uint64) {
+	t.st.MonthRx = rx
+	t.st.MonthTx = tx
+	t.save()
+}
+
 // ifaceAllowed reports whether an interface participates in accounting:
-// loopback never does; an allowlist, when configured, restricts to its members.
+// loopback never does; an allowlist, when configured, restricts to its
+// members; otherwise only the interfaces carrying the default route are
+// counted (falling back to all non-loopback when the routing table could
+// not be read).
 func (t *trafficTracker) ifaceAllowed(name string) bool {
 	if isLoopbackIface(name) {
 		return false
 	}
-	if len(t.allow) == 0 {
-		return true
+	if len(t.allow) > 0 {
+		return t.allow[name]
 	}
-	return t.allow[name]
+	if len(t.defaultIfaces) > 0 {
+		return t.defaultIfaces[name]
+	}
+	return true
 }
 
 // isLoopbackIface matches "lo" (Linux/macOS) and Windows'
@@ -172,15 +223,14 @@ func (t *trafficTracker) account(samples map[string]ifaceCounters, bootTime int6
 	// First sample ever (no persisted state): t.st.Ifaces is empty and
 	// BootTime is 0, so every interface below is treated as new and
 	// baselined without counting boot-to-install traffic into the cycle.
+	//
+	// Only deltas between two consecutive observed samples are ever
+	// counted. A reboot or a counter decrease rebaselines and counts 0
+	// for the sample: the full current counter value is never added, so
+	// no code path can inject the host's cumulative uptime traffic into
+	// the cycle (the phantom-add bug).
 	rebooted := bootTime > 0 && t.st.BootTime > 0 && bootTime != t.st.BootTime
-	if rebooted {
-		// Host rebooted: every counter restarted, so the current values
-		// are exactly the traffic since boot.
-		for _, s := range samples {
-			dRx += s.Rx
-			dTx += s.Tx
-		}
-	} else {
+	if !rebooted {
 		for name, s := range samples {
 			prev, ok := t.st.Ifaces[name]
 			if !ok {
@@ -188,16 +238,23 @@ func (t *trafficTracker) account(samples map[string]ifaceCounters, bootTime int6
 			}
 			if s.Rx >= prev.Rx {
 				dRx += s.Rx - prev.Rx
-			} else {
-				dRx += s.Rx // this interface's counter reset (driver reload, …)
 			}
+			// else: this interface's counter decreased (driver reload,
+			// interface recreated, …): rebaseline it and count 0 for
+			// this sample.
 			if s.Tx >= prev.Tx {
 				dTx += s.Tx - prev.Tx
-			} else {
-				dTx += s.Tx
 			}
+			// else: same as Rx, rebaseline, count 0.
 		}
 	}
+	// else: host rebooted. The counters restarted, so the current values
+	// are traffic since boot — but the agent cannot know how much of that
+	// flowed before it started sampling, and a false reboot detection
+	// (stale persisted boot time) would add the host's entire uptime
+	// traffic to the cycle in one sample. So the reboot sample is
+	// rebaselined and counts 0; only deltas observed from here on are
+	// counted. The baselines are refreshed below.
 
 	// Refresh baselines for the sampled interfaces; drop the ones that
 	// vanished (docker network removed, VPN down, …). Their past traffic

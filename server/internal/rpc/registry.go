@@ -906,6 +906,30 @@ func (r *Registry) PushRuntimeConfig(id string) bool {
 	})
 }
 
+// PushTrafficCorrection sends a one-time manual override of the agent's
+// monthly traffic totals (bytes) to its live hub, e.g. to repair a
+// corrupted total. The agent sets MonthRx/MonthTx to the supplied values
+// and persists them; later samples only add deltas observed after the
+// correction. Returns false for offline/unknown agents or when the hub
+// cannot accept the message — the correction is then not applied and the
+// caller must surface that instead of reporting success. An old agent
+// that does not know this message ignores it, so callers should only
+// offer the correction for agents new enough to apply it.
+func (r *Registry) PushTrafficCorrection(id string, rxBytes, txBytes uint64) bool {
+	r.mu.RLock()
+	_, okA := r.agents[id]
+	hub, okH := r.hubs[id]
+	r.mu.RUnlock()
+	if !okA || !okH {
+		return false
+	}
+	return hub.Send(&agentpb.ServerMessage{
+		Payload: &agentpb.ServerMessage_TrafficCorrect{
+			TrafficCorrect: &agentpb.TrafficCorrect{RxBytes: rxBytes, TxBytes: txBytes},
+		},
+	})
+}
+
 // RenameGroup rewrites every agent whose group is oldName to newName and
 // returns how many records changed. Passing an empty newName clears the group
 // (used when a group is deleted) so hosts are never left pointing at a group

@@ -402,6 +402,18 @@ func (d *Dialer) handleServerMessage(msg *agentpb.ServerMessage) error {
 		d.metrics.SetResetDay(int(p.ConfigUpdate.GetTrafficResetDay()))
 		return nil
 
+	// One-time manual correction of the monthly traffic totals, pushed
+	// live by the server when the admin saves the traffic-correction
+	// modal. The agent sets MonthRx/MonthTx to the supplied values and
+	// persists them; later samples only add deltas observed after the
+	// correction.
+	case *agentpb.ServerMessage_TrafficCorrect:
+		if d.metrics == nil {
+			return nil
+		}
+		d.metrics.SetTrafficCorrection(p.TrafficCorrect.GetRxBytes(), p.TrafficCorrect.GetTxBytes())
+		return nil
+
 	// SysInfo. Answered off the receive loop for the same reason as
 	// MetricsQ: a slow collection kind must not stall the loop and starve
 	// every other server->agent round trip. The reply still travels the

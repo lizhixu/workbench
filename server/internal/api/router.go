@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -198,6 +199,7 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	adminOnly.PUT("/hosts/:id/group", h.setHostGroup)
 	adminOnly.PUT("/hosts/:id/tags", h.setHostTags)
 	adminOnly.PUT("/hosts/:id/billing", h.setHostBilling)
+	adminOnly.Group("", h.auditMutation()).POST("/hosts/:id/traffic/correct", h.correctHostTraffic)
 
 	// Terminal. An interactive shell is full write access to the host.
 	hostWrite.POST("/hosts/:id/terminals", h.openTerminal)
@@ -942,6 +944,51 @@ func (h *handlers) setHostBilling(c *gin.Context) {
 	}
 	h.recordAudit(c, "host_billing", "host", c.Param("id"), "更新主机财务与流量配置", audit.RiskLow, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// correctHostTraffic applies a one-time manual override of the host's
+// monthly traffic totals. The panel sends GB (binary, 1 GB = 1024^3 B,
+// the same unit the panel displays); the agent stores bytes. The agent
+// must be online: the correction is delivered over its live gRPC stream
+// and there is no queued offline delivery — an offline agent keeps its
+// old totals until it reconnects, and a correction entered now would be
+// stale by then. The audit record is written by the auditMutation
+// middleware via the traffic_correct rule.
+func (h *handlers) correctHostTraffic(c *gin.Context) {
+	var body struct {
+		RxGB float64 `json:"rx_gb"`
+		TxGB float64 `json:"tx_gb"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if math.IsNaN(body.RxGB) || math.IsNaN(body.TxGB) || math.IsInf(body.RxGB, 0) || math.IsInf(body.TxGB, 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "流量值必须为有限数字"})
+		return
+	}
+	if body.RxGB < 0 || body.TxGB < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "流量值不能为负数"})
+		return
+	}
+	// Guard against a unit slip (bytes typed as GB): 1 PiB in GB is far
+	// above any real monthly total, so anything larger is a typo.
+	const maxGB = 1 << 20 // 1 PiB expressed in GB (1 GB = 1024^3 B)
+	if body.RxGB > maxGB || body.TxGB > maxGB {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "流量值过大，请确认单位为 GB"})
+		return
+	}
+	if h.reg.GetAgent(c.Param("id")) == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "agent not found"})
+		return
+	}
+	rxBytes := uint64(body.RxGB * float64(1<<30))
+	txBytes := uint64(body.TxGB * float64(1<<30))
+	if !h.reg.PushTrafficCorrection(c.Param("id"), rxBytes, txBytes) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline，校正未下发"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "month_rx": rxBytes, "month_tx": txBytes})
 }
 
 // ---- Terminal --------------------------------------------------------
@@ -2276,6 +2323,7 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodPost, "/api/v1/hosts/:id/apps/install", "app_install", "", "", "", "安装应用"},
 		{http.MethodDelete, "/api/v1/hosts/:id/apps/:name", "app_uninstall", "", "", "", "卸载应用"},
 		{http.MethodPost, "/api/v1/hosts/:id/docker/install-script", "docker_install", "", "", audit.RiskHigh, "一键安装 Docker"},
+		{http.MethodPost, "/api/v1/hosts/:id/traffic/correct", "traffic_correct", "host", "id", "", "校正主机月流量"},
 		// Terminal: closing a live session kills the shell, so it is high-risk.
 		{http.MethodDelete, "/api/v1/terminals/:sid", "terminal_close", "session", "sid", audit.RiskHigh, "关闭终端会话"},
 		{http.MethodPut, "/api/v1/me/settings", "user_settings_update", "", "", "", "更新个人设置"},

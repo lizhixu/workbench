@@ -87,6 +87,7 @@ export const actionLabels: Record<string, string> = {
   host_group: '调整分组',
   host_tags: '更新标签',
   host_billing: '更新财务与流量配置',
+  traffic_correct: '校正月流量',
   process_kill: '结束进程',
   agent_upgrade: '升级 Agent',
   scan_trigger: '触发安全扫描',

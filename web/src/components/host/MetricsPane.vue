@@ -11,6 +11,12 @@ import {
   NIcon,
   NEmpty,
   NProgress,
+  NModal,
+  NForm,
+  NFormItem,
+  NInputNumber,
+  NSpace,
+  useMessage,
 } from 'naive-ui'
 import { RefreshOutline } from '@vicons/ionicons5'
 // 按需引入 echarts：整包 import 会把地图、3D、所有图表类型都打进来，这里只用到
@@ -21,9 +27,10 @@ import { GridComponent, TooltipComponent, TitleComponent } from 'echarts/compone
 import { CanvasRenderer } from 'echarts/renderers'
 
 echarts.use([LineChart, GridComponent, TooltipComponent, TitleComponent, CanvasRenderer])
-import { getMetrics, getMetricsHistory, type MetricPoint } from '../../api/hosts'
+import { getMetrics, getMetricsHistory, correctHostTraffic, type MetricPoint } from '../../api/hosts'
 import type { Metrics, Mount, ProbeReading } from '../../api/types'
 import { useSettingsStore } from '../../stores/settings'
+import { useAuthStore } from '../../stores/auth'
 import { fmtDateTime, fmtTime as fmtTimeOfDay } from '../../utils/time'
 import { dedupeMountsByFilesystem, formatDiskBytes } from '../../utils/diskUsage'
 
@@ -43,6 +50,46 @@ const currentMetrics = ref<Metrics | null>(null)
 // 历史档位查询无数据时置真：明示空态而不是拿实时缓冲区顶替——否则三个
 // 历史档位画出来是同一条最近几分钟的曲线，看起来像档位切换没生效。
 const historyEmpty = ref(false)
+
+// 月流量手动校正：只有 admin 能调（接口本身也是 adminOnly）。Agent 离线时
+// 接口返回 503，保存失败会如实报错，不谎报成功。
+const auth = useAuthStore()
+const isAdmin = computed(() => auth.role === 'admin')
+const message = useMessage()
+const showCorrectModal = ref(false)
+const correcting = ref(false)
+const correctForm = ref({ rxGB: 0, txGB: 0 })
+
+// 打开校正弹窗时预填当前值（字节 → GB，与卡片同一口径，保留两位小数）。
+function openCorrectModal() {
+  const m = currentMetrics.value
+  if (!m) return
+  correctForm.value = {
+    rxGB: Math.round(((m.month_rx ?? 0) / (1 << 30)) * 100) / 100,
+    txGB: Math.round(((m.month_tx ?? 0) / (1 << 30)) * 100) / 100,
+  }
+  showCorrectModal.value = true
+}
+
+async function handleCorrectSave() {
+  const { rxGB, txGB } = correctForm.value
+  if (rxGB == null || txGB == null || isNaN(rxGB) || isNaN(txGB) || rxGB < 0 || txGB < 0) {
+    message.error('请输入有效的流量值（GB，不能为负数）')
+    return
+  }
+  correcting.value = true
+  try {
+    await correctHostTraffic(props.hostId, rxGB, txGB)
+    message.success('月流量已校正')
+    showCorrectModal.value = false
+    // 立即刷新一次指标，卡片显示校正后的数字，不用等下一次轮询。
+    await fetchRealtimeMetrics()
+  } catch (e: any) {
+    message.error(e.message || '校正失败')
+  } finally {
+    correcting.value = false
+  }
+}
 
 // Swap usage percent for the stats strip.
 const swapPct = computed(() => {
@@ -829,6 +876,7 @@ watch(() => settings.themeMode, () => {
       <div class="traffic-header">
         <span class="traffic-title">本月流量</span>
         <span class="traffic-cycle">按账单周期累计 · Agent 重启/主机重启自动校正</span>
+        <NButton v-if="isAdmin" size="tiny" quaternary @click="openCorrectModal">校正</NButton>
       </div>
       <div class="traffic-row">
         <div class="traffic-item">
@@ -845,6 +893,48 @@ watch(() => settings.themeMode, () => {
         </div>
       </div>
     </div>
+
+    <!-- 月流量手动校正：统计出错（如幻影累计）时把本月累计改回正确值 -->
+    <NModal
+      v-model:show="showCorrectModal"
+      preset="card"
+      title="校正本月流量"
+      style="width: 440px; max-width: 95vw"
+    >
+      <NForm label-placement="top" size="small">
+        <NFormItem label="下行 (RX) · GB">
+          <NInputNumber
+            v-model:value="correctForm.rxGB"
+            :min="0"
+            :precision="2"
+            placeholder="例如: 22.6"
+            style="width: 100%"
+          />
+        </NFormItem>
+        <NFormItem label="上行 (TX) · GB">
+          <NInputNumber
+            v-model:value="correctForm.txGB"
+            :min="0"
+            :precision="2"
+            placeholder="例如: 4.8"
+            style="width: 100%"
+          />
+        </NFormItem>
+        <p class="muted" style="margin: 0">
+          输入本月真实的累计流量（与服务商账单一致的数值）。校正后 Agent
+          直接按该值继续累计，之后只加新产生的流量。Agent 离线或版本过旧时
+          校正不会生效，请先确认 Agent 在线。
+        </p>
+      </NForm>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showCorrectModal = false">取消</NButton>
+          <NButton type="primary" :loading="correcting" @click="handleCorrectSave">
+            应用校正
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
 
     <!-- 挂载点容量：逐分区明细，最满的排在最前面 -->
     <div v-if="currentMetrics && sortedMounts.length" class="mounts-card">
@@ -1090,6 +1180,7 @@ watch(() => settings.themeMode, () => {
       }
 
       .traffic-cycle {
+        flex: 1;
         font-size: 11px;
         color: var(--text-secondary);
       }

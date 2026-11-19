@@ -25,6 +25,7 @@ import { getMetrics, getMetricsHistory, type MetricPoint } from '../../api/hosts
 import type { Metrics, Mount, ProbeReading } from '../../api/types'
 import { useSettingsStore } from '../../stores/settings'
 import { fmtDateTime, fmtTime as fmtTimeOfDay } from '../../utils/time'
+import { dedupeMountsByFilesystem, formatDiskBytes } from '../../utils/diskUsage'
 
 const props = defineProps<{ hostId: string; probeEnabled?: boolean }>()
 const settings = useSettingsStore()
@@ -54,7 +55,17 @@ const swapPct = computed(() => {
 // partitions (/boot, /boot/efi), which are firmware partitions rather than
 // usable storage. Same idea as the Baota panel, which keeps system
 // partitions out of the headline disk figure.
-const diskMounts = computed(() => (currentMetrics.value?.mounts ?? []).filter((m) => m.path !== '/boot' && !m.path.startsWith('/boot/')))
+//
+// One filesystem can appear under several mountpoints (bind mounts reuse the
+// source device, btrfs subvolumes share a device, and every ZFS dataset
+// reports its pool's capacity). Collapse those duplicates before summing,
+// otherwise the headline total multiplies; older agents send no device and
+// are deduped by identical capacity+usage.
+const diskMounts = computed(() =>
+  dedupeMountsByFilesystem(
+    (currentMetrics.value?.mounts ?? []).filter((m) => m.path !== '/boot' && !m.path.startsWith('/boot/')),
+  ),
+)
 const diskTotal = computed(() => diskMounts.value.reduce((s, m) => s + (m.total || 0), 0))
 const diskUsed = computed(() => diskMounts.value.reduce((s, m) => s + (m.used || 0), 0))
 const diskPct = computed(() => {
@@ -110,6 +121,7 @@ function fmtBytes(n: number): string {
   if (n >= 1e3) return (n / 1e3).toFixed(2) + ' KB'
   return n.toFixed(0) + ' B'
 }
+
 
 function fmtRate(n: number): string {
   return fmtBytes(n) + '/s'
@@ -737,7 +749,7 @@ watch(() => settings.themeMode, () => {
       <div class="stat-chip">
         <span class="chip-label">硬盘</span>
         <span class="chip-value mono">
-          <template v-if="diskPct !== null">{{ fmtBytes(diskUsed) }} / {{ fmtBytes(diskTotal) }} ({{ diskPct.toFixed(1) }}%)</template>
+          <template v-if="diskPct !== null">{{ formatDiskBytes(diskUsed) }} / {{ formatDiskBytes(diskTotal) }} ({{ diskPct.toFixed(1) }}%)</template>
           <template v-else>暂无数据</template>
         </span>
       </div>
@@ -793,7 +805,7 @@ watch(() => settings.themeMode, () => {
             <div class="mount-label">{{ m.path }}</div>
             <div class="mount-progress">
               <NProgress :percentage="mountPct(m)" :status="mountStatus(m)" :show-indicator="false" :height="6" />
-              <div class="mount-info">{{ fmtBytes(m.used) }} / {{ fmtBytes(m.total) }} ({{ mountPct(m).toFixed(1) }}%)</div>
+              <div class="mount-info">{{ formatDiskBytes(m.used) }} / {{ formatDiskBytes(m.total) }} ({{ mountPct(m).toFixed(1) }}%)</div>
             </div>
           </div>
         </NGridItem>

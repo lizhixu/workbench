@@ -1379,9 +1379,11 @@ func metricsToJSON(m *agentpb.MetricsSample) gin.H {
 	mounts := make([]gin.H, 0, len(m.GetMounts()))
 	for _, mt := range m.GetMounts() {
 		mounts = append(mounts, gin.H{
-			"path":  mt.GetPath(),
-			"total": mt.GetTotal(),
-			"used":  mt.GetUsed(),
+			"path":   mt.GetPath(),
+			"total":  mt.GetTotal(),
+			"used":   mt.GetUsed(),
+			"device": mt.GetDevice(),
+			"fstype": mt.GetFstype(),
 		})
 	}
 	// Per-carrier network quality probe readings (snake_case so the frontend

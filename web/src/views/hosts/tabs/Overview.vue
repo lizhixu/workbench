@@ -13,6 +13,7 @@ import {
 } from 'naive-ui'
 import { getMetrics } from '../../../api/hosts'
 import type { Metrics } from '../../../api/types'
+import { formatDiskBytes } from '../../../utils/diskUsage'
 
 const route = useRoute()
 const message = useMessage()
@@ -39,6 +40,7 @@ function fmtBytes(n: number): string {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + ' KB'
   return n + ' B'
 }
+
 
 const swapPct = computed(() => {
   const m = metrics.value
@@ -189,7 +191,7 @@ onBeforeUnmount(() => {
                   :height="6"
                 />
                 <div class="mount-info">
-                  {{ fmtBytes(m.used) }} / {{ fmtBytes(m.total) }}
+                  {{ formatDiskBytes(m.used, 1) }} / {{ formatDiskBytes(m.total, 1) }}
                 </div>
               </div>
             </div>

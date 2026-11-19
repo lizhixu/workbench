@@ -288,6 +288,8 @@ message Mount {
   string path = 1;
   int64 total = 2; // bytes
   int64 used = 3; // bytes
+  string device = 4; // backing device or ZFS dataset name (dedupe key)
+  string fstype = 5; // filesystem type (ext4, xfs, btrfs, zfs, ...)
 }
 
 // ---- System info -----------------------------------------------------

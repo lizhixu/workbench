@@ -324,9 +324,11 @@ func (m *Manager) collect() *agentpb.MetricsSample {
 				continue
 			}
 			sample.Mounts = append(sample.Mounts, &agentpb.Mount{
-				Path:  p.Mountpoint,
-				Total: int64(u.Total),
-				Used:  int64(u.Used),
+				Path:   p.Mountpoint,
+				Total:  int64(u.Total),
+				Used:   int64(u.Used),
+				Device: p.Device,
+				Fstype: p.Fstype,
 			})
 		}
 	}

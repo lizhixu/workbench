@@ -143,6 +143,10 @@ export interface Mount {
   path: string
   total: number
   used: number
+  // Backing device (or ZFS dataset) and filesystem type. Absent on older
+  // agents; used to collapse duplicate mountpoints of one filesystem.
+  device?: string
+  fstype?: string
 }
 
 export interface Metrics {

@@ -319,7 +319,7 @@ const expiryTooltip = computed(() => {
     <div class="banner-main-row">
       <!-- Host Icon & Name & Distro -->
       <div class="host-identity-box">
-        <OsLogo :os="host.os" :distro="host.distro" :badge-size="40" :size="24" />
+        <OsLogo :os="host.os" :distro="host.distro" :size="28" />
         <div class="host-title-box">
           <div class="host-name-row">
             <span class="host-name">{{ host.hostname }}</span>

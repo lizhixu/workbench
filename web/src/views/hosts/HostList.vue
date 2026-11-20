@@ -751,7 +751,7 @@ onUnmounted(() => {
           >
 	            <!-- 1. OS Logo 图标 -->
 	            <div class="col-os-logo">
-	              <OsLogo :os="host.os" :distro="host.distro" :badge-size="38" :size="22" />
+	              <OsLogo :os="host.os" :distro="host.distro" :size="28" />
 	            </div>
 
             <!-- 2. 主机名称与系统版本 -->

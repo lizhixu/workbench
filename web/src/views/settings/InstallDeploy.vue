@@ -139,7 +139,7 @@ onMounted(() => {
               :class="{ active: osType === 'linux' }"
               @click="osType = 'linux'"
             >
-              <OsLogo os="linux" :show-badge="false" :size="16" class="btn-logo" />
+              <OsLogo os="linux" :size="16" class="btn-logo" />
               <span class="btn-text">Linux</span>
               <span class="btn-sub">x86 / arm</span>
             </button>
@@ -149,7 +149,7 @@ onMounted(() => {
               :class="{ active: osType === 'windows' }"
               @click="osType = 'windows'"
             >
-              <OsLogo os="windows" :show-badge="false" :size="14" class="btn-logo win-logo" />
+              <OsLogo os="windows" :size="14" class="btn-logo win-logo" />
               <span class="btn-text">Windows</span>
               <span class="btn-sub">x64</span>
             </button>

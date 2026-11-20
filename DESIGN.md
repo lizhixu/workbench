@@ -252,7 +252,7 @@ web/
   - **左侧组别树**：显示 Workspace 分组结构及主机计数 (`Monster的个人空间 15`)。
   - **左侧消息列表 (`消息列表 99+`)**：实况推送日志（如 `• 主机上线 - game-pc (115.205...) 2024-10-21 19:53`）。
 - **右侧主机表格**：
-  - 展示 `主机` (OS 图标 + 主机名 + 系统发行版如 `Ubuntu 20.04.4 LTS` / `CentOS 7` / `Windows 11`)。
+  - 展示 `主机` (OS 图标 + 主机名 + 系统发行版如 `Ubuntu 20.04.4 LTS` / `CentOS 7` / `Windows 11`)。OS 图标为发行版官方全彩 logo（`OsLogo.vue`：Devicon original 覆盖 12 个品牌，其余用 Simple Icons 单色路径填品牌色或随主题色；openEuler 用官网 SVG 裁出的官方符号；Alibaba Cloud Linux 用阿里云 logo（Simple Icons alibabacloud，#FF6A00）；Anolis / OpenCloudOS / 麒麟无任何 SVG 来源，沿用旧手绘字形——前两者官方 PNG 已存 `~/workspace/oslogo-assets/`，待定），无圆底徽章，列表与详情横幅内尺寸 28px。
   - `状态` (在线绿 Pill `已开机 10天22小时` / 离线红 Pill `当前已离线`)。
   - `配置` (硬件规格 `CPU 16核(x64)`, `内存总量 15.6 GB`)。
   - `IP` (双 IP 独立展示：`内 172.20.69.191`，`外 183.159.65.120 (浙江省-杭州市)`).

@@ -115,8 +115,8 @@ type OperatorServiceDeps struct {
 	Coordinator *Coordinator
 	Audit       *audit.Store
 	Log         *slog.Logger
-	// CanAccessGroup mirrors groups.Store.CanAccessGroup.
-	CanAccessGroup func(username string, isAdmin bool, group string) bool
+	// CanAccessGroup mirrors groups.Store.CanAccessGroups.
+	CanAccessGroup func(username string, isAdmin bool, groups []string) bool
 	// ResolveApp mirrors apps.Store.GetApp plus PortMapping flattening.
 	ResolveApp func(appID string) (AppTargetInfo, bool)
 	// MeshIP returns the host's cached Tailscale IPv4 ("" when absent),
@@ -266,7 +266,7 @@ func (s *OperatorService) checkGroupAccess(claims *auth.Claims, hostID string) e
 	if agent == nil {
 		return fmt.Errorf("目标不存在或无权访问")
 	}
-	if s.deps.CanAccessGroup != nil && !s.deps.CanAccessGroup(claims.Username, claims.Role == auth.RoleAdmin, agent.Group) {
+	if s.deps.CanAccessGroup != nil && !s.deps.CanAccessGroup(claims.Username, claims.Role == auth.RoleAdmin, agent.Groups) {
 		return fmt.Errorf("目标不存在或无权访问")
 	}
 	return nil

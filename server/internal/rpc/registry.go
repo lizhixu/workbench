@@ -32,14 +32,18 @@ type persistedAgent struct {
 	Distro     string    `json:"distro"`
 	Version    string    `json:"version"`
 	Registered time.Time `json:"registered"`
-	Group      string    `json:"group"`
-	Tags       []string  `json:"tags"`
-	Uptime     int64     `json:"uptime"`
-	CPUCores   int32     `json:"cpu_cores"`
-	MemTotal   int64     `json:"mem_total"`
-	InternalIP string    `json:"internal_ip"`
-	PublicIP   string    `json:"public_ip"`
-	Location   string    `json:"location"`
+	// Groups is the list of group names this host belongs to. Group is the
+	// legacy single-group field: old agents.json files only have it, and it
+	// is migrated into Groups on load. New saves only write Groups.
+	Groups     []string `json:"groups,omitempty"`
+	Group      string   `json:"group,omitempty"`
+	Tags       []string `json:"tags"`
+	Uptime     int64    `json:"uptime"`
+	CPUCores   int32    `json:"cpu_cores"`
+	MemTotal   int64    `json:"mem_total"`
+	InternalIP string   `json:"internal_ip"`
+	PublicIP   string   `json:"public_ip"`
+	Location   string   `json:"location"`
 	// Optional billing & traffic quota configurations
 	Price           float64           `json:"price,omitempty"`
 	Currency        string            `json:"currency,omitempty"`
@@ -99,7 +103,7 @@ type Agent struct {
 	Status     string // online / offline
 	LastSeen   time.Time
 	Registered time.Time
-	Group      string
+	Groups     []string
 	Tags       []string
 	Uptime     int64 // real OS uptime in seconds (since boot), from registration/metrics
 	CPUCores   int32
@@ -125,6 +129,45 @@ type Agent struct {
 	// AuthToken is the long-lived token; persisted with the agent so the
 	// server can validate reconnects after a restart.
 	AuthToken string
+}
+
+// HasGroup reports whether the agent belongs to the named group.
+func (a *Agent) HasGroup(name string) bool {
+	for _, g := range a.Groups {
+		if g == name {
+			return true
+		}
+	}
+	return false
+}
+
+// migratePersistedGroups resolves a stored agent's groups: the current
+// Groups list wins, an old file with only the legacy single Group migrates
+// to a one-element list, and a host with neither is ungrouped.
+func migratePersistedGroups(p persistedAgent) []string {
+	if len(p.Groups) > 0 {
+		return NormalizeGroups(p.Groups)
+	}
+	if g := strings.TrimSpace(p.Group); g != "" {
+		return []string{g}
+	}
+	return []string{}
+}
+
+// NormalizeGroups trims, drops empties and dedupes group names, preserving
+// first-seen order. It always returns a non-nil slice.
+func NormalizeGroups(groups []string) []string {
+	out := make([]string, 0, len(groups))
+	seen := make(map[string]bool, len(groups))
+	for _, g := range groups {
+		g = strings.TrimSpace(g)
+		if g == "" || seen[g] {
+			continue
+		}
+		seen[g] = true
+		out = append(out, g)
+	}
+	return out
 }
 
 // Hub is the live connection state for a connected agent.
@@ -222,7 +265,7 @@ func (r *Registry) loadAgents() error {
 			Version:         p.Version,
 			Status:          "offline",
 			Registered:      p.Registered,
-			Group:           p.Group,
+			Groups:          migratePersistedGroups(p),
 			Tags:            p.Tags,
 			Uptime:          p.Uptime,
 			CPUCores:        p.CPUCores,
@@ -270,7 +313,7 @@ func (r *Registry) persistAgentsLocked() error {
 			Distro:          a.Distro,
 			Version:         a.Version,
 			Registered:      a.Registered,
-			Group:           a.Group,
+			Groups:          a.Groups,
 			Tags:            a.Tags,
 			Uptime:          a.Uptime,
 			CPUCores:        a.CPUCores,
@@ -541,15 +584,16 @@ func (r *Registry) Hub(id string) *Hub {
 	return r.hubs[id]
 }
 
-// SetAgentGroup sets the group for an agent.
-func (r *Registry) SetAgentGroup(id, group string) error {
+// SetAgentGroups replaces the group list for an agent. Names are trimmed,
+// emptied and deduped; an empty list means the host is ungrouped.
+func (r *Registry) SetAgentGroups(id string, groups []string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	a, ok := r.agents[id]
 	if !ok {
 		return fmt.Errorf("agent not found")
 	}
-	a.Group = group
+	a.Groups = NormalizeGroups(groups)
 	_ = r.persistAgentsLocked()
 	return nil
 }
@@ -930,10 +974,11 @@ func (r *Registry) PushTrafficCorrection(id string, rxBytes, txBytes uint64) boo
 	})
 }
 
-// RenameGroup rewrites every agent whose group is oldName to newName and
-// returns how many records changed. Passing an empty newName clears the group
-// (used when a group is deleted) so hosts are never left pointing at a group
-// that no longer exists.
+// RenameGroup rewrites oldName to newName inside every agent's group list
+// and returns how many records changed. Passing an empty newName removes
+// the group from the lists (used when a group is deleted) so hosts are never
+// left pointing at a group that no longer exists. Renaming onto a name the
+// host already has dedupes instead of doubling the entry.
 func (r *Registry) RenameGroup(oldName, newName string) int {
 	if oldName == "" {
 		return 0
@@ -942,10 +987,25 @@ func (r *Registry) RenameGroup(oldName, newName string) int {
 	defer r.mu.Unlock()
 	n := 0
 	for _, a := range r.agents {
-		if a.Group == oldName {
-			a.Group = newName
-			n++
+		if !a.HasGroup(oldName) {
+			continue
 		}
+		kept := make([]string, 0, len(a.Groups))
+		renamed := false
+		for _, g := range a.Groups {
+			if g != oldName {
+				kept = append(kept, g)
+				continue
+			}
+			// Drop the old name; re-add the new one only if the host
+			// doesn't already carry it.
+			if newName != "" && !renamed && !a.HasGroup(newName) {
+				kept = append(kept, newName)
+				renamed = true
+			}
+		}
+		a.Groups = kept
+		n++
 	}
 	if n > 0 {
 		_ = r.persistAgentsLocked()
@@ -1023,13 +1083,13 @@ func (r *Registry) CountOnline() int {
 	return n
 }
 
-// CountByGroup returns how many agents are in the given group name.
+// CountByGroup returns how many agents belong to the given group name.
 func (r *Registry) CountByGroup(name string) int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	n := 0
 	for _, a := range r.agents {
-		if a.Group == name {
+		if a.HasGroup(name) {
 			n++
 		}
 	}

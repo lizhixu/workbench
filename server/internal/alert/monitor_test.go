@@ -533,3 +533,30 @@ func TestFiringKeyOf(t *testing.T) {
 		t.Errorf("cert key = %q, want %q", got, "r:cert:c1")
 	}
 }
+
+// TestMatchesFilterMultiGroup covers the group filter against a host in
+// several groups: the rule fires when any of the host's groups matches.
+func TestMatchesFilterMultiGroup(t *testing.T) {
+	host := HostInfo{ID: "h1", Hostname: "h1", Groups: []string{"prod", "staging"}}
+	rule := &Rule{GroupFilter: "staging"}
+	if !matchesFilter(host, rule) {
+		t.Fatal("host in [prod staging] must match GroupFilter=staging")
+	}
+	rule.GroupFilter = "prod"
+	if !matchesFilter(host, rule) {
+		t.Fatal("host in [prod staging] must match GroupFilter=prod")
+	}
+	rule.GroupFilter = "other"
+	if matchesFilter(host, rule) {
+		t.Fatal("host in [prod staging] must not match GroupFilter=other")
+	}
+	rule.GroupFilter = ""
+	if !matchesFilter(host, rule) {
+		t.Fatal("empty GroupFilter must match every host")
+	}
+	ungrouped := HostInfo{ID: "h2", Hostname: "h2"}
+	rule.GroupFilter = "prod"
+	if matchesFilter(ungrouped, rule) {
+		t.Fatal("ungrouped host must not match GroupFilter=prod")
+	}
+}

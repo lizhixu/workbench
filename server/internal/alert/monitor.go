@@ -19,7 +19,7 @@ import (
 type HostInfo struct {
 	ID              string
 	Hostname        string
-	Group           string
+	Groups          []string
 	Status          string // online / offline
 	Metrics         *agentpb.MetricsSample
 	ReconnectReason string // "upgrade", "maintenance"
@@ -368,7 +368,15 @@ func matchesFilter(host HostInfo, rule *Rule) bool {
 		}
 	}
 	if rule.GroupFilter != "" {
-		if host.Group != rule.GroupFilter {
+		// A host matches when any of its groups equals the filter.
+		matched := false
+		for _, g := range host.Groups {
+			if g == rule.GroupFilter {
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			return false
 		}
 	}
@@ -927,7 +935,7 @@ func (a *registryAdapter) ListHosts() []HostInfo {
 		hi := HostInfo{
 			ID:              ag.ID,
 			Hostname:        ag.Hostname,
-			Group:           ag.Group,
+			Groups:          ag.Groups,
 			Status:          ag.Status,
 			ReconnectReason: ag.ReconnectReason,
 			TrafficLimitGB:  ag.TrafficLimitGB,

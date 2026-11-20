@@ -439,7 +439,7 @@ const expiryTooltip = computed(() => {
           </div>
           <div class="spec-row">
             <span class="spec-label">所属分组</span>
-            <span class="spec-value">{{ host.group || '默认分组' }}</span>
+            <span class="spec-value">{{ (host.groups || []).join('、') || '默认分组' }}</span>
           </div>
         </div>
 

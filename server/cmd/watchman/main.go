@@ -519,8 +519,8 @@ func main() {
 				Coordinator: reg.TunnelCoordinator(),
 				Audit:       auditStore,
 				Log:         log,
-				CanAccessGroup: func(username string, isAdmin bool, group string) bool {
-					return groupStore.CanAccessGroup(username, isAdmin, group)
+				CanAccessGroup: func(username string, isAdmin bool, groups []string) bool {
+					return groupStore.CanAccessGroups(username, isAdmin, groups)
 				},
 				ResolveApp: func(appID string) (rpc.AppTargetInfo, bool) {
 					app, ok := appStore.GetApp(appID)

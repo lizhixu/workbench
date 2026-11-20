@@ -81,7 +81,7 @@ const groups = ref<HostGroup[]>([])
 const groupFilter = ref<string>('')
 const showGroupModal = ref(false)
 const groupTarget = ref<Host | null>(null)
-const groupChoice = ref<string>('')
+const groupChoice = ref<string[]>([])
 const networkNodesMap = ref<Record<string, NetworkNode>>({})
 
 async function loadNetworkNodes() {
@@ -103,17 +103,15 @@ const groupFilterOptions = computed(() => [
   ...groups.value.map((g) => ({ label: `${g.name} (${g.host_count})`, value: g.name })),
 ])
 
-const groupAssignOptions = computed(() => [
-  { label: '（不属于任何分组）', value: '' },
-  ...groups.value.map((g) => ({ label: g.name, value: g.name })),
-])
+const groupAssignOptions = computed(() => groups.value.map((g) => ({ label: g.name, value: g.name })))
 
 const filteredHosts = computed(() => {
   const q = search.value.trim().toLowerCase()
   const gf = groupFilter.value
   return store.hosts.filter((h) => {
-    if (gf === '__none__' && h.group) return false
-    if (gf && gf !== '__none__' && h.group !== gf) return false
+    const groups = h.groups || []
+    if (gf === '__none__' && groups.length > 0) return false
+    if (gf && gf !== '__none__' && !groups.includes(gf)) return false
     if (!q) return true
     return (
       h.hostname.toLowerCase().includes(q) ||
@@ -122,7 +120,7 @@ const filteredHosts = computed(() => {
       (h.distro || '').toLowerCase().includes(q) ||
       (h.internal_ip || '').toLowerCase().includes(q) ||
       (h.public_ip || '').toLowerCase().includes(q) ||
-      (h.group || '').toLowerCase().includes(q) ||
+      groups.some((g) => g.toLowerCase().includes(q)) ||
       (h.notes || '').toLowerCase().includes(q)
     )
   })
@@ -138,7 +136,7 @@ async function loadGroups() {
 
 function openGroupModal(host: Host) {
   groupTarget.value = host
-  groupChoice.value = host.group || ''
+  groupChoice.value = [...(host.groups || [])]
   showGroupModal.value = true
 }
 
@@ -147,7 +145,11 @@ async function submitGroup() {
   if (!host) return
   try {
     await setHostGroup(host.id, groupChoice.value)
-    message.success(groupChoice.value ? `已将 ${host.hostname} 移入 ${groupChoice.value}` : `已将 ${host.hostname} 移出分组`)
+    message.success(
+      groupChoice.value.length > 0
+        ? `已将 ${host.hostname} 归入 ${groupChoice.value.join('、')}`
+        : `已将 ${host.hostname} 移出全部分组`,
+    )
     showGroupModal.value = false
     await Promise.all([store.fetchList(), loadGroups()])
   } catch (e: any) {
@@ -756,7 +758,9 @@ onUnmounted(() => {
             <div class="col-host-info">
               <div class="host-name-row">
                 <span class="host-name" :title="host.hostname">{{ host.hostname }}</span>
-                <NTag v-if="host.group" size="tiny" :bordered="false" type="info">{{ host.group }}</NTag>
+                <span v-if="host.groups?.length" class="group-tags">
+                  <NTag v-for="g in host.groups" :key="g" size="tiny" :bordered="false" type="info">{{ g }}</NTag>
+                </span>
               </div>
               <div class="host-distro">
                 {{ host.distro || host.os || 'Linux' }}
@@ -947,9 +951,9 @@ onUnmounted(() => {
     >
       <NSpace vertical :size="12">
         <p class="guide-text">
-          将主机 <code>{{ groupTarget?.hostname }}</code> 归入分组，用于按分组给用户授权访问。
+          将主机 <code>{{ groupTarget?.hostname }}</code> 归入分组（可多选），用于按分组给用户授权访问；不选即移出全部分组。
         </p>
-        <NSelect v-model:value="groupChoice" :options="groupAssignOptions" />
+        <NSelect v-model:value="groupChoice" :options="groupAssignOptions" multiple placeholder="选择分组" />
         <p v-if="!groups.length" class="guide-text">
           暂无可用分组，请先在「分组权限」页面创建分组。
         </p>
@@ -1128,6 +1132,13 @@ onUnmounted(() => {
               }
 
               .n-tag {
+                flex-shrink: 0;
+              }
+
+              .group-tags {
+                display: inline-flex;
+                flex-wrap: wrap;
+                gap: 4px;
                 flex-shrink: 0;
               }
             }

@@ -94,7 +94,7 @@ func newOpTestRig(t *testing.T) *opTestRig {
 	}
 	reg, hub, coord := newLegTestRig("agent-1")
 	reg.mu.Lock()
-	reg.agents["agent-1"] = &Agent{ID: "agent-1", Hostname: "prod-1", Group: "prod"}
+	reg.agents["agent-1"] = &Agent{ID: "agent-1", Hostname: "prod-1", Groups: []string{"prod"}}
 	reg.hubs["agent-1"] = hub
 	reg.mu.Unlock()
 	rig.reg, rig.hub, rig.coord = reg, hub, coord
@@ -110,11 +110,16 @@ func newOpTestRig(t *testing.T) *opTestRig {
 		Coordinator: coord,
 		Audit:       auditStore,
 		Log:         slog.Default(),
-		CanAccessGroup: func(username string, isAdmin bool, group string) bool {
+		CanAccessGroup: func(username string, isAdmin bool, groups []string) bool {
 			if isAdmin {
 				return true
 			}
-			return rig.groups[group]
+			for _, g := range groups {
+				if rig.groups[g] {
+					return true
+				}
+			}
+			return false
 		},
 		ResolveApp: func(appID string) (AppTargetInfo, bool) {
 			app, ok := rig.apps[appID]
@@ -294,6 +299,25 @@ func TestOperatorCrossGroupDenied(t *testing.T) {
 		t.Fatalf("expected PermissionDenied, got %v", err)
 	}
 	lastAudit(t, rig.audits, "op_tunnel_deny")
+}
+
+// A host in several groups is reachable when the caller is granted any one
+// of them (union): alice only has "staging", the host is in ["prod",
+// "staging"], so the open must succeed.
+func TestOperatorMultiGroupUnionAllowed(t *testing.T) {
+	rig := newOpTestRig(t)
+	rig.groups = map[string]bool{"staging": true}
+	rig.reg.mu.Lock()
+	rig.reg.agents["agent-1"].Groups = []string{"prod", "staging"}
+	rig.reg.mu.Unlock()
+	stream, done, _ := rig.openHostStream(t, "alice", auth.RoleOperator, &agentpb.OperatorOpen{
+		HostId:     "agent-1",
+		TargetPort: 22,
+	})
+	stream.recvCh <- &agentpb.OperatorMessage{Payload: &agentpb.OperatorMessage_Close{Close: &agentpb.OperatorClose{Reason: "done"}}}
+	if err := <-done; err != nil {
+		t.Fatalf("clean close should return nil, got %v", err)
+	}
 }
 
 func TestOperatorUnknownHostDenied(t *testing.T) {
@@ -562,7 +586,7 @@ func TestOperatorInfraFailureIsUnavailable(t *testing.T) {
 	// in the map) while OpenLeg's hub.Send fails.
 	hub2 := newHub("agent-2", 30, rig.reg)
 	rig.reg.mu.Lock()
-	rig.reg.agents["agent-2"] = &Agent{ID: "agent-2", Hostname: "prod-2", Group: "prod"}
+	rig.reg.agents["agent-2"] = &Agent{ID: "agent-2", Hostname: "prod-2", Groups: []string{"prod"}}
 	rig.reg.hubs["agent-2"] = hub2
 	rig.reg.mu.Unlock()
 

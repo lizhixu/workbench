@@ -74,7 +74,7 @@ type HostDTO struct {
 	Status     string   `json:"status"`
 	LastSeen   string   `json:"last_seen"`
 	Registered string   `json:"registered"`
-	Group      string   `json:"group"`
+	Groups     []string `json:"groups"`
 	Tags       []string `json:"tags"`
 	Uptime     int64    `json:"uptime"`
 	CPUCores   int32    `json:"cpu_cores"`
@@ -589,13 +589,14 @@ type handlers struct {
 }
 
 // canSeeHost reports whether the caller is allowed to reach the given host,
-// based on the host's group and the caller's group grants. Users without any
-// grant (and admins) are unrestricted, so grouping stays optional.
+// based on the host's groups and the caller's group grants. A host is
+// visible when the caller is granted any one of its groups (union). Users
+// without any grant (and admins) are unrestricted, so grouping stays optional.
 func (h *handlers) canSeeHost(c *gin.Context, a *rpc.Agent) bool {
 	if h.groups == nil || a == nil {
 		return true
 	}
-	return h.groups.CanAccessGroup(auth.Username(c), auth.RoleOf(c) == auth.RoleAdmin, a.Group)
+	return h.groups.CanAccessGroups(auth.Username(c), auth.RoleOf(c) == auth.RoleAdmin, a.Groups)
 }
 
 // recordAudit appends a unified audit entry, auto-filling the acting user and
@@ -892,17 +893,21 @@ func (h *handlers) deleteHost(c *gin.Context) {
 
 func (h *handlers) setHostGroup(c *gin.Context) {
 	var body struct {
-		Group string `json:"group"`
+		Groups []string `json:"groups"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := h.reg.SetAgentGroup(c.Param("id"), body.Group); err != nil {
+	if err := h.reg.SetAgentGroups(c.Param("id"), body.Groups); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	h.recordAudit(c, "host_group", "host", c.Param("id"), "设置分组: "+body.Group, audit.RiskLow, audit.ResultSuccess)
+	detail := "移出全部分组"
+	if len(body.Groups) > 0 {
+		detail = "设置分组: " + strings.Join(rpc.NormalizeGroups(body.Groups), "、")
+	}
+	h.recordAudit(c, "host_group", "host", c.Param("id"), detail, audit.RiskLow, audit.ResultSuccess)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -2781,6 +2786,10 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 	if tags == nil {
 		tags = []string{}
 	}
+	groups := a.Groups
+	if groups == nil {
+		groups = []string{}
+	}
 	targetVer := agentTargetVersion()
 	dto := HostDTO{
 		ID:                 a.ID,
@@ -2794,7 +2803,7 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 		Status:             a.Status,
 		LastSeen:           a.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
 		Registered:         a.Registered.Format("2006-01-02T15:04:05Z07:00"),
-		Group:              a.Group,
+		Groups:             groups,
 		Tags:               tags,
 		Uptime:             a.Uptime,
 		CPUCores:           a.CPUCores,
@@ -2892,6 +2901,10 @@ func toDTO(a *rpc.Agent) HostDTO {
 	if tags == nil {
 		tags = []string{}
 	}
+	groups := a.Groups
+	if groups == nil {
+		groups = []string{}
+	}
 	targetVer := agentTargetVersion()
 	return HostDTO{
 		ID:                 a.ID,
@@ -2905,7 +2918,7 @@ func toDTO(a *rpc.Agent) HostDTO {
 		Status:             a.Status,
 		LastSeen:           a.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
 		Registered:         a.Registered.Format("2006-01-02T15:04:05Z07:00"),
-		Group:              a.Group,
+		Groups:             groups,
 		Tags:               tags,
 		Uptime:             a.Uptime,
 		CPUCores:           a.CPUCores,

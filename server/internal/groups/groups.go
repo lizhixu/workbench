@@ -2,10 +2,10 @@
 // ("分组与权限"). A group is a named bucket of hosts; a grant binds a user to
 // a group so that user may see and operate the hosts in it.
 //
-// Host membership is stored on the host record itself (rpc.Agent.Group holds
-// the group name), so this package owns only the group definitions and the
-// user grants. That keeps a single source of truth for "which group is this
-// host in" and avoids a second membership table drifting out of sync.
+// Host membership is stored on the host record itself (rpc.Agent.Groups
+// holds the group names), so this package owns only the group definitions
+// and the user grants. That keeps a single source of truth for "which groups
+// is this host in" and avoids a second membership table drifting out of sync.
 //
 // Authorization model:
 //   - admin always has access to every group.
@@ -373,9 +373,22 @@ func (s *Store) AllowedGroupNames(username string, isAdmin bool) (map[string]boo
 
 // CanAccessGroup reports whether the user may reach hosts in groupName.
 func (s *Store) CanAccessGroup(username string, isAdmin bool, groupName string) bool {
+	return s.CanAccessGroups(username, isAdmin, []string{groupName})
+}
+
+// CanAccessGroups reports whether the user may reach a host in any of
+// groupNames (union): one granted group is enough. A host in no group is
+// only reachable by unrestricted users, same as the single-group check on
+// an empty name.
+func (s *Store) CanAccessGroups(username string, isAdmin bool, groupNames []string) bool {
 	allowed, restricted := s.AllowedGroupNames(username, isAdmin)
 	if !restricted {
 		return true
 	}
-	return allowed[groupName]
+	for _, name := range groupNames {
+		if allowed[name] {
+			return true
+		}
+	}
+	return false
 }

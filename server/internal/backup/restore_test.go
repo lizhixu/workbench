@@ -168,12 +168,12 @@ func TestRestoreStagingSurvivesAgentReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg.SetAgentGroup("host", "archived")
+	reg.SetAgentGroups("host", []string{"archived"})
 	m, err := s.Create("admin", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg.SetAgentGroup("host", "live")
+	reg.SetAgentGroups("host", []string{"live"})
 	if _, err := s.RestoreFile(m.Name, "admin"); err != nil {
 		t.Fatal(err)
 	}
@@ -185,8 +185,8 @@ func TestRestoreStagingSurvivesAgentReconnect(t *testing.T) {
 	if err := boot.ApplyPending(); err != nil {
 		t.Fatal(err)
 	}
-	if got := rpc.NewRegistry(dir, nil).GetAgent("host").Group; got != "archived" {
-		t.Fatalf("restored group=%s", got)
+	if got := rpc.NewRegistry(dir, nil).GetAgent("host").Groups; len(got) != 1 || got[0] != "archived" {
+		t.Fatalf("restored groups=%v", got)
 	}
 }
 

@@ -308,8 +308,8 @@
 ### 3.13 分组与权限
 
 - **分组管理**：分组的新增、修改、删除。
-- **分组-主机关联**：给分组关联主机。
-- **分组-用户授权**：给分组授权用户，使用户获得该分组下主机的访问权限。
+- **分组-主机关联**：给分组关联主机；一台主机可同时属于多个分组（分组名列表存在主机记录上），分组页的加入/移出只动本分组、不影响该主机的其他分组。
+- **分组-用户授权**：给分组授权用户，使用户获得该分组下主机的访问权限；主机可见性取并集——用户只要被授权了该主机的任一分组即可访问该主机。
 - **分组视角**：从分组出发管理主机与用户关系。
 - **用户视角**：从用户出发进行分组授权。
 
@@ -790,10 +790,11 @@ users(id, username, password_hash, email, role, status, created_at)
 
 groups(id, name, parent_id, description, created_at)          # 分组树
 user_groups(user_id, group_id, role)                          # 用户-分组授权
-host_groups(host_id, group_id)                               # 主机-分组关联
+# 主机-分组关联不另建表：分组名列表直接存在主机记录上（hosts.groups json），
+# 一台主机可属多个分组；改名/删分组时批量改写各主机记录的列表。
 
 hosts(id, agent_id, hostname, os, arch, distro, agent_version,
-      status, last_seen_at, tags json, created_at)
+      status, last_seen_at, tags json, groups json, created_at)
   status: online/offline/maintenance
   agent_id 唯一；一台主机 = 一个 agent 注册
 

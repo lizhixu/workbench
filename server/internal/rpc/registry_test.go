@@ -3,6 +3,9 @@ package rpc
 import (
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -253,5 +256,116 @@ func TestAgentUpgradeStateTrackingAndCleanup(t *testing.T) {
 	}
 	if upg := r.GetAgentUpgrade(agentID); upg != nil {
 		t.Fatalf("expected upgrade state to be cleared after version match on reconnect, got %+v", upg)
+	}
+}
+
+// TestSetAgentGroupsMulti covers multi-group assignment: names are trimmed
+// and deduped, an empty list ungroups the host, and CountByGroup matches a
+// host under any of its groups.
+func TestSetAgentGroupsMulti(t *testing.T) {
+	r := NewRegistry("", slog.Default())
+	r.agents["h1"] = &Agent{ID: "h1", Hostname: "h1", Groups: []string{}}
+
+	if err := r.SetAgentGroups("h1", []string{" prod ", "staging", "prod", ""}); err != nil {
+		t.Fatalf("SetAgentGroups: %v", err)
+	}
+	got := r.GetAgent("h1").Groups
+	if len(got) != 2 || got[0] != "prod" || got[1] != "staging" {
+		t.Fatalf("groups = %v, want [prod staging]", got)
+	}
+	if n := r.CountByGroup("prod"); n != 1 {
+		t.Fatalf("CountByGroup(prod) = %d, want 1", n)
+	}
+	if n := r.CountByGroup("staging"); n != 1 {
+		t.Fatalf("CountByGroup(staging) = %d, want 1", n)
+	}
+	if n := r.CountByGroup("other"); n != 0 {
+		t.Fatalf("CountByGroup(other) = %d, want 0", n)
+	}
+
+	if err := r.SetAgentGroups("h1", nil); err != nil {
+		t.Fatalf("SetAgentGroups(nil): %v", err)
+	}
+	if got := r.GetAgent("h1").Groups; len(got) != 0 {
+		t.Fatalf("groups after clear = %v, want []", got)
+	}
+	if n := r.CountByGroup("prod"); n != 0 {
+		t.Fatalf("CountByGroup(prod) after clear = %d, want 0", n)
+	}
+	if err := r.SetAgentGroups("ghost", []string{"prod"}); err == nil {
+		t.Fatal("SetAgentGroups on unknown agent must fail")
+	}
+}
+
+// TestRenameGroupInList covers rename/delete inside a host's group list:
+// rename rewrites the entry in place, deleting a group removes just that
+// entry, and renaming onto a name the host already has dedupes.
+func TestRenameGroupInList(t *testing.T) {
+	r := NewRegistry("", slog.Default())
+	r.agents["h1"] = &Agent{ID: "h1", Hostname: "h1", Groups: []string{"a", "b"}}
+	r.agents["h2"] = &Agent{ID: "h2", Hostname: "h2", Groups: []string{"x", "y"}}
+
+	if n := r.RenameGroup("a", "c"); n != 1 {
+		t.Fatalf("RenameGroup(a->c) = %d, want 1", n)
+	}
+	if got := r.GetAgent("h1").Groups; len(got) != 2 || got[0] != "c" || got[1] != "b" {
+		t.Fatalf("h1 groups = %v, want [c b]", got)
+	}
+	// Deleting a group removes only that entry; the other group survives.
+	if n := r.RenameGroup("c", ""); n != 1 {
+		t.Fatalf("RenameGroup(c->\"\") = %d, want 1", n)
+	}
+	if got := r.GetAgent("h1").Groups; len(got) != 1 || got[0] != "b" {
+		t.Fatalf("h1 groups after delete = %v, want [b]", got)
+	}
+	// Renaming "x" onto "y" (already held) must not double the entry.
+	if n := r.RenameGroup("x", "y"); n != 1 {
+		t.Fatalf("RenameGroup(x->y) = %d, want 1", n)
+	}
+	if got := r.GetAgent("h2").Groups; len(got) != 1 || got[0] != "y" {
+		t.Fatalf("h2 groups = %v, want [y]", got)
+	}
+	if n := r.RenameGroup("missing", "z"); n != 0 {
+		t.Fatalf("RenameGroup(missing) = %d, want 0", n)
+	}
+}
+
+// TestLoadAgentsLegacyGroupMigration covers the agents.json upgrade path: a
+// file written by the single-group era (only "group") loads as a
+// one-element Groups list, and a file that already has "groups" wins.
+func TestLoadAgentsLegacyGroupMigration(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{"legacy": {"hostname": "legacy", "group": "old-name"},` +
+		`"multi": {"hostname": "multi", "groups": ["g1", "g2"]},` +
+		`"none": {"hostname": "none"}}`
+	if err := os.WriteFile(filepath.Join(dir, "agents.json"), []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRegistry(dir, slog.Default())
+	if got := r.GetAgent("legacy").Groups; len(got) != 1 || got[0] != "old-name" {
+		t.Fatalf("legacy groups = %v, want [old-name]", got)
+	}
+	if got := r.GetAgent("multi").Groups; len(got) != 2 || got[0] != "g1" || got[1] != "g2" {
+		t.Fatalf("multi groups = %v, want [g1 g2]", got)
+	}
+	if got := r.GetAgent("none").Groups; len(got) != 0 {
+		t.Fatalf("none groups = %v, want []", got)
+	}
+	// A re-save must drop the legacy "group" key: touch the record (which
+	// persists), reload, and confirm the migration sticks and no stale
+	// single value survives.
+	if err := r.SetAgentGroups("legacy", []string{"old-name"}); err != nil {
+		t.Fatal(err)
+	}
+	r2 := NewRegistry(dir, slog.Default())
+	if got := r2.GetAgent("legacy").Groups; len(got) != 1 || got[0] != "old-name" {
+		t.Fatalf("legacy groups after re-save = %v, want [old-name]", got)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "agents.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"group":`) {
+		t.Fatalf("re-saved agents.json still carries legacy group key: %s", data)
 	}
 }

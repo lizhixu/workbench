@@ -45,7 +45,7 @@ export interface Host {
   upgrade_error?: string
   last_seen: string
   registered: string
-  group: string
+  groups: string[]
   tags: string[]
   uptime: number
   cpu_cores?: number

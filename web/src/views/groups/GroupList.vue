@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, h } from 'vue'
+import { computed, onActivated, onMounted, ref, h } from 'vue'
 import {
   NCard, NButton, NSpace, NTable, NTag, NModal, NForm, NFormItem, NDataTable,
   NInput, NSelect, NPopconfirm, NEmpty, NIcon, NDrawer, NDrawerContent,
@@ -284,18 +284,24 @@ async function openHosts(g: HostGroup) {
 }
 
 const memberHosts = computed(() =>
-  hostGroup.value ? hosts.value.filter((x) => x.group === hostGroup.value!.name) : [],
+  hostGroup.value ? hosts.value.filter((x) => (x.groups || []).includes(hostGroup.value!.name)) : [],
 )
 const candidateHosts = computed(() =>
-  hostGroup.value ? hosts.value.filter((x) => x.group !== hostGroup.value!.name) : [],
+  hostGroup.value ? hosts.value.filter((x) => !(x.groups || []).includes(hostGroup.value!.name)) : [],
 )
 
-// assignHost moves a host into (group name) or out of ('') the current group.
-async function assignHost(host: Host, group: string) {
+// assignHost adds the host to the current group, or removes it from the
+// current group when remove is set; the host's other group memberships
+// are untouched (a host may belong to several groups).
+async function assignHost(host: Host, remove = false) {
+  const name = hostGroup.value?.name
+  if (!name) return
+  const current = host.groups || []
+  const next = remove ? current.filter((g) => g !== name) : current.includes(name) ? current : [...current, name]
   try {
-    await setHostGroup(host.id, group)
-    host.group = group
-    message.success(group ? `${host.hostname} 已加入 ${group}` : `${host.hostname} 已移出分组`)
+    await setHostGroup(host.id, next)
+    host.groups = next
+    message.success(remove ? `${host.hostname} 已移出 ${name}` : `${host.hostname} 已加入 ${name}`)
     await refresh()
   } catch (e: any) {
     message.error(e.message || '设置主机分组失败')
@@ -303,6 +309,9 @@ async function assignHost(host: Host, group: string) {
 }
 
 onMounted(() => {
+  refresh()
+})
+onActivated(() => {
   refresh()
 })
 </script>
@@ -452,7 +461,7 @@ onMounted(() => {
                     quaternary
                     type="error"
                     :disabled="!isAdmin"
-                    @click="assignHost(hostItem, '')"
+                    @click="assignHost(hostItem, true)"
                   >
                     移出
                   </NButton>
@@ -465,14 +474,16 @@ onMounted(() => {
               <div v-else class="host-rows">
                 <div v-for="hostItem in candidateHosts" :key="hostItem.id" class="host-row">
                   <span class="host-name" :title="hostItem.hostname">{{ hostItem.hostname }}</span>
-                  <NTag v-if="hostItem.group" size="tiny" :bordered="false">{{ hostItem.group }}</NTag>
+                  <span v-if="hostItem.groups?.length" class="group-tags">
+                    <NTag v-for="g in hostItem.groups" :key="g" size="tiny" :bordered="false">{{ g }}</NTag>
+                  </span>
                   <NTag v-else size="tiny" :bordered="false" type="warning">未分组</NTag>
                   <NButton
                     size="tiny"
                     secondary
                     type="primary"
                     :disabled="!isAdmin || !hostGroup"
-                    @click="assignHost(hostItem, hostGroup!.name)"
+                    @click="assignHost(hostItem)"
                   >
                     加入
                   </NButton>
@@ -528,6 +539,13 @@ onMounted(() => {
   gap: 6px;
   max-height: 300px;
   overflow-y: auto;
+}
+// 抽屉内主机已有分组以多标签展示（同主机列表）。
+.group-tags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex-shrink: 0;
 }
 .host-row {
   display: flex;

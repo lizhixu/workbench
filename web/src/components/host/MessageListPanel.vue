@@ -29,7 +29,7 @@ const events = computed<MessageEvent[]>(() => {
   return store.hosts.map((h) => ({
     id: h.id,
     title: `${h.status === 'online' ? '主机上线' : '主机离线'} - ${h.hostname}`,
-    subtitle: h.group || '默认分组',
+    subtitle: (h.groups || []).join('、') || '默认分组',
     time: fmtDateTime(h.last_seen || h.registered),
     type: (h.status === 'online' ? 'online' : 'offline') as 'online' | 'offline',
   }))

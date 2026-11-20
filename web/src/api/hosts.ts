@@ -23,8 +23,8 @@ export function deleteHost(id: string, uninstallAgent = false) {
   )
 }
 
-export function setHostGroup(id: string, group: string) {
-  return unwrap<{ ok: boolean }>(http.put(`/hosts/${id}/group`, { group }))
+export function setHostGroup(id: string, groups: string[]) {
+  return unwrap<{ ok: boolean }>(http.put(`/hosts/${id}/group`, { groups }))
 }
 
 export function setHostTags(id: string, tags: string[]) {

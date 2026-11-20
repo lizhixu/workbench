@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, computed, h } from 'vue'
+import { onActivated, onMounted, ref, computed, h } from 'vue'
 import {
   NCard, NButton, NSpace, NTag, NModal, NForm, NFormItem, NDataTable,
   NInput, NSelect, NPopconfirm, useMessage, NIcon, NEmpty,
@@ -198,6 +198,9 @@ async function doDelete(username: string) {
 onMounted(() => {
   if (isAdmin()) refresh()
   else message.warning('需要管理员权限')
+})
+onActivated(() => {
+  if (isAdmin()) refresh()
 })
 </script>
 

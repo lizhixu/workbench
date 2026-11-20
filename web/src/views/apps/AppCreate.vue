@@ -682,23 +682,35 @@ function applyRepoProbeAuto(meta: RepoMetadata) {
   }
 }
 
-const repoProbeTags = computed(() => {
+// 探测标签：普通项是单个 NTag；.env 键列表拆成「短标签 + 可换行文本」——
+// NTag 内部 white-space: nowrap，整行拼成一个标签时窄屏会溢出卡片，
+// .probe-bar 的 flex-wrap 只能在标签之间换行、拆不开它。
+type RepoProbeTag = { label: string; text?: string }
+
+const repoProbeTags = computed((): RepoProbeTag[] => {
   const m = repoProbe.value.data
   if (!m) return []
-  const tags: string[] = []
-  if (m.has_compose) tags.push(`编排文件 ${m.compose_file}`)
+  const tags: RepoProbeTag[] = []
+  if (m.has_compose) tags.push({ label: `编排文件 ${m.compose_file}` })
   if (m.has_dockerfile) {
-    tags.push(m.exposed_ports?.length
-      ? `${m.dockerfile_path}（EXPOSE ${m.exposed_ports.join(' / ')}）`
-      : m.dockerfile_path)
+    tags.push({
+      label: m.exposed_ports?.length
+        ? `${m.dockerfile_path}（EXPOSE ${m.exposed_ports.join(' / ')}）`
+        : m.dockerfile_path,
+    })
   }
   if (!m.has_compose && !m.has_dockerfile) {
-    tags.push(m.language ? `未检出 Dockerfile/Compose（${m.language} 项目）` : '未检出 Dockerfile/Compose')
+    tags.push({ label: m.language ? `未检出 Dockerfile/Compose（${m.language} 项目）` : '未检出 Dockerfile/Compose' })
   }
   const envKeys = Object.keys(m.env_example || {} || {})
-  if (envKeys.length > 0) tags.push(`.env 示例键：${envKeys.slice(0, 6).join('、')}${envKeys.length > 6 ? '…' : ''}${form.build_type === 'dockerfile' ? '（已带入环境变量）' : ''}`)
+  if (envKeys.length > 0) {
+    tags.push({
+      label: '.env 示例键',
+      text: `${envKeys.slice(0, 6).join('、')}${envKeys.length > 6 ? '…' : ''}${form.build_type === 'dockerfile' ? '（已带入环境变量）' : ''}`,
+    })
+  }
   if ((m.volumes || []).length > 0) {
-    tags.push(`数据卷 ${m.volumes.length} 项${form.build_type === 'dockerfile' ? '（已自动带入表单）' : ''}`)
+    tags.push({ label: `数据卷 ${m.volumes.length} 项${form.build_type === 'dockerfile' ? '（已自动带入表单）' : ''}` })
   }
   return tags
 })
@@ -1758,7 +1770,10 @@ onMounted(loadData)
             <div v-else-if="repoProbe.data" class="probe-bar ok">
               <NTag size="tiny" type="success" :bordered="false">已客观读取</NTag>
               <span class="probe-text">默认分支 {{ repoProbe.data.branch }}</span>
-              <NTag v-for="t in repoProbeTags" :key="t" size="tiny" type="info" :bordered="false">{{ t }}</NTag>
+              <template v-for="t in repoProbeTags" :key="t.label">
+                <NTag size="tiny" type="info" :bordered="false">{{ t.label }}</NTag>
+                <span v-if="t.text" class="probe-text">{{ t.text }}</span>
+              </template>
               <span v-if="!buildTypeTouched && (repoProbe.data.has_compose !== repoProbe.data.has_dockerfile)" class="probe-text">
                 构建方式已按仓库事实自动对齐
               </span>

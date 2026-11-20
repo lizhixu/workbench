@@ -635,8 +635,66 @@ watch(() => form.repo_url, () => {
   }
 })
 
+// 生效的 Compose 模式：raw_compose 来源，或 Git 来源且构建方式为 compose。
+// 详情页同款判定（AppDetail isCompose）：创建页的端口/健康检查/环境变量
+// 区段与拓扑预览改按它显隐，而不是只看 sourceMode——否则 Git 应用切到
+// Compose 后表单还留着单容器那套输入框，填了也不会被部署使用
+// （Compose 部署只跑 `docker compose up`，表单端口/env/健康检查全被忽略）。
+const isGitCompose = computed(
+  () =>
+    (sourceMode.value === 'github' || sourceMode.value === 'custom') &&
+    form.build_type === 'compose',
+)
+const isComposeMode = computed(() => sourceMode.value === 'compose' || isGitCompose.value)
+
+// Dockerfile/Compose 路径是否被用户手填过：手填的路径永不被探测或切模式覆盖。
+let dockerfilePathTouched = false
+function markDockerfilePathTouched() {
+  dockerfilePathTouched = true
+}
+
+// 探测结果带入表单（仅 Dockerfile 模式）：端口（仅端口列表为空时）、
+// 环境变量与数据卷（仅对应字段为空时）。探测时与切回 Dockerfile 模式时
+// 共用同一套规则，行为一致。
+function fillFormFromProbe(meta: RepoMetadata) {
+  if (form.build_type !== 'dockerfile') return
+  if (meta.exposed_ports?.length && isPortsEffectivelyEmpty()) {
+    form.ports = meta.exposed_ports
+      .filter((p) => p > 0 && p <= 65535)
+      .map((p) => ({ host: p, container: p, bind_scope: 'public' as const }))
+  }
+  if (!form.env_vars_text.trim()) {
+    const text = mergeProbeEnvText(meta.dockerfile_env || {}, meta.env_example || {})
+    if (text) form.env_vars_text = text
+  }
+  if (!form.volumes_text.trim() && (meta.volumes || []).length > 0) {
+    form.volumes_text = probeVolumeSpecs(meta.volumes, form.name).join('\n')
+  }
+}
+
+// 切构建方式时路径与带入值跟随：未手填过路径时，按新模式填探测到的文件
+// 或模式默认值；手填过的路径不动。切回 Dockerfile 时把探测到的端口/env/卷
+// 按同一套规则补填（探测发生在 Compose 模式时当时不会填）。
+watch(
+  () => form.build_type,
+  (t) => {
+    if (!dockerfilePathTouched) {
+      const m = repoProbe.value.data
+      if (t === 'compose') {
+        form.dockerfile = m?.compose_file || 'compose.yaml'
+      } else {
+        form.dockerfile = m?.dockerfile_path || 'Dockerfile'
+      }
+    }
+    if (t === 'dockerfile') {
+      const m = repoProbe.value.data
+      if (m) fillFormFromProbe(m)
+    }
+  },
+)
+
 // 探测到事实后自动对齐：构建方式（仅用户未手改时）、编排/Dockerfile 路径
-//（仅仍是默认值时）、Dockerfile 模式下端口映射（仅端口列表为空时）。
+//（仅路径未被用户手填过时）、Dockerfile 模式下端口映射（仅端口列表为空时）。
 function applyRepoProbeAuto(meta: RepoMetadata) {
   if (!buildTypeTouched) {
     if (meta.has_compose && !meta.has_dockerfile) {
@@ -645,19 +703,15 @@ function applyRepoProbeAuto(meta: RepoMetadata) {
       form.build_type = 'dockerfile'
     }
   }
-  const pathField = form.dockerfile.trim()
-  const pathIsDefault = pathField === '' || pathField === 'Dockerfile'
-  if (form.build_type === 'compose') {
-    if (meta.has_compose && pathIsDefault) {
-      form.dockerfile = meta.compose_file || 'compose.yaml'
+  // 路径未被用户手填过时才按探测结果填；手填的路径永不覆盖。
+  if (!dockerfilePathTouched) {
+    if (form.build_type === 'compose') {
+      if (meta.has_compose) {
+        form.dockerfile = meta.compose_file || 'compose.yaml'
+      }
+    } else if (meta.has_dockerfile && meta.dockerfile_path !== 'Dockerfile') {
+      form.dockerfile = meta.dockerfile_path
     }
-  } else if (meta.has_dockerfile && pathIsDefault && meta.dockerfile_path !== 'Dockerfile') {
-    form.dockerfile = meta.dockerfile_path
-  }
-  if (form.build_type === 'dockerfile' && meta.exposed_ports?.length && isPortsEffectivelyEmpty()) {
-    form.ports = meta.exposed_ports
-      .filter((p) => p > 0 && p <= 65535)
-      .map((p) => ({ host: p, container: p, bind_scope: 'public' as const }))
   }
   if (meta.branch && (!form.branch.trim() || form.branch.trim() === 'main') && meta.branch !== 'main') {
     form.branch = meta.branch
@@ -671,15 +725,7 @@ function applyRepoProbeAuto(meta: RepoMetadata) {
   // （如 Redis）在部署后 60 秒探针失败；留给用户或镜像按钮显式确认。
   // env 合并 Dockerfile ENV 与 .env.example：示例声明的键都是必要的变量，
   // 有值原样带入、无值留 KEY= 提醒填写，不因无值就丢掉整项。
-  if (form.build_type === 'dockerfile') {
-    if (!form.env_vars_text.trim()) {
-      const text = mergeProbeEnvText(meta.dockerfile_env || {}, meta.env_example || {})
-      if (text) form.env_vars_text = text
-    }
-    if (!form.volumes_text.trim() && (meta.volumes || []).length > 0) {
-      form.volumes_text = probeVolumeSpecs(meta.volumes, form.name).join('\n')
-    }
-  }
+  fillFormFromProbe(meta)
 }
 
 // 探测标签：普通项是单个 NTag；.env 键列表拆成「短标签 + 可换行文本」——
@@ -1279,7 +1325,9 @@ function validate(): string | null {
       if (!/^https?:\/\//.test(form.repo_url.trim())) return '仓库地址必须是 http(s):// 开头的 URL'
       break
   }
-  for (const p of form.ports) {
+  // Compose 模式下端口在 YAML 中声明，表单端口不参与部署也不校验
+  //（隐藏的输入框里可能还留着切模式前的旧值）。
+  for (const p of isComposeMode.value ? [] : form.ports) {
     // 双 0 空行是初始占位，未填即忽略，不当非法端口报错
     if (isEmptyPortRow(p)) continue
     if (p.host <= 0 || p.host > 65535 || p.container <= 0 || p.container > 65535) {
@@ -1429,10 +1477,12 @@ async function submit() {
       mesh_forward_host_id: form.mesh_forward_enabled ? form.mesh_forward_host_id || undefined : undefined,
       mesh_forward_entry_port: form.mesh_forward_enabled ? form.mesh_forward_entry_port ?? undefined : undefined,
       mesh_forward_target_port: form.mesh_forward_enabled ? form.mesh_forward_target_port ?? undefined : undefined,
-      env_vars: parsedEnvVars.value,
-      ports: form.ports.filter((p) => p.host > 0 && p.container > 0),
-      volumes: parsedVolumes.value,
-      healthcheck_url: form.healthcheck_url.trim(),
+      // Git + Compose 模式下表单端口/env/卷/健康检查不参与部署（编排文件
+      // 本身就是权威），提交时清空，免得切模式前填的死值落库后在详情页误导。
+      env_vars: isGitCompose.value ? {} : parsedEnvVars.value,
+      ports: isGitCompose.value ? [] : form.ports.filter((p) => p.host > 0 && p.container > 0),
+      volumes: isGitCompose.value ? [] : parsedVolumes.value,
+      healthcheck_url: isGitCompose.value ? '' : form.healthcheck_url.trim(),
       container_name: form.container_name.trim() || undefined,
     })) as AppEntity
 
@@ -1831,6 +1881,7 @@ onMounted(loadData)
                 <NInput
                   v-model:value="form.dockerfile"
                   :placeholder="form.build_type === 'compose' ? 'compose.yaml' : 'Dockerfile'"
+                  @update:value="markDockerfilePathTouched"
                 />
               </NFormItem>
               <NFormItem label="构建超时" style="flex: 1">
@@ -1843,7 +1894,7 @@ onMounted(loadData)
           </template>
 
           <!-- 端口与网络（Compose 在 YAML 中声明） -->
-          <template v-if="sourceMode !== 'compose'">
+          <template v-if="!isComposeMode">
             <NFormItem label="端口映射与网络范围">
               <NSpace vertical style="width: 100%">
                 <NSpace v-for="(p, idx) in form.ports" :key="idx" align="center">
@@ -1980,7 +2031,7 @@ onMounted(loadData)
             :gateway-public-ip="selectedGateway?.public_ip || ''"
             :gateway-mesh-ip="meshIPMap.get(selectedGateway?.id || '') || ''"
             :ports="form.ports"
-            :compose-mode="sourceMode === 'compose'"
+            :compose-mode="isComposeMode"
             :mesh-forward-enabled="form.mesh_forward_enabled"
             :mesh-forward-host-name="selectedForwardHost?.hostname || ''"
             :mesh-forward-host-online="selectedForwardHost?.status === 'online'"
@@ -2002,7 +2053,7 @@ onMounted(loadData)
             </template>
           </NFormItem>
 
-          <NFormItem v-if="sourceMode !== 'template'" label="环境变量">
+          <NFormItem v-if="sourceMode !== 'template' && !isGitCompose" label="环境变量">
             <NInput
               v-model:value="form.env_vars_text"
               type="textarea"

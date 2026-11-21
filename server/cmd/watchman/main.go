@@ -631,6 +631,16 @@ func main() {
 	installHandler.ManifestPath = *manifestPath
 	installHandler.GRPCHostOverride = settingsStore.AgentGRPCHost
 	installHandler.RegisterRoutes(hr)
+	// Redirect provider + push hook: when the admin saves
+	// agent.redirect_to, every connected agent is told the new
+	// control-plane address at once (offline agents get it from
+	// RegisterResponse on their next reconnect).
+	reg.RedirectTarget = settingsStore.AgentRedirectTo
+	settingsStore.SetOnAgentRedirectChange(func() {
+		if n := reg.BroadcastRuntimeConfig(); n > 0 {
+			log.Info("agent redirect target saved, pushed to agents", "agents", n, "redirect_to", settingsStore.AgentRedirectTo())
+		}
+	})
 	// Allow up to 21000MB for the application volume backup upload-scan
 	// route (up to 10 files at the 2GB per-file cap, plus multipart
 	// overhead). All other endpoints retain the 512MB body ceiling.

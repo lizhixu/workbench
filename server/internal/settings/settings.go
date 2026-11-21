@@ -210,6 +210,14 @@ var Definitions = []Definition{
 	// 即用该地址生成 -server 参数；保存即时生效，无需重启。
 	{Key: "agent.grpc_host", Scope: ScopeSystem, Kind: KindString, Title: "Agent 直连接入地址", Default: "",
 		MaxLen: 253, Validate: validateAgentGRPCHost},
+	// 主控地址重定向（system 域，管理员专属）：控制面搬家时填新主控的
+	// gRPC 地址（如新主机 IP 或域名），保存后立即向所有在线 Agent 下发
+	// 重定向；Agent 先 TCP 预检目标地址，通了才切换拨号地址并持久化，
+	// 不通则留在原主控。离线 Agent 在下次连回旧主控时经 RegisterResponse
+	// 收到同一目标。留空表示不重定向；想把已迁走的 Agent 迁回来时，在
+	// 新主控上填回旧地址即可。保存即时生效，无需重启。
+	{Key: "agent.redirect_to", Scope: ScopeSystem, Kind: KindString, Title: "Agent 重定向目标地址", Default: "",
+		MaxLen: 253, Validate: validateAgentGRPCHost},
 }
 
 // validateAbsPath accepts an empty value (OS default applies) or an absolute
@@ -465,6 +473,12 @@ type Store struct {
 	// wiring uses it to pause auto-renew on orphaned panel IP certificates
 	// the moment the domain binds, instead of waiting for the renewal scan.
 	onPanelDomainChange func(oldDomain, newDomain string)
+	// onAgentRedirectChange, when set, is fired after a committed
+	// system-scope write touches agent.redirect_to (set, change or
+	// clear), outside the store lock. The RPC registry uses it to push
+	// the new redirect target to every connected agent the same instant
+	// it commits; settings itself stays decoupled from the rpc package.
+	onAgentRedirectChange func()
 	// servingProvider reports what the panel actually serves right now
 	// (standard-port listeners + primary port), supplied by the panel
 	// security layer. Nil when not wired (tests, reset tools); BaseURL
@@ -801,6 +815,17 @@ func (s *Store) SetOnPanelDomainChange(fn func(oldDomain, newDomain string)) {
 	s.onPanelDomainChange = fn
 }
 
+// SetOnAgentRedirectChange registers a callback fired after a committed
+// system-scope write touches agent.redirect_to, outside the store lock.
+// It exists so the RPC registry can push the new redirect target to all
+// connected agents the same instant it commits; settings itself stays
+// decoupled from the rpc package.
+func (s *Store) SetOnAgentRedirectChange(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onAgentRedirectChange = fn
+}
+
 // SetServingStateProvider registers the callback BaseURL uses to learn what
 // the panel actually serves (standard-port listeners + primary port). It is
 // a callback, not a direct call, because settings cannot import the panel
@@ -899,19 +924,35 @@ func (s *Store) setManyLocked(scope Scope, username string, items map[string]jso
 	}
 	s.system = newSystem
 	s.users = newUsers
-	if !domainChanged || s.onPanelDomainChange == nil {
+	// A write that touches agent.redirect_to (set, change or clear)
+	// must push the new target to connected agents right away — even a
+	// re-save of the same value is a deliberate "push again".
+	redirectTouched := false
+	if scope == ScopeSystem {
+		if _, ok := normed["agent.redirect_to"]; ok {
+			redirectTouched = true
+		}
+	}
+	if !domainChanged && !redirectTouched {
 		return s.onChange, nil
 	}
 	// Compose the post-commit callback: the standard-port reconciliation
-	// keeps its head start, then the domain-change hook observes the already
-	// committed state (both run outside the store lock via SetMany).
+	// keeps its head start, then the domain-change and redirect hooks
+	// observe the already committed state (all run outside the store
+	// lock via SetMany).
 	onChange := s.onChange
 	onDomainChange := s.onPanelDomainChange
+	onRedirectChange := s.onAgentRedirectChange
 	return func() {
 		if onChange != nil {
 			onChange()
 		}
-		onDomainChange(prevDomain, nextDomain)
+		if domainChanged && onDomainChange != nil {
+			onDomainChange(prevDomain, nextDomain)
+		}
+		if redirectTouched && onRedirectChange != nil {
+			onRedirectChange()
+		}
 	}, nil
 }
 
@@ -997,6 +1038,14 @@ func (s *Store) PanelSecurity() PanelSecurityConfig {
 func (s *Store) AgentGRPCHost() string {
 	var v string
 	s.decode(ScopeSystem, "", "agent.grpc_host", &v)
+	return strings.TrimSpace(v)
+}
+
+// AgentRedirectTo returns the admin-configured redirect target agents
+// should dial ("" = no redirect, see agent.redirect_to).
+func (s *Store) AgentRedirectTo() string {
+	var v string
+	s.decode(ScopeSystem, "", "agent.redirect_to", &v)
 	return strings.TrimSpace(v)
 }
 

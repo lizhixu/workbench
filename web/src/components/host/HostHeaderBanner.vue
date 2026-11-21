@@ -350,6 +350,14 @@ const expiryTooltip = computed(() => {
             </span>
             <span v-else class="spec-value text-muted" style="font-size: 12px">未连接</span>
           </div>
+          <div class="spec-row">
+            <span class="spec-label">回连地址</span>
+            <span class="spec-value mono-font" :title="host.server_addr ? 'Agent 当前拨号的主控地址' : '旧版 Agent，未上报回连地址'">{{ host.server_addr || '-' }}</span>
+          </div>
+          <div v-if="host.redirect_failed_target" class="spec-row">
+            <span class="spec-label">重定向失败</span>
+            <span class="spec-value mono-font text-warning" title="该 Agent 未能切换到此目标地址，仍在原主控">{{ host.redirect_failed_target }}</span>
+          </div>
         </div>
 
         <div class="spec-column">

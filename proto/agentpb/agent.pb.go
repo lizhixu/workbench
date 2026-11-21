@@ -738,8 +738,19 @@ type RegisterRequest struct {
 	// reconnect_reason indicates why the agent is connecting/reconnecting:
 	// "upgrade" (post agent self-upgrade), "maintenance" (post server restart), or empty.
 	ReconnectReason string `protobuf:"bytes,14,opt,name=reconnect_reason,json=reconnectReason,proto3" json:"reconnect_reason,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// server_addr is the control-plane address this agent is currently
+	// dialing (host:port, as normalized by the agent). The server stores it
+	// on the host record so the panel can show which address each agent
+	// actually uses — the key visibility for a control-plane move. Old
+	// agents leave it empty; the server keeps the stored value then.
+	ServerAddr string `protobuf:"bytes,15,opt,name=server_addr,json=serverAddr,proto3" json:"server_addr,omitempty"`
+	// redirect_failed_target is the redirect target this agent last failed
+	// to reach (probe refused, or applied then unreachable for the fallback
+	// window). Empty means no outstanding redirect failure. The server
+	// stores it on the host record so a failed move is visible in the panel.
+	RedirectFailedTarget string `protobuf:"bytes,16,opt,name=redirect_failed_target,json=redirectFailedTarget,proto3" json:"redirect_failed_target,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *RegisterRequest) Reset() {
@@ -870,6 +881,20 @@ func (x *RegisterRequest) GetReconnectReason() string {
 	return ""
 }
 
+func (x *RegisterRequest) GetServerAddr() string {
+	if x != nil {
+		return x.ServerAddr
+	}
+	return ""
+}
+
+func (x *RegisterRequest) GetRedirectFailedTarget() string {
+	if x != nil {
+		return x.RedirectFailedTarget
+	}
+	return ""
+}
+
 type RegisterResponse struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Ok      bool                   `protobuf:"varint,1,opt,name=ok,proto3" json:"ok,omitempty"`
@@ -891,7 +916,17 @@ type RegisterResponse struct {
 	// Values are "host[:port]" TCP endpoints (default port 80); only carriers
 	// with a non-empty target are included. Empty means probing disabled
 	// (old server or the host has the switch off).
-	ProbeTargets  map[string]string `protobuf:"bytes,9,rep,name=probe_targets,json=probeTargets,proto3" json:"probe_targets,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	ProbeTargets map[string]string `protobuf:"bytes,9,rep,name=probe_targets,json=probeTargets,proto3" json:"probe_targets,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// server_addr is the control-plane address the agent should dial
+	// (host[:port], from the agent.redirect_to setting). When non-empty the
+	// agent redirects to it: it probes the address first, and only switches
+	// over when the probe answers. Empty means "no opinion": the agent
+	// keeps whatever redirect state it already has (an empty value must
+	// never clear a redirect, or an agent that just moved would flap back
+	// to its old flag address on first contact with the new server).
+	// Offline agents receive it here on their next (re)connect; online ones
+	// get the same value live via ConfigUpdate.
+	ServerAddr    string `protobuf:"bytes,10,opt,name=server_addr,json=serverAddr,proto3" json:"server_addr,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -982,6 +1017,13 @@ func (x *RegisterResponse) GetProbeTargets() map[string]string {
 	return nil
 }
 
+func (x *RegisterResponse) GetServerAddr() string {
+	if x != nil {
+		return x.ServerAddr
+	}
+	return ""
+}
+
 // ConfigUpdate carries per-host runtime config changes to a CONNECTED agent,
 // mirroring what RegisterResponse would deliver on the next (re)connect, so
 // panel edits (billing modal: probe targets / switch, traffic reset day)
@@ -991,8 +1033,14 @@ type ConfigUpdate struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	ProbeTargets    map[string]string      `protobuf:"bytes,1,rep,name=probe_targets,json=probeTargets,proto3" json:"probe_targets,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	TrafficResetDay int32                  `protobuf:"varint,2,opt,name=traffic_reset_day,json=trafficResetDay,proto3" json:"traffic_reset_day,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// server_addr carries the redirect target (host[:port]) when the admin
+	// set agent.redirect_to, mirroring RegisterResponse.server_addr. Empty
+	// means "no opinion": the agent keeps its current redirect state. The
+	// agent probes the target before switching; an unreachable target is
+	// ignored and the agent stays on its current server.
+	ServerAddr    string `protobuf:"bytes,3,opt,name=server_addr,json=serverAddr,proto3" json:"server_addr,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ConfigUpdate) Reset() {
@@ -1037,6 +1085,13 @@ func (x *ConfigUpdate) GetTrafficResetDay() int32 {
 		return x.TrafficResetDay
 	}
 	return 0
+}
+
+func (x *ConfigUpdate) GetServerAddr() string {
+	if x != nil {
+		return x.ServerAddr
+	}
+	return ""
 }
 
 type Heartbeat struct {
@@ -3792,7 +3847,7 @@ const file_agent_proto_rawDesc = "" +
 	"\vexec_cancel\x18\x16 \x01(\v2\x1a.watchman.agent.ExecCancelH\x00R\n" +
 	"execCancel\x12I\n" +
 	"\x0ftraffic_correct\x18\x17 \x01(\v2\x1e.watchman.agent.TrafficCorrectH\x00R\x0etrafficCorrectB\t\n" +
-	"\apayload\"\xa3\x03\n" +
+	"\apayload\"\xfa\x03\n" +
 	"\x0fRegisterRequest\x12!\n" +
 	"\fenroll_token\x18\x01 \x01(\tR\venrollToken\x12\x19\n" +
 	"\bagent_id\x18\x02 \x01(\tR\aagentId\x12\x1a\n" +
@@ -3809,7 +3864,10 @@ const file_agent_proto_rawDesc = "" +
 	"internalIp\x12\x1b\n" +
 	"\tpublic_ip\x18\f \x01(\tR\bpublicIp\x12\x1a\n" +
 	"\blocation\x18\r \x01(\tR\blocation\x12)\n" +
-	"\x10reconnect_reason\x18\x0e \x01(\tR\x0freconnectReason\"\xa9\x03\n" +
+	"\x10reconnect_reason\x18\x0e \x01(\tR\x0freconnectReason\x12\x1f\n" +
+	"\vserver_addr\x18\x0f \x01(\tR\n" +
+	"serverAddr\x124\n" +
+	"\x16redirect_failed_target\x18\x10 \x01(\tR\x14redirectFailedTarget\"\xca\x03\n" +
 	"\x10RegisterResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12\x19\n" +
@@ -3819,13 +3877,18 @@ const file_agent_proto_rawDesc = "" +
 	"\x16heartbeat_interval_sec\x18\x05 \x01(\x05R\x14heartbeatIntervalSec\x12(\n" +
 	"\x10session_keep_sec\x18\x06 \x01(\x05R\x0esessionKeepSec\x12*\n" +
 	"\x11traffic_reset_day\x18\a \x01(\x05R\x0ftrafficResetDay\x12W\n" +
-	"\rprobe_targets\x18\t \x03(\v22.watchman.agent.RegisterResponse.ProbeTargetsEntryR\fprobeTargets\x1a?\n" +
+	"\rprobe_targets\x18\t \x03(\v22.watchman.agent.RegisterResponse.ProbeTargetsEntryR\fprobeTargets\x12\x1f\n" +
+	"\vserver_addr\x18\n" +
+	" \x01(\tR\n" +
+	"serverAddr\x1a?\n" +
 	"\x11ProbeTargetsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\b\x10\tR\tprobe_url\"\xd0\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\b\x10\tR\tprobe_url\"\xf1\x01\n" +
 	"\fConfigUpdate\x12S\n" +
 	"\rprobe_targets\x18\x01 \x03(\v2..watchman.agent.ConfigUpdate.ProbeTargetsEntryR\fprobeTargets\x12*\n" +
-	"\x11traffic_reset_day\x18\x02 \x01(\x05R\x0ftrafficResetDay\x1a?\n" +
+	"\x11traffic_reset_day\x18\x02 \x01(\x05R\x0ftrafficResetDay\x12\x1f\n" +
+	"\vserver_addr\x18\x03 \x01(\tR\n" +
+	"serverAddr\x1a?\n" +
 	"\x11ProbeTargetsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x1b\n" +

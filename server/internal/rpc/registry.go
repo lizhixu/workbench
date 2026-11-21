@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"watchman/proto/agentpb"
@@ -60,6 +61,12 @@ type persistedAgent struct {
 	// AuthToken is the long-lived token issued at registration; kept here
 	// (NOT in r.tokens) so a server restart doesn't invalidate it.
 	AuthToken string `json:"auth_token"`
+	// ServerAddr is the control-plane address the agent last reported
+	// dialing; RedirectFailedTarget is the redirect target it last
+	// reported failing to reach. Both survive a server restart so the
+	// panel keeps showing the migration state.
+	ServerAddr           string `json:"server_addr,omitempty"`
+	RedirectFailedTarget string `json:"redirect_failed_target,omitempty"`
 }
 
 // Registry holds all known agents (online and recently offline) and the live
@@ -76,6 +83,12 @@ type Registry struct {
 	tunnel   *Coordinator             // reverse TCP tunnels (nil = disabled)
 	dataDir  string
 	log      *slog.Logger
+	// RedirectTarget, when set, returns the admin-configured redirect
+	// target (agent.redirect_to) agents should dial. Supplied by the
+	// settings store at startup; nil means no redirect. A provider func
+	// (not a plain string) so the registry always reads the live setting
+	// instead of a stale copy.
+	RedirectTarget func() string
 }
 
 type UpgradeState struct {
@@ -126,6 +139,13 @@ type Agent struct {
 	Notes           string
 	// ReconnectReason is the reason sent by the agent on its most recent registration.
 	ReconnectReason string
+	// ServerAddr is the control-plane address this agent last reported
+	// dialing (host:port, after any redirect). Empty for agents that
+	// have never reported it (old agent versions).
+	ServerAddr string
+	// RedirectFailedTarget is the redirect target the agent last
+	// reported failing to reach ("" = no outstanding failure).
+	RedirectFailedTarget string
 	// AuthToken is the long-lived token; persisted with the agent so the
 	// server can validate reconnects after a restart.
 	AuthToken string
@@ -286,6 +306,8 @@ func (r *Registry) loadAgents() error {
 			ProbeTargets:    p.ProbeTargets,
 			Notes:           p.Notes,
 			AuthToken:       p.AuthToken,
+			ServerAddr:      p.ServerAddr,
+			RedirectFailedTarget: p.RedirectFailedTarget,
 		}
 		if a.Tags == nil {
 			a.Tags = []string{}
@@ -334,6 +356,8 @@ func (r *Registry) persistAgentsLocked() error {
 			ProbeTargets:    a.ProbeTargets,
 			Notes:           a.Notes,
 			AuthToken:       a.AuthToken,
+			ServerAddr:      a.ServerAddr,
+			RedirectFailedTarget: a.RedirectFailedTarget,
 		}
 	}
 	data, err := json.MarshalIndent(raw, "", "  ")
@@ -453,6 +477,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 			SessionKeepSec:       sessionKeep,
 			TrafficResetDay:      int32(normTrafficResetDay(a.TrafficResetDay)),
 			ProbeTargets:         EffectiveProbeTargets(a),
+			ServerAddr:           r.redirectTo(),
 		}, nil
 	}
 
@@ -507,6 +532,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 		SessionKeepSec:       sessionKeep,
 		TrafficResetDay:      int32(normTrafficResetDay(a.TrafficResetDay)),
 		ProbeTargets:         EffectiveProbeTargets(a),
+		ServerAddr:           r.redirectTo(),
 	}, nil
 }
 
@@ -545,6 +571,13 @@ func applyReg(a *Agent, req *agentpb.RegisterRequest) {
 		a.Location = v
 	}
 	a.ReconnectReason = req.GetReconnectReason()
+	// The dial address and redirect failure are only overwritten when
+	// the agent reports an address at all: old agents send neither
+	// field, and must not clear a value a newer agent stored.
+	if v := req.GetServerAddr(); v != "" {
+		a.ServerAddr = v
+		a.RedirectFailedTarget = req.GetRedirectFailedTarget()
+	}
 }
 
 func (r *Registry) ListAgents() []*Agent {
@@ -927,12 +960,32 @@ func (r *Registry) SetAgentBilling(id string, b HostBillingConfig) error {
 	return nil
 }
 
+// redirectTo returns the current redirect target ("" = no redirect).
+func (r *Registry) redirectTo() string {
+	if r.RedirectTarget == nil {
+		return ""
+	}
+	return strings.TrimSpace(r.RedirectTarget())
+}
+
+// runtimeConfigFor builds the per-host runtime config the agent applies
+// live (probe targets, traffic reset day) plus the current redirect
+// target, mirroring what RegisterResponse carries on (re)connect.
+func (r *Registry) runtimeConfigFor(a *Agent, redirectTarget string) *agentpb.ConfigUpdate {
+	return &agentpb.ConfigUpdate{
+		ProbeTargets:    EffectiveProbeTargets(a),
+		TrafficResetDay: int32(normTrafficResetDay(a.TrafficResetDay)),
+		ServerAddr:      redirectTarget,
+	}
+}
+
 // PushRuntimeConfig sends the agent's current per-host runtime config
 // (probe targets + traffic reset day, same semantics as the RegisterResponse
 // fields) to its live hub, so a billing-modal edit applies without waiting
 // for a reconnect. Best-effort: returns false for offline/unknown agents —
 // they pick the config up from RegisterResponse on their next (re)connect.
 func (r *Registry) PushRuntimeConfig(id string) bool {
+	target := r.redirectTo()
 	r.mu.RLock()
 	a, okA := r.agents[id]
 	hub, okH := r.hubs[id]
@@ -940,14 +993,67 @@ func (r *Registry) PushRuntimeConfig(id string) bool {
 		r.mu.RUnlock()
 		return false
 	}
-	cfg := &agentpb.ConfigUpdate{
-		ProbeTargets:    EffectiveProbeTargets(a),
-		TrafficResetDay: int32(normTrafficResetDay(a.TrafficResetDay)),
-	}
+	cfg := r.runtimeConfigFor(a, target)
 	r.mu.RUnlock()
 	return hub.Send(&agentpb.ServerMessage{
 		Payload: &agentpb.ServerMessage_ConfigUpdate{ConfigUpdate: cfg},
 	})
+}
+
+// BroadcastRuntimeConfig pushes the current runtime config (including
+// the redirect target, if any) to every connected agent. It is fired
+// when agent.redirect_to is saved, so a control-plane move takes effect
+// immediately instead of waiting for each agent to reconnect; offline
+// agents receive the same value from RegisterResponse on their next
+// (re)connect. Returns how many agents were pushed to.
+func (r *Registry) BroadcastRuntimeConfig() int {
+	target := r.redirectTo()
+	r.mu.RLock()
+	type pending struct {
+		hub *Hub
+		cfg *agentpb.ConfigUpdate
+	}
+	pendingList := make([]pending, 0, len(r.hubs))
+	for id, hub := range r.hubs {
+		if hub == nil {
+			continue
+		}
+		if a, ok := r.agents[id]; ok {
+			pendingList = append(pendingList, pending{hub: hub, cfg: r.runtimeConfigFor(a, target)})
+		}
+	}
+	r.mu.RUnlock()
+
+	if len(pendingList) == 0 {
+		return 0
+	}
+	r.log.Info("broadcasting runtime config", "agents", len(pendingList), "redirect_to", target)
+
+	done := make(chan struct{})
+	var pushed atomic.Int32
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(len(pendingList))
+		for _, p := range pendingList {
+			go func(h *Hub, cfg *agentpb.ConfigUpdate) {
+				defer wg.Done()
+				if h.Send(&agentpb.ServerMessage{
+					Payload: &agentpb.ServerMessage_ConfigUpdate{ConfigUpdate: cfg},
+				}) {
+					pushed.Add(1)
+				}
+			}(p.hub, p.cfg)
+		}
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(broadcastTimeout):
+		r.log.Warn("runtime config broadcast timed out", "agents", len(pendingList))
+	}
+	return int(pushed.Load())
 }
 
 // PushTrafficCorrection sends a one-time manual override of the agent's

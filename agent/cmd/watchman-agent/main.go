@@ -53,6 +53,18 @@ func main() {
 		log.Error("load config", "err", err)
 		os.Exit(1)
 	}
+	// A server-pushed redirect outranks the -server flag, but an explicit
+	// local change of the flag wins over a stale redirect: if the operator
+	// edited the unit file (or reinstalled with a new address), the
+	// redirect is dropped so the new flag takes effect. The persisted
+	// ServerAddr is the flag value from the previous start.
+	if *server != cfg.ServerAddr && cfg.ServerAddr != "" && cfg.RedirectTarget != "" {
+		log.Info("server flag changed, dropping stale redirect",
+			"old", cfg.ServerAddr, "new", *server, "redirect", cfg.RedirectTarget)
+		if err := cfg.ClearRedirect(); err != nil {
+			log.Warn("clear stale redirect", "err", err)
+		}
+	}
 	cfg.ServerAddr = *server
 	cfg.EnrollToken = *enroll
 	cfg.StateFile = *state
@@ -67,7 +79,9 @@ func main() {
 	}
 
 	log.Info("watchman-agent starting",
-		"server", cfg.ServerAddr,
+		"server", cfg.EffectiveAddr(),
+		"server_flag", cfg.ServerAddr,
+		"redirect", cfg.RedirectTarget,
 		"state", cfg.StateFile,
 		"has_token", cfg.State.AuthToken != "",
 		"has_enroll", cfg.EnrollToken != "")

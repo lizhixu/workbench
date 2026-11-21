@@ -91,6 +91,17 @@ message RegisterRequest {
   // reconnect_reason indicates why the agent is connecting/reconnecting:
   // "upgrade" (post agent self-upgrade), "maintenance" (post server restart), or empty.
   string reconnect_reason = 14;
+  // server_addr is the control-plane address this agent is currently
+  // dialing (host:port, as normalized by the agent). The server stores it
+  // on the host record so the panel can show which address each agent
+  // actually uses — the key visibility for a control-plane move. Old
+  // agents leave it empty; the server keeps the stored value then.
+  string server_addr = 15;
+  // redirect_failed_target is the redirect target this agent last failed
+  // to reach (probe refused, or applied then unreachable for the fallback
+  // window). Empty means no outstanding redirect failure. The server
+  // stores it on the host record so a failed move is visible in the panel.
+  string redirect_failed_target = 16;
 }
 
 message RegisterResponse {
@@ -117,6 +128,16 @@ message RegisterResponse {
   // Field 8 was the removed single-target probe_url; never reuse it.
   reserved 8;
   reserved "probe_url";
+  // server_addr is the control-plane address the agent should dial
+  // (host[:port], from the agent.redirect_to setting). When non-empty the
+  // agent redirects to it: it probes the address first, and only switches
+  // over when the probe answers. Empty means "no opinion": the agent
+  // keeps whatever redirect state it already has (an empty value must
+  // never clear a redirect, or an agent that just moved would flap back
+  // to its old flag address on first contact with the new server).
+  // Offline agents receive it here on their next (re)connect; online ones
+  // get the same value live via ConfigUpdate.
+  string server_addr = 10;
 }
 
 // ConfigUpdate carries per-host runtime config changes to a CONNECTED agent,
@@ -127,6 +148,12 @@ message RegisterResponse {
 message ConfigUpdate {
   map<string, string> probe_targets = 1;
   int32 traffic_reset_day = 2;
+  // server_addr carries the redirect target (host[:port]) when the admin
+  // set agent.redirect_to, mirroring RegisterResponse.server_addr. Empty
+  // means "no opinion": the agent keeps its current redirect state. The
+  // agent probes the target before switching; an unreachable target is
+  // ignored and the agent stays on its current server.
+  string server_addr = 3;
 }
 
 message Heartbeat {

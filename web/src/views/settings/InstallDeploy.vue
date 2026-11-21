@@ -35,6 +35,11 @@ const grpcHost = ref('')
 const grpcSaving = ref(false)
 const grpcLoaded = ref(false)
 
+// 主控地址重定向（仅管理员可见）：空表示不重定向；填新主控地址后保存
+// 即向所有在线 Agent 下发，离线 Agent 下次连回时收到。
+const redirectTo = ref('')
+const redirectSaving = ref(false)
+
 const effectiveGrpc = computed(() => {
   const v = grpcHost.value.trim()
   if (v) {
@@ -51,6 +56,7 @@ async function loadGrpcHost() {
   try {
     const res = await getSystemSettings()
     grpcHost.value = String(res.data?.[SETTING_KEYS.agentGRPCHost] ?? '')
+    redirectTo.value = String(res.data?.[SETTING_KEYS.agentRedirectTo] ?? '')
   } catch {
     // 加载失败不阻塞安装命令展示
   } finally {
@@ -67,6 +73,18 @@ async function saveGrpcHost() {
     message.error(e.message || '保存失败')
   } finally {
     grpcSaving.value = false
+  }
+}
+
+async function saveRedirectTo() {
+  redirectSaving.value = true
+  try {
+    await saveSystemSettings({ [SETTING_KEYS.agentRedirectTo]: redirectTo.value.trim() })
+    message.success(redirectTo.value.trim() ? '已保存，已向在线 Agent 下发重定向' : '已保存，已清空重定向')
+  } catch (e: any) {
+    message.error(e.message || '保存失败')
+  } finally {
+    redirectSaving.value = false
   }
 }
 
@@ -214,12 +232,30 @@ onMounted(() => {
       </template>
       <NSpin v-if="!grpcLoaded" size="small" class="token-loading" />
       <NSpace v-else vertical :size="12">
-        <div class="muted">安装脚本里 Agent 回连控制面的地址。留空则跟随面板地址（域名或访问 IP）+ :9090；面板域名走 Cloudflare 等不转发 9090 的代理时，在此填服务端直连地址，之后新安装的 Agent 才会注册成功。已安装的 Agent 不受影响，需手动改服务单元或重装。</div>
+        <div class="muted">安装脚本里 Agent 回连控制面的地址。留空则跟随面板地址（域名或访问 IP）+ :9090；面板域名走 Cloudflare 等不转发 9090 的代理时，在此填服务端直连地址，之后新安装的 Agent 才会注册成功。已安装的 Agent 不受影响；要让已安装的 Agent 改拨新主控，用下面「主控地址重定向」。</div>
         <NSpace :size="8" align="center">
           <NInput v-model:value="grpcHost" placeholder="例如 192.255.178.173（留空跟随面板地址）" clearable style="width: 320px" />
           <NButton type="primary" :loading="grpcSaving" @click="saveGrpcHost">保存</NButton>
         </NSpace>
         <div class="muted">当前安装脚本将使用的地址：<code>{{ effectiveGrpc }}</code></div>
+      </NSpace>
+    </NCard>
+
+    <NCard v-if="isAdmin" :bordered="false">
+      <template #header>
+        <span style="font-size: 16px; font-weight: 700">
+          <NIcon style="vertical-align: middle; margin-right: 6px"><LinkOutline /></NIcon>
+          主控地址重定向
+        </span>
+      </template>
+      <NSpin v-if="!grpcLoaded" size="small" class="token-loading" />
+      <NSpace v-else vertical :size="12">
+        <div class="muted">控制面搬家时填新主控的 gRPC 地址，保存后立即通知所有在线 Agent。Agent 会先预检目标地址，通了才切换过去并记住新地址；不通就留在原主控不动。离线 Agent 下次连回旧主控时自动收到。留空表示不重定向。想把已迁走的 Agent 迁回来时，在新主控上填回旧地址。重新保存同一地址可再次下发。</div>
+        <NSpace :size="8" align="center">
+          <NInput v-model:value="redirectTo" placeholder="例如 35.212.206.45（留空不重定向）" clearable style="width: 320px" />
+          <NButton type="primary" :loading="redirectSaving" @click="saveRedirectTo">保存</NButton>
+        </NSpace>
+        <div class="muted">主机详情横幅「回连地址」可查看每台 Agent 当前实际拨号的地址。</div>
       </NSpace>
     </NCard>
 

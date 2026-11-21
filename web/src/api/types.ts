@@ -53,6 +53,11 @@ export interface Host {
   internal_ip?: string
   public_ip?: string
   location?: string
+  // Control-plane address this agent last reported dialing (after any
+  // redirect), and the redirect target it last reported failing to
+  // reach. Empty for old agents that never reported them.
+  server_addr?: string
+  redirect_failed_target?: string
   // Extended live metrics from the agent's latest sample.
   cpu_model?: string
   load1?: number

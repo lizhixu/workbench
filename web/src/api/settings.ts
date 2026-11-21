@@ -49,6 +49,9 @@ export const SETTING_KEYS = {
   // address; set to a direct host[:port] when the panel domain sits behind
   // a proxy that does not forward :9090.
   agentGRPCHost: 'agent.grpc_host',
+  // 主控地址重定向 (system scope, admin only): '' = no redirect; set to
+  // the new control plane's host[:port] to move installed agents over.
+  agentRedirectTo: 'agent.redirect_to',
   // Panel SSL / HTTPS (system scope)
   panelSSLEnabled: 'security.panel_ssl_enabled',
   panelSSLMode: 'security.panel_ssl_mode',

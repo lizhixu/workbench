@@ -7,13 +7,13 @@ package conn
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"net"
 	"os"
 	"runtime"
-	"strings"
 	"time"
 
 	"watchman/agent/internal/cleanup"
@@ -54,7 +54,25 @@ type Dialer struct {
 	tunnel  *tunnel.Manager
 
 	uninstall *uninstall.Executor
+
+	// connCancel tears down the current stream so the dialer reconnects
+	// (used when a redirect is applied mid-session). It is only ever
+	// touched from the Run goroutine that owns connectOnce.
+	connCancel context.CancelFunc
+	// redirectApplied is set when a redirect is applied mid-session; the
+	// receive loop then reports the stream end as a planned reconnect
+	// instead of a failure.
+	redirectApplied bool
+	// redirectFailedSince marks when the current redirect target started
+	// failing continuously; cleared on a successful registration. It
+	// backs the fallback window in maybeFallback.
+	redirectFailedSince time.Time
 }
+
+// errRedirectReconnect is returned by connectOnce when the agent
+// deliberately drops its stream to dial a redirect target. Run treats it
+// as a planned reconnect (no error backoff), not a failure.
+var errRedirectReconnect = errors.New("redirect: reconnecting to new server address")
 
 // Hub is the agent-side view of an established stream.
 type Hub struct {
@@ -115,6 +133,23 @@ func (d *Dialer) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		if errors.Is(err, errRedirectReconnect) {
+			// Planned move to a redirect target: reconnect promptly
+			// instead of sitting out the failure backoff.
+			attempt = 0
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		if d.maybeFallback() {
+			// The redirect proved unreachable and the old server is
+			// still there: we already reverted to it, reconnect now.
+			attempt = 0
+			continue
+		}
 		backoff := d.backoff(attempt)
 		d.log.Warn("connection lost, retrying",
 			"err", err, "attempt", attempt, "backoff", backoff)
@@ -147,15 +182,100 @@ func (d *Dialer) backoff(attempt int) time.Duration {
 	return time.Duration(base*float64(time.Second)) + time.Millisecond*time.Duration(attempt*17%500)
 }
 
-func (d *Dialer) connectOnce(ctx context.Context) error {
-	addr := d.cfg.ServerAddr
-	addr = strings.TrimPrefix(addr, "http://")
-	addr = strings.TrimPrefix(addr, "https://")
-	if idx := strings.Index(addr, "/"); idx != -1 {
-		addr = addr[:idx]
+// probeTCP reports whether something accepts a TCP connection at addr
+// within the redirect probe timeout. It only proves the port answers,
+// not that it is our control plane — the real check is the gRPC
+// registration that follows the redirect.
+func probeTCP(addr string, timeout time.Duration) bool {
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return false
 	}
-	if !strings.Contains(addr, ":") {
-		addr = net.JoinHostPort(addr, "9090")
+	_ = conn.Close()
+	return true
+}
+
+// applyRedirectFromServer handles a redirect target pushed by the server
+// (ConfigUpdate or RegisterResponse). It returns true when the agent
+// switched its dial address and the caller should reconnect. An empty
+// target means "no opinion" and never changes anything; an unreachable
+// target is ignored and the agent stays where it is.
+func (d *Dialer) applyRedirectFromServer(target string) bool {
+	now := time.Now()
+	target = config.NormalizeServerAddr(target)
+	if target == "" {
+		return false
+	}
+	current := config.NormalizeServerAddr(d.cfg.EffectiveAddr())
+	if target == current {
+		return false
+	}
+	if d.cfg.RedirectCoolingDown(target, now) {
+		d.log.Info("redirect target in failure cooldown, ignoring", "target", target)
+		return false
+	}
+	if d.cfg.RedirectReversal(target, now) {
+		d.log.Warn("ignoring redirect back to previous server (possible redirect loop between two control planes)",
+			"target", target, "current", current)
+		return false
+	}
+	if !probeTCP(target, config.RedirectProbeTimeout) {
+		d.log.Warn("redirect target unreachable, staying on current server",
+			"target", target, "current", current)
+		return false
+	}
+	if err := d.cfg.SetRedirect(target, current, now); err != nil {
+		d.log.Warn("persist redirect", "err", err)
+		return false
+	}
+	if err := d.cfg.SyncAgentConf(target); err != nil {
+		d.log.Debug("sync agent.conf", "err", err)
+	}
+	d.redirectFailedSince = time.Time{}
+	d.log.Info("redirect applied, reconnecting to new server",
+		"target", target, "previous", current)
+	return true
+}
+
+// maybeFallback reverts an applied redirect after it has failed
+// continuously for RedirectFallbackAfter — but only when the previous
+// server still answers a TCP probe. If the old control plane is already
+// gone, the agent keeps dialing the new address. It returns true when
+// it reverted (the caller should reconnect promptly).
+func (d *Dialer) maybeFallback() bool {
+	target, prev := d.cfg.RedirectState()
+	if target == "" {
+		d.redirectFailedSince = time.Time{}
+		return false
+	}
+	if d.redirectFailedSince.IsZero() {
+		d.redirectFailedSince = time.Now()
+		return false
+	}
+	if time.Since(d.redirectFailedSince) < config.RedirectFallbackAfter {
+		return false
+	}
+	prev = config.NormalizeServerAddr(prev)
+	if prev == "" || !probeTCP(prev, config.RedirectProbeTimeout) {
+		// Old server not reachable either: keep trying the new one.
+		return false
+	}
+	d.log.Warn("redirect target unreachable, falling back to previous server",
+		"target", target, "previous", prev)
+	if err := d.cfg.NoteRedirectFailed(time.Now()); err != nil {
+		d.log.Warn("persist redirect fallback", "err", err)
+	}
+	if err := d.cfg.SyncAgentConf(d.cfg.EffectiveAddr()); err != nil {
+		d.log.Debug("sync agent.conf", "err", err)
+	}
+	d.redirectFailedSince = time.Time{}
+	return true
+}
+
+func (d *Dialer) connectOnce(ctx context.Context) error {
+	addr := config.NormalizeServerAddr(d.cfg.EffectiveAddr())
+	if addr == "" {
+		return fmt.Errorf("no server address configured")
 	}
 
 	kacp := keepalive.ClientParameters{
@@ -176,9 +296,15 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 
 	client := agentpb.NewAgentServiceClient(cc)
 
-	callCtx := ctx
+	// A per-connection context so a redirect applied mid-session can
+	// tear this stream down without cancelling the whole dialer.
+	connCtx, connCancel := context.WithCancel(ctx)
+	d.connCancel = connCancel
+	defer func() { d.connCancel = nil }()
+
+	callCtx := connCtx
 	if authToken := d.cfg.Snapshot().AuthToken; authToken != "" {
-		callCtx = metadata.AppendToOutgoingContext(ctx,
+		callCtx = metadata.AppendToOutgoingContext(connCtx,
 			"authorization", "Bearer "+authToken)
 	}
 
@@ -207,6 +333,11 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 		PublicIp:        hwInfo.PublicIP,
 		Location:        hwInfo.Location,
 		ReconnectReason: reconnectReason,
+		// Report the address actually being dialed (after redirect) plus
+		// any outstanding redirect failure, so the panel can show which
+		// address each agent uses and which moves failed.
+		ServerAddr:           addr,
+		RedirectFailedTarget: d.cfg.FailedTargetForReport(time.Now()),
 	}
 	if reconnectReason != "" {
 		d.log.Info("sending register with reconnect reason", "reason", reconnectReason)
@@ -257,6 +388,18 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 			d.log.Warn("clear reconnect reason", "err", err)
 		}
 	}
+
+	// A redirect delivered with registration (offline agents catch up
+	// here): probe it and, when it answers, drop this stream and dial
+	// the new server instead of wiring subsystems to a stream we are
+	// about to abandon.
+	if d.applyRedirectFromServer(regResp.GetServerAddr()) {
+		return errRedirectReconnect
+	}
+	// Registration against the current server succeeded: any redirect
+	// failure window restarts from a later failure.
+	d.redirectFailedSince = time.Time{}
+	d.redirectApplied = false
 
 	hub := &Hub{
 		stream: stream,
@@ -314,6 +457,12 @@ func (d *Dialer) connectOnce(ctx context.Context) error {
 		msg, err := stream.Recv()
 		if err != nil {
 			d.log.Debug("recv ended", "err", err)
+			if d.redirectApplied {
+				// A redirect was applied mid-session (ConfigUpdate):
+				// this is a planned move, not a failure.
+				d.redirectApplied = false
+				return errRedirectReconnect
+			}
 			return err
 		}
 		if err := d.handleServerMessage(msg); err != nil {
@@ -394,12 +543,19 @@ func (d *Dialer) handleServerMessage(msg *agentpb.ServerMessage) error {
 	// Runtime config pushed live by the server when the admin saves the
 	// billing modal (probe targets / switch, traffic reset day) — same
 	// semantics as what RegisterResponse would carry on the next reconnect.
+	// A non-empty server_addr in the same message is a redirect: the
+	// agent probes the target and moves over when it answers.
 	case *agentpb.ServerMessage_ConfigUpdate:
-		if d.metrics == nil {
-			return nil
+		if d.metrics != nil {
+			d.metrics.SetProbeTargets(p.ConfigUpdate.GetProbeTargets())
+			d.metrics.SetResetDay(int(p.ConfigUpdate.GetTrafficResetDay()))
 		}
-		d.metrics.SetProbeTargets(p.ConfigUpdate.GetProbeTargets())
-		d.metrics.SetResetDay(int(p.ConfigUpdate.GetTrafficResetDay()))
+		if d.applyRedirectFromServer(p.ConfigUpdate.GetServerAddr()) {
+			d.redirectApplied = true
+			if d.connCancel != nil {
+				d.connCancel()
+			}
+		}
 		return nil
 
 	// One-time manual correction of the monthly traffic totals, pushed

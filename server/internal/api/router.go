@@ -82,6 +82,11 @@ type HostDTO struct {
 	InternalIP string   `json:"internal_ip"`
 	PublicIP   string   `json:"public_ip"`
 	Location   string   `json:"location"`
+	// Control-plane address this agent last reported dialing, and the
+	// redirect target it last reported failing to reach (migration
+	// visibility; empty for old agents that never reported them).
+	ServerAddr           string `json:"server_addr,omitempty"`
+	RedirectFailedTarget string `json:"redirect_failed_target,omitempty"`
 	// Optional billing & traffic quota configurations
 	Price           float64           `json:"price,omitempty"`
 	Currency        string            `json:"currency,omitempty"`
@@ -2792,37 +2797,39 @@ func (h *handlers) toDTO(a *rpc.Agent) HostDTO {
 	}
 	targetVer := agentTargetVersion()
 	dto := HostDTO{
-		ID:                 a.ID,
-		Hostname:           a.Hostname,
-		OS:                 a.OS,
-		Arch:               a.Arch,
-		Distro:             a.Distro,
-		Version:            a.Version,
-		AgentLatestVersion: targetVer,
-		AgentOutdated:      a.Status == "online" && a.Version != "" && a.Version != targetVer,
-		Status:             a.Status,
-		LastSeen:           a.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
-		Registered:         a.Registered.Format("2006-01-02T15:04:05Z07:00"),
-		Groups:             groups,
-		Tags:               tags,
-		Uptime:             a.Uptime,
-		CPUCores:           a.CPUCores,
-		MemTotal:           a.MemTotal,
-		InternalIP:         a.InternalIP,
-		PublicIP:           a.PublicIP,
-		Location:           a.Location,
-		Price:              a.Price,
-		Currency:           a.Currency,
-		BillingCycle:       a.BillingCycle,
-		ExpiresAt:          a.ExpiresAt,
-		AutoRenewal:        a.AutoRenewal,
-		TrafficLimitGB:     a.TrafficLimitGB,
-		TrafficCalcType:    a.TrafficCalcType,
-		TrafficResetDay:    a.TrafficResetDay,
-		RenewalURL:         a.RenewalURL,
-		ProbeEnabled:       a.ProbeEnabled,
-		ProbeTargets:       panelProbeTargets(a),
-		Notes:              a.Notes,
+		ID:                   a.ID,
+		Hostname:             a.Hostname,
+		OS:                   a.OS,
+		Arch:                 a.Arch,
+		Distro:               a.Distro,
+		Version:              a.Version,
+		AgentLatestVersion:   targetVer,
+		AgentOutdated:        a.Status == "online" && a.Version != "" && a.Version != targetVer,
+		Status:               a.Status,
+		LastSeen:             a.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
+		Registered:           a.Registered.Format("2006-01-02T15:04:05Z07:00"),
+		Groups:               groups,
+		Tags:                 tags,
+		Uptime:               a.Uptime,
+		CPUCores:             a.CPUCores,
+		MemTotal:             a.MemTotal,
+		InternalIP:           a.InternalIP,
+		PublicIP:             a.PublicIP,
+		Location:             a.Location,
+		ServerAddr:           a.ServerAddr,
+		RedirectFailedTarget: a.RedirectFailedTarget,
+		Price:                a.Price,
+		Currency:             a.Currency,
+		BillingCycle:         a.BillingCycle,
+		ExpiresAt:            a.ExpiresAt,
+		AutoRenewal:          a.AutoRenewal,
+		TrafficLimitGB:       a.TrafficLimitGB,
+		TrafficCalcType:      a.TrafficCalcType,
+		TrafficResetDay:      a.TrafficResetDay,
+		RenewalURL:           a.RenewalURL,
+		ProbeEnabled:         a.ProbeEnabled,
+		ProbeTargets:         panelProbeTargets(a),
+		Notes:                a.Notes,
 	}
 	// Surface the real OS uptime and latest metrics
 	live := false
@@ -2907,25 +2914,27 @@ func toDTO(a *rpc.Agent) HostDTO {
 	}
 	targetVer := agentTargetVersion()
 	return HostDTO{
-		ID:                 a.ID,
-		Hostname:           a.Hostname,
-		OS:                 a.OS,
-		Arch:               a.Arch,
-		Distro:             a.Distro,
-		Version:            a.Version,
-		AgentLatestVersion: targetVer,
-		AgentOutdated:      a.Status == "online" && a.Version != "" && a.Version != targetVer,
-		Status:             a.Status,
-		LastSeen:           a.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
-		Registered:         a.Registered.Format("2006-01-02T15:04:05Z07:00"),
-		Groups:             groups,
-		Tags:               tags,
-		Uptime:             a.Uptime,
-		CPUCores:           a.CPUCores,
-		MemTotal:           a.MemTotal,
-		InternalIP:         a.InternalIP,
-		PublicIP:           a.PublicIP,
-		Location:           a.Location,
+		ID:                   a.ID,
+		Hostname:             a.Hostname,
+		OS:                   a.OS,
+		Arch:                 a.Arch,
+		Distro:               a.Distro,
+		Version:              a.Version,
+		AgentLatestVersion:   targetVer,
+		AgentOutdated:        a.Status == "online" && a.Version != "" && a.Version != targetVer,
+		Status:               a.Status,
+		LastSeen:             a.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
+		Registered:           a.Registered.Format("2006-01-02T15:04:05Z07:00"),
+		Groups:               groups,
+		Tags:                 tags,
+		Uptime:               a.Uptime,
+		CPUCores:             a.CPUCores,
+		MemTotal:             a.MemTotal,
+		InternalIP:           a.InternalIP,
+		PublicIP:             a.PublicIP,
+		Location:             a.Location,
+		ServerAddr:           a.ServerAddr,
+		RedirectFailedTarget: a.RedirectFailedTarget,
 	}
 }
 

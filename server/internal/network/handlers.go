@@ -23,6 +23,7 @@ type Handlers struct {
 	store *Store
 	reg   *rpc.Registry
 	audit *audit.Store
+	tasks *TaskStore
 }
 
 // NewHandlers creates network Handlers.
@@ -31,6 +32,7 @@ func NewHandlers(store *Store, reg *rpc.Registry, auditStore *audit.Store) *Hand
 		store: store,
 		reg:   reg,
 		audit: auditStore,
+		tasks: NewTaskStore(),
 	}
 }
 
@@ -39,6 +41,9 @@ func (h *Handlers) Register(rg, writeRG *gin.RouterGroup) {
 	rg.GET("/network/config", h.getConfig)
 	rg.GET("/network/nodes", h.listNodes)
 	rg.GET("/network/nodes/:id", h.getNode)
+	// Task status for async install/join (read-only, no audit): the client
+	// polls this after a 202; see tasks.go.
+	rg.GET("/network/nodes/:id/tasks/:taskId", h.getTask)
 	// Read-only live mesh-IP probe: audit-exempt on purpose (see meshIP).
 	rg.GET("/network/nodes/:id/mesh-ip", h.meshIP)
 
@@ -352,7 +357,13 @@ func buildInstallCommand(shell string) string {
 	}
 }
 
-// installNode executes automated Tailscale installation script on the host.
+// installNode starts an async Tailscale installation on the host.
+//
+// The install exec can take minutes, so this only validates and returns
+// 202 + task_id; the work runs in runInstallTask and the client polls
+// GET /network/nodes/:id/tasks/:taskId. A synchronous reply here would
+// be cut by any proxy on the path (Cloudflare: 100s) while the install
+// kept running — a false timeout for a task that later succeeds.
 func (h *Handlers) installNode(c *gin.Context) {
 	hostID := c.Param("id")
 	hub := h.reg.Hub(hostID)
@@ -367,14 +378,38 @@ func (h *Handlers) installNode(c *gin.Context) {
 		return
 	}
 
+	task, ok := h.tasks.Start(hostID, TaskKindInstall)
+	if !ok {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":   "该主机已有进行中的组网任务，请稍后重试",
+			"task_id": task.ID,
+			"status":  string(task.Status),
+		})
+		return
+	}
+
 	shell := agentShellFor(agent)
 	cmd := buildInstallCommand(shell)
 
 	h.recordAudit(c, "install", "network_node", hostID, "一键安装 Tailscale 客户端")
 
+	go h.runInstallTask(task, hub, shell, cmd)
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"ok":      true,
+		"task_id": task.ID,
+		"status":  string(TaskRunning),
+		"message": "安装任务已开始，后台执行中",
+	})
+}
+
+// runInstallTask runs the installer exec in the background and records
+// the outcome on the task. The durable result (installed=true) is written
+// to NodeStatus, so a lost task record is recoverable by probing the node.
+func (h *Handlers) runInstallTask(task *NetworkTask, hub *rpc.Hub, shell, cmd string) {
 	res, err := h.runExecWithTimeout(hub, cmd, shell, 300)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "执行安装超时或出错: " + err.Error()})
+		h.tasks.Finish(task, TaskFailed, "执行安装超时或出错", err.Error())
 		return
 	}
 
@@ -383,30 +418,23 @@ func (h *Handlers) installNode(c *gin.Context) {
 		if out == "" {
 			out = string(res.Stdout)
 		}
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":       "安装脚本执行失败 (exit code: " + strconv.Itoa(int(res.ExitCode)) + ")",
-			"detail":      strings.TrimSpace(out),
-			"duration_ms": res.DurationMs,
-		})
+		h.tasks.Finish(task, TaskFailed,
+			"安装脚本执行失败 (exit code: "+strconv.Itoa(int(res.ExitCode))+")",
+			strings.TrimSpace(out))
 		return
 	}
 
 	// Recheck status
 	time.Sleep(2 * time.Second)
 	st := NodeStatus{
-		HostID:      hostID,
+		HostID:      task.HostID,
 		Installed:   true,
 		Online:      false,
 		LastChecked: time.Now(),
 	}
 	_ = h.store.SetNodeStatus(st)
 
-	c.JSON(http.StatusOK, gin.H{
-		"ok":          true,
-		"message":     "Tailscale 安装成功并已启动守护进程",
-		"duration_ms": res.DurationMs,
-		"output":      string(res.Stdout),
-	})
+	h.tasks.Finish(task, TaskSuccess, "Tailscale 安装成功并已启动守护进程", strings.TrimSpace(string(res.Stdout)))
 }
 
 type JoinRequest struct {
@@ -459,7 +487,12 @@ func buildJoinArgs(shell, authKey, serverURL string, acceptRoutes bool, advertis
 	return args
 }
 
-// joinNode executes `tailscale up` with params to enroll node into the mesh.
+// joinNode starts an async `tailscale up` to enroll the node into the mesh.
+//
+// Same async shape as installNode: validates, returns 202 + task_id, and
+// the exec runs in runJoinTask while the client polls the task endpoint.
+// The previous address is captured before the exec so the task can report
+// whether the mesh IP changed (see §8.7 rule 1: no --reset unless asked).
 func (h *Handlers) joinNode(c *gin.Context) {
 	hostID := c.Param("id")
 	hub := h.reg.Hub(hostID)
@@ -501,6 +534,16 @@ func (h *Handlers) joinNode(c *gin.Context) {
 		acceptRoutes = globalCfg.AcceptRoutes
 	}
 
+	task, ok := h.tasks.Start(hostID, TaskKindJoin)
+	if !ok {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":   "该主机已有进行中的组网任务，请稍后重试",
+			"task_id": task.ID,
+			"status":  string(task.Status),
+		})
+		return
+	}
+
 	agentShell := agentShellFor(agent)
 	args := buildJoinArgs(agentShell, authKey, serverURL, acceptRoutes, req.AdvertiseRoutes, req.AdvertiseExitNode, req.Hostname, req.Reset)
 	cmd := strings.Join(args, " ")
@@ -511,12 +554,23 @@ func (h *Handlers) joinNode(c *gin.Context) {
 
 	h.recordAudit(c, "join", "network_node", hostID, "执行 tailscale up 加入异地组网")
 
-	res, err := h.runExecWithTimeout(hub, cmd, agentShell, 90)
+	go h.runJoinTask(task, hub, agentShell, cmd, prevStatus, prevIP)
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"ok":      true,
+		"task_id": task.ID,
+		"status":  string(TaskRunning),
+		"message": "加入组网任务已开始，后台执行中",
+	})
+}
+
+// runJoinTask runs `tailscale up` in the background and records the outcome
+// on the task, including the new mesh IP and whether it changed.
+func (h *Handlers) runJoinTask(task *NetworkTask, hub *rpc.Hub, shell, cmd string, prevStatus NodeStatus, prevIP string) {
+	res, err := h.runExecWithTimeout(hub, cmd, shell, 90)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":  "加入组网失败: 执行命令超时 (90s)",
-			"detail": "超时通常由于目标客户端版本过旧被 Headscale 拒绝握手、网络不通或未启动 tailscaled",
-		})
+		h.tasks.Finish(task, TaskFailed, "加入组网失败: 执行命令超时 (90s)",
+			"超时通常由于目标客户端版本过旧被 Headscale 拒绝握手、网络不通或未启动 tailscaled")
 		return
 	}
 
@@ -529,19 +583,17 @@ func (h *Handlers) joinNode(c *gin.Context) {
 		if res.Error != "" {
 			detailMsg = res.Error + ": " + detailMsg
 		}
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":  "加入组网失败 (exit code: " + strconv.Itoa(int(res.ExitCode)) + ")",
-			"detail": detailMsg,
-		})
+		h.tasks.Finish(task, TaskFailed,
+			"加入组网失败 (exit code: "+strconv.Itoa(int(res.ExitCode))+")", detailMsg)
 		return
 	}
 
 	// Give it a brief moment to assign IP, then read it back.
 	time.Sleep(2 * time.Second)
-	ipStr, ip6Str := h.querySelfIPs(hub, agentShell, hostID)
+	ipStr, ip6Str := h.querySelfIPs(hub, shell, task.HostID)
 
 	st := prevStatus
-	st.HostID = hostID
+	st.HostID = task.HostID
 	st.Installed = true
 	st.Online = true
 	if ipStr != "" {
@@ -553,16 +605,21 @@ func (h *Handlers) joinNode(c *gin.Context) {
 	st.LastChecked = time.Now()
 	_ = h.store.SetNodeStatus(st)
 
-	ipChanged := prevIP != "" && ipStr != "" && prevIP != ipStr
+	h.tasks.SetJoinResult(task, ipStr, prevIP, prevIP != "" && ipStr != "" && prevIP != ipStr)
+	h.tasks.Finish(task, TaskSuccess, "成功加入异地虚拟网络！", "")
+}
 
-	c.JSON(http.StatusOK, gin.H{
-		"ok":          true,
-		"message":     "成功加入异地虚拟网络！",
-		"ip":          ipStr,
-		"previous_ip": prevIP,
-		"ip_changed":  ipChanged,
-		"data":        st,
-	})
+// getTask returns one async install/join task for polling. The task must
+// belong to the host in the path; anything else (unknown id, expired
+// result, other host) reads as 404 so the client falls back to probing
+// the node with POST .../check.
+func (h *Handlers) getTask(c *gin.Context) {
+	task, ok := h.tasks.Get(c.Param("taskId"))
+	if !ok || task.HostID != c.Param("id") {
+		c.JSON(http.StatusNotFound, gin.H{"error": "任务不存在或已过期，请点探测确认当前状态"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": task})
 }
 
 // querySelfIPs reads the node's own Tailscale addresses.

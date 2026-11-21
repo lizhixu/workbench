@@ -3,7 +3,7 @@ import { onMounted, ref, computed, watch } from 'vue'
 import {
   NButton, NSpace, NTag, NModal, NForm, NFormItem,
   NInput, NSelect, NSwitch, useMessage, NIcon, NAlert, NPagination, NPopconfirm, NText, NTooltip,
-  NSpin, NEmpty,
+  NSpin, NEmpty, NCheckbox,
 } from 'naive-ui'
 import {
   RefreshOutline,
@@ -13,7 +13,8 @@ import {
 } from '@vicons/ionicons5'
 import {
   getNetworkConfig, updateNetworkConfig, listNetworkNodes,
-  checkNetworkNode, installNetworkNode, joinNetworkNode, leaveNetworkNode,
+  checkNetworkNode, startInstallNetworkNode, startJoinNetworkNode, runNetworkTask,
+  leaveNetworkNode,
   pingNetworkNode, type NetworkConfig, type NetworkNode, type PingResult,
 } from '../../api/network'
 import { copyToClipboard } from '../../utils/clipboard'
@@ -67,6 +68,15 @@ const checkingIds = ref<Record<string, boolean>>({})
 const installingIds = ref<Record<string, boolean>>({})
 const leavingIds = ref<Record<string, boolean>>({})
 
+// 批量安装 / 加入：多选 + 并发编排（3 台同时），零后端改动，复用单机接口。
+const selectedIds = ref<Set<string>>(new Set())
+const BATCH_CONCURRENCY = 3
+type OpPhase = 'queued' | 'installing' | 'joining' | 'done' | 'failed'
+const opStatus = ref<Record<string, { phase: OpPhase; message?: string }>>({})
+const batchRunning = ref(false)
+const batchKind = ref<'install' | 'join' | null>(null)
+const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+
 // 拓扑统计
 const stats = computed(() => {
   const total = nodes.value.length
@@ -74,6 +84,21 @@ const stats = computed(() => {
   const installed = nodes.value.filter((n) => n.installed).length
   return { total, connected, installed }
 })
+
+// 批量操作的目标集合：勾选按 host_id 存、跨页保留，执行时按当时状态过滤。
+const selectedNodes = computed(() => nodes.value.filter((n) => selectedIds.value.has(n.host_id)))
+const batchInstallable = computed(() =>
+  selectedNodes.value.filter((n) => n.agent_online && !n.installed),
+)
+const batchJoinable = computed(() =>
+  selectedNodes.value.filter((n) => n.agent_online && !n.online),
+)
+const pageAllChecked = computed(() =>
+  pagedNodes.value.length > 0 && pagedNodes.value.every((n) => selectedIds.value.has(n.host_id)),
+)
+const pageSomeChecked = computed(() =>
+  !pageAllChecked.value && pagedNodes.value.some((n) => selectedIds.value.has(n.host_id)),
+)
 
 // 过滤后的数据列表
 const filteredNodes = computed(() => {
@@ -150,6 +175,17 @@ async function loadData() {
     config.value = cfg as NetworkConfig
     authKeySet.value = !!(cfg as NetworkConfig).auth_key_set
     nodes.value = list as NetworkNode[]
+    // 刷新后清掉已不存在的主机勾选，避免批量操作带上幽灵 ID
+    const alive = new Set((list as NetworkNode[]).map((n) => n.host_id))
+    selectedIds.value.forEach((id) => {
+      if (!alive.has(id)) selectedIds.value.delete(id)
+    })
+    // 刷新拿到的是最新状态，旧的操作进度（已完成/失败）不再对应当前行；
+    // 批量进行中时不动，等本轮跑完再由 runBatch 收尾。
+    if (!batchRunning.value) {
+      opStatus.value = {}
+      batchSummary.value = null
+    }
   } catch (e: any) {
     message.error(e.message || '获取网络拓扑失败')
   } finally {
@@ -197,11 +233,14 @@ async function handleCheck(node: NetworkNode) {
 
 async function handleInstall(node: NetworkNode) {
   installingIds.value[node.host_id] = true
+  opStatus.value[node.host_id] = { phase: 'installing' }
   try {
-    const res = await installNetworkNode(node.host_id)
-    message.success(`[${node.hostname}] ${res.message}`)
+    const task = await runNetworkTask(node.host_id, () => startInstallNetworkNode(node.host_id))
+    message.success(`[${node.hostname}] ${task.message}`)
     await handleCheck(node)
+    opStatus.value[node.host_id] = { phase: 'done' }
   } catch (e: any) {
+    opStatus.value[node.host_id] = { phase: 'failed', message: e.message || '执行出错' }
     message.error(`安装失败: ${e.message || '执行出错'}`)
   } finally {
     installingIds.value[node.host_id] = false
@@ -225,26 +264,32 @@ function openJoinModal(node: NetworkNode) {
 async function doJoin() {
   if (!targetNode.value) return
   joining.value = true
+  const hostId = targetNode.value.host_id
+  opStatus.value[hostId] = { phase: 'joining' }
   try {
-    const res = await joinNetworkNode(targetNode.value.host_id, {
-      auth_key: joinForm.value.auth_key.trim(),
-      server_url: joinForm.value.server_url.trim(),
-      accept_routes: joinForm.value.accept_routes,
-      advertise_routes: joinForm.value.advertise_routes.trim(),
-      advertise_exit_node: joinForm.value.advertise_exit_node,
-      reset: joinForm.value.reset,
-    })
-    if (res.ip_changed) {
+    const task = await runNetworkTask(hostId, () =>
+      startJoinNetworkNode(hostId, {
+        auth_key: joinForm.value.auth_key.trim(),
+        server_url: joinForm.value.server_url.trim(),
+        accept_routes: joinForm.value.accept_routes,
+        advertise_routes: joinForm.value.advertise_routes.trim(),
+        advertise_exit_node: joinForm.value.advertise_exit_node,
+        reset: joinForm.value.reset,
+      }),
+    )
+    if (task.ip_changed) {
       message.warning(
-        `注意：组网 IP 已从 ${res.previous_ip} 变为 ${res.ip}（本次启用了状态重置）`,
+        `注意：组网 IP 已从 ${task.previous_ip} 变为 ${task.ip}（本次启用了状态重置）`,
         { duration: 8000 },
       )
     } else {
-      message.success(res.message || '成功加入虚拟网络！')
+      message.success(task.message || '成功加入虚拟网络！')
     }
     showJoinModal.value = false
     await handleCheck(targetNode.value)
+    opStatus.value[hostId] = { phase: 'done' }
   } catch (e: any) {
+    opStatus.value[hostId] = { phase: 'failed', message: e.message || '执行出错' }
     message.error(`加入失败: ${e.message}`)
   } finally {
     joining.value = false
@@ -262,6 +307,140 @@ async function handleLeave(node: NetworkNode, action: 'down' | 'logout') {
   } finally {
     leavingIds.value[node.host_id] = false
   }
+}
+
+function toggleRow(hostId: string, checked: boolean) {
+  if (checked) {
+    selectedIds.value.add(hostId)
+  } else {
+    selectedIds.value.delete(hostId)
+  }
+}
+
+function toggleSelectAllPage() {
+  if (pageAllChecked.value) {
+    pagedNodes.value.forEach((n) => selectedIds.value.delete(n.host_id))
+  } else {
+    pagedNodes.value.forEach((n) => selectedIds.value.add(n.host_id))
+  }
+}
+
+function clearSelection() {
+  selectedIds.value.clear()
+  opStatus.value = {}
+  batchSummary.value = null
+  batchKind.value = null
+}
+
+function isOpBusy(hostId: string) {
+  const st = opStatus.value[hostId]
+  return !!st && (st.phase === 'queued' || st.phase === 'installing' || st.phase === 'joining')
+}
+
+// 批量加入沿用单机弹窗的默认值：密钥留空走服务端预设、reset 恒 false
+// （§8.7：--reset 必须显式授权，批量绝不默认携带）。
+function batchJoinParams() {
+  return {
+    auth_key: '',
+    server_url: config.value.server_url || '',
+    accept_routes: config.value.accept_routes,
+    advertise_routes: '',
+    advertise_exit_node: config.value.advertise_exit_node,
+    reset: false,
+  }
+}
+
+async function runBatch(kind: 'install' | 'join', targets: NetworkNode[]) {
+  if (kind === 'join') {
+    // 密钥 GET 永不回显，但接口返回 auth_key_set 布尔值：未配置时逐台都会 400，
+    // 提前拦截比跑完一圈失败更清楚。
+    if (!authKeySet.value) {
+      message.error('未配置预设 Auth Key，请先在「控制面设置」里配置后再批量加入')
+      return
+    }
+    if (config.value.control_plane === 'headscale' && !config.value.server_url) {
+      message.error('未配置 Headscale 服务端地址，请先在「控制面设置」里填写后再批量加入')
+      return
+    }
+  }
+  const eligible = kind === 'install'
+    ? targets.filter((n) => n.agent_online && !n.installed)
+    : targets.filter((n) => n.agent_online && !n.online)
+  const skipped = targets.length - eligible.length
+  if (eligible.length === 0) {
+    message.warning(kind === 'install'
+      ? '所选主机中没有可安装的（须在线且未安装）'
+      : '所选主机中没有可加入的（须在线且未加入组网）')
+    return
+  }
+
+  batchRunning.value = true
+  batchKind.value = kind
+  batchSummary.value = null
+  opStatus.value = {}
+  eligible.forEach((n) => {
+    opStatus.value[n.host_id] = { phase: 'queued' }
+  })
+  let done = 0
+  let failed = 0
+  let ipChanged = 0
+
+  // 每台独立链路：安装 →（加入时）加入；3 台并发，失败一台不影响其他。
+  // install/join 都是异步任务：先 POST 拿 task_id 再轮询，不再挂长请求。
+  const queue = [...eligible]
+  async function worker() {
+    while (queue.length > 0) {
+      const node = queue.shift()!
+      try {
+        if (!node.installed) {
+          opStatus.value[node.host_id] = { phase: 'installing' }
+          await runNetworkTask(node.host_id, () => startInstallNetworkNode(node.host_id))
+          node.installed = true
+        }
+        if (kind === 'join') {
+          opStatus.value[node.host_id] = { phase: 'joining' }
+          const task = await runNetworkTask(node.host_id, () =>
+            startJoinNetworkNode(node.host_id, batchJoinParams()),
+          )
+          if (task.ip_changed) ipChanged += 1
+        }
+        // 成功后探活一次，把行内状态（installed/online/IP）刷新为准；
+        // 探活本身失败不影响已完成的结果。
+        try {
+          const updated = await checkNetworkNode(node.host_id)
+          const idx = nodes.value.findIndex((n) => n.host_id === node.host_id)
+          if (idx !== -1) nodes.value[idx] = { ...nodes.value[idx], ...updated }
+        } catch { /* ignore */ }
+        opStatus.value[node.host_id] = { phase: 'done' }
+        done += 1
+      } catch (e: any) {
+        opStatus.value[node.host_id] = { phase: 'failed', message: e.message || '执行出错' }
+        failed += 1
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(BATCH_CONCURRENCY, eligible.length) }, () => worker()),
+  )
+  batchRunning.value = false
+  batchSummary.value = { done, failed, skipped }
+  const verb = kind === 'install' ? '安装' : '加入'
+  const skipText = skipped > 0 ? `，跳过 ${skipped} 台` : ''
+  const ipText = ipChanged > 0 ? `，其中 ${ipChanged} 台组网 IP 已变化` : ''
+  if (failed === 0) {
+    message.success(`批量${verb}完成：成功 ${done} 台${skipText}${ipText}`)
+  } else {
+    message.warning(`批量${verb}完成：成功 ${done} 台，失败 ${failed} 台${skipText}${ipText}，可点「重试失败」只重跑失败的主机`)
+  }
+}
+
+function retryBatchFailed() {
+  if (!batchKind.value || !batchSummary.value || batchSummary.value.failed === 0) return
+  const failedIds = Object.entries(opStatus.value)
+    .filter(([, st]) => st.phase === 'failed')
+    .map(([id]) => id)
+  const targets = nodes.value.filter((n) => failedIds.includes(n.host_id))
+  runBatch(batchKind.value, targets)
 }
 
 function openPingModal(node: NetworkNode) {
@@ -353,6 +532,14 @@ onMounted(loadData)
       <!-- 筛选条：与主机列表一致，放在卡片内（见 DESIGN.md §9.20） -->
       <div class="network-toolbar">
         <NSpace align="center" :size="12">
+          <NCheckbox
+            :checked="pageAllChecked"
+            :indeterminate="pageSomeChecked"
+            :disabled="batchRunning"
+            @update:checked="toggleSelectAllPage"
+          >
+            全选本页
+          </NCheckbox>
           <NInput
             v-model:value="searchKeyword"
             placeholder="搜索主机名、物理 IP 或虚拟组网 IP..."
@@ -394,6 +581,49 @@ onMounted(loadData)
           </div>
         </NSpace>
       </div>
+
+      <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐台显示进度 -->
+      <div v-if="selectedIds.size > 0" class="batch-bar">
+        <span class="batch-info">
+          已选 {{ selectedIds.size }} 台
+          <span class="text-muted">（可安装 {{ batchInstallable.length }} 台 · 可加入 {{ batchJoinable.length }} 台）</span>
+        </span>
+        <NButton
+          size="small"
+          type="primary"
+          secondary
+          :loading="batchRunning && batchKind === 'install'"
+          :disabled="batchRunning || batchInstallable.length === 0"
+          @click="runBatch('install', selectedNodes)"
+        >
+          批量安装
+        </NButton>
+        <NButton
+          size="small"
+          type="primary"
+          :loading="batchRunning && batchKind === 'join'"
+          :disabled="batchRunning || batchJoinable.length === 0"
+          @click="runBatch('join', selectedNodes)"
+        >
+          批量加入
+        </NButton>
+        <NButton
+          v-if="batchSummary && batchSummary.failed > 0"
+          size="small"
+          type="warning"
+          secondary
+          :disabled="batchRunning"
+          @click="retryBatchFailed"
+        >
+          重试失败（{{ batchSummary.failed }}）
+        </NButton>
+        <span v-if="batchSummary" class="batch-summary">
+          成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}<span v-if="batchSummary.skipped > 0"> · 跳过 {{ batchSummary.skipped }}</span>
+        </span>
+        <NButton size="small" quaternary :disabled="batchRunning" @click="clearSelection">
+          取消选择
+        </NButton>
+      </div>
       <NSpin v-if="loading && nodes.length === 0" style="padding: 60px" />
 
       <div v-else-if="filteredNodes.length === 0" class="empty-box">
@@ -404,8 +634,17 @@ onMounted(loadData)
         <div
           v-for="row in pagedNodes"
           :key="row.host_id"
-          class="node-row"
+          :class="['node-row', { 'is-op-busy': isOpBusy(row.host_id) }]"
         >
+          <!-- 0. 批量勾选列：28px 窄列，共享列宽不变（见 DESIGN.md §9.20） -->
+          <div class="col-check">
+            <NCheckbox
+              :checked="selectedIds.has(row.host_id)"
+              :disabled="batchRunning"
+              @update:checked="(v: boolean) => toggleRow(row.host_id, v)"
+            />
+          </div>
+
           <!-- 1. 纯色扁平主机状态圆点徽标 (去除彩色背景大 Logo) -->
           <div class="col-logo">
             <div class="host-avatar-box">
@@ -446,6 +685,19 @@ onMounted(loadData)
             </div>
             <div v-else class="status-pill is-not-installed">
               未安装客户端
+            </div>
+            <!-- 批量进度：执行期间逐行显示当前阶段，失败时显示原因（悬停看全文） -->
+            <div
+              v-if="opStatus[row.host_id]"
+              class="op-progress"
+              :class="`is-${opStatus[row.host_id].phase}`"
+              :title="opStatus[row.host_id].message || ''"
+            >
+              <template v-if="opStatus[row.host_id].phase === 'queued'">排队中…</template>
+              <template v-else-if="opStatus[row.host_id].phase === 'installing'">安装中…</template>
+              <template v-else-if="opStatus[row.host_id].phase === 'joining'">加入中…</template>
+              <template v-else-if="opStatus[row.host_id].phase === 'done'">已完成</template>
+              <template v-else>失败：{{ opStatus[row.host_id].message || '执行出错' }}</template>
             </div>
           </div>
 
@@ -896,6 +1148,29 @@ onMounted(loadData)
   }
 }
 
+// 批量操作栏：有勾选时出现，贴在筛选条下方、列表上方
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--n-color-modal);
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  padding: 8px 12px;
+
+  .batch-info {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .batch-summary {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+}
+
 .network-card-wrap {
   flex: 1;
   min-height: 0;
@@ -935,6 +1210,21 @@ onMounted(loadData)
 
       &:last-child {
         border-bottom: none;
+      }
+
+      // 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突
+      &.is-op-busy {
+        .col-actions {
+          pointer-events: none;
+          opacity: 0.5;
+        }
+      }
+
+      .col-check {
+        flex: 0 0 28px;
+        min-width: 0;
+        display: flex;
+        align-items: center;
       }
 
       .col-logo {
@@ -1020,8 +1310,12 @@ onMounted(loadData)
 
       .col-status {
         flex: 0 0 170px;
+        min-width: 0;
         display: flex;
-        align-items: center;
+        flex-direction: column;
+        align-items: flex-start;
+        justify-content: center;
+        gap: 4px;
         padding-right: 12px;
 
         .status-pill {
@@ -1046,6 +1340,29 @@ onMounted(loadData)
           &.is-offline {
             background-color: rgba(148, 163, 184, 0.15);
             color: #94a3b8;
+          }
+        }
+
+        // 批量进度行：单行省略号、失败原因悬停看全文
+        .op-progress {
+          font-size: 12px;
+          max-width: 100%;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+
+          &.is-queued,
+          &.is-installing,
+          &.is-joining {
+            color: #3b82f6;
+          }
+
+          &.is-done {
+            color: #059669;
+          }
+
+          &.is-failed {
+            color: #dc2626;
           }
         }
       }

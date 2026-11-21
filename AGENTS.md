@@ -1739,6 +1739,12 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
    - **必须挂在 authed 读分组、免审计**：`POST /network/nodes/:id/check` 虽能刷新缓存，但在 writeRG（审计），每次选主机都调会灌爆操作审计流；诊断类只读探测按 §7 豁免（与 `ai/nl2command` 同例）。
    - 部署侧（`resolveMeshIP`）保持自己的实时探测逻辑不读此端点——部署在 agent 侧执行，与此 API 互为独立实现，均遵循"live 优先、cache 兜底、禁止静默降级公网"。
 
+9. **安装/加入走异步任务 + 轮询，禁止同步长请求**：
+   - 安装（服务端最长 300 秒）与加入（90 秒）曾是同步请求：浏览器必须把一个 HTTP 请求挂到远端命令跑完才返回，链路上任何一环先断（Cloudflare 代理 100 秒切断、浏览器超时）就报超时，但服务端 handler 不跟死、任务继续跑——界面报失败、主机实际已进网。根治办法是异步：`POST install/join` 只做校验（离线 503、未找到主机 404、Auth Key 缺失 400）并立即返回 `202 {task_id, status:"running"}`，远端命令在 goroutine 里跑，前端每 2 秒轮询 `GET /network/nodes/:id/tasks/:taskId` 直至 `success`/`failed`（成功带真实原因、失败带 `detail`），完成后探活刷新行内状态。
+   - **单主机单飞行**：同一主机同一时间只允许一个组网任务（install 与 join 共用互斥，安装器重启 tailscaled 时加入会撞上），重复提交返回 `409 {error, task_id, status}`，前端按已有任务轮询、不要另起一个。
+   - **任务记录只放内存、不落盘**：完成结果保留 10 分钟供轮询，过后读作 404，前端回落到 `POST .../check` 探活确认；重启后任务记录丢失同样以 404 表达。持久化结果只写 `NodeStatus`（installed/online/IP），不另建任务表。
+   - **审计在任务创建时记一次**（install/join 各一条，`recordAudit` 在 202 前调用），结果只影响任务记录，不补审计；任务查询接口挂 authed 读分组、免审计。
+
 ### 8.8 组件选用与页面布局进阶规范
 
 前端组件选型、页面排版、卡片分层与设计令牌规范已完整收录于 `DESIGN.md §9`，遵循以下核心原则：

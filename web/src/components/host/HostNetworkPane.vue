@@ -11,7 +11,8 @@ import {
   CopyOutline, SwapHorizontalOutline,
 } from '@vicons/ionicons5'
 import {
-  checkNetworkNode, installNetworkNode, joinNetworkNode, leaveNetworkNode,
+  checkNetworkNode, startInstallNetworkNode, startJoinNetworkNode, runNetworkTask,
+  leaveNetworkNode,
   pingNetworkNode, getNetworkConfig, type NetworkNode, type NetworkConfig,
   type PingResult,
 } from '../../api/network'
@@ -117,8 +118,10 @@ async function handleCheck() {
 async function handleInstall() {
   installing.value = true
   try {
-    const res = await installNetworkNode(props.hostId)
-    message.success(res.message || '安装成功')
+    // 异步任务：POST 拿 task_id 后轮询直至终态，不再挂 300 秒长请求
+    // （会被 Cloudflare 代理 100 秒切断而假超时）。
+    await runNetworkTask(props.hostId, () => startInstallNetworkNode(props.hostId))
+    message.success('安装成功')
     await handleCheck()
   } catch (e: any) {
     message.error(`安装失败: ${e.message}`)
@@ -146,21 +149,23 @@ async function doJoin() {
   }
   joining.value = true
   try {
-    const res = await joinNetworkNode(props.hostId, {
-      auth_key: joinForm.value.auth_key.trim(),
-      server_url: joinForm.value.server_url.trim(),
-      accept_routes: joinForm.value.accept_routes,
-      advertise_routes: joinForm.value.advertise_routes.trim(),
-      advertise_exit_node: joinForm.value.advertise_exit_node,
-      reset: joinForm.value.reset,
-    })
-    if (res.ip_changed) {
+    const task = await runNetworkTask(props.hostId, () =>
+      startJoinNetworkNode(props.hostId, {
+        auth_key: joinForm.value.auth_key.trim(),
+        server_url: joinForm.value.server_url.trim(),
+        accept_routes: joinForm.value.accept_routes,
+        advertise_routes: joinForm.value.advertise_routes.trim(),
+        advertise_exit_node: joinForm.value.advertise_exit_node,
+        reset: joinForm.value.reset,
+      }),
+    )
+    if (task.ip_changed) {
       message.warning(
-        `注意：组网 IP 已从 ${res.previous_ip} 变为 ${res.ip}（本次启用了状态重置）`,
+        `注意：组网 IP 已从 ${task.previous_ip} 变为 ${task.ip}（本次启用了状态重置）`,
         { duration: 8000 },
       )
     } else {
-      message.success(res.message || '成功加入虚拟局域网！')
+      message.success(task.message || '成功加入虚拟局域网！')
     }
     showJoinModal.value = false
     await handleCheck()

@@ -65,7 +65,11 @@ export function listNetworkNodes() {
 }
 
 export function checkNetworkNode(hostId: string) {
-  return unwrap<{ data: NetworkNode }>(http.post(`/network/nodes/${hostId}/check`)).then((r) => r.data)
+  // 服务端探测最长 20 秒（tailscale status --json）+ 15 秒 Agent 回传余量，
+  // 默认 15 秒会在慢主机上误杀请求，按惯例放宽到 25 秒。
+  return unwrap<{ data: NetworkNode }>(
+    http.post(`/network/nodes/${hostId}/check`, undefined, { timeout: 25000 }),
+  ).then((r) => r.data)
 }
 
 // 只读实时探测主机的组网 IP（live 优先、缓存兜底）。创建应用页选中主机时
@@ -76,21 +80,68 @@ export function probeMeshIP(hostId: string) {
   ).then((r) => r.data)
 }
 
-export function installNetworkNode(hostId: string) {
-  return unwrap<{ ok: boolean; message: string; duration_ms?: number; output?: string }>(
-    http.post(`/network/nodes/${hostId}/install`),
+// 异步组网任务：install/join 不再同步等远端命令跑完（安装最长 300 秒，
+// 同步请求会被 Cloudflare 代理 100 秒切断、造成假超时）。POST 只做校验
+// 并立即返回 202 + task_id，任务在服务端后台跑，前端轮询 getNetworkTask
+// 直至 success/failed。
+export interface NetworkTask {
+  task_id: string
+  host_id: string
+  kind: 'install' | 'join'
+  status: 'running' | 'success' | 'failed'
+  message: string
+  detail?: string
+  ip?: string
+  previous_ip?: string
+  ip_changed?: boolean
+  duration_ms?: number
+  created_at?: string
+  finished_at?: string
+}
+
+export interface NetworkTaskAccepted {
+  ok: boolean
+  task_id: string
+  status: 'running'
+  message: string
+}
+
+export function startInstallNetworkNode(hostId: string) {
+  return unwrap<NetworkTaskAccepted>(http.post(`/network/nodes/${hostId}/install`))
+}
+
+export function startJoinNetworkNode(hostId: string, req: JoinRequest) {
+  return unwrap<NetworkTaskAccepted>(http.post(`/network/nodes/${hostId}/join`, req))
+}
+
+export function getNetworkTask(hostId: string, taskId: string) {
+  return unwrap<{ data: NetworkTask }>(http.get(`/network/nodes/${hostId}/tasks/${taskId}`)).then(
+    (r) => r.data,
   )
 }
 
-export function joinNetworkNode(hostId: string, req: JoinRequest) {
-  return unwrap<{
-    ok: boolean
-    message: string
-    ip?: string
-    previous_ip?: string
-    ip_changed?: boolean
-    data: NetworkNode
-  }>(http.post(`/network/nodes/${hostId}/join`, req))
+// 发起一个异步组网任务并等到终态（单机与批量共用）：POST 拿 task_id 后
+// 每 2 秒轮询一次，上限 6 分钟；失败抛错（message + detail）。轮询超时
+// 不报失败，只提示点探测确认——任务仍可能在服务端继续跑。
+export async function runNetworkTask(
+  hostId: string,
+  start: () => Promise<NetworkTaskAccepted>,
+): Promise<NetworkTask> {
+  const { task_id } = await start()
+  const deadline = Date.now() + 360000
+  for (;;) {
+    const task = await getNetworkTask(hostId, task_id)
+    if (task.status === 'success' || task.status === 'failed') {
+      if (task.status === 'failed') {
+        throw new Error(task.detail ? `${task.message}：${task.detail}` : task.message)
+      }
+      return task
+    }
+    if (Date.now() > deadline) {
+      throw new Error('任务轮询超时，服务端可能仍在执行，请稍后点探测确认状态')
+    }
+    await new Promise((r) => setTimeout(r, 2000))
+  }
 }
 
 export function leaveNetworkNode(hostId: string, action: 'down' | 'logout' = 'down') {
@@ -100,5 +151,9 @@ export function leaveNetworkNode(hostId: string, action: 'down' | 'logout' = 'do
 }
 
 export function pingNetworkNode(hostId: string, target: string, count = 3) {
-  return unwrap<PingResult>(http.post(`/network/nodes/${hostId}/ping`, { target, count }))
+  // 服务端 ping 最长 40 秒，旧版 flag 失败还会再花 40 秒重试一次，
+  // 默认 15 秒会在慢主机上误杀请求，放宽到 90 秒。
+  return unwrap<PingResult>(
+    http.post(`/network/nodes/${hostId}/ping`, { target, count }, { timeout: 90000 }),
+  )
 }

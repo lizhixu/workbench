@@ -349,9 +349,11 @@ export function dockerImages(hostId: string) {
 }
 
 // dockerAll fetches containers + images in a single round trip.
+// 客户端超时必须长于服务端 30 秒预算（router.go dockerOpTimeout），否则浏览器先在
+// 15s 默认超时处中断报错，而 Agent 侧仍在继续执行，列表也就等不到结果（dockerOp 同款问题）。
 export function dockerAll(hostId: string): Promise<{ containers: any[]; images: any[] }> {
   return unwrap<{ data: { containers: any[]; images: any[] } }>(
-    http.get(`/hosts/${hostId}/docker/all`),
+    http.get(`/hosts/${hostId}/docker/all`, { timeout: 40000 }),
   ).then((r) => r.data || { containers: [], images: [] })
 }
 
@@ -363,8 +365,11 @@ export function dockerPsAll(hostId: string) {
 }
 
 // dockerSystemDf reports per-category disk usage for the deep-clean preview.
+// 同 dockerAll：服务端预算 30 秒，客户端超时须长于它。
 export function dockerSystemDf(hostId: string) {
-  return unwrap<{ data: any[] }>(http.get(`/hosts/${hostId}/docker/system-df`)).then((r) => r.data || [])
+  return unwrap<{ data: any[] }>(
+    http.get(`/hosts/${hostId}/docker/system-df`, { timeout: 40000 }),
+  ).then((r) => r.data || [])
 }
 
 // ---- System cleanup ----
@@ -422,7 +427,10 @@ export function dockerOp(hostId: string, op: string, container = '', image = '',
 }
 
 export function dockerGetMirrors(hostId: string) {
-  return unwrap<{ ok: boolean; mirrors: string[] }>(http.get(`/hosts/${hostId}/docker/mirrors`))
+  // 服务端读 daemon.json 最长等 20 秒，客户端超时须长于它（dockerOp 同款问题）。
+  return unwrap<{ ok: boolean; mirrors: string[] }>(
+    http.get(`/hosts/${hostId}/docker/mirrors`, { timeout: 40000 }),
+  )
 }
 
 export function dockerSetMirrors(hostId: string, mirrors: string[]) {

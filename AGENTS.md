@@ -5,11 +5,12 @@
 > 背景：原 SaaS 服务说停就停、不提供服务，数据与可用性不可控，故自研一套可自部署的等价系统，核心目标是「自己掌控、永久可用、不依赖第三方 SaaS」。
 >
 > **必读 + 维护约定**：
-> 1. 本文档**每次会话/每次任务开工前必须完整阅读**，并且**必须严格遵循其中的全部约束**（§7 代码质量校验、§8 前端工程与会话可靠性规范、§8.5 终端断线重连、§8.6 维护握手与告警防抖、DESIGN.md §9 前端页面布局与组件规范等）。开工前先读、改代码时对照，不得凭印象或惯例行事；与文档冲突时以文档为准，若文档确实过时则先更新文档再改代码。
+> 1. 本文档**每次会话/每次任务开工前必须完整阅读**，并且**必须严格遵循其中的全部约束**（§7 代码质量校验、§8 前端工程与会话可靠性规范、§8.5 终端断线重连、§8.6 维护握手与告警防抖、`API.md` 接口契约、DESIGN.md §9 前端页面布局与组件规范等）。开工前先读、改代码时对照，不得凭印象或惯例行事；与文档冲突时以文档为准，若文档确实过时则先更新文档再改代码。
 > 2. **文档分工与唯一事实源边界**：
->    - 本文档是系统功能需求、业务架构、通信协议（gRPC/WebSocket/REST）、数据模型、安全与审计边界、以及底层系统可靠性（长连接维护握手、终端会话持久化、RPC 锁纪律等）的**唯一权威事实源**。
+>    - 本文档是系统功能需求、业务架构、通信协议（gRPC/WebSocket；REST 契约见 `API.md`）、数据模型、安全与审计边界、以及底层系统可靠性（长连接维护握手、终端会话持久化、RPC 锁纪律等）的**唯一权威事实源**。
 >    - `DESIGN.md` 是前端 Web 控制台页面布局、视觉设计令牌（Design Tokens）、UI/UX 交互规范、组件选用与封装、CSS/SCSS 样式类名以及前端架构的**唯一权威事实源**（特别是 `DESIGN.md` 第 9 节「前端页面布局与组件开发规范」）。
->    - **严禁在本文档中堆砌纯前端 CSS 类名、内边距度量、表单像素间距、按钮圆角等纯 UI 视觉实现细节**；凡涉及前端页面设计、布局结构、组件规范或交互美学的改动，必须完整维护并同步更新 `DESIGN.md`。涉及协议字段、数据模型、接口契约与后端工程规则的，必须在本文档对应章节补齐。
+>    - `API.md` 是控制端 REST API 契约（方法、路径、权限、关键入参与返回）的**唯一权威事实源**，按资源分组的表格呈现。接口改动先改 `API.md`，再在本文档对应功能章节补行为说明；本文档不重复罗列接口清单。
+>    - **严禁在本文档中堆砌纯前端 CSS 类名、内边距度量、表单像素间距、按钮圆角等纯 UI 视觉实现细节**；凡涉及前端页面设计、布局结构、组件规范或交互美学的改动，必须完整维护并同步更新 `DESIGN.md`。涉及协议字段、数据模型与后端工程规则的，必须在本文档对应章节补齐；接口契约只写进 `API.md`，本文档只保留指向它的引用与行为说明。
 > 3. **版本唯一真相源**：**版本完全由官方 Release 提供，严禁任何自行决定或拼凑版本的行为**。系统版本、安装包与升级清单必须 100% 来源于 Git tag 触发 GitHub Actions 产出的官方 Release（形如 `v1.2.3` / `v1.2.3-beta.1`）及 CI 生成的 `manifest.json`；严禁在任何环境部署或升级流程中私自捏造/拼接版本号（如 `0.1.0-<hash>`）。
 > 4. **正文与章节标题不得出现「更新时间」式日期标注**：不要写 `（YYYY-MM-DD）`、`（YYYY-MM-DD 修复）`、`（YYYY-MM-DD 起）`、`（YYYY-MM-DD 加固）`、`落地日期：YYYY-MM-DD`、`调研日期：YYYY-MM-DD`、`已于 YYYY-MM-DD …` 这类变更时间戳（此处用 `YYYY-MM-DD` 占位，正文也不写具体日期）。本文档描述的是**当前事实**，不是变更流水：需要交代来历时用「此前 / 早前 / 旧实现」等相对表述，新增章节不带日期后缀（写 `§8.13 xxx`，不写 `§8.13 xxx（YYYY-MM-DD）`）。时间字段本身的格式、时区与接口时间参数按 §8.14（及 DESIGN.md §9.15）记录，不受此条限制。
 
@@ -32,7 +33,7 @@
 | 控制端（Server / Console） | Web 控制台 + API 网关 + 接入服务 + 数据存储 + 告警引擎 | 自部署的中心节点，对外提供 Web UI 与 API，接收 Agent 回连 |
 | Agent（被管端） | 采集主机信息、执行下发指令、提供终端/文件/Docker 操作通道 | 轻量常驻进程，兼容 Linux/Windows、arm64/amd64 |
 | 组网模块 | 内网穿透 / 虚拟组网 | 把处于不同内网的主机打通成一个大内网 |
-| AI 引擎 | 对接大模型，提供智能诊断、命令生成、报告解读、异常检测等能力 | 可接入第三方模型（OpenAI / 兼容 OpenAI 协议的网关）或本地模型；通过统一适配层调用，模型可热切换 |
+| AI 引擎 | 对接大模型，提供智能诊断、命令生成、报告解读等能力 | 可接入第三方模型（OpenAI / 兼容 OpenAI 协议的网关）或本地模型；通过统一适配层调用，模型可热切换 |
 
 ### 2.2 关键设计原则（对标原产品痛点）
 
@@ -95,7 +96,7 @@
 - **容器终端**：一键进入容器 shell。
 - **镜像管理**：镜像名称、ID、大小、创建时间、使用状态（使用中/未使用，按是否被任意容器引用，含已停止容器）；支持删除单个、批量删除、清除悬空镜像；深度清理带磁盘占用预览（已停止容器、未使用镜像/网络、构建缓存，可选同时清理未使用卷），应用中心纳管的已停止容器（含 -prev 回滚容器）受保护不删除。
 - **系统清理**：主机详情「系统清理」页签（与 Docker 页签并列）。先预览每类可回收量（APT 缓存、journal 日志、临时文件、旧日志），勾选后确认执行，分项回显每步回收量；仅 Debian/Ubuntu（按 /etc/os-release 判定），其余系统直接提示不支持；执行为高危审计操作，5 分钟超时。apt autoremove 不在 v1 范围内。
-- **一键安装 Docker**：若主机未安装 Docker，控制端可一键为其安装。**安装源不再单依赖官方脚本**：`POST /hosts/:id/docker/install-script` 内置脚本按「国内 docker-ce 镜像源优先 → `get.docker.com` 兜底」顺序执行，因境内主机常常连 `get.docker.com` 都无法解析，单一官方源会让按钮必然失败。镜像源依次尝试阿里云 `mirrors.aliyun.com/docker-ce`、华为云 `mirrors.huaweicloud.com/docker-ce`、清华 TUNA `mirrors.tuna.tsinghua.edu.cn/docker-ce`，每个源按 `/etc/os-release` 的 `ID` 选路：Ubuntu/Debian 走 apt（`gpg` + `sources.list.d/docker.list`，codename 取 `VERSION_CODENAME`/`UBUNTU_CODENAME`，架构取 `dpkg --print-architecture`），CentOS/RHEL/Fedora 走 dnf/yum（直接取镜像的 `docker-ce.repo`），Rocky/AlmaLinux 映射到 `centos` 子树（镜像不单独发布 rocky/almalinux 目录，centos 与之 ABI 兼容），Alpine 走发行版仓库 `apk add docker docker-cli-compose`。安装包集合为 `docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin`，老仓库缺少插件包时回退只装核心三个；apt/yum 失败会清掉本次写入的源文件，避免污染宿主机后续 `apt-get update`。下载优先 `curl`、缺失时回退 `wget` 并带连接/总时长上限。全部镜像与官方源都不可达时以非零退出码结束并给出可操作文案（曾出现 `curl` 失败后脚本仍继续执行 `systemctl`/`docker` 导致假性「安装完成」，现安装后强制执行 `command -v docker` 校验）。脚本内含 systemd 与 sysvinit 双启动路径（`systemctl enable --now docker` 失败回退 `service docker start`）。执行超时为 600 秒（多源逐个尝试需要更长预算），前端请求超时同步放宽为 630 秒。
+- **一键安装 Docker**：若主机未安装 Docker，控制端可一键为其安装。**安装源不再单依赖官方脚本**：服务端内置脚本（见 API.md「Docker」）按「国内 docker-ce 镜像源优先 → `get.docker.com` 兜底」顺序执行，因境内主机常常连 `get.docker.com` 都无法解析，单一官方源会让按钮必然失败。镜像源依次尝试阿里云 `mirrors.aliyun.com/docker-ce`、华为云 `mirrors.huaweicloud.com/docker-ce`、清华 TUNA `mirrors.tuna.tsinghua.edu.cn/docker-ce`，每个源按 `/etc/os-release` 的 `ID` 选路：Ubuntu/Debian 走 apt（`gpg` + `sources.list.d/docker.list`，codename 取 `VERSION_CODENAME`/`UBUNTU_CODENAME`，架构取 `dpkg --print-architecture`），CentOS/RHEL/Fedora 走 dnf/yum（直接取镜像的 `docker-ce.repo`），Rocky/AlmaLinux 映射到 `centos` 子树（镜像不单独发布 rocky/almalinux 目录，centos 与之 ABI 兼容），Alpine 走发行版仓库 `apk add docker docker-cli-compose`。安装包集合为 `docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin`，老仓库缺少插件包时回退只装核心三个；apt/yum 失败会清掉本次写入的源文件，避免污染宿主机后续 `apt-get update`。下载优先 `curl`、缺失时回退 `wget` 并带连接/总时长上限。全部镜像与官方源都不可达时以非零退出码结束并给出可操作文案（曾出现 `curl` 失败后脚本仍继续执行 `systemctl`/`docker` 导致假性「安装完成」，现安装后强制执行 `command -v docker` 校验）。脚本内含 systemd 与 sysvinit 双启动路径（`systemctl enable --now docker` 失败回退 `service docker start`）。执行超时为 600 秒（多源逐个尝试需要更长预算），前端请求超时同步放宽为 630 秒。
 
 ### 3.5 在线终端（Web Terminal）
 
@@ -117,7 +118,7 @@
 
 ### 3.7 应用中心（统一部署入口）
 
-> 原主机级「应用市场」Tab 与 Docker「创建容器」表单已废弃删除：所有应用部署（模板/单镜像/Compose/Git）统一收敛到全局应用中心，主机详情不再有应用市场页签。模板目录 API `GET /apps/catalog` 保留，作为应用中心「应用模板」来源的数据。
+> 原主机级「应用市场」Tab 与 Docker「创建容器」表单已废弃删除：所有应用部署（模板/单镜像/Compose/Git）统一收敛到全局应用中心，主机详情不再有应用市场页签。模板目录接口（见 API.md「应用中心」）保留，作为应用中心「应用模板」来源的数据。
 
 - **四种部署来源**（`Application.source_type`）：
   - `template`：内置模板一键部署（Nginx、Redis、MySQL、PostgreSQL、雷池 WAF 等），只填模板参数即可拉起；模板经 `ResolveTemplate` 解析为镜像 + 环境变量 + 默认端口/卷，走与应用中心一致的引擎部署流（持久化、健康检查、滚动替换）。
@@ -126,13 +127,13 @@
   - `git`：链接 Git 仓库（GitHub 授权选择或手动 URL），Dockerfile / Compose 构建，支持推送自动部署（Webhook；GitHub App 路径见下条）。
 - **GitHub App 自动部署（github.com 主推路径，逐仓 Webhook 降级为备选）**：
   - **一次安装覆盖全部/部分仓库**：面板「系统设置 → 代码源集成」新建 GitHub App（Manifest 两步流：填名称 + 目标（个人/组织）→ 跳 GitHub 创建 → 回调换 code（1 小时内，state 防 CSRF，state 嵌在 redirect_url 的 `github_app_state` 参数里带回——submit URL 的 query GitHub 不保证透传）→ 配置落盘；或手动填已有 App 的 App ID/私钥/Webhook Secret）→ 到 GitHub 安装页选账号/组织与仓库范围 → 面板「同步安装」拉取安装与仓库清单。**名称可留空**：GitHub App 名称在 GitHub 全站唯一，手填常用名极易被占用，留空时服务端生成 `watchman-<8 位小写 hex>`（`DefaultAppName`）并随 manifest 一起提交，响应 `name` 字段回传实际取值、前端回填输入框以便重试；填了名称则原样使用。
-  - **事件入口**：公开端点 `POST /api/v1/github-app/webhook`（HMAC-SHA256 验签、恒时比较、`X-GitHub-Delivery` 去重、body 4MB 上限；未配置 503；ping 200；仅 `refs/heads/` 分支推送触发，tag 推送跳过；push 按 `repository.full_name` 归一化匹配应用，分支匹配 + auto_deploy 门 + 在途 409，复用 `StartDeployment`，`trigger=github-app`；`installation`/`installation_repositories` 事件同步安装状态与仓库清单，卸载则相关应用降级提示；安装事件的仓库清单刷新走异步，upsert 本身同步落盘，持久化失败返回 5xx 供 GitHub 重投）。安全入口开启时该端点仍可达（secentry 豁免）。
+  - **事件入口**：GitHub App webhook（见 API.md「GitHub App」），HMAC-SHA256 验签、恒时比较、`X-GitHub-Delivery` 去重；仅 `refs/heads/` 分支推送触发，tag 推送跳过；push 按 `repository.full_name` 归一化匹配应用，分支匹配 + auto_deploy 门 + 在途 409，复用 `StartDeployment`，`trigger=github-app`；`installation`/`installation_repositories` 事件同步安装状态与仓库清单，卸载则相关应用降级提示；安装事件的仓库清单刷新走异步，upsert 本身同步落盘，持久化失败返回 5xx 供 GitHub 重投）。安全入口开启时该端点仍可达（secentry 豁免）。
   - **部署取数优先级**：应用 vault 凭据 > installation token（现取现用、内存缓存 1h、过期前 5 分钟刷新；仓库不在安装范围时全量刷新后重试）> 现有 provider token。**刷新合并语义**：部分安装刷新失败时保留其旧缓存（只丢 GitHub 侧已不存在的安装），失败数如实返回调用方；配置变更/断开时清空内存 token 缓存。
   - **凭据存储**：App ID/私钥/Webhook Secret 存 `github_app.json`（dataDir、0600、tmp+rename 原子写、API 永不回显），**不用 Vault**——Vault 是用户自管凭据的 UI，程序性塞入系统私钥反而会暴露在 Vault 界面；与 `git_provider.json` 同款先例。
   - **前端**：GitProviders.vue GitHub App 分区（创建/手动/安装/同步/断开、事件地址复制，同步请求超时 60s）；AppDetail 三种自动部署状态（GitHub App 托管 / GitHub 自动托管 / 手动模式）+「切换到 GitHub App」按钮（切换前置条件：App 已配置且仓库在未暂停安装覆盖内，否则 409 并引导先安装/同步；切换时后端删旧逐仓 hook，失败 502 不改库）；AppCreate 仓库选择改为两步：先选接入方式，再选该方式下的仓库——「接入方式」只列出实际已配置的项（`GitHub 账号（PAT）` / `GitHub App`），两种都可用时留空要求先选、只有一种时自动选中，切换方式会清空已选仓库与分支；两套仓库清单各自独立、不做跨来源合并去重（PAT 清单中同时被 App 覆盖的仓库仍标注 `· App 已覆盖`，推送触发与拉码凭据实际 App 优先，App 方式即使仓库也在 PAT 清单里仍走 App 令牌拉分支）；顶部同时展示账号与 App 的连接状态，所选方式下仓库为空时给出对应设置/同步引导；App 来源应用默认 `auto_deploy=true`。**创建页把「代码推送自动部署」与「代码来源」显式分离**：来源（template/image/raw_compose/git）决定构建什么，自动部署独立成块只决定何时构建，按所选仓库实时标注实际触发机制——仓库在（未暂停）App 安装覆盖内 → `GitHub App 托管`（App 级事件触发，不注册逐仓 Webhook）；已连接 GitHub 账号的 github.com 仓库 → `自动注册 Webhook`（创建时经 GitHub API 注册逐仓 Push Webhook）；其余 → `手动 Webhook`（创建后在详情页复制地址）。文案随机制给出对应说明与目标分支，不再对仅有 GitHub App 的用户误称「通过已连接的 GitHub 账号配置 Webhook」。**账号接入统一收口到系统设置**：创建页不再内嵌 GitHub PAT 连接弹窗与断开按钮，「连接 GitHub 账号」「代码源设置」均跳转 `/settings?s=git`——GitProviders 是 PAT 与 GitHub App 的唯一管理入口，避免同一份授权在两处各维护一套 UI；创建页被 KeepAlive 缓存，从设置切回时经 `onActivated` 静默重拉授权状态与仓库清单（首次激活跳过、由 onMounted 负责），断开后清空已失效的 PAT 仓库清单；`SettingsLayout` 监听 `?s=` 深链并回写页签路径，保证点回设置页签仍停在代码源集成。
   - **两种触发机制不叠加**：创建与更新应用时，若仓库已被（未暂停）GitHub App 安装覆盖（`repoCoveredByGitHubApp`），后端跳过逐仓 Webhook 注册——同一次 push 只会经 App 级事件抵达一次；关闭 `auto_deploy` 时仍照常删除历史逐仓 hook（存量遗留清理）。
   - **监听目录（Watch paths）**：git 来源应用可配 `watch_paths`（仓库相对目录前缀或精确文件路径，空 = 监听全部）；push 触发时先比对本次推送的变更文件（取自 push 事件 `commits[].added/removed/modified`），无一命中则跳过本次部署、不产生部署记录；GitHub App 事件与逐仓 Webhook 两条路径共用同一套提取与匹配。拿不到文件清单时照常部署：GitLab/Gitee 推送不带文件清单、GitHub 一次 push 超 20 个 commit 会截断 `commits` 数组，此时无法判断、以部署为准并记日志；手动重新部署/升级不受监听目录影响。
-  - **前提与边界**：面板必须有 GitHub 可达的公网地址。Manifest 的 `hook_attributes.url` / `redirect_url` / `url` 与状态接口的 `webhook_url` 统一走面板对外地址解析（见下文「面板对外地址统一解析」小节，唯一配置来源是绑定的 `security.panel_domain`，未绑定则取请求 `scheme://Host`）；地址来自绑定域名时前三者视为显式配置（`public_url_configured=true`）；未绑定域名时地址取自浏览器访问方式（内网 IP/localhost），GitHub 投递不到，创建页弹 warning；反代终结 TLS 时对外 scheme 不再凭请求头推导（见下文「面板对外地址统一解析」）：面板自身未开 SSL 时对外地址为 http，如需 https 须开启面板 SSL、让 :443 实际提供 TLS。内网面板不在本方案范围内，需轮询兜底（未实现）。权限最小化：`contents:read` + `metadata:read`，只订阅 push；v1 不含 PR 预览。
+  - **前提与边界**：面板必须有 GitHub 可达的公网地址。Manifest 的 `hook_attributes.url` / `redirect_url` / `url` 与状态接口的 `webhook_url` 统一走面板对外地址解析（见下文「面板对外地址统一解析」小节，唯一配置来源是绑定的 `security.panel_domain`，未绑定则取请求 `scheme://Host`）；地址来自绑定域名时前三者视为显式配置（`public_url_configured=true`）；未绑定域名时地址取自浏览器访问方式（内网 IP/localhost），GitHub 投递不到，创建页弹 warning；反代终结 TLS 时对外 scheme 不再凭请求头推导（见下文「面板对外地址统一解析」）：面板自身未开 SSL 时对外地址为 http，如需 https 须开启面板 SSL、让 :443 实际提供 TLS。内网面板不在本方案范围内。权限最小化：`contents:read` + `metadata:read`，只订阅 push；v1 不含 PR 预览。
   - **审计**：`app_github_app_switch`（medium）/ `github_app_manifest`（low）/ `github_app_config`（high）/ `github_app_disconnect`（high）/ `github_app_install_sync`（medium）。
 - **集成组网端口转发（4 层 TCP 流量中继）**：
   - 组网转发彻底从独立的假应用收敛为**具体业务应用的内置 4 层网络中继能力**（与 7 层 HTTP/HTTPS 域名反代并列）。
@@ -143,13 +144,13 @@
     - **创建与更新同一套校验**（`validateMeshForward`）：开启转发时入口主机必填、入口主机不能是应用主机自身、入口/目标端口均须 1~65535；更新时应用主机不可变更，故以存储的 `host_id` 为准校验。
     - **（入口主机， 入口端口）全应用唯一**（`meshForwardConflict`）：创建与更新均校验（更新排除自身），冲突返回 409 并提示占用方应用名。
     - **入口主机变更/关闭转发即拆除旧中继**：入口主机变更时先按旧坐标 `CleanMeshForwarder`（新表单已清空旧字段，不清理会遗留孤儿容器）；purge 以**记录过入口主机**为准（而非仅看 Enabled 开关），历史遗留配置仍可被回收。
-    - **更新响应同步化**：`PUT /apps/:id` 在转发配置变化时同步执行 `SyncMeshForwarder`，结果经响应字段 `mesh_forward_target`（生效的中继目标）/ `mesh_forward_warning`（同步失败原因）返回，不再只依赖异步协程。
+    - **更新响应同步化**：应用更新接口（见 API.md「应用中心」）在转发配置变化时同步执行 `SyncMeshForwarder`，结果经响应字段 `mesh_forward_target`（生效的中继目标）/ `mesh_forward_warning`（同步失败原因）返回，不再只依赖异步协程。
     - **中继清理失败不再静默**：`CleanMeshForwarder`/`SyncMeshForwarder` 改为返回 error；更新时入口主机变更或禁用转发，先预清理旧中继，失败则 409 且不落库（旧坐标得以保留，杜绝孤儿中继）；部署成功路径的中继失败仍只记 WARN（记录告警并允许主服务上线，避免辅助中继故障阻断主部署）。
     - **部署完成重读存储**：`finishDeploySuccess` 创建中继前重新 `GetApp`，应用在部署期间被删除则跳过并在部署日志说明（消除用过期指针建中继的竞态）。
     - **启停联动结果可观测**：`containerAction`（stop/start/restart）对中继容器的联动失败（入口主机离线/执行失败/非零退出）以响应字段 `relay_warning` 上抛，主操作仍按自身结果返回。
   - **拓扑预览协同**：创建页与详情页的流量拓扑实时呈现 TCP 4 层中继链路与 7 层 HTTP/HTTPS 反代链路。
 - **端口绑定范围**（`PortMapping.bind_scope`）：每条端口映射可选「公网开放」（默认，`-p host:container` 绑定 0.0.0.0）或「仅异地组网」（`-p <tailscaleIP>:host:container` 只绑定主机 Tailscale IP，公网不可达）。选择「仅异地组网」时目标主机必须已加入组网，引擎找不到 Mesh IP 时降级为公网绑定并在部署日志中告警。
-- **域名与反代集成**（`PUT /apps/:id/proxy`）：
+- **域名与反代集成**（见 API.md「应用中心：域名绑定」）：
   - **系统托管反代容器（对齐 1Panel OpenResty / dokploy-traefik 的面板托管反代模式）**：反代 Nginx 不要求宿主机安装任何 nginx 服务（宝塔式宿主安装污染系统、跨发行版负担，不采纳），而是由系统在绑定域名时于目标主机**自动初始化并持续保障**专用伴生容器 `watchman-proxy-nginx`（`nginx:alpine`，`--restart unless-stopped --network host --label watchman.managed=proxy`，挂载 `/opt/apps/nginx/conf.d:/etc/nginx/conf.d:ro` 与 `/opt/apps/nginx/certs:/opt/apps/nginx/certs:ro`，两个宿主目录由保障脚本 `mkdir -p` 自建，不假定运维手工准备）。命名**刻意脱离 `watchman-app-*` 用户应用命名空间**（防用户部署同名 nginx 应用劫持/冲突，与 dokploy-traefik 保留名同哲学）。`ensureProxyNginx` 幂等保障：先跑 30s 检查脚本（mkdir 两目录 + `command -v docker` + `docker info` + `docker inspect` 容器状态与两挂载），容器运行中且挂载齐全则跳过重建（秒回、不动用户在线服务）；缺失/停止/挂载不符/用户手工改坏 → 执行 300s 重建脚本（`docker rm -f` 吞不存在 → `docker run` 重建 → sleep 2 验 running，起后即退则抓 `docker logs --tail 30` 分类），与 socat 中继容器同一套幂等替换先例（`server/internal/apps/proxy.go`）。bind 在目标主机 hub 解析后、**证书解析前**执行 ensure（基础设施坏了快速失败，不浪费同步 ACME 签发）；ensure 与文件推送/续期回推共用 `pushMu` 全串行（重建不与在途 reload 竞态），但**不跨证书解析持锁**（慢 ACME 不阻塞他人）。`RepushAppCerts` 系统动作**不做 ensure**（保持轻量；容器被手动删除由下次用户绑定自愈）。**`--network host` 的因果**：local 模式上游是 `127.0.0.1:<port>`，bridge 网络下容器内 127.0.0.1 指向容器自身（流量黑洞），host 网络下语义正确且 80/443 直监听宿主（无 `-p` 映射需维护）。**错误分类**（`classifyEnsureError`，纯字符串表驱动可测）：Docker 不可用 → 409「一键安装或启动 Docker」；80/443 被占（nginx 日志含 `address already in use`）→ 409；`nginx:alpine` 拉取失败 → 409「配置镜像加速」；其余 → 500 + 日志摘要（≤200 字符截断），绝不静默吞错。**Windows 主机前置 400**（「反代绑定暂仅支持 Linux 主机」）：保障脚本假定 Linux 宿主，明确拒绝而非在 docker exec 深处晦涩失败。vhost 443 块含 `client_max_body_size 64m;`（nginx 默认 1m，走反代的上传会被 413 静默截断）。**保留 nginx 而非 Traefik 的取舍**：gateway 模式上游是另一台主机的 mesh/公网 IP（Dokploy 的 docker.sock label 发现无法表达跨主机）；nginx 容器零 docker.sock 攻击面；证书中心是唯一证书真相源（ACME/续期/回推闭环，不建第二套）；conf.d 文件推送 + agent reload 与既有实现零迁移成本。
   - `local` 模式：应用所在主机运行系统托管反代容器，上游 `127.0.0.1:<port>`。端口取第一个发布端口：表单/模板的 `ports[0].host` 优先，其次解析 `raw_compose` 编排文件的首个发布端口（服务按名字典序，首个有效的 `host:container` 或长格式 `published`；仅容器端口、端口范围、IPv6 写法跳过不猜），两者皆无时回落 8080（`defaultUpstream` / `syncFirstPort`）。**存量 8080 占位修复**：非手动记录上存的 `127.0.0.1:8080` 只是「当时无端口信息」的占位，不是选择——下次反代同步（重新绑定/迁移）时若已能解析出真实端口则自动修正为该端口；手动指定的 upstream 永不改写；真实发布 8080 的应用重算后值不变。证书续期回推只推证书文件、不重算上游，不触发该修复。
   - `gateway` 模式：另选一台有公网 IP 的网关主机运行 Nginx，公网流量在网关卸载 TLS 后转发到应用主机。**异地组网不是必需条件**，上游按两条路径自动解析（`defaultUpstream`）：
@@ -157,21 +158,21 @@
     - **直连路径**：否则 → 上游取应用主机的**公网 IP**，无公网 IP 再回退**内网 IP**（同局域网/VPC 场景），仅两者皆无时才报错并要求在详情页手动填写 Upstream。
     - 上游永不用 `127.0.0.1`（会指向网关自身造成流量黑洞）；网关主机**不能是应用主机自身**（相同场景即 local 模式）。
   - **多域名与证书自动匹配（宝塔式站点模型）**：
-    - **契约（`ProxyDomains []DomainBinding`）**：`Application.Domain` 单值字段升级为 `ProxyDomains []DomainBinding`（`{domain, cert_id, auto, force_https}`），一个应用支持绑定多个独立域名；**证书不再要求用户逐个选择**——`PUT /apps/:id/proxy` 的 `cert_id` 可省略/留空，表示由服务端按域名自动匹配当前可用的覆盖证书，并在保存时把具体证书 ID 物化进 `cert_id`（同时置 `auto=true`）。运行期没有动态 SNI 匹配：Nginx vhost、续期回推、删除守卫都读已存储的 ID。**每个域名可单独设置是否强制跳转 HTTPS**（`force_https`，默认关闭：80 端口直接提供明文访问；开启时 80 端口 301 跳转 https，443 反代不变；存量绑定无该字段时按关闭处理）。
+    - **契约（`ProxyDomains []DomainBinding`）**：`Application.Domain` 单值字段升级为 `ProxyDomains []DomainBinding`（`{domain, cert_id, auto, force_https}`），一个应用支持绑定多个独立域名；**证书不再要求用户逐个选择**——域名绑定接口（见 API.md「应用中心：域名绑定」）的 `cert_id` 可省略/留空，表示由服务端按域名自动匹配当前可用的覆盖证书，并在保存时把具体证书 ID 物化进 `cert_id`（同时置 `auto=true`）。运行期没有动态 SNI 匹配：Nginx vhost、续期回推、删除守卫都读已存储的 ID。**每个域名可单独设置是否强制跳转 HTTPS**（`force_https`，默认关闭：80 端口直接提供明文访问；开启时 80 端口 301 跳转 https，443 反代不变；存量绑定无该字段时按关闭处理）。
     - **自动匹配口径（`hub.FindUsableByDomain`）**：与 `FindByDomain` 同一套确定性排序（精确 SAN > 通配符；通配符标签深度多者优先；`NotAfter` 新者优先；证书 ID 字典序兜底），但只接受**当前可用**的证书——已生效（`NotBefore ≤ now`）、未过期、且私钥材料齐全；过期/未生效/缺私钥的证书不会被自动选中（`CertUnusableReason` 给出原因）。**跨整个请求先解析再写主机**：任一域名无可用证书时整体拒绝（400 + `missing_domains` 列表），此时尚未对任何主机做写入，前端可一次性批量签发后重试。
     - **显式证书仍严格校验**：传了具体 `cert_id` 时按显式绑定处理（`auto=false`），校验存在性（400）、**SAN 覆盖域名（`cert.DomainCovers`，未覆盖 400）**与私钥材料完整性（409）；显式指定的过期证书仍允许保存（便于接管遗留材料，UI 标注），下次续期按身份回推。UI 标注的口径：手动指定行的提示按证书有效期给语气——已过期或尚未生效时为警告（仍允许保存，仅说明后果），有效时才为正常；手动下拉里过期证书的剩余天数不写「剩余 0 天」，直接标「已过期」。缺私钥无法从列表数据判断（私钥永不出网），只按有效期标注，不可用的最终判定仍以服务端绑定校验为准。
     - **`auto` 标志持久化**：服务端自动选中的绑定记 `auto=true`，前端展示为「自动匹配：<证书 SAN>」；重新载入后该行仍按「未指定证书」提交，下一次保存会按当时可用证书重新解析——避免把已物化的旧 ID 钉成显式选择，导致证书过期后绑回旧证。存量迁移与遗留单域名解析同样写 `auto=true`。
     - **多域名 Nginx Virtual Host 渲染**：统一生成至单文件 `watchman-<appID>.conf`，为每个域名独立渲染 HTTP 80 server 块与 HTTPS 443 反代 server 块，各自引用专用证书与密钥文件（`/opt/apps/nginx/certs/<domain>.crt` 与 `<domain>.key`）。80 块按该域名的 `force_https` 渲染：开启时 `return 301 https://$host$request_uri`，关闭时直接反代上游（与 443 同款 location 块，只是明文、`X-Forwarded-Proto http`，同样带 `client_max_body_size 64m`）。解绑应用反代或彻底删除应用时，联动清理全部绑定域名的证书与配置文件。
     - **身份优先证书回推（Identity-First Re-push）**：证书自动化续期成功后，`ProxyHandler.RepushAppCerts` 遍历各应用，优先匹配 `binding.CertID == crt.ID`（或存量未物化空 CertID 条目且域名覆盖）；更新并热重载 Nginx，杜绝多厂商/新签证书跨应用漂移劫持。
     - **确定性最佳证书匹配（Deterministic SAN Ranking）**：`FindByDomain` 改为绝对确定性排序：精确 SAN 匹配 > 通配符覆盖；通配符按标签深度（label count）多者优先；再按剩余有效期 `NotAfter` 新者优先；证书 ID 字典序作为确定性 tie-breaker。驱动覆盖探测端点、存量条目解析与面板 SNI 降级。`storeResult` 保存续期证书时严格保留管理员既有 `Remark`。
-    - **证书删除守卫与强制清绑（Delete Guard & Force Override）**：`DELETE /certs/:id` 检查证书是否正被任何应用的 `ProxyDomains` 引用（按物化后的 `cert_id` 匹配，自动匹配物化的绑定同样受守卫）；若有引用则返回 409 Conflict 并列出占用方应用名称，防止误删生产在线证书；支持传入 `?force=true` 强制删除，删除时通过回调解耦将相关应用的绑定 `cert_id` 安全置空（回落「待重新绑定」的自动解析语义，不破坏正在运行的 Nginx 实例）并完成删除。**面板守卫**：面板显式绑定的证书（`panelCertInfo` 返回的 `SSLCertID`）另受面板守卫，一律 409，`?force=true` **不可绕过**——面板绑定只能从「系统设置 → 面板域名与证书」解除后才能删除（cert 包内无安全的反向解绑入口，放行 force 会回到删证后面板静默换证）。**守卫触发条件收紧**：仅当面板 SSL 启用且证书来源模式为 `cert_center` 时拦截；切到 custom PEM 或关闭 SSL 后残留的 `SSLCertID` 不再拦删除（面板此时并不实际服务该证书）。残留风险：面板 SSL 开启但未显式绑定时，面板实际服务的是 `FindByDomain(panelDomain)` 命中的证书，删掉那张证书仍不会被守卫拦截（已收紧回退链：已绑定域名时不再回退 `List()[0]` 任意证书，仅无域名时保留该兜底）。
+    - **证书删除守卫与强制清绑（Delete Guard & Force Override）**：删除证书接口（见 API.md「证书中心」）检查证书是否正被任何应用的 `ProxyDomains` 引用（按物化后的 `cert_id` 匹配，自动匹配物化的绑定同样受守卫）；若有引用则返回 409 Conflict 并列出占用方应用名称，防止误删生产在线证书；支持传入 `?force=true` 强制删除，删除时通过回调解耦将相关应用的绑定 `cert_id` 安全置空（回落「待重新绑定」的自动解析语义，不破坏正在运行的 Nginx 实例）并完成删除。**面板守卫**：面板显式绑定的证书（`panelCertInfo` 返回的 `SSLCertID`）另受面板守卫，一律 409，`?force=true` **不可绕过**——面板绑定只能从「系统设置 → 面板域名与证书」解除后才能删除（cert 包内无安全的反向解绑入口，放行 force 会回到删证后面板静默换证）。**守卫触发条件收紧**：仅当面板 SSL 启用且证书来源模式为 `cert_center` 时拦截；切到 custom PEM 或关闭 SSL 后残留的 `SSLCertID` 不再拦删除（面板此时并不实际服务该证书）。残留风险：面板 SSL 开启但未显式绑定时，面板实际服务的是 `FindByDomain(panelDomain)` 命中的证书，删掉那张证书仍不会被守卫拦截（已收紧回退链：已绑定域名时不再回退 `List()[0]` 任意证书，仅无域名时保留该兜底）。
     - **存量数据平滑迁移与物化冻结**：Store 加载 `apps.json` 时自动将历史 `Domain` 字段迁移为 `ProxyDomains=[{domain: Domain, cert_id: ""}]`（`auto` 未标记）；存量空 `cert_id` 条目在首次证书回推或迁移同步时，由 `resolveBindingCerts` 用 `FindByDomain`（确定性最佳匹配）解析并以 `auto=true` **物化冻结回写**到应用元数据，实现无缝平滑升级。该路径**刻意不做可用性过滤**（不用 `FindUsableByDomain`）：正在服务线上流量的存量绑定不能因为证书刚好到期就解析不到而中断回推，运维人员从应用详情重新绑定才会走「只认当前可用证书」的自动匹配口径。
-    - **前端多域名行式编辑器与自动优先交互**：`AppDetail.vue` 与 `AppCreate.vue` 统一为「域名输入 + 实时证书状态」行式编辑：域名输入防抖 400~500ms 调 `GET /certs/cover`，显示「已匹配可用证书：<SAN>（保存时自动绑定）」/「已有覆盖证书但当前不可用（原因），保存时将尝试自动签发」/「暂无覆盖证书，保存时将尝试自动签发」，**不再自动预选具体证书**（不再出现逐域名必选的证书下拉）。详情页进页不自动探测（只查看不触发请求，查看不是编辑），探测只在域名输入改动时触发；未探测行的提示留空、「暂无可用证书」区不收录，不按无证书误报；新探测排期时即作废旧结果与在途请求，探测进行中的行同样按「未知」处理，不按旧结论闪烁提醒。手动指定收进「高级：手动指定证书」折叠区，逐域名一个 NSelect，首个选项为「自动匹配（推荐）」（真实 `value: ''`，符合 §8.3.1 例外），其余选项格式化为 `SAN 列表 · 颁发者 · 剩余天数`。`AppMigrateModal` 与 `AppTopologyPreview` 支持多域名展示与拓扑节点证书状态联动。
+    - **前端多域名行式编辑器与自动优先交互**：`AppDetail.vue` 与 `AppCreate.vue` 统一为「域名输入 + 实时证书状态」行式编辑：域名输入防抖 400~500ms 调证书覆盖探测（见 API.md「证书中心」），显示「已匹配可用证书：<SAN>（保存时自动绑定）」/「已有覆盖证书但当前不可用（原因），保存时将尝试自动签发」/「暂无覆盖证书，保存时将尝试自动签发」，**不再自动预选具体证书**（不再出现逐域名必选的证书下拉）。详情页进页不自动探测（只查看不触发请求，查看不是编辑），探测只在域名输入改动时触发；未探测行的提示留空、「暂无可用证书」区不收录，不按无证书误报；新探测排期时即作废旧结果与在途请求，探测进行中的行同样按「未知」处理，不按旧结论闪烁提醒。手动指定收进「高级：手动指定证书」折叠区，逐域名一个 NSelect，首个选项为「自动匹配（推荐）」（真实 `value: ''`，符合 §8.3.1 例外），其余选项格式化为 `SAN 列表 · 颁发者 · 剩余天数`。`AppMigrateModal` 与 `AppTopologyPreview` 支持多域名展示与拓扑节点证书状态联动。
   - 网关主机 ID 持久化在 `Application.proxy_gateway_host_id`，解绑时同时清理应用主机与网关主机两侧配置，并清空该字段（修复：此前解绑残留旧网关 ID 的脏字段）。
   - **反代加固**：手动 `upstream` 实行严格白名单（仅 IP/严格主机名 + 1~65535 端口，拒绝空格与 `;{}#$/?@` 及缺失端口，非法 400）；`SyncProxyForHost` 两分支改用存量 upstream（空值/非法值回退默认计算）与存量 `ProxyWebSocket`（不再硬编码 true），网关模式下存量 upstream 若仍指向旧应用主机则重新计算（防迁移后网关指回旧主机，旧主机离线无法确认时按手动值保留）；`Application.ProxyWebSocket` 为 `*bool`——nil 表示未记录选择（存量记录、未传该字段的绑定），渲染时等同 true（与改动前恒 true 一致），仅显式 false 关闭，杜绝存量应用迁移后静默丢失 Upgrade 头。`SyncProxyForHost` 网关分支补齐 Windows 拒绝、`ensureProxyNginx` 与逐域名证书推送（与 local 分支对称）；绑定失败时补偿删除本次写入的 conf 与已推证书并再 reload（破损 conf 不再滞留 `conf.d` 毒化后续 `nginx -t`，但写 conf 之前失败时不删已推的新证书——旧 conf 仍引用旧证书路径，删了反而让旧 conf 引用缺失文件）；换绑时清理旧目标主机的旧 conf 与被剔除域名的证书，清理失败进响应 `warnings`（首绑跳过旧目标清理）；解绑时离线主机/exec 失败/reload 非零各进 `warnings`，`UpdateApp` 失败改返 500（此前静默丢弃却报成功），解绑同时清 `ProxyWebSocket`；绑定/解绑成功响应新增可选 `warnings` 字段。**补偿双守卫与上游手动标志**：`pushVhost` 的 `confWritten` 只在写 conf 成功后才置位（此前先置位，写失败时补偿会删掉完好的旧 conf 与已推新证书）；`nginx -t` 失败时补偿只在 `-t` 输出归因到本应用时触发（提及本应用 conf 文件名或本次推送的证书文件——证书缺失时 -t 报的是证书路径而非 conf，必须算归因），输出未提及本应用时保留本次 conf+证书并记日志（超时等无法归因的失败保持原有补偿行为）；手动 `upstream` 端口串必须全数字（`+8080` 此前被 `Atoi` 放过、到 nginx 才拒收，现直接 400）。新增 `Application.ProxyUpstreamManual`：`bindProxy` 在请求带 `upstream` 时置 true、无 upstream 的重绑清零、解绑清零；`SyncProxyForHost` 网关分支对 manual 记录直接沿用存量、跳过旧主机启发式重算（此前手动值撞旧主机+首发布端口会被当计算值覆盖），存量未标记记录继续走既有启发式，local 分支恒沿用不变。
 - **证书自动匹配与就地签发编排**：
-  - **覆盖探测端点**：只读端点 `GET /api/v1/certs/cover?domain=<d>`（登录即可、免操作审计，与 detail/download 同例）复用 `hub.FindByDomain` 确定性同源匹配（精确 SAN 或通配符覆盖子域名、不含通配符裸域名本身），响应带 `usable` 与 `reason`：有可用证书时 `{covered:true, usable:true, cert?{id,domains,source,account_name,not_after}}`；仅有不可用证书（过期/未生效/缺私钥）时 `{covered:true, usable:false, reason, cert?}`；完全没有覆盖时 `covered:false`。PEM 经 `json:"-"` 永不出网；前端永不复刻匹配规则、预检与最终绑定不会分叉；域名非法/空/通配符 → 400（校验语义与反代 `validProxyDomain` 镜像一致）。
-  - **共用签发 composable**（`web/src/composables/useCertIssuance.ts`）：集中 ACME 账户列表（预填默认账户）、challenge 单选（自动推荐 / HTTP-01 / DNS-01）、dns-mng 就绪判定（`enabled && base_url` 同款）、`canIssue`（仅 admin）与签发任务日志弹窗状态；`issueDomains(domains)` 调 `POST /certs/issue`（**多域名合成一张多 SAN 证书**、单个任务）后轮询 `GET /certs/tasks/:taskID`（2s、上限 5 分钟），返回成功证书 ID 或失败原因，组件卸载即停止轮询；签发过程统一展示 `CertLogModal` 实时日志。
+  - **覆盖探测**（见 API.md「证书中心」）：复用 `hub.FindByDomain` 确定性同源匹配（精确 SAN 或通配符覆盖子域名、不含通配符裸域名本身），响应带 `usable` 与 `reason`：有可用证书时返回可用证书，仅有不可用证书（过期/未生效/缺私钥）时返回不可用原因，完全没有覆盖时返回未覆盖。PEM 永不出网；前端永不复刻匹配规则、预检与最终绑定不会分叉；域名非法/空/通配符的校验语义与反代 `validProxyDomain` 镜像一致。
+  - **共用签发 composable**（`web/src/composables/useCertIssuance.ts`）：集中 ACME 账户列表（预填默认账户）、challenge 单选（自动推荐 / HTTP-01 / DNS-01）、dns-mng 就绪判定（`enabled && base_url` 同款）、`canIssue`（仅 admin）与签发任务日志弹窗状态；`issueDomains(domains)` 调签发接口（见 API.md「证书中心」）（**多域名合成一张多 SAN 证书**、单个任务）后轮询签发任务（2s、上限 5 分钟），返回成功证书 ID 或失败原因，组件卸载即停止轮询；签发过程统一展示 `CertLogModal` 实时日志。
   - **创建页编排**（`AppCreate.vue`，`bindDomainsWithCert`，先绑定后签发）：创建应用成功后，用当前域名列表（未手动指定证书的不带 `cert_id`）调用 `bindProxy`。
     - 绑定成功：反代已下发（响应 `warnings` 照常提示残留）。
     - 服务端返回 `missing_domains`（整批拒绝、未写任何主机）：当前账号无签发权限 → 只绑定已有可用证书的子集并 warning 引导管理员处理；admin 且已配置 ACME 账户 → 为**恰好这些缺失域名**签发**一张多 SAN 证书**（不是逐域多张），成功后重试整批绑定。
@@ -183,23 +184,23 @@
   - **AI 一致性**：AI 草稿仅填充首行域名、**不新增任何证书字段**（证书选择与 `auth_vault_id` 同理必须人工选）；`sanitizeAppDraft` 现状已不含证书字段，仅在此注明边界。
 - **创建页异地组网防错与拓扑预览**：
   - **网关主机约束**（前端禁用 + 提交校验 + 后端兜底）：网关主机**不能与应用主机相同**（相同场景即 local）。**异地组网非必需**：网关到应用主机可走组网（双方都在组网内 → 100.x）或直连（应用主机公网 → 内网 IP），下拉按「有公网 IP」优先排序并标注 `组网直达`/`直连` 路径，未组网主机不再禁选。后端 `bindProxy`：同主机返回 400；两条路径都无法解析出上游时返回 409 并提示手动填写 Upstream。
-  - **组网 IP 实时探测**：选中主机即调只读端点 `GET /network/nodes/:id/mesh-ip`（§8.7 第 8 条），提示区分「实时探测/缓存」；mesh 端口但主机未组网时，端口区给出 NAlert 与「前往加入组网」深链（`/hosts/:id?tab=network`），不再等到提交才报错。
-  - **组网全局未配置引导**：创建页拉取 `GET /network/config`，未配置 Auth Key/控制面时顶部 NAlert 提示并深链 `/network`（可关闭）。
+  - **组网 IP 实时探测**：选中主机即调组网 IP 实时探测（见 API.md「动态组网」，§8.7 第 8 条），提示区分「实时探测/缓存」；mesh 端口但主机未组网时，端口区给出 NAlert 与「前往加入组网」深链（`/hosts/:id?tab=network`），不再等到提交才报错。
+  - **组网全局未配置引导**：创建页拉取组网配置（见 API.md「动态组网」），未配置 Auth Key/控制面时顶部 NAlert 提示并深链 `/network`（可关闭）。
   - **local 模式与主机公网能力不匹配**：填写域名后若 local 模式但应用主机无公网 IP，NAlert 建议切「统一网关」并提供一键切换。
   - **流量拓扑预览卡片**（`web/src/components/apps/AppTopologyPreview.vue`，创建页选中主机后渲染）：随表单实时展示 公网用户 → 网关主机(Nginx/443) → （`Tailscale 组网` 或 `直连`）→ 应用主机 → 应用容器 的链路与每条端口的绑定范围（`0.0.0.0:host` 公网开放 / `meshIP:host` 仅异地组网），节点离线时降亮；链路箭头的「组网/直连」由双方是否都有组网 IP 决定。视觉语言复用 AppDetail「域名与反代」页 topology-box（§8.8 组件规范）。
   - **AppDetail 域名与反代同步**：网关下拉同样标注组网状态与 `组网直达`/`直连` 路径、仅禁用应用主机自身；保存前校验网关非应用主机自身（两路径均由后端解析，不强制组网）；已绑定应用的拓扑展示按 `proxy_upstream` 是否落在 100.64.0.0/10 判定并显示「Tailscale 组网」或「直连」。
   - **AI 草稿一致性**：`app_assist` 系统规则第 11 条与对话规则要求 `gateway_host_id` 为在线主机、不能等于 `host_id`（网关可走组网或直连，不强制组网）；`sanitizeAppDraft` 仅在同主机时丢弃并告警，未组网时追加「将按直连转发，请确认网络可达」提示而不丢弃。
-- **创建页 AI 辅助**：创建应用页（`AppCreate.vue`）右侧挂载 AI 部署助手（`web/src/components/apps/AppAiAssistant.vue`），复用统一 LLM 适配层（§3.16），提供两种能力：
-  - **智能填充**：用户用自然语言描述需求，`POST /api/v1/ai/app-draft` 返回结构化表单草稿（`Assistant.AppDraft`，实现位于 `server/internal/ai/app_assist.go`）。服务端把在线主机清单（仅 id/主机名/系统/公网IP/组网IP）与模板目录（含 `env_fields`）作为接地上下文注入提示词；模型只能从清单中选 `host_id`/`template_id`，不得输出 `auth_vault_id`（Git 凭据必须人工选）。返回前经 `sanitizeAppDraft` 消毒（来源类型白名单、端口 1~65535、模板参数按声明字段过滤、`bind_scope=mesh` 与主机组网IP 一致性告警等），并计算 `missing`（还需用户补充的字段）；前端点「填充到表单」才合并进表单，**AI 永不直接创建应用**，最终提交仍走原有已审计的 `POST /apps` 与前端校验（§3.16.7 草稿-确认模型）。
+- **创建页 AI 辅助**：创建应用页（`AppCreate.vue`）右侧挂载 AI 部署助手（`web/src/components/apps/AppAiAssistant.vue`），复用统一 LLM 适配层（§3.15），提供两种能力：
+  - **智能填充**：用户用自然语言描述需求，创建应用草稿接口（见 API.md「AI」）返回结构化表单草稿（`Assistant.AppDraft`，实现位于 `server/internal/ai/app_assist.go`）。服务端把在线主机清单（仅 id/主机名/系统/公网IP/组网IP）与模板目录（含 `env_fields`）作为接地上下文注入提示词；模型只能从清单中选 `host_id`/`template_id`，不得输出 `auth_vault_id`（Git 凭据必须人工选）。返回前经 `sanitizeAppDraft` 消毒（来源类型白名单、端口 1~65535、模板参数按声明字段过滤、`bind_scope=mesh` 与主机组网IP 一致性告警等），并计算 `missing`（还需用户补充的字段）；前端点「填充到表单」才合并进表单，**AI 永不直接创建应用**，最终提交仍走原有已审计的应用创建与前端校验（§3.15.6 草稿-确认模型）。
   - **环境变量与挂载卷事实补齐**：仅靠提示词要求模型填 `env_vars`/`volumes` 不可靠（模型在用户未点名时习惯留空），故服务端在消毒后做确定性补齐（`alignDraftWithFacts` / 模板默认值填充），不依赖模型是否配合：镜像来源按 Registry 探测到的容器路径生成 `/opt/apps/<应用名>/<目录>:/容器路径` 挂载、按探测到的非密钥环境变量默认值预填；Git Dockerfile 来源按 Dockerfile `ENV` 与 `.env.example` 键补齐；模板来源按声明的非密钥默认值预填参数、按 `DefaultVolume` 补齐挂载。补齐只在草稿与表单都未提供该字段时发生，永不覆盖用户或模型已填的值；密钥类变量（口令/密钥/token）与无值的示例变量不编造，改为进 `missing` 让用户手动填；Compose 来源不补齐（编排文件本身即权威）。
   - **参考来源**：草稿与对话 patch 响应带 `sources`（`DraftSource{kind, ref, fields, detail}`，服务端在消毒后按字段实际取值与探测值比对生成，**不是模型自述**）：`image`（Registry 免拉取探测）、`repo`（GitHub 仓库探测）、`template`（模板目录声明）、`host`（在线主机清单）；前端在草稿结果与 patch 卡片中展示「参考来源」，让用户一眼看出端口/变量/卷是实测来的还是模型猜的。
-  - **对话辅助**：`POST /api/v1/ai/app-chat` 每次请求携带**当前表单快照**与最近 10 轮对话，回答可附带 `form_patch`（结构化改动，同样经消毒与事实补齐、带 `sources`），前端以「建议修改」卡片呈现，用户点「应用到表单」才生效，禁止静默改表。
+  - **对话辅助**：创建页对话辅助接口（见 API.md「AI」）每次请求携带**当前表单快照**与最近 10 轮对话，回答可附带 `form_patch`（结构化改动，同样经消毒与事实补齐、带 `sources`），前端以「建议修改」卡片呈现，用户点「应用到表单」才生效，禁止静默改表。
   - **调用过程可视化（Codex 风格时间线）**：三个 AI 入口（`app-draft`、`app-chat`、运维问答 `ai/chat`）的响应都带 `trace`（`CallTrace{steps, total_ms}`，实现位于 `server/internal/ai/trace.go`）与 `usage`（provider 上报的 token 量，OpenAI `usage` / Ollama eval counts，未上报则为空、不编造零值）。步骤是服务端实测的真实阶段：创建页两入口为「事实探测 → 模型调用 → 解析、消毒与来源归因」，运维问答为「收集平台数据 → 模型调用」；每步含状态（done/failed）、毫秒耗时与一句话详情（探测到几个端口/变量/卷、模型名与 token 量、缺失/警告数）。`total_ms` 是从调用开始到响应组装完成的墙钟，含步骤之间未归因的时间（如 prompt 拼接），故各步之和略小于 total 属正常。调用失败时 503 响应同样带已跑完的 partial trace（`TracedError`，`handlers.go:writeAIError`），前端在报错旁展开失败步骤。前端共享组件 `web/src/components/ai/AiCallTrace.vue` 渲染时间线（草稿结果默认展开、对话消息默认收起、可点步骤展开详情）；等待中因后端是非流式单请求、前端无法知道当前跑到哪一步，**只显示真实已用时计时，不伪造分步进度**——真·实时步骤推进需服务端 SSE，那是下一步，不在本批范围。
-  - **脱敏**：表单快照送模型前在服务端脱敏（`redactFormForLLM`）：环境变量值、模板密钥参数（`is_secret`）一律掩码为 `***`（只给键名与已填标记），Compose 内容中疑似口令行掩码，`auth_vault_id` 清空；不信任前端脱敏。AI 未启用/未配置时右侧面板明示并可跳转系统设置，手动填表完全不受影响（§3.16.1 降级原则）。两个接口均不改变系统状态，属 AI 诊断类，按 §7 豁免操作审计（与 `ai/nl2command` 同例）。
+  - **脱敏**：表单快照送模型前在服务端脱敏（`redactFormForLLM`）：环境变量值、模板密钥参数（`is_secret`）一律掩码为 `***`（只给键名与已填标记），Compose 内容中疑似口令行掩码，`auth_vault_id` 清空；不信任前端脱敏。AI 未启用/未配置时右侧面板明示并可跳转系统设置，手动填表完全不受影响（§3.15.1 降级原则）。两个接口均不改变系统状态，属 AI 诊断类，按 §7 豁免操作审计（与 `ai/nl2command` 同例）。
 - **镜像/仓库真实元数据探测（免拉取，防 AI 臆造端口）**：面对任意镜像引用（如 `ghcr.io/xerxes-2/clewdr`）或 GitHub 仓库，系统在生成草稿/填表前先**客观读取**目标的真实配置，彻底取代凭先验知识猜测：
   - **镜像探测**（`server/internal/registry`，新包，纯标准库无 SDK）：走 Docker Registry V2 / OCI 协议——`GET /v2/<repo>/manifests/<tag>`（Accept 声明 manifest v2/list + OCI manifest/index）→ 401 时按 `Www-Authenticate` 握手匿名 Bearer token（仅 pull scope）→ manifest list 自动选 `linux/amd64`（跳过 attestation 伪条目）→ 跟进 30x 读 config blob（上限 1MB）抽取 `ExposedPorts/EnvVars/Volumes/Cmd/Entrypoint`。**免拉取镜像层**，秒级往返；SSRF 防护拒绝解析为环回/私网地址的 registry；registry 传输不可达时回退 Docker Hub 镜像 `docker.m.daocloud.io` 重试一次。默认单请求超时 12s（ghcr.io 的 config blob 会 302 到 CDN）。
   - **仓库探测**（`server/internal/gitprovider/inspect.go`）：不 clone，`GET /repos/<o>/<r>` 取默认分支，再按 `docker-compose.yml`/`compose.yaml` → `Dockerfile`/`docker/Dockerfile` → `.env.example` → 语言栈标记的优先级梯队拉取并解析：compose 经 yaml 解析 `services.*.ports/environment`（原文上限 64KB），Dockerfile 行级正则解析 `EXPOSE/ENV/VOLUME/ENTRYPOINT/CMD`；仅支持 github.com（公开仓库匿名、私有仓库用已接入的 provider token），非 GitHub 地址返回明确的「暂不支持探测」而非报错。
-  - **AI 管线集成**（`server/internal/ai/app_facts.go`）：智能填充/对话辅助在调用模型**前**，从需求文本与表单快照扫描镜像引用（`registry.LooksLikeImageRef`，排除时间串/URL 等误报）与 `github.com/<o>/<r>` URL 并探测（镜像 6s / 仓库 8s ctx 上限，5 分钟内存缓存容量 64）；命中则把 `【已客观读取的真实配置】`事实区块（含真实端口、变量名、构建方式，密钥类变量值掩码 `***`）置顶注入 prompt 并附「事实优先级最高」规则。`sanitizeAppDraft` 再做**确定性兜底**（`alignDraftWithFacts`）：草稿端口与真实暴露端口不符时自动对齐/补齐并向 `warnings` 追加中文说明；仓库仅检出 Dockerfile 而草稿选了 compose（或反之）时自动纠正 `build_type` 与路径；环境变量与挂载卷同样按事实补齐（镜像/仓库探测值、模板非密钥默认值，密钥类只进 `missing` 不编造），响应附 `sources` 说明每项取自哪次探测；探测失败不改行为、仅在 warnings 提醒核实。模型输出始终只是草稿，创建仍走 `POST /apps` 审计链路。
+  - **AI 管线集成**（`server/internal/ai/app_facts.go`）：智能填充/对话辅助在调用模型**前**，从需求文本与表单快照扫描镜像引用（`registry.LooksLikeImageRef`，排除时间串/URL 等误报）与 `github.com/<o>/<r>` URL 并探测（镜像 6s / 仓库 8s ctx 上限，5 分钟内存缓存容量 64）；命中则把 `【已客观读取的真实配置】`事实区块（含真实端口、变量名、构建方式，密钥类变量值掩码 `***`）置顶注入 prompt 并附「事实优先级最高」规则。`sanitizeAppDraft` 再做**确定性兜底**（`alignDraftWithFacts`）：草稿端口与真实暴露端口不符时自动对齐/补齐并向 `warnings` 追加中文说明；仓库仅检出 Dockerfile 而草稿选了 compose（或反之）时自动纠正 `build_type` 与路径；环境变量与挂载卷同样按事实补齐（镜像/仓库探测值、模板非密钥默认值，密钥类只进 `missing` 不编造），响应附 `sources` 说明每项取自哪次探测；探测失败不改行为、仅在 warnings 提醒核实。模型输出始终只是草稿，创建仍走应用创建的审计链路。
   - **表单手动触发**：创建页「镜像地址」失焦/`Enter` 自动探测并展示紧凑提示条（「已客观读取：端口 8484 · 预置变量 N 项」）+「按真实配置填入」一键带入（仅替换未填的端口占位/空的环境变量与默认健康检查，不覆盖用户已填值；环境变量过滤通用运行时变量与空值，挂载卷按 `/opt/apps/<应用名>/<目录>:/容器路径` 生成，名字先按仓库末段补齐再生成卷路径）；Git 来源仓库失焦探测展示「默认分支 / Dockerfile（EXPOSE x）/ compose / 语言栈」徽章，并在用户未手动改动构建方式时自动对齐 `build_type`、分支与端口预填，Dockerfile 模式另自动带入 Dockerfile `ENV` 与 `VOLUME`（均仅字段为空时），环境变量再与 `.env.example` 合并：Dockerfile `ENV` 优先，示例文件补其余声明键——示例值原样带入、无值以 `KEY=` 形式保留进表单提醒填写（声明了键就是必要的变量，不因无值丢掉整项；提交前用户看得见，不是编造值）；Compose 模式下编排文件本身即权威，不填表单 env/卷；健康检查不自动补——端口给不出该服务是不是 HTTP，静默填 http 探针会让 TCP 服务部署后探针失败。其余表单级自动补充一律只填空值、不猜多选项：在线主机仅一台时预选目标主机、切网关模式且仅一个可选网关时选中它、组网转发目标端口在开启后或端口后填入时跟随首个端口补齐；域名、凭据 Vault、入口主机（多选）不自动猜。探测失败静默降级为提示条文字（「（不影响手动填写）」），不打断手动流程。单请求超时放宽为镜像 20s / 仓库 30s（必须覆盖服务端 15s/20s 的 ctx 预算，短了会把慢响应误报为失败）。接口为只读、无状态，按 §7 豁免操作审计。**角色与限速**：两探测端点改为仅 admin/operator 可用（viewer 调用 403——此前所有登录角色可用，且仓库探测无条件取用管理员存量 GitHub token，可读私有仓库完整 compose 与 env 值），每用户每分钟 30 次限速（超限 429，viewer 被拒不消耗配额）。**registry SSRF 纵深**：拨号层改为解析后校验公网 IP（拒绝环回/私网/链路本地/CGNAT/保留段，混合解析 fail-closed，拨号直连校验过的 IP 以关闭 DNS 重绑定窗口，TLS ServerName 仍取 URL 主机名）；重定向目标与 token realm 主机走同一套校验（ghcr blob 302 到 CDN 只要解析为公网 IP 即放行）；上游非 2xx 错误不再回显响应体（仅状态码）。拒绝清单另补 `0.0.0.0/8`（`0.1.2.3` 类此前可过，Linux 上 0.x 常路由本机）与 `198.18.0.0/15`（RFC 2544 benchmarking 段）。收紧注意：此前可用「解析到内网 IP 的自建 registry 主机名」探测，现会被拨号层拒绝（探测不影响部署本身）。
 - **系统设置面板安全与应用反代职责彻底解耦**：
   - 应用中心独立负责业务容器的反向代理与域名绑定（在应用详情 `AppDetail.vue` 的「域名与反代」页签中配置，经 Nginx 容器路由流量到应用容器或网关节点）；
@@ -209,30 +210,30 @@
   - **防失联与紧急恢复**：若配置错误域名或无效证书导致无法登录，提供控制机命令行救援开关：`watchman-server -reset-panel-domain -data <数据目录>`（解绑面板域名；绑定即严格，解绑后恢复 IP 访问）以及 `watchman-server -reset-panel-ssl -data <数据目录>`（关闭面板 SSL 与强制 HTTPS 重定向）。
   - 独立「证书中心」（`/certs`，`CertList.vue` + `CertManager.vue`）保持作为全局基础设施，管理 ACME 自动化证书与证书凭证，供面板及各业务应用按需选用；**工具栏「证书时间设置」**（仅管理员，`CertTimeSettingsModal.vue`，原「系统设置 → 证书时间设置」分区已移除）就地配置自动续期与手动证书到期提醒的提前天数（**全局策略，对全部证书生效**，无按证书覆盖；实际阈值按各证书有效期 1/3 收紧；`certs.auto_renew_days` / `certs.expiry_reminder_days`，1~90，保存即时生效；入口仍走管理员专用的系统设置接口），与证书列表、续期操作同屏；另提供只读覆盖探测端点 `GET /certs/cover?domain=`（登录即可、免操作审计，与 `FindByDomain` 同源匹配并返回 `usable`/`reason`，见 §3.7「证书自动匹配与就地签发编排」）。已签发证书列表每行提供「详情」弹窗：只读端点 `GET /certs/:id/detail`（登录即可、免操作审计）对存储的证书链现场解析 leaf（序列号、SHA-256 指纹、密钥算法/长度、签名算法、链张数，解析失败降级为基本元信息 + `parse_error`），并反查用途（面板证书显式绑定或按 `panel_domain` 兜底匹配 `panel_bound`/`panel_fallback`、应用按域名经 `hub.FindByDomain` 同源规则匹配 `used_by_apps`）及来源推断（`source` = acme / manual_dns01 / manual_upload）；弹窗内可展开查看并复制证书链 PEM 与私钥（「证书材料」区并列展示）：私钥明文经显式查看端点 `POST /certs/:id/key` 返回（adminOnly + 审计 `cert_key_reveal`/high，与 AI API Key 明文查看同惯例；用 POST 是因为共享审计中间件跳过 GET），打开详情弹窗时随证书链一并拉取、每次查看各落一条审计；常规响应（列表/单查/详情/下载）仍一律剥离私钥，该端点是唯一出口。证书列表「操作」列提供「下载证书」按钮：`GET /certs/:id/download`（登录即可、只读免操作审计、浏览器导航下载、JWT 走 `?token=` 查询参数——与审计导出/备份下载同惯例，鉴权中间件为无法带 header 的导航请求提供查询参数回退）以附件返回存储的公钥链，文件名取主域名 `<域名>.crt`（通配符 `*` 置换为 `_wildcard`、其余文件名不安全字符折叠为 `_`、无域名回退证书 id），下载仅公钥链、不打包私钥（私钥查看/复制走上述显式端点）。操作列按钮排布规范：文字按钮放前面（「详情」「编辑」「申请」），图标按钮放后面（「下载」「删除」），视觉风格统一；原「续期」按钮更名为「申请」（代表对该域名的重新申请与签发覆盖），仅对有 ACME 账户的证书展示：手动上传（`manual_upload`）的证书无账户，服务端续期会回落到默认账户重新签发并覆盖上传材料，故不展示申请按钮（`manual_dns01` 两阶段证书有账户，保留申请）；其续命方式应为「编辑」改配置后重新签发（或重新上传）；新增显式「编辑」按钮：唤起编辑证书模态框（备注 + 签发配置，见末段）；占位与失败状态守卫：当状态为 `pending` 或 `failed` 时，因尚无有效公私钥材料，操作列自动隐藏「下载」按钮，过期时间列显示为「签发中」或 `-`。（详情弹窗视觉打磨）弹窗为 `NModal preset="card"` 自定义头部：主域名 + 状态标签一行可读；内容按「指纹与算法 / 有效期与续期 / 使用情况」三区展示（分区标题 13px 加品牌色强调条；原第四区「基本信息」移除——来源/颁发机构/备注/SAN/最近错误与列表列及弹窗头部全重复，失败原因全文已由日志列悬停弹层承载），序列号与 SHA-256 指纹行内提供一键复制，有效期以进度条呈现（颜色随剩余天数分档：>30 天绿 / >7 天琥珀 / 其余红），PEM 折叠区冠以与三区同一视觉语言的「证书材料」分区标题（补充，自渲染节点复刻 13px + 品牌色竖条样式），等宽字体 + 主题变量底色；内容区 `maxHeight calc(100vh - 120px)` 内部滚动、头部固定。注意 scoped CSS 锚定：`NModal` teleport 到 body 后卡片根节点不带组件 `data-v` 作用域，`:deep()` 必须锚定在模板内自渲染的 `.cert-detail-body` 包裹层上才能命中 Naive 内部节点。已签发证书列表为宝塔式 11 列：域名 / 其他域名 / 申请方式 / ACME 账号 / 状态 / 日志 / 颁发组织 / 备注 / 自动续签 / 过期时间 / 操作；其中「申请方式」「ACME 账号」由服务端在列表响应中派生（`source`/`account_name`，与 detail 端点同一推断规则，前端不再自行推断）；「日志」列与运行状态合并呈现为交互式入口：续期中展示转圈动画 Tag「续期中 · 日志」，报错展示警告 Tag「异常 · 查看日志」（悬停以 `NPopover` 限宽弹层展示 `last_error` 全文摘要：小标题「最近一次失败原因」+ 12px 小字、`break-all` 换行、内容区 `max-width: 340px`、`max-height: 200px` 超长内部滚动，单元格内自行省略截断——不用内置省略 tooltip，对长错误实测单行铺出 1088px 宽溢出屏幕；点击打开日志弹窗），正常展示「查看日志」按钮，点击统一调起终端风格日志弹窗（`CertLogModal.vue`，等宽字体、背景 `#18181c`、支持自动跟随滚动、手动刷新与复制，活跃时 2s 静默轮询）；申请证书（`POST /certs/issue`）在启动后台异步任务前**立即同步创建**一条 `Status="pending"` 的占位证书记录并回传 `cert_id`，前端受理后立刻刷新展示「签发中」，彻底杜绝用户点击后数分钟界面毫无反应的体感；占位记录无公私钥材料、有效期为零值，`FindByDomain` 与 `FindUsableByDomain` 显式跳过 `pending` 与 `failed` 状态的记录，占位记录绝不遮蔽真实可用证书，不影响 SNI 与反代下发；同时立即调起日志弹窗实时展示全流程步骤日志，成功通过 `storeResult` 原地更新为 `issued`、失败通过 `markIssueFailed` 原地置为 `failed` 并保留 `LastError` 与排障日志；服务重启时，`loadCerts` 执行未决状态对账，将残留的 `pending` 证书置为 `failed`（`服务重启，签发中断`），杜绝死等；签发中的占位记录不可删除（409，handler 前置守卫 + `Hub.Delete` 哨兵 `ErrCertificateBeingIssued` 双层）：在途任务完成时 `storeResult` 会原地更新为已签发，删了也会复活，失败记录可删；已签发证书在 Renew 在途期间被删除时，`storeResult` 依据删除墓碑丢弃迟到结果并清理孤儿 PEM、`markIssueFailed` 只对 `pending` 生效，杜绝删除后复活与把已签发证书降级为 failed；`Renew` 的状态与互斥守卫在 `h.mu` 锁内读当前记录，避免并发重复签发；自动续期循环每 6 小时扫描一次，仅对已签发证书生效——`pending`/`failed` 占位记录不参与（签发中重复签发与失败无限重试即由此杜绝），对 `pending` 记录直接调续期同样拒绝，失败记录可经「申请」重试；手动 DNS-01 验证弹窗支持「查看验证日志」；「状态」列新增 `pending`「签发中」（info 浅蓝）与 `failed`「签发失败」（error 浅红），其余在续期中/异常之外按有效期给出已过期/未生效；「日志」列针对 `pending` 状态展示转圈动画 Tag「签发中 · 日志」，点击调起日志弹窗实时查看执行进度。每张证书带管理员备注字段 `Certificate.remark`（≤200 字，仅元信息，不影响证书）；行内铅笔按钮与操作列「编辑」按钮均弹起同一编辑证书模态框：备注经 `PUT /certs/:id/remark` 保存（adminOnly + 审计 `cert_remark`/medium 补齐此前缺失的审计规则，前端 `audit.ts` 标签同批补齐，另含 `cert_key_reveal`、`ai_config_key_reveal` 两处同类缺口）；模态框另提供「签发配置」区：CA 机构账户下拉、域名列表、验证方式（自动/HTTP-01/DNS-01/手动 DNS-01，泛域名强制 DNS-01 的联动与申请弹窗一致），保存时配置有改动即经 `POST /certs/:id/reissue` 按新配置重新签发（审计 `cert_reissue`/high）：后台异步任务、老证书继续服务、成功后原地覆盖到同一条记录（同一 ID 与绑定，备注保留），失败老材料与域名不动、只记 LastError；验证方式持久化到记录 `Certificate.challenge`（手动 DNS-01 仅当次有效、不存），续期（申请）与自动续期循环按存量验证方式走（手动/非法值回落自动）；手动 DNS-01 走两阶段（订单 `CertID` 指向原记录，确认后落到同一条记录并保留自动续期设置，目标已删则确认失败、绝不复活）；签发中/续期中拒绝 409；仅改备注不触发签发；自动续期设置编辑不碰、原样保留；列表/详情/导入/签发等响应不再回显私钥的既有约束不变。
     - **ACME 机构预设目录地址（只收录官方 directory，唯一事实源）**：内置预设 `Presets`（`server/internal/cert/types.go`，前端「新建机构」的默认值与之同源）只收录各 CA 官方公布的 ACME directory —— Let's Encrypt `https://acme-v02.api.letsencrypt.org/directory`（测试 `https://acme-staging-v02.api.letsencrypt.org/directory`）、Google Trust Services `https://dv.acme-v02.api.pki.goog/directory`（测试 `https://dv.acme-v02.test-api.pki.goog/directory`）、ZeroSSL `https://acme.zerossl.com/v2/DV90`、SSL.com `https://acme.ssl.com/sslcom-dv-ecc`。此前 GTS 预设误写为 `dv.acme.pki.goog` / `dv.acme.staging.pki.goog`，这两个主机并非 ACME 端点：解析会落到 Google 通用前端，TLS 握手返回 `*.google.com` 的默认多 SAN 证书，请求在协议层之前就失败为 `x509: certificate is valid for *.google.com ... not dv.acme.pki.goog`。该错误已改正，并由 `NormalizeDirectoryURL`（表驱动 `legacyDirectoryURLs`、匹配时忽略尾部斜杠）在 `loadAccounts` 与 `PutAccount` 两处把历史账户里存下的旧地址就地迁移为官方地址；自定义 CA（Step-CA / Pebble / 企业内网）地址原样透传，升级后无需手工重建机构账户。
-    - **EAB 凭据读写约定（掩码为常态，明文仅管理员按需查看）**：ACME 机构账户的 `eab_hmac_key` 以 0600 落盘在 `<dataDir>/certs/accounts.json`，任何常规响应（列表 `GET /certs/accounts`、创建/更新回执）都经 `ACMEAccount.Redacted()` 把非空值替换为固定掩码 `••••••••`，**没有明文出口**；唯一例外是账户弹窗眼睛按钮按需调用的 `POST /certs/accounts/:id/key`（adminOnly + 审计 `cert_account_key_reveal`/high，与证书私钥 / AI API Key 明文查看同惯例；用 POST 以确保命中审计中间件——其跳过 GET；账户未配置 EAB 时返回 404）。**前端编辑态不回填掩码**：`openEditAccount` 只根据掩码是否为空记录「已配置」事实（`hasEABHMAC`），输入框保持空值并以占位「已配置，留空则保持不变」+ 标签行「已配置」标签提示；提交时为空即原样发送空串。**眼睛预览（`toggleHMACPreview`）**：输入框已有内容时只做明/密文切换（`hmacRevealed` 控制 `type`），编辑态且输入框为空但账户已配置时，点击才经上述 admin-only 端点拉取真值回填并明文展示，每次查看各落一条高危审计；非管理员该按钮禁用（`canPreviewHMAC` 判定，悬停提示仅管理员可预览），拉取期间若用户已输入新值则不覆盖。**更新语义**：`updateAccount` 仅在 `eab_hmac_key` 非空且不含掩码字符时才覆盖旧值，因此「留空保存 = 保持原密钥、填写 = 替换」，不存在把掩码写成真实密钥或误清空密钥的路径。
+    - **EAB 凭据读写约定（掩码为常态，明文仅管理员按需查看）**：ACME 机构账户的 `eab_hmac_key` 以 0600 落盘在 `<dataDir>/certs/accounts.json`，任何常规响应（账户列表、创建/更新回执）都经 `ACMEAccount.Redacted()` 把非空值替换为固定掩码 `••••••••`，**没有明文出口**；唯一例外是账户弹窗眼睛按钮按需调用的 EAB 明文查看接口（见 API.md「证书中心」）（adminOnly + 审计 `cert_account_key_reveal`/high，与证书私钥 / AI API Key 明文查看同惯例；用 POST 以确保命中审计中间件——其跳过 GET；账户未配置 EAB 时返回 404）。**前端编辑态不回填掩码**：`openEditAccount` 只根据掩码是否为空记录「已配置」事实（`hasEABHMAC`），输入框保持空值并以占位「已配置，留空则保持不变」+ 标签行「已配置」标签提示；提交时为空即原样发送空串。**眼睛预览（`toggleHMACPreview`）**：输入框已有内容时只做明/密文切换（`hmacRevealed` 控制 `type`），编辑态且输入框为空但账户已配置时，点击才经上述 admin-only 端点拉取真值回填并明文展示，每次查看各落一条高危审计；非管理员该按钮禁用（`canPreviewHMAC` 判定，悬停提示仅管理员可预览），拉取期间若用户已输入新值则不覆盖。**更新语义**：`updateAccount` 仅在 `eab_hmac_key` 非空且不含掩码字符时才覆盖旧值，因此「留空保存 = 保持原密钥、填写 = 替换」，不存在把掩码写成真实密钥或误清空密钥的路径。
     - **联系邮箱策略（按 CA 主机判定，先于网络请求拦截）**：RFC 8555 §7.3 把 `contact` 列为可选，Let's Encrypt 等机构不带 contact 也能注册（且会以 `invalidContact` 拒绝无公共后缀的域名，历史上自动播种的 `admin@watchman.local` 因此在加载时被清空）；Google Trust Services 相反，无 contact 的 `newAccount` 直接返回 `400 malformed (urn:ietf:params:acme:error:malformed): Accounts must have at least one contact.`。因此 `cert.RequiresContact(directoryURL)` 按 Directory **主机名**（`pki.goog` 及其子域，与预设 ID 解耦，手工填写的 GTS 地址同样生效）判定，命中时 `ValidateAccountContact` 要求邮箱非空、`mail.ParseAddress` 可解析且域名具备公共后缀（`publicsuffix.PublicSuffix` 的 `icann` 为真，`admin@watchman.local` 这类直接拦下），任一不满足即在**发出请求之前**返回可操作的中文错误。其中格式校验对全部 CA 生效（保存格式错误的邮箱即 400，不限于要求联系邮箱的机构），公共后缀校验只对要求联系邮箱的机构生效（私有 CA 的内网邮箱域名不受其约束）；域名还须在公共后缀之外另有注册标签，裸后缀本身（如 `com`）同样不通过。校验有两个入口：创建/更新机构账户的 HTTP handler（400 回给前端）与 `acmeClient.ensureAccount` 起始处（覆盖自动签发、续期、手动 DNS-01 下单三条路径，历史存量账户无需重建即可得到明确提示）。预设 `Presets` 通过 `requires_contact` 下发同一事实，前端账户弹窗据此把「联系邮箱」标为必填、在 `#feedback` 给出说明并在提交前拦截，避免用户跑到签发阶段才看到 CA 的原始报文。
     - **泛域名强制 DNS-01（前置校验与跨机制回退守卫）**：RFC 8555 §8.4 规定通配符标识符的授权只会下发 `dns-01` 挑战，因此 `firstWildcard(identifiers)` 在 `issueACME` 创建订单**之前**识别 `*.` 前缀并分两步拦截：① 验证方式显式为 HTTP-01 时直接拒绝（「泛域名只能使用 DNS-01 验证」，不再走到 CA 才报 `no usable challenge`）；② 求解器就绪后若 `dns` 为空（dns-mng 未配置/未启用）同样直接拒绝，并给出「配置 dns-mng 或改用 DNS-01（手动解析）」的可操作指引。**RFC 8555 §7.1.4 授权识别**：CA 下发的泛域名授权中 `identifier.value` 为基础域名且标记 `wildcard: true`，反序列化授权时显式解析 `Wildcard bool`，`pickSolvers` 按 `wildcard || strings.HasPrefix(value, "*.")` 判定求解器，杜绝泛域名授权误选 HTTP-01；求解器候选为空时统一提示明确中文文案。**跨机制回退守卫**：在 `obtainCertificate` 发生 `challengeFailedError` 时，若 DNS-01 失败且订单包含泛域名，因剩余的 HTTP-01 无法验证泛域名授权，系统立即终止重试并如实上抛真实错误，禁止重新下单烧毁 CA 配额。前端签发表单按同一判据（`wildcardDetected`）禁用 HTTP-01 单选项、在验证方式说明处提示「已识别到泛域名」，并在已选 HTTP-01 又输入 `*.` 时自动退回「自动」；提交前再拦一次。自动模式（`""`）对混合域名仍按标识符逐个选路：普通域名 HTTP-01 优先，泛域名固定 DNS-01。
     - **RFC 8555 批量呈现、权威 NS 传播预检与统一延迟清理（Lego 模式）**：针对单域名与泛域名混合订单（如 `lizhixu.cn` 与 `*.lizhixu.cn`）共用相同 `_acme-challenge.<base>` FQDN 的场景，系统遵循 RFC 8555 最佳实践重构订单验证流程，彻底杜绝串行写入/删除导致的解析震荡：① **批量呈现（Batch Present）**：在通知 CA 之前，为订单内全部授权同时向 DNS 接口调用添加 TXT 记录（前置要求：dns-mng 的 present 须为追加语义、同一 FQDN 下多条不同值的 TXT 记录并存；若服务端以覆盖方式写入，传播预检会在通知 CA 之前失败，并在错误中提示覆盖可能，不消耗 CA 验证次数），收集全部清理闭包；② **权威 DNS 传播预检（Authoritative Propagation Check）**：呈现完成后，本地通过纯 Go 实现的 RFC 1035 UDP 客户端向上追溯并直连域名的权威 NS 服务器（UDP :53），**真实轮询**探测直到多数权威 NS 见到记录（严格多数，如 16 个 NS 至少 9 个命中；单节点命中不再放行——2026-11-05 ZeroSSL 实证：16 个 NS 之一 3 秒命中、CA 却因其余节点未同步而 pending 超时），再经公共解析器复核可见，方可通知 CA（总预算 `dns01PropagationCheckTimeout = 600s`（10 分钟）——按主流国内 DNS 服务商（阿里云/腾讯云 dnspod）NS 集群跨节点分钟级同步收敛、部分 NS 节点迟到或被过滤丢包的最慢实测场景设定：记录数秒内进服务商 API，但服务商默认 TTL 600 只作用于缓存解析器、管不住授权 NS 自身的跨节点同步延迟，等待窗口必须覆盖这类服务商；观察窗口统一对齐 10 分钟：后端权威 NS 传播预检 600s、前端 composable 任务轮询 300 次 × 2s = 10 分钟、前端管理表格完成轮询 120 次 × 5s = 10 分钟；窗口覆盖的是传播预检单项，多域名订单的 CA 逐授权轮询（每授权 10 分钟、顺序执行）还可能更久，窗口结束时证书中心与应用创建页/详情页编排三处均明示「仍在签发中、后台继续执行」而非谎报失败（`useCertIssuance` 返回 `in_progress` 状态位，调用方不得显示「签发失败」或诱导重试重复下单），列表与任务日志继续带回终态；阶梯式校验调度（`dns01PollSchedule`）：轮询探测采用先密后疏的阶梯间隔——0~60s 每 3 秒（密集探测快速命中秒级收敛的服务商）、60~180s 每 10 秒、180s 以后每 30 秒（长窗口平滑探测），在保障快速生效的同时彻底杜绝 10 分钟长窗口下的日志刷屏；单次探测整体预算 `dns01AttemptTimeout = 10s`、单条 UDP 查询读写上限 `dns01QueryTimeout = 3s`、首次检查防抖 `dns01PropagationMinWait = 2s`；主校验路径的 NS 与 NS IP 解析只做一次（失败诊断 `lookupAuthoritativeTXTValues` 会再发现一次 NS），轮询仅花在 TXT 查询上；每轮探测轮转 NS 顺序，避免单次预算被排头慢节点/被过滤节点占满、尾部 NS 永远排不上；无权威 NS 或全不可达时回退系统解析器并如实记录；系统解析器仅在两种情形下可作通过依据——未定位到权威 NS/全不可达，或权威 NS 全部应答但未返回任何 TXT 记录（CNAME 委托情形），有 TXT 记录在权威 NS 上时系统解析器绝不覆盖多数判定；公共解析器复核（`verifyPublicTXTPropagation`）：多数命中后，再用系统解析器查一次，外部递归视角可见才通知 CA（预算 `dns01PublicCheckTimeout = 3 分钟`、共享 10 分钟总预算，单次查询上限仍为 `dns01AttemptTimeout = 10s`）；阶段 1 已走系统解析器通过时复核与之一致、直接跳过）。**探测必须可观测**：每次探测（含命中与未命中及原因）逐条写入 `[挑战呈现]` 阶段日志，杜绝「一行开头 + 90 秒死寂 + 裸 `context deadline exceeded`」式假轮询——单条 UDP 丢包最多消耗 3 秒（查询级上限），不会吃掉整个剩余预算；每次探测以剩余时间与探测预算独立限时。**超时诊断**：预检超时的错误永远携带总等待时长、探测次数与最后一次未命中的具体原因（「DNS 已应答但尚未返回该 TXT 记录」= 正常传播中；「权威 NS 查询失败： …」= NS 不可达/丢包），区分「记录未生效」与「NS 联系不上」；多数未达时错误附最多 X/Y 个 NS 见到记录（部分同步诊断），公共复核超时另给独立诊断（「DNS 公共解析器校验超时」），与权威 NS 超时区分；外层 ctx 预算比总预算多留一个轮询间隔的余量，诊断性超时信息恒定跑赢裸 ctx 取消（预检链路自建 `context.Background()` 超时、未接父 ctx，服务关闭只能靠进程退出中断该等待）。预检超时则直接失败清理，绝不通知 CA 避免消耗验证失败次数；③ **统一触发与统一轮询**：确认两阶段传播预检通过后，再统一向 CA 逐个触发验证并轮询授权状态，CA 查询时可一次性命中全部 TXT 记录并直接转为 valid；④ **统一延迟清理（Deferred Cleanup）**：所有挑战临时凭据（DNS-01 TXT 记录与 HTTP-01 共享注册表）延迟保留至整个订单完全结束（CSR Finalize 及证书链下载完成）后，在 `defer` 阶段统一批量清理，避免提前删除导致 CA 后续验证节点查询失败。
     - **证书关键日志体系（ACME 签发、续期与验证日志链路）**：此前 ACME 签发/续期过程黑盒、首次签发失败信息丢弃、列表日志列仅有简单 Popover。为彻底解决上述问题，系统构建了贯穿内存、持久化与 Web UI 的全生命周期结构化日志体系：
       - **结构化日志缓冲与实时追踪机制（certLogger & liveLogs）**：每个证书操作拥有专属的内存 `certLogger`（上限 64KB，对齐应用构建日志规范，环形有界截断；带时间戳与标准阶段前缀 `[YYYY-MM-DD HH:mm:ss] [阶段] 具体说明...`，警告以 `[WARN:阶段]` 标识；同步流向服务端 `slog.Info/Warn`；私钥材料严格剥离，绝不写入普通日志）。`Hub` 维护 `liveLogs`（`sync.Map`），活跃的签发任务（`task_<16位hex>`）、续期中的证书（`crt_xxx`）与手动验证订单（`mord_xxx`）在执行期间注册其内存 logger，提供 `LiveLog(id)` 实时读取流，终态后注销并持久化至磁盘。
       - **ACME 全生命周期关键阶段标准打点**：覆盖 `[准备账户]`（Directory 获取、EAB 签名、账户注册/定位）、`[创建订单]`（提交 SAN 标识符与 Profile 协商）、`[挑战选择]`（匹配 HTTP-01 / DNS-01 / 手动 DNS）、`[挑战呈现]`（80 端口空闲时临时监听及冲突告警、面板自持 80（绑定域名）时写入共享挑战注册表交由面板 HTTP 栈代答 / dns-mng 批量下发 TXT 记录与权威 NS 传播预检 / 手动 DNS 本地探测预检结果）、`[CA验证]`（两阶段传播预检通过后统一向 CA 触发验证、轮询授权状态及 RFC 8555 problem JSON 详细错误提取）、`[清理挑战]`（订单完成后统一延迟清理：释放临时 80 端口并清理共享挑战注册表 / 批量移除 DNS TXT 记录）、`[生成CSR]`（生成 ECDSA P-256 私钥与 PKCS#10 CSR）、`[提交Finalize]`（提交 CSR 并等待订单就绪）、`[下载证书]`（拉取公钥链 PEM、解析叶子证书有效期与颁发者）、`[完成入库]`（落盘至证书存储及关联任务状态回写）、`[反代回推]`（触发 `onRenewed` 回调分发给各应用 Nginx 容器并热重载）。
-      - **任务化签发与日志持久化**：首次签发解耦为 `IssueTask` 任务机制，`POST /certs/issue` 异步受理后返回 `task_id`。任务创建先构造候选快照并原子写入 `<dataDir>/certs/tasks.json`，只有写入与 rename 成功后才提交内存状态；失败时返回错误、不启动后台任务，并保留原内存与磁盘内容。任务更新同样采用候选快照事务语义，持久化失败会保留旧状态并记录服务端错误。任务保留策略为**全部保留 `running`，终态仅保留按创建时间最新 30 条**，因此运行中任务较多时总数可超过 30；控制端启动时执行未决任务对账，将残留的 `running` 状态置为 `failed`（`服务重启，任务已中断`），杜绝前端永久死等。已签发证书每次续期/重新签发生成的全量日志持久化在 `<dataDir>/certs/logs/<crt_id>.log`；删除证书（`Delete`）时联动清理该日志文件；`Certificate` 元数据扩展 `last_log_at` 时间戳。
-      - **查询端点**：`GET /certs/:id/log`（优先读取活跃续期 `liveLogs`，无活跃任务回退读取落盘 `<crt_id>.log`）、`GET /certs/tasks`（查询最近签发任务列表，精简载荷）、`GET /certs/tasks/:taskID`（查询任务状态与完整执行日志，运行中叠加 live log），均为登录即可、只读免操作审计。Hub 级 `acmeMu` 串行保护自动签发、续期以及手动 DNS-01 下单/确认的实际 ACME 网络与挑战流程，避免仅锁 HTTP handler 却让后台任务并发竞争端口、挑战和 CA 限流。手动 DNS-01 的 `mord_*.log` 属于临时订单日志：订单过期、JSON 损坏或管理员取消时与订单 JSON 一并清理；成功确认产生的 `crt_*.log` 独立保留，不会被订单清理误删。
+      - **任务化签发与日志持久化**：首次签发解耦为 `IssueTask` 任务机制，签发接口（见 API.md「证书中心」）异步受理后返回 `task_id`。任务创建先构造候选快照并原子写入 `<dataDir>/certs/tasks.json`，只有写入与 rename 成功后才提交内存状态；失败时返回错误、不启动后台任务，并保留原内存与磁盘内容。任务更新同样采用候选快照事务语义，持久化失败会保留旧状态并记录服务端错误。任务保留策略为**全部保留 `running`，终态仅保留按创建时间最新 30 条**，因此运行中任务较多时总数可超过 30；控制端启动时执行未决任务对账，将残留的 `running` 状态置为 `failed`（`服务重启，任务已中断`），杜绝前端永久死等。已签发证书每次续期/重新签发生成的全量日志持久化在 `<dataDir>/certs/logs/<crt_id>.log`；删除证书（`Delete`）时联动清理该日志文件；`Certificate` 元数据扩展 `last_log_at` 时间戳。
+      - **查询**：证书执行日志、签发任务列表与单任务日志（见 API.md「证书中心」）均为登录即可、只读免操作审计。日志读取优先活跃续期 `liveLogs`，无活跃任务回退读落盘 `<crt_id>.log`；任务列表精简载荷，单任务含全量步骤日志、运行中叠加 live log。Hub 级 `acmeMu` 串行保护自动签发、续期以及手动 DNS-01 下单/确认的实际 ACME 网络与挑战流程，避免仅锁 HTTP handler 却让后台任务并发竞争端口、挑战和 CA 限流。手动 DNS-01 的 `mord_*.log` 属于临时订单日志：订单过期、JSON 损坏或管理员取消时与订单 JSON 一并清理；成功确认产生的 `crt_*.log` 独立保留，不会被订单清理误删。
 - **全生命周期管理**：部署历史、构建日志、健康检查探活失败自动保留旧版本（`-next`/`-prev` 滚动替换）、回滚、启停、AI 排障诊断，对所有来源的应用一致生效。
   - **部署取消与强制重新部署**：
     - **取消执行（Context 级全链路熔断）**：活跃部署由 `Engine` 记录其 `context.CancelFunc`、Agent 通道与正在构建的替换容器名（`-next`）。调用 `CancelDeployment` 时立即触发 context 取消，各阶段边界（代码拉取、Docker 构建、启动新容器、健康探活、swap 切换前）检测 `ctx.Done()` 并提前熔断；
     - **安全清理（零停机保障）**：若新容器（`watchman-app-<appID>-next`）已被拉起，取消时异步调用 `removeContainer` 仅清理半拉起容器，在线服务容器全程不受影响；部署记录状态置为 `cancelled`，记录 `CancelledBy` 操作员与 `FinishedAt`；
-    - **强制重新部署（`force=true`）**：在已有部署执行时，`POST /apps/:id/deploy` 支持 `force=true`（Query 或 JSON Body），服务端自动先终止当前在途任务、释放槽位并立即启动全新部署，前端弹窗确认「当前已有部署任务正在进行中，继续将终止当前任务并启动全新部署」；
+    - **强制重新部署（`force=true`）**：在已有部署执行时，部署接口（见 API.md「应用中心」）支持 `force=true`（Query 或 JSON Body），服务端自动先终止当前在途任务、释放槽位并立即启动全新部署，前端弹窗确认「当前已有部署任务正在进行中，继续将终止当前任务并启动全新部署」；
     - **历史记录与多点控制**：顶部操作栏展示醒目「终止部署」按钮与二次确认；部署历史列表针对 `queued`/`building`/`deploying` 记录提供行内「停止」按钮；部署状态 Tag 增加「已取消」（warning 琥珀色），提交信息列展示取消人。
     - **部署历史页签（重做）**：独立工具栏（共 N 次部署 / N 个进行中 / 最近一次时间，右侧「刷新」与「重新部署」，空态给「立即部署」CTA）+ 标准表格布局（`NCard.table-flex-fill` + `flex-height` NDataTable + 独立 `.table-pagination-bar` NPagination，符合 §8.2）。状态列对非终态记录带转圈；触发列第二行显示发起人；耗时列对进行中记录按当前时间滚动累加；开始时间统一走 `fmtDateTime`（面板时区，零值时间显示 `-`）；操作列 `fixed: 'right'`。**自动刷新**以「列表/最新记录里是否存在 queued/building/deploying」为依据每 2 秒静默拉一次（`loadDeployments(true)` 不点亮 loading、失败不弹错），全部落终态即停表，并有 30 分钟有界窗口防止脏记录永久轮询；不再依赖 `status.deploying`——前置检查类失败 1 秒内落终态，5 秒状态轮询可能一次都没看到“部署中”，新记录会永远停在“排队”。换页/改每页条数显式重新请求：改条数会把页码重置为 1，若只 `watch(page)`，用户本来就在第 1 页时不会触发任何请求。**布局根因**：此前 `NDataTable flex-height` 直接放进自建 flex 列，表格自身没有 `flex: 1`，`flex-height` 拿到的可用高度是 0，页签里只剩表头和分页条、所有记录都渲染在 0 高滚动区里——这是「部署历史完全没法用」的直接原因。
-    - **部署日志弹窗**：列表接口不返回日志正文（`build_log` 单条上限 64KB，20 条 × 2 秒轮询会变成兆级流量），打开弹窗时按 depID 单独取全文；运行中的记录随上述 2 秒轮询刷新（`GET /apps/:id/deployments/:depID` 在记录尚未落终态时叠加引擎内存中的实时构建缓冲 `Engine.LiveLog`，任务结束移除缓冲，以记录里的终态 `build_log` 为准；`logBuffer` 读写加锁，API 读取与管线写入不再有数据竞争）。弹窗头部展示状态 Tag、触发方式与发起人、耗时、开始时间；提供「自动跟随」（新内容贴底，可关闭）、刷新、复制；构建中尚无输出时提示「等待构建输出…」。
+    - **部署日志弹窗**：列表接口不返回日志正文（`build_log` 单条上限 64KB，20 条 × 2 秒轮询会变成兆级流量），打开弹窗时按 depID 单独取全文；运行中的记录随上述 2 秒轮询刷新（单条部署记录接口在记录尚未落终态时叠加引擎内存中的实时构建缓冲 `Engine.LiveLog`，任务结束移除缓冲，以记录里的终态 `build_log` 为准；`logBuffer` 读写加锁，API 读取与管线写入不再有数据竞争）。弹窗头部展示状态 Tag、触发方式与发起人、耗时、开始时间；提供「自动跟随」（新内容贴底，可关闭）、刷新、复制；构建中尚无输出时提示「等待构建输出…」。
     - **取消与终态加固**：Compose 部署取消时自动 `compose down` 清理已上线栈（raw_compose 与 git-compose 两分支；清理失败时记录 Error 明确标注栈仍在运行，请手动 down，禁止静默记干净取消）；部署记录终态守卫——success/failed/cancelled 一旦写入，任何后续阶段/取消/成功路径不得重写（此前探活取消可被 fail 覆盖丢 `CancelledBy`、swap 后取消可翻 success）；`-next` 容器名带 depID 后缀（`watchman-app-<id>-next-dep_<8字符>`，新旧两 run 容器名必然不同，旧管线清理删不掉新容器，purge 与迁移清理同步覆盖新旧两种命名）；swap 前与 `finishDeploySuccess` 入口查应用存活，已删则删 `-next` 并 fail（不建中继）；`deployApp` 补 engine nil 守卫（503）。
-  - **应用升级（`POST /api/v1/apps/:id/upgrade`）**：详情页「升级」按钮的后端入口，与重新部署共用同一条单槽位部署队列与部署记录（`trigger=upgrade`，审计 `app_upgrade`/high），拉取步骤写进部署日志。按来源分：`image`/`template` 先 `docker pull` 解析后的镜像再走正常滚动替换；`raw_compose` 在写好 `compose.yaml` 后先 `docker compose pull` 再 `up -d`；`git` 无额外拉取步骤——`fetch` + 构建本身就是刷新（构建不带 `--pull`，基础镜像仍用缓存）。**`git` 来源应用详情页不显示「升级」按钮**：对这类应用升级与重新部署完全等价（push 自动部署或点重新部署即刷新），摆两个按钮会误导；按钮仅 `image`/`template`/`raw_compose` 显示。拉取失败即本次部署失败、旧容器原样保留；部署进行中再点升级返回 409（按钮在部署中禁用，无 force 语义）。v1 不做镜像 digest 前后比对：固定 tag 拉取无变化时仍会走一次完整重新部署。
-  - **部署 Docker 前置检查**：管线在 Agent 在线校验通过后、拉取代码/构建之前，先对目标主机执行 Docker 可用性检查（`command -v docker` 与 `docker info` 两段、退出码区分，复用反代保障的分类口径）：未安装 → 快速失败「目标主机未安装 Docker：请先在主机详情 Docker 页一键安装 Docker 后重试」；daemon 未起 → 「目标主机 Docker 服务未运行：请先启动 Docker 服务后重试」；检查本身传输失败（Agent 断连/exec 超时）不归类为 Docker 问题。覆盖全部来源（git/镜像/模板/Compose 终点都是 docker），此前缺失该检查时，无 Docker 主机会一路跑到起容器才以裸 `docker: command not found`（exit 127）失败。创建即部署同样走该检查，失败时经 `deploy_warning` 带出同一文案。不覆盖：`docker compose` 插件缺失（`docker info` 通过但 compose 子命令不存在）仍在 Compose 步骤以原错误失败，属后续缺口。**前端安装提醒**：光给文字提示不够便捷，`AppDetail.vue` 在最新一次部署死于“未安装 Docker”时给两条路——详情页眉与正文之间的常驻警告横幅（一键安装 Docker 按钮）与本页会话内发起的部署刚失败时的自动弹窗（问是否安装，安装中禁关、装完给「立即重新部署」）；安装走现有 `POST /hosts/:id/docker/install-script`（服务端内置官方脚本，前端 330 秒超时）。识别靠部署记录 `error` 含固定文案“未安装 Docker”（记录无 error_code 字段，改后端文案须同步前端）；提醒状态取最新一条记录（单独拉第 1 页第 1 条，不依赖历史页签当前页码）；部署结束（部署中→非部署中）时补刷一次历史与最新记录，否则 1 秒内落终态的快速失败永远刷不出来。
-  - **创建即部署**：`POST /apps` 持久化成功后立即 `engine.StartDeployment(app, "create", …)` 入队首轮部署（`Deployment.trigger` 新增 `create`，详情页展示为「创建」），响应附 `deployment`；引擎忙/启动失败不失败创建本身，仅附 `deploy_warning`（应用记录合法，可手动重试）。前端创建页提示「已创建，正在部署…」，详情页既有轮询自然展示 排队→构建→发布→成功/失败 与日志。
-  - **应用列表**：列为 应用名称 / 服务器 / 来源 / 当前版本 / 状态 / 最近部署 / 最近更新 / 操作。「服务器」由前端并行 `listHosts()` 按 `host_id → hostname` 映射（`/apps` 不 join 主机，主机接口失败不阻断应用列表）；「来源」替代原只对 Git 有意义的 `repo_url @ branch` 列（git → 仓库+自动部署标记、image → 镜像、template → 模板、raw_compose → Docker Compose）；「最近更新」取 `Application.updated_at`。右上角入口文案「创建应用」（原「链接 Git 应用」）。
+  - **应用升级**（见 API.md「应用中心」）：详情页「升级」按钮的后端入口，与重新部署共用同一条单槽位部署队列与部署记录（`trigger=upgrade`，审计 `app_upgrade`/high），拉取步骤写进部署日志。按来源分：`image`/`template` 先 `docker pull` 解析后的镜像再走正常滚动替换；`raw_compose` 在写好 `compose.yaml` 后先 `docker compose pull` 再 `up -d`；`git` 无额外拉取步骤——`fetch` + 构建本身就是刷新（构建不带 `--pull`，基础镜像仍用缓存）。**`git` 来源应用详情页不显示「升级」按钮**：对这类应用升级与重新部署完全等价（push 自动部署或点重新部署即刷新），摆两个按钮会误导；按钮仅 `image`/`template`/`raw_compose` 显示。拉取失败即本次部署失败、旧容器原样保留；部署进行中再点升级返回 409（按钮在部署中禁用，无 force 语义）。v1 不做镜像 digest 前后比对：固定 tag 拉取无变化时仍会走一次完整重新部署。
+  - **部署 Docker 前置检查**：管线在 Agent 在线校验通过后、拉取代码/构建之前，先对目标主机执行 Docker 可用性检查（`command -v docker` 与 `docker info` 两段、退出码区分，复用反代保障的分类口径）：未安装 → 快速失败「目标主机未安装 Docker：请先在主机详情 Docker 页一键安装 Docker 后重试」；daemon 未起 → 「目标主机 Docker 服务未运行：请先启动 Docker 服务后重试」；检查本身传输失败（Agent 断连/exec 超时）不归类为 Docker 问题。覆盖全部来源（git/镜像/模板/Compose 终点都是 docker），此前缺失该检查时，无 Docker 主机会一路跑到起容器才以裸 `docker: command not found`（exit 127）失败。创建即部署同样走该检查，失败时经 `deploy_warning` 带出同一文案。不覆盖：`docker compose` 插件缺失（`docker info` 通过但 compose 子命令不存在）仍在 Compose 步骤以原错误失败，属后续缺口。**前端安装提醒**：光给文字提示不够便捷，`AppDetail.vue` 在最新一次部署死于“未安装 Docker”时给两条路——详情页眉与正文之间的常驻警告横幅（一键安装 Docker 按钮）与本页会话内发起的部署刚失败时的自动弹窗（问是否安装，安装中禁关、装完给「立即重新部署」）；安装走现有的一键安装 Docker 接口（见 API.md「Docker」，服务端内置官方脚本，前端 330 秒超时）。识别靠部署记录 `error` 含固定文案“未安装 Docker”（记录无 error_code 字段，改后端文案须同步前端）；提醒状态取最新一条记录（单独拉第 1 页第 1 条，不依赖历史页签当前页码）；部署结束（部署中→非部署中）时补刷一次历史与最新记录，否则 1 秒内落终态的快速失败永远刷不出来。
+  - **创建即部署**：创建应用接口（见 API.md「应用中心」）持久化成功后立即 `engine.StartDeployment(app, "create", …)` 入队首轮部署（`Deployment.trigger` 新增 `create`，详情页展示为「创建」），响应附 `deployment`；引擎忙/启动失败不失败创建本身，仅附 `deploy_warning`（应用记录合法，可手动重试）。前端创建页提示「已创建，正在部署…」，详情页既有轮询自然展示 排队→构建→发布→成功/失败 与日志。
+  - **应用列表**：列为 应用名称 / 服务器 / 来源 / 当前版本 / 状态 / 最近部署 / 最近更新 / 操作。「服务器」由前端并行 `listHosts()` 按 `host_id → hostname` 映射（应用列表接口不 join 主机，主机接口失败不阻断应用列表）；「来源」替代原只对 Git 有意义的 `repo_url @ branch` 列（git → 仓库+自动部署标记、image → 镜像、template → 模板、raw_compose → Docker Compose）；「最近更新」取 `Application.updated_at`。右上角入口文案「创建应用」（原「链接 Git 应用」）。
   - **`updated_at` 语义**：`Application.UpdatedAt` 在任何持久化变更时推进，写入点唯一——`Store.UpdateApp` 内统一打点（覆盖配置编辑、部署成功/失败收尾、反代绑定/解绑、组网中继同步），`PutApp` 在空值时以 `CreatedAt` 播种；时间戳单调（`nextUpdatedAt`，时钟回拨不回退）。历史 `apps.json` 缺该字段时，加载期回填 `max(CreatedAt, LastDeployAt)`，老应用不显示空白。`UpdateApp` 为事务写入：在候选副本上执行变更、`saveAppsLocked` 成功后才替换内存记录，失败回滚内存并返回错误，杜绝「内存已改、磁盘没写」的分叉。
-  - **`PUT /apps/:id` 为部分更新**：改用独立 `updateAppReq`，全部可变字段为 `*T` 指针——未提交的键保持原值，显式 `false`/`""`/`{}` 才清空。此前复用 `createAppReq` 会无条件覆盖 `auto_deploy`/`auth_vault_id`/`healthcheck_url`/`mesh_forward_*`，导致「只保存环境变量」或「只保存 Compose」静默清空这些配置（已修复）。组网转发按「存储值 + 本次改动」的有效配置校验，且仅当请求触及任一 `mesh_forward_*` 字段时才校验（无关编辑不会因入口主机离线而失败）；`mesh_forward_enabled=false` 时坐标清空。**镜像地址仅 `source_type=image` 可改**（模板镜像由模板解析、Git/Compose 走各自构建产物，其余来源 400）；`host_id`/`source_type`/`container_name` 不可改。前端 `AppDetail.vue` 概览页签「编辑配置」弹窗（名称/镜像/健康检查/端口映射/挂载卷，仅提交差异字段，已部署应用可「保存并重新部署」），环境变量页签改为行式编辑器（支持 `{{ vault:… }}` 原文引用、模板来源提示变量会被模板参数重渲染）；**值首尾成对的引号在展示时剥除**（`syncEnvRows` 经 `stripEnvQuotes`），口径与后端解析 `.env.example` / Dockerfile `ENV`（`parseEnvFile`/`parseEnvPairs` 的 `strings.Trim(v, "'\"")`）一致——`.env` 风格粘贴（`KEY="value"`）带进来的引号不属于值本身，不应在编辑器里占位；无引号时不改动值（不清洗两侧空格）。仅在载入表单时剥除，用户重新输入并保存的引号仍按原文入库。**显式清空真正生效**：`dockerfile`/`build_context`/`build_timeout_sec`/`compose_content`/`build_type` 五字段的显式空值此前被非空守卫静默忽略（文档写「显式清空」而代码不清空），现已改为指针非 nil 即赋值（`build_timeout_sec` 显式 0 入库后由管线按 900 默认执行）。
+  - **应用更新接口为部分更新**（见 API.md「应用中心」）：改用独立 `updateAppReq`，全部可变字段为 `*T` 指针——未提交的键保持原值，显式 `false`/`""`/`{}` 才清空。此前复用 `createAppReq` 会无条件覆盖 `auto_deploy`/`auth_vault_id`/`healthcheck_url`/`mesh_forward_*`，导致「只保存环境变量」或「只保存 Compose」静默清空这些配置（已修复）。组网转发按「存储值 + 本次改动」的有效配置校验，且仅当请求触及任一 `mesh_forward_*` 字段时才校验（无关编辑不会因入口主机离线而失败）；`mesh_forward_enabled=false` 时坐标清空。**镜像地址仅 `source_type=image` 可改**（模板镜像由模板解析、Git/Compose 走各自构建产物，其余来源 400）；`host_id`/`source_type`/`container_name` 不可改。前端 `AppDetail.vue` 概览页签「编辑配置」弹窗（名称/镜像/健康检查/端口映射/挂载卷，仅提交差异字段，已部署应用可「保存并重新部署」），环境变量页签改为行式编辑器（支持 `{{ vault:… }}` 原文引用、模板来源提示变量会被模板参数重渲染）；**值首尾成对的引号在展示时剥除**（`syncEnvRows` 经 `stripEnvQuotes`），口径与后端解析 `.env.example` / Dockerfile `ENV`（`parseEnvFile`/`parseEnvPairs` 的 `strings.Trim(v, "'\"")`）一致——`.env` 风格粘贴（`KEY="value"`）带进来的引号不属于值本身，不应在编辑器里占位；无引号时不改动值（不清洗两侧空格）。仅在载入表单时剥除，用户重新输入并保存的引号仍按原文入库。**显式清空真正生效**：`dockerfile`/`build_context`/`build_timeout_sec`/`compose_content`/`build_type` 五字段的显式空值此前被非空守卫静默忽略（文档写「显式清空」而代码不清空），现已改为指针非 nil 即赋值（`build_timeout_sec` 显式 0 入库后由管线按 900 默认执行）。
   - **挂载卷备份与恢复**：应用挂载卷（单容器应用声明卷 `Application.Volumes` 及 Docker Compose 运行时挂载卷）补齐卷数据全生命周期管理，全面支持单容器与 Docker Compose 应用、整应用多卷原子快照、受管主机本地存储与 S3 对象存储双引擎、三种一致性模式及跨主机纯净回滚。实现位于 `server/internal/apps/volbackup.go`（引擎与 `VolumeStore`）、`volcompose.go`（Compose 卷发现与生命周期调度）与 `handlers_volbackup.go`（HTTP 面）：
     - **卷形态与 Compose 全面覆盖**：支持单容器应用 bind mount（`/opt/apps/xxx/data:/data`）与 Docker 具名卷（`volname:/data`）；全面支持 `raw_compose` 与 `git+compose` 编排应用——动态扫描匹配 Compose 项目（`com.docker.compose.project=watchman-<appID>`）的全部具名卷（`docker volume ls`）与容器运行时 Mounts（`docker inspect`），自动剔除 `/etc/resolv.conf`、`/etc/hostname`、`docker.sock` 等系统内部挂载，精确提取业务挂载卷及其所属 Compose 服务名称（`com.docker.compose.service`）。`parseVolumeSpec` 兼容 Windows 盘符路径（`C:\data:/data`）；`..` 穿越与空路径一律拒绝。
     - **整应用多卷原子快照模型**：备份归档采用整应用多卷快照设计，一次备份任务同时捕获该应用当前生效的全部挂载卷（亦支持按需选择指定卷子集），生成一份全局唯一的应用级快照归档（`vbk_<archiveID>.tar.gz`）。归档包内包含统一元数据描述文件 `manifest.json`（记录 AppID、快照 ID、各卷规格与宿主/容器对应路径、哈希及创建时间）与各卷子目录 `volumes/vol_0/`、`volumes/vol_1/` 等；主机打包采用符号链接解引用技术（`ln -s` + `tar -czhf`），零复制避免打包前产生双倍磁盘占用。跟随是全量的：卷内软链无论指向卷内还是卷外都会被解引用打进归档，卷内若有指向宿主敏感路径的软链，其内容同样会进入归档，备份前需确认卷内无越界软链。恢复支持整应用一键原子回滚（单次停机一次性覆盖全部卷），亦支持选择性单卷提取恢复。
@@ -240,19 +241,19 @@
     - **三种一致性模式（Consistency Modes）**：发起备份支持三种一致性级别：① `online`（在线热备，默认）：容器不间断运行，适用于无持续大流量写入的静态或日志卷；② `pause`（写暂停）：打包前调用 `docker pause` 或 `docker compose pause` 挂起容器写入，快速打包后立即在 `defer` 中执行 `unpause` 恢复，消除文件切片写入风险；③ `stop`（停机冷备）：调用 `docker stop` 或 `docker compose stop` 安全停机，打包完成后在 `defer` 中自动启动容器，为数据库等强事务一致性场景提供最严谨的备份保障。Compose 应用启停与暂停统一使用带项目名前缀 `-p watchman-<appID>` 的标准 Compose 编排命令。
     - **恢复语义与纯净回滚（Clean Restore）**：恢复前校验归档完整与 SHA256 哈希（S3 归档先下载至暂存；本地归档直接校验），校验失败不产生停机；状态判定为 fail-closed，明确输出运行态后才执行安全停机（Compose 执行 `docker compose stop`，单容器执行 `docker stop`）。恢复前自动在受管主机生成 `<id>.pre-restore.tar.gz` 安全副本；支持「清空现有卷目录残留文件（纯净快照回滚）」（`clean_restore: true`，默认勾选）：在解压前清空卷目录内非隐藏文件（保留宿主根目录及挂载点 inode，严防破坏 Docker 容器内挂载映射），彻底消除备份后新增的脏文件残留；解压时根据归档内容自动识别格式——若包含 `manifest.json` 则提取对应卷子目录（`--strip-components=2 volumes/vol_<i>`）；未包含的裸 tar 按上传识别时判定的布局解包：顶层目录与目标卷容器/宿主基名一致时去一层包装目录、条目全在完整容器路径之下时按路径深度去层，其余平铺解包（判定只在布局无歧义且扫描完整时才去层，扁平、混杂或单个顶层文件的归档保持原样解压，杜绝静默丢文件；去层数随确认落到归档记录的 `strip_components` 字段、恢复时照此解包，旧记录无该字段时按 0 处理即原样解包）。解包完成后由具名返回值及 `defer` 保证自动拉起容器——恢复前在运行的应用重启，恢复前停着的应用在解包成功后同样拉起（拉起失败则恢复记失败，不报假成功）；解包失败时停着的应用保持停止、其安全副本仍可回滚；执行结果写回 `last_restore_*` 供回溯。跨主机迁移支持：解除旧实现对主机 ID 必须一致的硬限制，应用迁移到新主机后，历史 S3 归档与上传归档可直接在新主机上对齐挂载点并恢复。
     - **同应用串行与互斥**：`volMu/volBusy` 按 `appID` 互斥，同一应用的备份、恢复、删除严格互斥（409「该应用已有备份或恢复任务在执行」）；部署与迁移管道与卷操作双向互斥（互查槽位）；purge 应用时全程抢占卷槽，联动清理该应用全部本地与 S3 归档及对应任务。
-    - **下载与前端交互**：只读端点 `GET /api/v1/apps/:id/volume-backups/:archiveID/download` 对 S3 归档返回 302 预签名重定向，对本地存储归档通过 Agent RPC 文件流读取直接流式输出给浏览器，均支持导航带 JWT `?token=` 下载。应用详情页「数据卷备份」Tab 完整呈现三张规整卡片（应用挂载卷、备份归档记录、定时备份计划）：右上角按钮分别唤起「手动数据卷备份」模态框与「离线备份上传与恢复」模态框，主界面专注资产与历史表格；恢复快照模态框支持选择恢复全部或指定卷子集、纯净回滚开关；备份任务管理以及归档历史分页表格显示整应用快照标签与展开浮层、一致性模式、本地/S3 存储标识、大小、SHA256 复制、恢复与下载操作。
-    - **离线备份上传与恢复（上传识别 → 核对配对 → 内联二次确认 → 提交恢复）**：详情页「数据卷备份」提供「离线备份上传与恢复」模态框（由备份归档记录卡片右上角「离线导入恢复」按钮唤起），支持不选目标卷直接上传——服务端自动识别每份文件该恢复到哪个挂载卷，操作员核对/改选后才执行恢复（恢复是清空式覆盖，识别结果必须先过目，不做盲自动恢复）。**第一步 `POST /api/v1/apps/:id/volume-backups/upload-scan`**（multipart，多个 `file` 部件，一次最多 10 份、单份 2GB 上限，多余的非 file 字段静默丢弃；Windows 主机 400）：每个文件经 `hashingReader` 流式落面板暂存目录的同时由服务端计算 SHA256（不再依赖客户端填写），随后解开 tar 客观读取内容做自动识别——gzip 魔数嗅探自动适配压缩/未压缩（`docker cp` 管道导出的裸 `.tar` 同样可用），归档含顶层 `manifest.json` 即判为系统导出的多卷快照（`Snapshot=true`），按清单以 VolumeSpec 或 ContainerPath 匹配当前候选卷（`match=manifest`）；否则为普通数据包，按容器路径命中/前缀=`container_path`、文件名特征与基名=`filename`、顶层目录与基名=`basename`（去除前导点等标点规范化）综合评分，命中分 ≥20 的唯一最高分则 `unique` 预选；同一轮识别还按归档顶层布局判定裸 tar 解包的去层数（顶层目录与目标卷基名一致去一层、条目全在完整容器路径之下按路径深度去层，其余不去层，只在布局无歧义且扫描完整时判定），判定结果随提交落到归档记录、恢复时照此解包；单个弱命中（分数不足 20，如文件名包含 18 分、宿主基名 15 分）与多个同分候选均为 `ambiguous` 待人工确认；应用仅单个可写卷时兜底为 `single_candidate`（`unique` 预选）、其余 `none`。候选卷来源：单容器应用取声明的 `Application.Volumes`（过滤 `ro` 只读卷），Compose 应用优先取在线 Agent 动态挂载发现、Agent 离线或服务停止时自动回退至静态解析 `ComposeContent` YAML（`staticComposeVolumes`）；动态发现失败且静态解析无结果时返回错误而非空列表：`GET /apps/:id/volumes` 返回 500，离线导入的 `upload-scan`/`upload-commit` 返回 503，归档列表仍保持可读并以 `volumes_error` 字段附带中文原因、前端就地提示（调用方不再把失败误读为无挂载卷或卷不在白名单），同时自动过滤 `/etc/localtime`、`/etc/timezone`、`docker.sock` 等系统只读与内部挂载；相对路径 bind mount（`./data`、`.\data`、`.`、`../shared`）正确识别为 bind 挂载并按 compose 文件所在目录解析宿主路径（解析结果必须仍位于 `/var/lib/watchman/apps` 之内，逃出该应用根目录的相对 bind 卷直接丢弃，防止成为清空式恢复的 `rm -rf` 目标）；long-form 里 `tmpfs` 等非 bind/非 volume 类型与无 source 的匿名卷直接跳过（不产生畸形候选）。识别有资源护栏：条目数、目录数、manifest 大小与总耗时预算上限，超限只截断识别用的元数据采集、不阻断导入（快照清单由备份脚本写在归档首部，正常产物必在截断前读到，大归档不会因条目多而被拒）；但根级 `manifest.json` 损坏/超限/缺少卷清单，或清单合法却找不到 `volumes/` 卷目录时**整批 400 拒绝**并回滚暂存文件（fail-closed，不按裸 tar 降级）——扫描侧与主机端恢复脚本对「是否快照」的判定必须一致，否则非快照归档会被按 `volumes/vol_0` 解到错误目标卷；恢复脚本的快照探测同时接受 `manifest.json` 与 `./manifest.json`。响应逐文件返回 `{archive_id, filename, size, sha256, snapshot, top_dirs, manifest_volumes, match, matched[]}`；暂存登记进内存扫描注册表（`stagedScan`），TTL 2 小时与下载 token 一致、每次 scan 调用时顺带清扫过期条目与文件，面板重启即失效。任一文件无法识别（非 tar/损坏）整批 400 并回滚已暂存文件。**第二步 `POST /api/v1/apps/:id/volume-backups/upload-commit`**（JSON `{pairs:[{archive_id, specs[]}]}`，一次最多 10 对）：前置校验顺序 Windows→卷槽位(409)→部署中(409)→Agent 在线(503)→面板域名推导下载地址(400，拒绝请求 Host)；先对全部配对校验、全部通过才消费任何扫描登记（被拒的提交不破坏任何已上传文件，可改选后重试）——未知/已失效/已被消费的 archive_id 410「请重新上传识别」、specs 必须全部落在应用候选卷白名单内（支持按原相对规格、绝对规格或容器目标路径匹配，拒绝任意宿主目录写入）、空选择 400（含快照，杜绝落库阶段 `chosen[0]` 越界）、非快照文件只能选一个目标、快照所选卷必须存在于其 manifest、同一挂载卷在一次导入中只能出现一次、同一 `archive_id` 被重复引用时 Phase A 前置 400（不白白作废整批暂存）、具名卷的宿主挂载点在提交时经 Agent 现查（bind 直接取声明源路径）。快照记录**保留 manifest 全量卷顺序**（tar 按 `volumes/vol_<Index>` 位置解包，选择子集只经逐条 `specs` 过滤表达、绝不重排序号，否则会解错卷），被选中的条目改写为应用当前坐标（VolumeSpec/HostPath/ContainerPath），未选条目保留原值仅被过滤。校验通过后逐对创建 `VolumeArchive`（`Source=upload`、`Status=uploaded`、SHA256 取服务端计算值）并签发一次性下载 token，202 返回 `archive_ids`（`archive_id` 为首个，兼容单目标调用方）。**整批原子语义沿用批量恢复核心**：全部文件经 Agent 回拉到主机 staging 并按服务端 SHA256 硬校验（无 SHA 时才回落 `tar -tf` 探测）之后才停机——任一文件拉取或校验失败整批取消、失败目标记录真实原因、其余目标记录「批次导入已取消」未做任何改动；随后一次停机、逐对 安全副本→清空残留→解包（含 manifest 的按 `volumes/vol_<i>` 提取、无 manifest 的整包解压）、一次（重）启动；停机后单对失败只标记该对、其余照常；结果逐对写回 `last_restore_*`，面板暂存文件与 token 无论成败在批次终态统一销毁。审计：`app_volume_upload_scan`（medium）/`app_volume_upload_restore`（high）。前端交互：多选上传控件一次选多份备份文件（accept `.tar/.tar.gz/.tgz`），点「上传并识别」后逐文件成行展示文件名、大小与识别状态标签（快照·内含 N 个卷 / 已识别 / 识别到多个候选，请选择 / 识别到 1 个弱匹配候选，请确认选择 / 未能识别，请选择目标卷）；快照行以复选框组列出 manifest 内匹配到的卷（可只勾一部分），普通行以目标卷下拉单选；仅 `manifest`/`unique` 自动预填，`ambiguous`/`none` 留空待人工选择；跨行不得重复选同一卷、每行至少一个有效目标才允许进入二次确认；二次确认在弹窗页脚就地展开（说明会停容器、覆盖卷数据、失败整批取消），点「确认恢复」才提交，确认态期间配对控件只读且任何配对变更都退回核对步骤（弹窗布局与二次确认规范见 DESIGN.md §9.17）；提交后清空识别区并按 `archive_ids` 轮询归档历史展示各自最近恢复结果。
+    - **下载与前端交互**：归档下载接口（见 API.md「应用中心：挂载卷备份」）对 S3 归档返回 302 预签名重定向，对本地存储归档通过 Agent RPC 文件流读取直接流式输出给浏览器，均支持导航带 JWT `?token=` 下载。应用详情页「数据卷备份」Tab 完整呈现三张规整卡片（应用挂载卷、备份归档记录、定时备份计划）：右上角按钮分别唤起「手动数据卷备份」模态框与「离线备份上传与恢复」模态框，主界面专注资产与历史表格；恢复快照模态框支持选择恢复全部或指定卷子集、纯净回滚开关；备份任务管理以及归档历史分页表格显示整应用快照标签与展开浮层、一致性模式、本地/S3 存储标识、大小、SHA256 复制、恢复与下载操作。
+    - **离线备份上传与恢复（上传识别 → 核对配对 → 内联二次确认 → 提交恢复）**：详情页「数据卷备份」提供「离线备份上传与恢复」模态框（由备份归档记录卡片右上角「离线导入恢复」按钮唤起），支持不选目标卷直接上传——服务端自动识别每份文件该恢复到哪个挂载卷，操作员核对/改选后才执行恢复（恢复是清空式覆盖，识别结果必须先过目，不做盲自动恢复）。**第一步 上传识别接口**（见 API.md「应用中心：挂载卷备份」）（multipart，多个 `file` 部件，一次最多 10 份、单份 2GB 上限，多余的非 file 字段静默丢弃；Windows 主机 400）：每个文件经 `hashingReader` 流式落面板暂存目录的同时由服务端计算 SHA256（不再依赖客户端填写），随后解开 tar 客观读取内容做自动识别——gzip 魔数嗅探自动适配压缩/未压缩（`docker cp` 管道导出的裸 `.tar` 同样可用），归档含顶层 `manifest.json` 即判为系统导出的多卷快照（`Snapshot=true`），按清单以 VolumeSpec 或 ContainerPath 匹配当前候选卷（`match=manifest`）；否则为普通数据包，按容器路径命中/前缀=`container_path`、文件名特征与基名=`filename`、顶层目录与基名=`basename`（去除前导点等标点规范化）综合评分，命中分 ≥20 的唯一最高分则 `unique` 预选；同一轮识别还按归档顶层布局判定裸 tar 解包的去层数（顶层目录与目标卷基名一致去一层、条目全在完整容器路径之下按路径深度去层，其余不去层，只在布局无歧义且扫描完整时判定），判定结果随提交落到归档记录、恢复时照此解包；单个弱命中（分数不足 20，如文件名包含 18 分、宿主基名 15 分）与多个同分候选均为 `ambiguous` 待人工确认；应用仅单个可写卷时兜底为 `single_candidate`（`unique` 预选）、其余 `none`。候选卷来源：单容器应用取声明的 `Application.Volumes`（过滤 `ro` 只读卷），Compose 应用优先取在线 Agent 动态挂载发现、Agent 离线或服务停止时自动回退至静态解析 `ComposeContent` YAML（`staticComposeVolumes`）；动态发现失败且静态解析无结果时返回错误而非空列表：挂载卷清单接口（见 API.md「应用中心」）返回 500，离线导入的两步返回 503，归档列表仍保持可读并以 `volumes_error` 字段附带中文原因、前端就地提示（调用方不再把失败误读为无挂载卷或卷不在白名单），同时自动过滤 `/etc/localtime`、`/etc/timezone`、`docker.sock` 等系统只读与内部挂载；相对路径 bind mount（`./data`、`.\data`、`.`、`../shared`）正确识别为 bind 挂载并按 compose 文件所在目录解析宿主路径（解析结果必须仍位于 `/var/lib/watchman/apps` 之内，逃出该应用根目录的相对 bind 卷直接丢弃，防止成为清空式恢复的 `rm -rf` 目标）；long-form 里 `tmpfs` 等非 bind/非 volume 类型与无 source 的匿名卷直接跳过（不产生畸形候选）。识别有资源护栏：条目数、目录数、manifest 大小与总耗时预算上限，超限只截断识别用的元数据采集、不阻断导入（快照清单由备份脚本写在归档首部，正常产物必在截断前读到，大归档不会因条目多而被拒）；但根级 `manifest.json` 损坏/超限/缺少卷清单，或清单合法却找不到 `volumes/` 卷目录时**整批 400 拒绝**并回滚暂存文件（fail-closed，不按裸 tar 降级）——扫描侧与主机端恢复脚本对「是否快照」的判定必须一致，否则非快照归档会被按 `volumes/vol_0` 解到错误目标卷；恢复脚本的快照探测同时接受 `manifest.json` 与 `./manifest.json`。响应逐文件返回识别结果（含 `match`/`matched[]`）；暂存登记进内存扫描注册表（`stagedScan`），TTL 2 小时与下载 token 一致、每次 scan 调用时顺带清扫过期条目与文件，面板重启即失效。任一文件无法识别（非 tar/损坏）整批 400 并回滚已暂存文件。**第二步 确认配对接口**（见 API.md「应用中心：挂载卷备份」）（JSON `{pairs:[{archive_id, specs[]}]}`，一次最多 10 对）：前置校验顺序 Windows→卷槽位(409)→部署中(409)→Agent 在线(503)→面板域名推导下载地址(400，拒绝请求 Host)；先对全部配对校验、全部通过才消费任何扫描登记（被拒的提交不破坏任何已上传文件，可改选后重试）——未知/已失效/已被消费的 archive_id 410「请重新上传识别」、specs 必须全部落在应用候选卷白名单内（支持按原相对规格、绝对规格或容器目标路径匹配，拒绝任意宿主目录写入）、空选择 400（含快照，杜绝落库阶段 `chosen[0]` 越界）、非快照文件只能选一个目标、快照所选卷必须存在于其 manifest、同一挂载卷在一次导入中只能出现一次、同一 `archive_id` 被重复引用时 Phase A 前置 400（不白白作废整批暂存）、具名卷的宿主挂载点在提交时经 Agent 现查（bind 直接取声明源路径）。快照记录**保留 manifest 全量卷顺序**（tar 按 `volumes/vol_<Index>` 位置解包，选择子集只经逐条 `specs` 过滤表达、绝不重排序号，否则会解错卷），被选中的条目改写为应用当前坐标（VolumeSpec/HostPath/ContainerPath），未选条目保留原值仅被过滤。校验通过后逐对创建 `VolumeArchive`（`Source=upload`、`Status=uploaded`、SHA256 取服务端计算值）并签发一次性下载 token，受理后返回 `archive_ids`（`archive_id` 为首个，兼容单目标调用方）。**整批原子语义沿用批量恢复核心**：全部文件经 Agent 回拉到主机 staging 并按服务端 SHA256 硬校验（无 SHA 时才回落 `tar -tf` 探测）之后才停机——任一文件拉取或校验失败整批取消、失败目标记录真实原因、其余目标记录「批次导入已取消」未做任何改动；随后一次停机、逐对 安全副本→清空残留→解包（含 manifest 的按 `volumes/vol_<i>` 提取、无 manifest 的整包解压）、一次（重）启动；停机后单对失败只标记该对、其余照常；结果逐对写回 `last_restore_*`，面板暂存文件与 token 无论成败在批次终态统一销毁。审计：`app_volume_upload_scan`（medium）/`app_volume_upload_restore`（high）。前端交互：多选上传控件一次选多份备份文件（accept `.tar/.tar.gz/.tgz`），点「上传并识别」后逐文件成行展示文件名、大小与识别状态标签（快照·内含 N 个卷 / 已识别 / 识别到多个候选，请选择 / 识别到 1 个弱匹配候选，请确认选择 / 未能识别，请选择目标卷）；快照行以复选框组列出 manifest 内匹配到的卷（可只勾一部分），普通行以目标卷下拉单选；仅 `manifest`/`unique` 自动预填，`ambiguous`/`none` 留空待人工选择；跨行不得重复选同一卷、每行至少一个有效目标才允许进入二次确认；二次确认在弹窗页脚就地展开（说明会停容器、覆盖卷数据、失败整批取消），点「确认恢复」才提交，确认态期间配对控件只读且任何配对变更都退回核对步骤（弹窗布局与二次确认规范见 DESIGN.md §9.17）；提交后清空识别区并按 `archive_ids` 轮询归档历史展示各自最近恢复结果。
     - **审计与互斥**：备份/恢复/删除归档均为 admin+operator 写操作并落审计——`app_volume_backup`（medium）/`app_volume_restore`（high）/`app_volume_backup_delete`（high）；归档列表与下载是只读、免审计。
-    - **与快照备份统一调度**：应用数据卷备份不再只是详情页的手动动作，快照备份模块新增一等任务类型 `app_volume`（`snapshots.KindAppVolume`）：任务定义新增 `Job.AppID` 绑定应用，`HostID` 由应用推导（创建时不要求用户选主机）。职责边界——快照模块持有任务定义、定时调度（复用 `cron.go` 每分钟捡拾）、保留份数、统一归档历史；应用引擎持有执行语义（声明卷白名单、S3-only、SHA 校验、停机恢复）。两者经 `snapshots.AppVolumeHost` 接口解耦（`apps` 已 import `snapshots`，反向 import 会成环）：接口声明在 `snapshots`，由 `apps.Engine` 实现，`main.go` 中 `snapshotEngine.SetAppVolumeHost(appEngine)` 注入；恢复预检 `CheckAppVolumeRestore(appID)` 不做任何操作、只报告「为什么现在不能恢复」，可重试冲突返回 `snapshots.ErrVolumeRestore{Busy,Deploying,Offline}` 哨兵错误供 HTTP 层映射 409/503。同一份 `VolumeArchive` 记录同时出现在应用详情「数据卷备份」与快照任务「历史归档」：定时/手动任务产生的归档可在详情页下载/恢复，详情页手动备份的归档也出现在对应任务历史；快照归档响应为 app_volume 携带派生的 `storage_target_name`/`status`/`error`/`note`/`last_restore_*`。保留策略按「应用 + 卷规格」共享，任务保留份数经 `runBackupAppVolumesWith(..., keep)` 传入（缺省 `volumeRetention`=5，失败记录不占配额）。**保留策略只归定时任务（手动备份永不裁剪）**：一次手动备份是一次刻意的安全副本，绝不能顺手删掉旧归档——尤其不能把定时任务刻意保留的滚动窗口裁短。引擎经 `effectiveVolumeKeep` 解析 keep：`noPruneVolumes`（-1）哨兵表示本次运行后不裁剪，其余非正值回落默认 `volumeRetention`=5，正值按任务窗口裁剪（失败记录不占配额）；`POST /apps/:id/volume-backups` 的 `retention` 缺省/0 映射为不裁剪（面板手动备份即此形态，界面上不再有份数输入），显式传正数（1~100，上限与 `volumeArchiveMetaCap` 对齐）才裁剪，快照任务按任务配置（默认 7）传入。因此裁剪上限完全由任务配置决定，「谁后跑谁定上限」的歧义不复存在；仅手动备份的应用归档自然累积，可在归档表逐条删除或交给任务管理保留窗口。任务 PUT 更新为**部分更新**（`updateJobReq` 全字段 `*T` 指针，与 `PUT /apps/:id` 同款契约）：未提交的键保持原值，显式 `""`/`0`/`false` 才写入（`cron` 空串=仅手动、`db_name` 空串=全部库）；`target`/`storage_target` 以合并后的有效值过 `resolveAppVolumeJob` 白名单校验，不再因省略而清空或误报 400（前端契约 `Partial<CreateJobReq>` 与此一致）。创建/更新任务时 `resolveAppVolumeJob` 实时校验：应用存在、非 Windows、目标卷逐条在当前应用挂载清单内；单容器取 `Application.Volumes`，`raw_compose` 与 `git+compose` 复用 `DiscoverAppVolumes`（在线发现优先、静态解析兜底），与应用详情卷列表同源；发现失败透传真实原因，不误报无挂载卷；存储目标须为存在的 S3 目标（明确拒绝 `local`，仅 `default` 或具体 S3）；运行时 `RunAppVolumeBackup` 按同一来源重新解析应用与挂载清单，指定子集逐项校验，再交统一快照引擎执行；卷被移除或应用已消失则本轮任务失败并写 `LastError`。**目标卷多选与全选（`Job.Target` 语义）**：`target` 取 `ALL`（`snapshots.AppVolumeTargetAll`，整应用全部挂载卷——运行时按当时的挂载清单解析，任务创建后新增的卷自动纳入备份）或逗号拼接的卷规格清单（裸单规格为历史形态、两者同语义）；`snapshots.ParseAppVolumeSpecList` 解析（大小写不敏感识别 ALL、空白与重复条目丢弃），创建与部分更新在落库前经 `NormalizeAppVolumeTarget` 归一化，白名单逐条校验、清单解析为空即 400「必须选择挂载卷」；任务历史 `ListAppVolumeArchives` 按**选择集合精确匹配**过滤——`ALL` 匹配恰好覆盖当前挂载清单的快照（Compose 同样走卷发现，不读取空的 `Application.Volumes`；多个服务共用同一卷规格按集合去重比较）、多选清单匹配恰好该子集的快照（不看归档记录上的 `ALL` 多卷标签、以 `Volumes` 条目清单为准；无条目的普通上传记录回落单规格标签匹配，保持既有可见性），各任务只看到自己口径的归档，声明集变更后旧口径归档自然移出该任务历史（应用详情页仍全量可见）。**purge 删除应用即连带清理任务**：`apps.Engine.PurgeVolumeArchives` 先调 `snapshots.Store.DeleteJobsByApp`（按 `Kind==app_volume && AppID` 精确匹配、原子重写 `snapshots.json`、返回删除条数记 info 日志）再清归档，避免 cron 每分钟对着已消失的应用反复失败并追加失败记录（`dir`/`volume`/`database` 任务即使带 `AppID` 也绝不受影响，测试 `snapshots/store_test.go` 锁住）；`apps` 对快照的反向依赖同样走窄接口 `apps.SnapshotJobStore` + `SetSnapshotJobStore`，在 `main.go` 装配。快照历史里的恢复/删除委托 `RestoreAppVolumeByID`/`DeleteAppVolumeByID`（与应用级 `RestoreAppVolume`/`DeleteAppVolumeArchive` 区分命名），恢复语义与详情页一致（停机→校验 SHA256→安全副本→解压→重启）；`running` 归档禁止删除（409）、非 `success` 禁止恢复（400）。前端「新建备份任务」选择「应用数据卷」后展示应用下拉 + **挂载卷多选**（「全部挂载卷」勾选项；仅列出已声明挂载卷的非 Compose 应用，勾选全部或选中全部选项时提交归一为 `ALL`），存储位置只列 S3 目标（无默认目标时警示并引导去「S3 异地存储配置」）；任务表「目标对象」展示应用名 + 目标卷（`全部挂载卷` / `N 个挂载卷` / 单卷规格，悬停可见原始清单），归档弹窗展示状态/最近恢复/错误并按状态禁用恢复/删除；应用详情页「数据卷备份」新增「备份任务」区块：本应用的 app_volume 任务在详情页直接新建/编辑/删除/立即执行/开关启用，任务弹窗的「目标卷」为同一套多选 + 全部勾选（新建计划默认勾选全部挂载卷），复用快照模块 `/backups/jobs` 接口（任务定义与调度仍归快照模块，执行与归档仍走应用引擎；任务列表前端按 `app_id` 过滤，不新增接口）；快照页任务表新增「按应用聚合」视图（app_volume 按应用分组折叠，其他种类平铺，默认聚合视图，可切回平铺）。备份日志 = 归档表（每次运行一条，含状态/错误）+ 任务行的最近执行/上次错误（逐行 tar/上传输出服务端不落盘，不在日志范围内）。
+    - **与快照备份统一调度**：应用数据卷备份不再只是详情页的手动动作，快照备份模块新增一等任务类型 `app_volume`（`snapshots.KindAppVolume`）：任务定义新增 `Job.AppID` 绑定应用，`HostID` 由应用推导（创建时不要求用户选主机）。职责边界——快照模块持有任务定义、定时调度（复用 `cron.go` 每分钟捡拾）、保留份数、统一归档历史；应用引擎持有执行语义（声明卷白名单、S3-only、SHA 校验、停机恢复）。两者经 `snapshots.AppVolumeHost` 接口解耦（`apps` 已 import `snapshots`，反向 import 会成环）：接口声明在 `snapshots`，由 `apps.Engine` 实现，`main.go` 中 `snapshotEngine.SetAppVolumeHost(appEngine)` 注入；恢复预检 `CheckAppVolumeRestore(appID)` 不做任何操作、只报告「为什么现在不能恢复」，可重试冲突返回 `snapshots.ErrVolumeRestore{Busy,Deploying,Offline}` 哨兵错误供 HTTP 层映射 409/503。同一份 `VolumeArchive` 记录同时出现在应用详情「数据卷备份」与快照任务「历史归档」：定时/手动任务产生的归档可在详情页下载/恢复，详情页手动备份的归档也出现在对应任务历史；快照归档响应为 app_volume 携带派生的 `storage_target_name`/`status`/`error`/`note`/`last_restore_*`。保留策略按「应用 + 卷规格」共享，任务保留份数经 `runBackupAppVolumesWith(..., keep)` 传入（缺省 `volumeRetention`=5，失败记录不占配额）。**保留策略只归定时任务（手动备份永不裁剪）**：一次手动备份是一次刻意的安全副本，绝不能顺手删掉旧归档——尤其不能把定时任务刻意保留的滚动窗口裁短。引擎经 `effectiveVolumeKeep` 解析 keep：`noPruneVolumes`（-1）哨兵表示本次运行后不裁剪，其余非正值回落默认 `volumeRetention`=5，正值按任务窗口裁剪（失败记录不占配额）；手动备份的 `retention` 缺省/0 映射为不裁剪（面板手动备份即此形态，界面上不再有份数输入），显式传正数（1~100，上限与 `volumeArchiveMetaCap` 对齐）才裁剪，快照任务按任务配置（默认 7）传入。因此裁剪上限完全由任务配置决定，「谁后跑谁定上限」的歧义不复存在；仅手动备份的应用归档自然累积，可在归档表逐条删除或交给任务管理保留窗口。任务 PUT 更新为**部分更新**（`updateJobReq` 全字段 `*T` 指针，与应用更新接口同款契约）：未提交的键保持原值，显式 `""`/`0`/`false` 才写入（`cron` 空串=仅手动、`db_name` 空串=全部库）；`target`/`storage_target` 以合并后的有效值过 `resolveAppVolumeJob` 白名单校验，不再因省略而清空或误报 400（前端契约 `Partial<CreateJobReq>` 与此一致）。创建/更新任务时 `resolveAppVolumeJob` 实时校验：应用存在、非 Windows、目标卷逐条在当前应用挂载清单内；单容器取 `Application.Volumes`，`raw_compose` 与 `git+compose` 复用 `DiscoverAppVolumes`（在线发现优先、静态解析兜底），与应用详情卷列表同源；发现失败透传真实原因，不误报无挂载卷；存储目标须为存在的 S3 目标（明确拒绝 `local`，仅 `default` 或具体 S3）；运行时 `RunAppVolumeBackup` 按同一来源重新解析应用与挂载清单，指定子集逐项校验，再交统一快照引擎执行；卷被移除或应用已消失则本轮任务失败并写 `LastError`。**目标卷多选与全选（`Job.Target` 语义）**：`target` 取 `ALL`（`snapshots.AppVolumeTargetAll`，整应用全部挂载卷——运行时按当时的挂载清单解析，任务创建后新增的卷自动纳入备份）或逗号拼接的卷规格清单（裸单规格为历史形态、两者同语义）；`snapshots.ParseAppVolumeSpecList` 解析（大小写不敏感识别 ALL、空白与重复条目丢弃），创建与部分更新在落库前经 `NormalizeAppVolumeTarget` 归一化，白名单逐条校验、清单解析为空即 400「必须选择挂载卷」；任务历史 `ListAppVolumeArchives` 按**选择集合精确匹配**过滤——`ALL` 匹配恰好覆盖当前挂载清单的快照（Compose 同样走卷发现，不读取空的 `Application.Volumes`；多个服务共用同一卷规格按集合去重比较）、多选清单匹配恰好该子集的快照（不看归档记录上的 `ALL` 多卷标签、以 `Volumes` 条目清单为准；无条目的普通上传记录回落单规格标签匹配，保持既有可见性），各任务只看到自己口径的归档，声明集变更后旧口径归档自然移出该任务历史（应用详情页仍全量可见）。**purge 删除应用即连带清理任务**：`apps.Engine.PurgeVolumeArchives` 先调 `snapshots.Store.DeleteJobsByApp`（按 `Kind==app_volume && AppID` 精确匹配、原子重写 `snapshots.json`、返回删除条数记 info 日志）再清归档，避免 cron 每分钟对着已消失的应用反复失败并追加失败记录（`dir`/`volume`/`database` 任务即使带 `AppID` 也绝不受影响，测试 `snapshots/store_test.go` 锁住）；`apps` 对快照的反向依赖同样走窄接口 `apps.SnapshotJobStore` + `SetSnapshotJobStore`，在 `main.go` 装配。快照历史里的恢复/删除委托 `RestoreAppVolumeByID`/`DeleteAppVolumeByID`（与应用级 `RestoreAppVolume`/`DeleteAppVolumeArchive` 区分命名），恢复语义与详情页一致（停机→校验 SHA256→安全副本→解压→重启）；`running` 归档禁止删除（409）、非 `success` 禁止恢复（400）。前端「新建备份任务」选择「应用数据卷」后展示应用下拉 + **挂载卷多选**（「全部挂载卷」勾选项；仅列出已声明挂载卷的非 Compose 应用，勾选全部或选中全部选项时提交归一为 `ALL`），存储位置只列 S3 目标（无默认目标时警示并引导去「S3 异地存储配置」）；任务表「目标对象」展示应用名 + 目标卷（`全部挂载卷` / `N 个挂载卷` / 单卷规格，悬停可见原始清单），归档弹窗展示状态/最近恢复/错误并按状态禁用恢复/删除；应用详情页「数据卷备份」新增「备份任务」区块：本应用的 app_volume 任务在详情页直接新建/编辑/删除/立即执行/开关启用，任务弹窗的「目标卷」为同一套多选 + 全部勾选（新建计划默认勾选全部挂载卷），复用快照模块的备份任务接口（见 API.md「快照备份」）（任务定义与调度仍归快照模块，执行与归档仍走应用引擎；任务列表前端按 `app_id` 过滤，不新增接口）；快照页任务表新增「按应用聚合」视图（app_volume 按应用分组折叠，其他种类平铺，默认聚合视图，可切回平铺）。备份日志 = 归档表（每次运行一条，含状态/错误）+ 任务行的最近执行/上次错误（逐行 tar/上传输出服务端不落盘，不在日志范围内）。
   - **服务迁移（应用跨主机迁移）**：把一个已部署的应用从当前主机整体搬到另一台主机，可选携带声明的挂载卷数据，并同步重定向反代与组网转发；实施落在 `server/internal/apps/migrate.go`（引擎）与 `handlers_app.go`（HTTP 面）。四条硬约束：
-    - **契约**：`POST /api/v1/apps/:id/migrate`（写组 + 审计 `app_migrate`/high）受理 `MigrateAppReq{target_host_id, migrate_volumes, clean_source}`，**同步校验后 202 返回 `Deployment`**（`trigger="migrate"`），进度与日志沿用部署历史轮询（前端迁移成功后自动切到「部署历史」页签）；`POST /api/v1/apps/:id/migrate/precheck`（读组、免审计、只读）返回 `MigratePrecheckResp{target_host_id, agent_online, docker_running, volume_count, s3_ready, s3_bucket, port_conflicts, warnings}`，**一切问题都只以 `warnings` 上报、不阻断**（操作员仍可决定），供弹窗选中目标主机后实时展示 Agent/Docker/S3/端口占用四张状态卡。
+    - **契约**：迁移接口（见 API.md「应用中心」）（写组 + 审计 `app_migrate`/high）受理 `MigrateAppReq{target_host_id, migrate_volumes, clean_source}`，**同步校验后 202 返回 `Deployment`**（`trigger="migrate"`），进度与日志沿用部署历史轮询（前端迁移成功后自动切到「部署历史」页签）；迁移预检接口（见 API.md「应用中心」）（读组、免审计、只读）返回 `MigratePrecheckResp{target_host_id, agent_online, docker_running, volume_count, s3_ready, s3_bucket, port_conflicts, warnings}`，**一切问题都只以 `warnings` 上报、不阻断**（操作员仍可决定），供弹窗选中目标主机后实时展示 Agent/Docker/S3/端口占用四张状态卡。
     - **同步前置校验**（`StartMigration`，失败即 HTTP 409、不产生排队任务）：目标主机非空且不等于当前主机；目标 Agent 在线；目标**非 Windows**（迁移管线是 POSIX `tar`/`set -e` 语义，与反代绑定同款前置拒绝）；应用无在途部署（`IsRunning`）与卷操作（`VolumeBusy`）；`migrate_volumes=true` 且应用有卷时必须已配置默认 S3 目标（否则 409「数据卷迁移需要 S3 存储目标」），并**同步抢占卷槽**（`acquireVolumeSlot`，协程 `defer` 释放）——迁移与备份/恢复共用同一把按应用的互斥。**新增**：源主机 Agent 在线校验（离线 409「源主机 Agent 不在线」）与源非 Windows 校验（409）；此前从未部署过的应用若源离线也无法再受理迁移，属行为收紧。
     - **六阶段执行与自动回滚**（`runMigration`）：① 源容器先停（迁移期不写入，保证 tar 快照一致）；② 逐卷 `tar.gz` → 预签名 PUT 直传 S3 → 目标主机预签名 GET 下载 → **SHA256 逐卷比对** → 解压到目标（bind mount 直接 tar 宿主路径，具名卷先 `docker volume inspect` 解析挂载点，与 §3.7 卷归档同一套脚本契约；暂存文件与 S3 中转对象在每卷结束或失败时立即清理）；③ 落库切换 `HostID` 并 `SyncProxyForHost`（local 模式在目标主机 `ensureProxyNginx` + 推证书/vhost + reload 并清理源主机旧 vhost；gateway 模式向网关重新推上游）与 `syncMeshForwarder`（socat 中继改指目标主机 Mesh IP/直连 IP）。**绑定切换可观测**：主机绑定统一经 `persistMigrationHost`——写库后重读确认实际绑定并同步 `app_volume` 快照任务的 `HostID`（`UpdateAppVolumeJobHost`），任一步失败即 fail + rollback；回滚同样重读存储，仅当确认绑定已回到源主机（`bindingRestored`）才把反代与组网转发指回源主机，否则保留现状并将原因计入回滚问题清单；④ 按四种 `source_type` 在目标主机完整构建 + 拉起 + 健康探活；⑤ 可选清理源主机容器（**bind mount 宿主目录严格保留**，绝不删除）；⑥ `finishDeploySuccess` 收尾。**任一步失败均调用 `rollback`**：恢复 `HostID=oldHostID`、反代与组网转发指回源主机、源容器重新 `start`（Compose 则 `compose up -d`）、清理目标主机残留容器——服务绝不会停在半迁移状态；日志全程写入 `build_log` 并以 `[ROLLBACK]` 标记回滚过程。**失败语义收紧**：阶段 3 反代/组网同步失败改为 fail + rollback（此前仅 WARN 继续并打「迁移完成」，域名会指向已停的源容器，违反本节「任一步失败均回滚」）；阶段 1 停源失败（transport 错误或非零退出码）同样 fail + rollback；阶段 2 全部失败点（卷目录解析、tar、预签 PUT/GET、上传/下载、SHA 校验、解压）统一 fail + rollback；阶段 3 前取消改为先回滚再置取消（此前只置取消不回滚）；Compose 迁移探活改为仅 `HealthcheckURL` 非空时做 HTTP 探活，无 URL 不探活（此前无 URL 时必败回滚）；回滚卷清理改为仅删本 run 解压的文件清单（解析 `tar -tzf` 成员，跳过目录/`..`/绝对路径，绝不清整个目标目录、不删具名卷；解压本身仍是 overlay，备份后新增文件在回滚后仍保留——与「恢复覆盖归档时间点之后所有数据」的表述仍有偏差，文档待二选一澄清）；回滚失败时记录 Error 追加「回滚未完成，需人工检查源主机容器与反代状态」后缀并记 server Error 日志（告警中心/webhook 未接线，属已知缺口）；阶段边界存活检查：开局、阶段 3/4/5 之前查应用存活，已删则尽力清目标残留并 fail；Stage 5 git-compose 清理改为 `compose down`（原 `docker rm -f <container> <container>-next` 对 `<project>-<service>-1` 容器名无效，源栈会继续运行）。**第二批收紧**：阶段 3 之后取消同样走取消回滚（阶段 3 失败分支、阶段 3 成功后、阶段 4 入口见终态时各补一次 `cancelled()` 检查；此前阶段 3 内 HostID 已切、反代/组网已指目标、源容器已停，取消落在此窗口会静默中断服务）；迁移管线全部 compose 命令统一带 `-p watchman-<appID>`（回滚清理、阶段 5 源清理、abortIfGone 清理、阶段 1 停源、回滚重启——此前 bare 命令命中目录派生项目名为空操作，目标/源栈双活残留）；阶段 1 状态探测 exec 失败 fail-closed（此前静默跳过停源，随后 tar 可能拍到在线写入的卷）；阶段 2 源 SHA 为空即 fail（此前跳过校验）；回滚卷清理看退出码（`set -e` 脚本中途 abort 不再静默通过）；abortIfGone 对 Compose 应用改用带 `-p` 的 compose down 并尽力清理本 run 已解压的卷文件；迁移开局 Building 写走终态守卫；已删应用部署路径的 compose down 失败不再静默，失败信息进记录 Error 与构建日志。
     - **边界**：Compose 来源的应用卷在编排 YAML 内声明、记录不持有，卷迁移无意义（前端对 Compose 关闭该开关并说明）；预检额外提示两类拓扑冲突——组网转发入口主机恰为目标主机（迁移后入口不再可行）、网关模式网关主机恰为目标主机（上游会指向自身）；`clean_source` 不勾选时源容器保持停止状态作为冷备，可再迁回。
     - **删除互斥**：`deleteApp` 在 purge 前查 `IsRunning`（在途部署/迁移）与 `VolumeBusy`（卷备份/恢复），命中即 409；此前删除是全包唯一不查在途状态的写入口，删除后在途部署 swap 上线孤儿容器（迁移中途删除同根因，另由阶段边界存活检查兜底；检查与删库之间仍有微小 TOCTOU 窗口，无法 100% 消除）。purge 第 2 步追加 `-next`（含 dep 后缀新命名）与 `-prev` 清理；purge 全程持卷槽（入口抢占、defer 释放），卷操作在 purge 期间无法新起；**检查与 purge 之间新起的卷操作**：purge 抢槽失败返回哨兵错误、`deleteApp` 映射为 409（与前置 `VolumeBusy` 检查同码），其余 purge 失败仍 503。
   - 实现备注：`deploySingleContainer` 的起新容器命令只清理残留的 `-next` 容器（`docker rm -f <name>-next`），旧版本容器在 swap 前全程运行、失败时原样保留——此前曾误删旧容器（`rm -f` 目标写成了正式容器名），与"探活失败自动保留旧版本"的设计相悖，已修复。部署前预检（`preflightSingleContainer`）：先清上次失败残留的 `<容器>-next-dep_*` 孤儿容器，再按绑定地址逐端口查占用——被非本应用容器占用直接 fail 并点名占用容器；预检本身失败只记 WARN 继续部署。`docker run` 超时分支同样清理本 run 的 `-next`（超时时 Agent 侧会杀掉整棵进程树，见下条；清理兜底的是超时前已建起来的容器，晚于清理建起来的由下次预检扫除）。**exec 超时杀整棵进程树**：Agent 执行命令超时时不再只杀 shell——shell 在自有进程组里运行，超时回调杀掉整个进程组（Linux `kill(-pgid, SIGKILL)`，Windows `taskkill /F /T`），子进程（`docker run` 拉镜像的 CLI 等）一并死亡，不再留下孤儿进程；`WaitDelay` 另兜底，万一有子进程用 setsid 逃出进程组并占住输出管道，结果最多再等 5 秒也必回传。此前只杀 shell 时，孤儿 CLI 占住管道导致 Agent 迟迟不回结果，服务端等满 `timeout+30 秒` 先放弃、部署记失败，而孤儿 CLI 随后仍把容器建起来——即部署孤儿 `-next` 容器的根因。服务端 `execOnAgent` 的等待预算恒为 `timeout+30 秒`，Agent 的超时结果总先到；`docker run` 的容器本身是 daemon 侧进程，CLI 被杀时若容器已建起、仍由部署管线超时分支的 `docker rm -f <next>` 清理。**失速检测（operative 限制）**：`ExecRequest.stall_timeout_sec`（字段 6），0=关闭、>0=连续这么多秒无 stdout/stderr 输出即杀整棵进程组，error 为 `stalled: no output for <N>s`、exit -1；Agent 侧 1 秒 ticker 看门狗，命令结束即停；墙钟 `timeout_sec` 仍是外层兜底（`timeout after Xs` 文案不动）；服务端不做失速检测，Agent 是权威。部署引擎统一 stall=120 秒；卷/迁移传输类（tar/curl/sha256sum 全程静默到结束）与用户临时脚本 stall=0。**流式输出**：Agent 每 ~200ms 或满 4KB 发一个 `ExecOutput` 块（AgentMessage oneof 字段 14），同时累积进最终 stdout/stderr，`ExecResult` 内容不变；服务端按 exec_id 路由进部署日志 live log，现有 2 秒轮询即实时可见，无需前端改动。**主动取消**：`ExecCancel`（ServerMessage oneof 字段 22）；部署取消或 `execOnAgent` 服务端等待超时时经 hub.Send 发 ExecCancel，Agent 杀整棵进程组、回 `ExecResult`（error `cancelled`）。旧 resp handler 只认 ExecResult，chunk 到达时继续等、不注销（此前只取 `GetExecResult()` 的 handler 会在首个 chunk 到达时误判断开）。`image`/`template` 非升级部署先 `docker image inspect || docker pull`（1800 秒），镜像已缓存则跳过拉取；长步骤墙钟预算放宽：docker build 900→1800 秒、拉镜像 300→1800 秒、`docker run` 120→600 秒（部署与迁移两处），短步骤不动，router.go 的 dockerOpTimeout 与前端超时不动。**先停旧容器（stop-first）**：带宿主端口的单容器应用重新部署时，旧容器运行时新容器绑不上同一端口、滚动替换无从谈起——预检发现端口被本应用当前运行容器占用时不再 fail，而是先 `docker stop -t 30` 停旧容器（短暂停机，数据库有 30 秒优雅关停），再起新容器、探活、swap（swap 脚本原样把已停的旧容器改名 -prev）；停旧容器失败（容器仍在运行）则直接 fail、旧版本继续服务。停旧容器之后、swap 完成之前任何失败（起新容器失败、探活失败、用户取消）都尽力 `docker start` 重启旧容器，失败文案如实说明旧容器是否已恢复、未恢复时提示手动启动；**swap 失败现在回滚**（`rollbackSwap`：先同步删 -next——它占着宿主端口，否则 `docker start` 旧容器必因端口冲突失败——再按状态恢复旧容器：live 名存在但停了→start，live 名没了但 -prev 在→改名回来再 start，live 在且运行→no-op）；**取消路径先删 -next 再重启旧容器**（原顺序先 restart 后清理，带端口应用上 restart 必然失败）；探活失败与起容器失败分支同样先同步删 -next 再 restart（异步删时 restart 必因端口被占而失败，应用会被留在停机状态；同步删在 Agent 无流时立即返回，不会卡住引擎槽位）。`removeContainer` 在 Agent 无流时立即返回，不再白等 30 秒。
   - 实现备注（发布流程 review）：git 拉取脚本必须 `set -e`——此前 `fetch` 失败会落到 `checkout --force` 用本地旧代码继续部署并上报成功；Git token 只持久化在 server 端 vault，下发时经 `git -c http.extraHeader="Authorization: Basic <base64(git:token)>"` 随单次 clone/fetch 使用，不再 `remote set-url` 写进 agent 的 `.git/config`（自动发布每次从 vault 现取，不受影响）；下发到 agent 的命令里所有用户输入变量必须 shell 转义（环境变量值曾因空格打散 `docker run` 参数）；swap 脚本 `set -e`，`docker rename` 失败不得被末尾 `docker inspect` 的退出码掩盖；镜像清理只针对 `watchman-app-*` 自建镜像、按创建时间保留最新 5 个（此前 `docker images repo:tag` 只匹配单个 tag 导致从不清，且 `head -n 6 | tail -n +6` 语义错误）；store 的 `GetApp/ListApps/FindAppByWebhookToken` 返回深拷贝——部署协程 `ResolveTemplate` 原地写 EnvVars map 时 HTTP 层正 marshal 同一对象，曾有 crash 风险；反代域名做严格 hostname 校验并检查跨应用重复绑定；网关模式上游按「组网（双方都在组网内 → 100.x）→ 直连（应用主机公网 IP → 内网 IP）」顺序解析，绝不回退 `127.0.0.1`（会指向网关自身造成流量黑洞），两条路径都拿不到才报错要求手动填 Upstream（早期版本在拿不到 Mesh IP 时直接报错，现改为直连兜底）；`raw_compose` 每次部署快照 compose 内容到部署记录，回滚时恢复快照（此前"回滚"实际重部署了当前内容）；healer 跳过有部署在途的应用。
-- **已安装管理**：应用列表/详情支持重启、停止、启动、查看日志、删除（`watchman.app` 标签标记容器归属）。**运行日志页签**（详情页「部署历史」之后）：单容器应用直接显示该容器，多容器 Compose 应用按服务切换查看——容器清单取主机 Docker 页同款 `docker ps`，按 `watchman.app=<appID>` 或 `com.docker.compose.project=watchman-<appID>` 标签过滤（组网中继容器 `watchman-fwd-<id>` 两者皆无、天然排除；滚动替换期 `-next`/`-prev` 与正式容器并存时同列，运行中优先）；日志走现有 `POST /hosts/:id/docker/logs`（Agent 侧 `docker logs`，`args_json` 支持 `tail` 1~10000 默认 200、`since` 全部/`1h`/`6h`/`24h`/`168h`、`timestamps`，非法值 fail-closed，老 Agent 忽略参数恒返回 200 行、新面板自然降级）；页签内提供搜索实时过滤、仅错误开关、错误行红 / 警告行黄 / 时间戳弱化、自动跟随（向上滚动暂停、回到底部恢复）与每 2 秒自动刷新（与部署日志同节奏，失败保留旧内容），另有复制全部与下载 `.log`；查看日志是只读、不记审计，但接口挂 hostWrite 组，viewer 角色页签内明示无权而非静默空白；拉取带请求序号、旧响应到达时丢弃（快速切换容器不串日志），搜索与仅错误筛选只改变呈现行、不触发自动跟随，容器不存在时中文提示并引导刷新容器列表。**容器终端入口**（概览页右上角「终端」按钮，仅 admin/operator 可见）：弹窗复用 Docker 页的 TerminalPane 模式，`docker exec -it <容器> /bin/sh` 进应用容器；单容器直接进，多容器 Compose 应用先在弹窗内选择容器再连接，切换容器即重连新会话，旁有刷新按钮重拉清单；容器清单与运行日志页签同款取数（`docker ps` 按 `watchman.app=<appID>` 或 `com.docker.compose.project=watchman-<appID>` 标签过滤，含 `container_name` 兜底），无运行中容器时按钮禁用；点开时刷新一次清单。页签使用 `display-directive="show:lazy"` 保住选中容器、筛选与滚动位置（§8.4）；2 秒轮询带 in-flight 去重，页签停用、应用切换或容器清单失效时统一递增请求序号作废在途响应；日志框是页签内唯一滚动源（DESIGN.md §9.7）；下载文件名后缀为 `.log`。
+- **已安装管理**：应用列表/详情支持重启、停止、启动、查看日志、删除（`watchman.app` 标签标记容器归属）。**运行日志页签**（详情页「部署历史」之后）：单容器应用直接显示该容器，多容器 Compose 应用按服务切换查看——容器清单取主机 Docker 页同款 `docker ps`，按 `watchman.app=<appID>` 或 `com.docker.compose.project=watchman-<appID>` 标签过滤（组网中继容器 `watchman-fwd-<id>` 两者皆无、天然排除；滚动替换期 `-next`/`-prev` 与正式容器并存时同列，运行中优先）；日志走现有的容器日志接口（见 API.md「Docker」）（Agent 侧 `docker logs`，`args_json` 支持 `tail` 1~10000 默认 200、`since` 全部/`1h`/`6h`/`24h`/`168h`、`timestamps`，非法值 fail-closed，老 Agent 忽略参数恒返回 200 行、新面板自然降级）；页签内提供搜索实时过滤、仅错误开关、错误行红 / 警告行黄 / 时间戳弱化、自动跟随（向上滚动暂停、回到底部恢复）与每 2 秒自动刷新（与部署日志同节奏，失败保留旧内容），另有复制全部与下载 `.log`；查看日志是只读、不记审计，但仅 admin/operator 可用，viewer 角色页签内明示无权而非静默空白；拉取带请求序号、旧响应到达时丢弃（快速切换容器不串日志），搜索与仅错误筛选只改变呈现行、不触发自动跟随，容器不存在时中文提示并引导刷新容器列表。**容器终端入口**（概览页右上角「终端」按钮，仅 admin/operator 可见）：弹窗复用 Docker 页的 TerminalPane 模式，`docker exec -it <容器> /bin/sh` 进应用容器；单容器直接进，多容器 Compose 应用先在弹窗内选择容器再连接，切换容器即重连新会话，旁有刷新按钮重拉清单；容器清单与运行日志页签同款取数（`docker ps` 按 `watchman.app=<appID>` 或 `com.docker.compose.project=watchman-<appID>` 标签过滤，含 `container_name` 兜底），无运行中容器时按钮禁用；点开时刷新一次清单。页签使用 `display-directive="show:lazy"` 保住选中容器、筛选与滚动位置（§8.4）；2 秒轮询带 in-flight 去重，页签停用、应用切换或容器清单失效时统一递增请求序号作废在途响应；日志框是页签内唯一滚动源（DESIGN.md §9.7）；下载文件名后缀为 `.log`。
 - **可扩展**：模板定义为服务端声明式配置（`server/internal/apps/templates.go` 的 `Catalog`），支持自定义接入新模板。
 
 ### 3.8 推送命令（批量执行）
@@ -282,12 +283,12 @@
 - **月流量超额预警（内置，非规则）**：基于每台主机在「财务与规格」中配置的「流量限制 (GB)」与「月流量计算类型」（双向/仅上行/仅下行）自动判定：达到 80% 触发警告、达到 100% 触发严重告警（触发 ID 为 `builtin-traffic-80` / `builtin-traffic-100`），回落后自动标记解决。**不存在也不允许再创建 `traffic_high` 类型的告警规则**——流量配额是主机属性而非全局规则，告警中心的规则类型选项中已移除该项。未配置流量限制的主机不产生流量告警。
   - 实现备注（流量计量重写）：Agent 按**网卡逐个**跟踪内核累计计数器的增量并落盘（`agent/internal/metrics/traffic.go`），**回环网卡（lo / Windows Loopback）不计入**；只计连续两次采样之间观测到的增量，**累计值本身永不直接计入**——主机重启（boot time 变化）与单网卡计数器回落时均只重建基线、本次采样计 0，杜绝误判重启把整机累计流量一次性计入当月；网卡消失（docker 网络删建、VPN 启停等）只丢弃其基线、**不再把剩余网卡的累计总量误作增量**（旧逻辑的幽灵流量 bug）。默认只统计承载默认路由的网卡（外网网卡），docker/tailscale 等虚拟网卡不再与其底层网卡重复计数同一报文；路由表读不到时回落全部非回环网卡，Agent 启动参数 `-traffic-ifaces=eth0` 可显式限定统计网卡。
   - **流量重置日**由面板「财务与规格」统一下发：`RegisterResponse.traffic_reset_day`（proto field 7）在每次 Agent（重）连时推送，Agent 经 `SetResetDay` 热应用并持久化，**面板保存后同时经 `ServerMessage.config_update`（field 20，`ConfigUpdate.traffic_reset_day`）对在线 Agent 即时下发**（`Registry.PushRuntimeConfig`，离线 Agent 下次重连兜底，见 §3.2 兼容说明）；取值范围统一为 1~28（server 侧 `SetAgentBilling` 同步钳制，前端输入框 `max=28`）。
-  - **月流量手动校正**：统计出错（如幻影累计）时，admin 在主机详情「资源监控」页「本月流量」卡片点「校正」，输入正确的下行/上行 GB（与卡片同一口径），面板经 `POST /api/v1/hosts/:id/traffic/correct` 下发 `ServerMessage.traffic_correct`（field 23，`TrafficCorrect`），Agent 经 `SetTrafficCorrection` 把 MonthRx/MonthTx 设为该值并落盘，之后只加新产生的增量。Agent 必须在线（离线返回 503，不谎报成功）；旧版 Agent 不认识该字段会静默忽略，校正按钮须等 Agent 升级后才生效。
-  - **单位为二进制 GB**：配额换算与前后端展示统一按 `1<<30`（1 GB = 1024³ B，阿里云官方流量口径），与面板「流量限制 (GB)」标签一致（此前按十进制 `1e9`，差 7.4%）。
+  - **月流量手动校正**：统计出错（如幻影累计）时，admin 在主机详情「资源监控」页「本月流量」卡片点「校正」，输入正确的下行/上行 GB（与卡片同一口径），面板经月流量校正接口（见 API.md「主机」）下发 `ServerMessage.traffic_correct`（field 23，`TrafficCorrect`），Agent 经 `SetTrafficCorrection` 把 MonthRx/MonthTx 设为该值并落盘，之后只加新产生的增量。Agent 必须在线（离线返回 503，不谎报成功）；旧版 Agent 不认识该字段会静默忽略，校正按钮须等 Agent 升级后才生效。
+  - **单位**：配额换算与展示按 §3.2 单位口径（1 GB = 1024³ B）。
 - **到期续费提醒（内置，非规则）**：主机在「财务与规格」中配置了「到期时间」后，距到期不足 30 天时自动发起一次续费提醒（触发 ID `builtin-expiry-remind`，警告级别，走告警中心与 webhook 通知）；到期时间在 30 天以外的主机不提醒，续费（到期时间推后）后提醒自动解除，逾期未续保持提醒且不重复触发。
 - **证书到期提醒（内置，非规则）**：不会自动续期的证书（手动 DNS-01 两阶段签发的、手动上传的）在到期阈值内自动发起一次到期提醒（触发 ID `builtin-cert-expiry`，警告级别，走告警中心与 webhook 通知，告警可跳转证书中心）；提前天数可在「证书中心 → 证书时间设置」中配置（`certs.expiry_reminder_days`，默认 30 天，1~90）；阈值与自动续期缩放一致（`min(配置天数, 有效期/3)`）；证书被续期/替换（到期时间推后）或删除后提醒自动解除，逾期未处理保持提醒且不重复触发。手动 DNS-01 签发的证书不自动续期（续期走自动验证通道，与管理员选择手动的原因相悖）。
 - **自定义监控项**：可添加监控参数并设置告警条件。
-- **消息通知**：支持配置告警通知方式（邮件/Webhook 等，可扩展）。
+- **消息通知**：支持配置告警 Webhook 通知。
 - **秒级感知**：主机状态变化及时告警。
 
 ### 3.12 系统设置
@@ -295,10 +296,10 @@
 > **设置中心架构与工程实现**：
 > 1. **统一存储与作用域**：所有设置项统一持久化于 `server/internal/settings`（`settings.json`，支持 system/user 双作用域、点分命名空间、类型与注册表校验），前端经 `stores/settings` 统一读写。`appearance.theme_mode` 统一由服务端落盘持久化（浏览器 localStorage 仅作首屏首态加载缓存兜底）。秘密类凭证（AI Key / Git Token 等）不进统一设置，独立由专用安全存储持有。
 > 2. **前端页面架构与导航**：设置中心采用左右两栏工程布局（`SettingsLayout.vue`：左侧为分组导航与快捷搜索框，右侧为主内容展示区；`views/settings/sections.ts` 集中注册各分区：key、label、icon、component、keywords 与 group）。分区切换统一走 `?s=` 查询参数（与主机详情 `?tab=` 模式对齐：URL 深链优先、非法值自动回退 general 分区，并在选中后把包含深链的完整路径回写至工作区页签）。路由保持单条 `/settings`（组件名为 `Settings`，`meta.viewName` 保持稳定），配合内层 `<KeepAlive>` 缓存，既避免了嵌套路由导致 AppShell 页面重复重建，又保证了用户在切换不同设置分区时不会丢失正在编辑的未保存表单内容；搜索支持按 label 与 keywords 联合模糊匹配，回车即可聚焦首个命中项。
-> 3. **全局首选项与偏好配置**：支持配置 `navigation.default_host_tab`（进入主机详情时的默认页签，URL `?tab=` 深链优先级高于首选项；选项与 HostDetail 保持同源）、`appearance.show_tips`（功能说明提示语全局展示开关：前端说明性 `<p class="muted">` 标记 `tip-hint` 类，由 App.vue 依据偏好动态切换根类 `hide-tips` 实现全局隐藏；业务警告类 NAlert 保持显示不受影响）、`files.default_path`（文件管理初始路径，空值依系统类型默认回退至 Linux `/root` 或 Windows `C:\`，服务端严格校验必须为绝对路径）。各分区对应组件（如 `GeneralPrefs.vue`、`SystemStatus.vue`、`AiConfig.vue`、`GitProviders.vue`、`InstallDeploy.vue` 等）按模块化独立解耦维护。
+> 3. **全局首选项与偏好配置**：支持配置 `navigation.default_host_tab`（进入主机详情时的默认页签，URL `?tab=` 深链优先级高于首选项；选项与 HostDetail 保持同源）、`appearance.show_tips`（功能说明提示语全局展示开关，机制见 DESIGN.md §9.11）、`files.default_path`（文件管理初始路径，空值依系统类型默认回退至 Linux `/root` 或 Windows `C:\`，服务端严格校验必须为绝对路径）。各分区对应组件（如 `GeneralPrefs.vue`、`SystemStatus.vue`、`AiConfig.vue`、`GitProviders.vue`、`InstallDeploy.vue` 等）按模块化独立解耦维护。
 
 - **通用设置**：
-  - 首选页面（进入主机管理时默认展示的模块：资源负载/系统状态/Docker/在线终端/文件管理/应用市场）。
+  - 首选页面（进入主机管理时默认展示的模块：资源负载/系统状态/Docker/在线终端/文件管理）。
   - 开关加载页面时的功能提示语。
 - **面板时区**（`server.timezone`，system 作用域，管理员在「系统设置 → 系统状态」中配置）：IANA 时区名称（如 `Asia/Shanghai`），空 = 跟随服务器系统时区。控制端进程本地时间（日志、API 时间戳、日界计算）与面板全部时间展示（告警、审计、会话、监控图表）统一按此时区渲染，所有登录用户一致；保存即时生效，无需重启。Agent 的月流量计费周期仍按各 Agent 所在主机的本地时间，不受此项影响。
 - **自定义常用命令**：增删改查，用于推送命令快速选取。
@@ -316,7 +317,7 @@
 - **校验与隔离**：现有归档恢复核对记录的压缩包 SHA256；上传归档完整读取 gzip 尾部、验证 tar、清单文件集与逐文件哈希，再验证 JSON 配置和凭据解密。拒绝路径穿越、符号链接、重复条目、备份目录覆盖与特殊文件。备份、恢复与删除操作串行，异步入口在忙时返回 409；临时文件独占创建，索引采用临时文件原子替换。
 - **跨机密钥延续**：数据目录 `server-secrets.json`（0600）持有 JWT 与 Vault 根密钥，首次启动从 CLI 密钥参数初始化，参数为空时生成并持久化；存在时以此文件为准，确保重启与迁移延续同一凭据解密和 Agent 升级签名身份。该文件包含在管理员专用备份中，常规 API 永不回显。旧归档缺少密钥文件时，优先验证本机密钥；不匹配时要求提供原机器的 Vault 密钥，拒绝静默跳过凭据。迁移后使用归档内的面板域名、安全入口和账号，页面在确认前明确说明。
 - **控制端定时备份**：独立策略持久化到 `control-backup-policy.json`（随归档迁移），提供每日执行时间（控制端时区）、启用开关、自动备份保留份数（1~100）及可选 S3 副本目标；复用快照模块已配置的 S3 目标，控制端直接上传。手动备份和恢复前安全备份不被自动保留策略裁剪；S3 上传失败保留本地归档并记录失败，删除/裁剪同步清理已记录的 S3 副本，删除失败保留记录供重试；归档已记录的 S3 目标此后被删除属永久状态（重试永远无法成功），删除/裁剪按尽力而为放行本地清理并在删除响应 `warning` 字段中提示（远程孤儿副本需到对象存储中手动清理），不得因此永久阻塞归档删除或保留裁剪；`Meta.Kind` 在创建归档时即随索引落库（manual/scheduled/safety），不得事后改写——中途崩溃不得把定时归档错记为豁免裁剪的安全副本。
-- **接口与审计**：既有创建/恢复接口接受异步任务模式，新增 `GET /system/backups/status`、`GET/PUT /system/backups/policy`、`DELETE /system/restore/pending`，全部管理员可用；策略保存和取消分别审计 `system_backup_policy`/medium、`system_restore_cancel`/high，现有创建、删除和恢复审计继续保留。上传恢复的 multipart 请求中 `vault_pass` 部件必须位于 `file` 部件之前（服务端流式读取、遇 file 部件即停止扫描，其后部件不再读取）。上传进度与服务端打包/校验/待重启/应用结果分开展示，实际进度不得伪造；S3 副本上传按已上传字节数约每秒刷新任务进度。
+- **接口与审计**：既有创建/恢复接口接受异步任务模式，新增备份状态查询、备份策略读写与取消待恢复任务三个接口（见 API.md「系统备份 / 恢复 / 升级」），全部管理员可用；策略保存和取消分别审计 `system_backup_policy`/medium、`system_restore_cancel`/high，现有创建、删除和恢复审计继续保留。上传恢复的 multipart 请求中 `vault_pass` 部件必须位于 `file` 部件之前（服务端流式读取、遇 file 部件即停止扫描，其后部件不再读取）。上传进度与服务端打包/校验/待重启/应用结果分开展示，实际进度不得伪造；S3 副本上传按已上传字节数约每秒刷新任务进度。
 
 ### 3.13 分组与权限
 
@@ -326,59 +327,47 @@
 - **分组视角**：从分组出发管理主机与用户关系。
 - **用户视角**：从用户出发进行分组授权。
 
-### 3.14 多云联动（规划中 / 扩展能力）
-
-- **联动云计算 API**：录入阿里云/腾讯云/微软云/亚马逊云等的 token，对云上服务器进行自动发现与联动管理。
-
-### 3.15 用户与认证
+### 3.14 用户与认证
 
 - **登录认证**：控制端登录（账号密码，可扩展 OAuth/SSO）。
 - **多用户**：支持多用户，配合分组权限实现隔离。
 - **操作审计（自研增量）**：记录谁在何时对哪台主机做了什么操作（原产品为 SaaS，自研需自保审计日志，满足「停服自担」背景下的可追溯要求）。
-- **安全入口（宝塔式）**：系统设置 → 安全入口（`web/src/views/settings/SecureEntry.vue`，`sections.ts` 注册 `key: 'secure-entry'`，`adminOnly` 仅管理员可见）。开启后只能通过秘密入口地址访问/登录面板：`GET /api/v1/secure-entry/<路径>` 校验通过后签发 HttpOnly cookie（`wm_secure_entry=<路径>.<HMAC>`，密钥由 JWT 签名密钥域分离派生 `server/internal/secentry`）并 302 到 `/`；之后才能看到登录页并发起登录。直接访问常规页面/API、无有效 JWT 又无入口 cookie 的请求一律 404（不暴露面板存在）。豁免：Agent 安装/注册（`/install*`、`/agent/*`、`/api/v1/hosts/enroll` 等，B.4 公开注册设计）、应用 webhook、终端分享链接、入口自身端点。Web 控制台经 `go:embed` 打进 server 二进制（`server/web`，构建见 DESIGN.md §8.1），由 Go 直接提供静态页面——无需 nginx；安全入口启用时，guard 中间件对 `/`、`/index.html`、`/assets/*` 同样返回 404（无 cookie/JWT 时），静态页面层同样隐藏。配置键：`security.secure_entry_enabled`（bool）、`security.secure_entry_path`（6~64 位 URL 安全字符，`settings` 注册表校验）；`PUT /settings` 本就 adminOnly + 审计。**忘记路径**：控制机执行 `watchman-server -reset-secure-entry -data <数据目录>`（置 false 后退出）或改 settings.json 后重启。
+- **安全入口（宝塔式）**：系统设置 → 安全入口（`web/src/views/settings/SecureEntry.vue`，`sections.ts` 注册 `key: 'secure-entry'`，`adminOnly` 仅管理员可见）。开启后只能通过秘密入口地址访问/登录面板：秘密入口端点（见 API.md「安全入口」）校验通过后签发 HttpOnly cookie（`wm_secure_entry=<路径>.<HMAC>`，密钥由 JWT 签名密钥域分离派生 `server/internal/secentry`）并 302 到 `/`；之后才能看到登录页并发起登录。直接访问常规页面/API、无有效 JWT 又无入口 cookie 的请求一律 404（不暴露面板存在）。豁免：Agent 安装/注册（Agent 安装/注册等公开路径，见 API.md「安装与下载」「主机」）、应用 webhook、终端分享链接、入口自身端点。Web 控制台经 `go:embed` 打进 server 二进制（`server/web`，构建见 DESIGN.md §8.1），由 Go 直接提供静态页面——无需 nginx；安全入口启用时，guard 中间件对 `/`、`/index.html`、`/assets/*` 同样返回 404（无 cookie/JWT 时），静态页面层同样隐藏。配置键：`security.secure_entry_enabled`（bool）、`security.secure_entry_path`（6~64 位 URL 安全字符，`settings` 注册表校验）；保存设置本就 adminOnly + 审计。**忘记路径**：控制机执行 `watchman-server -reset-secure-entry -data <数据目录>`（置 false 后退出）或改 settings.json 后重启。
 
-### 3.16 AI 能力（增强）
+### 3.15 AI 能力（增强）
 
-> 设计原则：AI 是「增强」而非「必需」。通过统一模型适配层（兼容 OpenAI 协议）接入，可接第三方（OpenAI / 兼容网关 / 国产大模型）或本地模型，模型可热切换；未配置模型时其余功能不受影响。所有 AI 调用需可审计、可关闭、可限速。
+> 设计原则：AI 是「增强」而非「必需」。通过统一模型适配层（兼容 OpenAI 协议）接入，可接第三方（OpenAI / 兼容网关 / 国产大模型）或本地模型，模型可热切换；未配置模型时其余功能不受影响。所有 AI 调用需可审计、可关闭。
 
-#### 3.16.1 模型接入与配置
-- **统一适配层**：兼容 OpenAI Chat Completions 协议；支持配置 BaseURL / API Key / 模型名 / 超时 / 重试。设置页模型字段支持从当前端点主动探测可用模型列表（OpenAI 兼容 `/models`、Ollama `/api/tags`）下拉选择，也可手动输入；探测用表单当前值、未保存也可测，失败时手动输入仍可用。
-- **多 provider**：可配置多个模型来源（OpenAI、兼容网关、本地 Ollama/vLLM 等），按场景或按用户选择/路由。
-- **可观测**：记录 token 用量、耗时、调用来源，便于成本控制。
-- **开关与降级**：全局开关、按功能开关；模型不可用时降级为「不使用 AI」的常规流程，不阻断主流程。
+#### 3.15.1 模型接入与配置
+- **统一适配层**：兼容 OpenAI Chat Completions 协议；支持配置 BaseURL / API Key / 模型名。设置页模型字段支持从当前端点主动探测可用模型列表（OpenAI 兼容 `/models`、Ollama `/api/tags`）下拉选择，也可手动输入；探测用表单当前值、未保存也可测，失败时手动输入仍可用。
+- **单 provider 配置**：BaseURL / API Key / 模型名 + provider 预设（`deepseek` / `openai` / `ollama` / `custom`），可接第三方或本地模型；一次只生效一个 provider。
+- **可观测**：每次调用随响应返回 CallTrace（步骤、token 用量、耗时），前端展示；不持久化。
+- **开关与降级**：全局开关（`enabled`）；模型未配置或不可用时 AI 功能静默关闭，常规流程不受影响。
 
-#### 3.16.2 智能终端助手
+#### 3.15.2 智能终端助手
 - **自然语言转命令**：在在线终端/推送命令中用自然语言描述意图，AI 生成对应 Shell（Bash/PowerShell/CMD）命令。
 - **命令解释**：对任意命令给出中文解释与风险评估（高危命令提示）。
 - **一键执行 / 编辑**：生成的命令默认进入可编辑草稿，确认后再执行，不自动盲跑。
-- **上下文感知**：可携带当前主机信息（系统、发行版、已装软件等）提升生成准确度；敏感信息脱敏后再送模型。
+- **上下文感知**：可携带当前主机信息（主机名、系统、发行版、架构、默认 Shell）提升生成准确度。
 
-#### 3.16.3 智能诊断
+#### 3.15.3 智能诊断
 - **异常根因分析**：当主机离线、资源告警、进程异常、端口异常时，AI 结合监控数据与系统状态给出可能原因与处置建议。
-- **日志解读**：上传/选择一段日志，AI 总结要点、定位报错、给出修复建议（对标原产品「百川漏扫」大模型报告解读思路）。
+- **日志/报错解读**：把日志或报错文本作为上下文发给 AI 诊断（diagnose 接口），总结要点、定位报错、给出修复建议。
 - **故障排查向导**：多轮对话式排查，AI 根据反馈建议下一步要执行的诊断命令（用户确认后下发）。
 
-#### 3.16.4 监控与告警智能分析
-- **智能阈值/异常检测**：在固定阈值之外，提供基于 AI 的异常检测（趋势突变、毛刺），降低手动配阈值成本。
-- **告警降噪与合并**：对告警风暴做合并、去重、分级，AI 生成一句话摘要。
-- **告警解读**：每条告警附带 AI 生成的可能原因与处置建议。
-
-#### 3.16.5 安全扫描报告解读
+#### 3.15.4 安全扫描报告解读
 - **基线 / 漏洞 / 入侵痕迹报告解读**：扫描完成后 AI 生成中文解读：风险概述、影响范围、修复优先级、修复命令/步骤。
 - **可对话追问**：对报告内容多轮追问，逐步细化到「这台主机这个漏洞怎么修」。
-- **修复建议可执行化**：建议中的命令可一键带入「推送命令」草稿，确认后下发。
 
-#### 3.16.6 主机概览与运维报告
+#### 3.15.5 主机概览与运维报告
 - **单机/多机巡检报告**：按需或定时生成主机健康度报告（资源、进程、登录、安全扫描），AI 撰写摘要与改进建议。
-- **自然语言问答**：在控制台用自然语言问「哪台机器磁盘快满了」「最近有哪些异常登录」，AI 查询后回答（Function/Tool calling 调用平台 API，而非自由编造）。
 
-#### 3.16.7 权限与安全约束
-- **数据脱敏**：送往外部模型前对密钥、token、密码、敏感路径等做脱敏；本地模型可选不脱敏。
+#### 3.15.6 权限与安全约束
+- **数据脱敏**：仅应用创建表单快照在送模型前做脱敏（`redactFormForLLM`：环境变量值、疑似凭证的 compose 行、凭据保险库引用均遮蔽）；其他 AI 调用（诊断、对话、转命令）不做脱敏。
 - **不自动高危操作**：AI 仅给建议/草稿，高危命令、删除、重启等一律需人工二次确认。
-- **审计留痕**：记录每次 AI 调用的输入摘要、输出、操作者、是否被采纳/执行。
-- **按用户/分组限速**：可对 AI 调用做配额与频率限制。
+- **调用链路可追溯**：每次调用随响应返回 CallTrace（步骤、token 用量、耗时），前端展示；不持久化，诊断类调用按 §7 豁免不记操作审计。
 
-### 3.17 按需运维隧道（kubectl port-forward 式）
+### 3.16 按需运维隧道（kubectl port-forward 式）
 
 > 解决「临时打开某台主机/某个应用的某端口做运维调试」场景：不要求在主机、交换机或安全组上开任何面向公网/内网的监听端口，由运维本机发起、经既有 Agent 反向回连通道中继、进程退出即关闭的按需隧道。
 
@@ -392,7 +381,7 @@
   - `watchmanctl tunnel --app <appID> --port <端口> [--listen [ip:]port]`：应用定向模式，本地随机或指定端口转发到应用暴露端口（服务端按 `app.Ports[].Host` 白名单校验，`bind_scope=mesh` 时上游自动解析为主机组网 IP，否则 `127.0.0.1`）；
   - `watchmanctl tunnel --host <hostID或主机名> --target 127.0.0.1:<端口> [--listen ...]`：主机模式，`--target` 任意内网地址仅 admin 可用且记高危审计（防网络跳板滥用），operator 仅允许回环目标；
   - `watchmanctl ls` / `watchmanctl close <connID>` / `watchmanctl version`；
-  - 每次启动隧道**实时**调 `GET /api/v1/tunnels/client-info` 取数据面端点（不缓存，防面板漂移；`enabled` 反映数据面监听器真实状态——`-opgrpc` 未配置证书或监听失败时服务端 fail-closed 上报未启用；`endpoint` 推导链走面板对外地址统一解析：绑定的面板域名 → 请求 Host（未绑定域名即用访问 IP），IPv6 字面量去重围括号后 `JoinHostPort` 保证 `[::1]:9443` 形态）；断流语义对齐 kubectl——不自动重连，干净退出（隧道是会话态工具），代理首帧 15 秒 ack 看门狗超时即取消整条流（per-stream ctx，防 `stream.Recv` 永久阻塞）。HTTP/2 流控窗口增大（流 4MB / 连接 16MB，两端对称），TLS 启用会话恢复（`ClientSessionCache`）。
+  - 每次启动隧道**实时**调隧道 client-info 接口（见 API.md「按需运维隧道」）取数据面端点（不缓存，防面板漂移；`enabled` 反映数据面监听器真实状态——`-opgrpc` 未配置证书或监听失败时服务端 fail-closed 上报未启用；`endpoint` 推导链走面板对外地址统一解析：绑定的面板域名 → 请求 Host（未绑定域名即用访问 IP），IPv6 字面量去重围括号后 `JoinHostPort` 保证 `[::1]:9443` 形态）；断流语义对齐 kubectl——不自动重连，干净退出（隧道是会话态工具），代理首帧 15 秒 ack 看门狗超时即取消整条流（per-stream ctx，防 `stream.Recv` 永久阻塞）。HTTP/2 流控窗口增大（流 4MB / 连接 16MB，两端对称），TLS 启用会话恢复（`ClientSessionCache`）。
 - **Web 控制面入口**：应用详情页「端口映射」每行端口带「隧道」按钮、主机详情组网页工具区带「临时隧道」按钮，打开共享弹层（`web/src/components/tunnels/OpsTunnelModal.vue`）：展示可复制的 `watchmanctl login`（以 `window.location.origin` 为面板地址）与 `watchmanctl tunnel` 命令、5 平台 CLI 下载链接（GitHub Release 直链）、当前用户活动隧道列表及逐项关闭；数据面未启用时给出管理员开启 `-opgrpc` 的引导。
 - **安全边界**：角色仅限 admin/operator（viewer 拒绝并记审计）；分组可见性按 `groups.CanAccessGroup` 实时校验；开腿鉴权**每次 open 实时重查**（不缓存）；`target_port` 强制 1~65535（应用模式白名单之前先过界值）；目标存在性对外不透露——应用不存在/主机不存在/跨分组无权访问统一回 `目标不存在或无权访问`（消除存在性预言机；鉴权顺序修正：`resolveTarget` 在应用/主机解析成功后、任何端口白名单与目标地址校验之前先做分组校验——此前跨分组应用 + 非法端口会先报白名单错误，泄露存在性）；**错误分类**：策略拒绝（角色、分组、端口白名单、并发腿数超限）→ `PermissionDenied` + `op_tunnel_deny`（ResultBlocked）；基础设施失败（Agent 下线、腿建立失败）→ `Unavailable` + `op_tunnel_open`（ResultFailed），两者绝不混记；`OperatorOpenAck` 发送失败时拆除腿并补记一条成对的 `op_tunnel_close`，保证 open/close 审计配平。审计动作 `op_tunnel_open`（app 模式 medium，任意 target_host 的 host 模式 high）、`op_tunnel_close`（low）、`op_tunnel_deny`（ResultBlocked）。
 - **限额与回收**：每用户并发隧道腿 ≤ 8（`maxLegsPerOperator`），单 Agent 流式腿 ≤ 64；两个上限在 `Coordinator.OpenLeg` 内**同一把互斥锁下完成计数+插入**（并发开腿无 TOCTOU 窗口），超限返回哨兵错误 `ErrOwnerLegsExceeded`/`ErrAgentLegsExceeded`（`errors.Is` 可辨，归为策略拒绝类审计）；每腿空闲 15 分钟或存活 8 小时由 `Coordinator.StartReaper` 自动回收；Agent 断连时 `CloseByAgent` 连带清扫其孤儿流腿；慢消费流腿按既有策略丢弃（`toSock` 满即弃腿）。
@@ -404,26 +393,19 @@
 | 维度 | 要求 |
 | --- | --- |
 | 可用性 | 自部署、不依赖任何第三方 SaaS；单机即可跑，支持数据备份/迁移。 |
-| 部署 | 控制端支持 Docker 一键部署或单二进制部署；内置可选数据库（SQLite/Postgres 等）。 |
+| 部署 | 控制端单二进制部署；数据存 JSON/JSONL 文件（见 B.3）。 |
 | 兼容性 | Agent 兼容 Linux（常见发行版）/ Windows，arm64/amd64。 |
-| 性能 | 资源监控采集频率可调（默认秒级~分钟级）；历史数据至少保留 7 天（可配置保留时长）。 |
+| 性能 | 资源监控每 15 秒采集一次；历史数据保留 7 天。 |
 | 安全 | Agent ↔ 控制端全链路加密（TLS/WSS）；token 鉴权；终端/文件等高危操作需鉴权与审计。 |
-| 可扩展 | 应用市场、告警通知方式、扫描规则均可扩展。 |
+| 可扩展 | 告警 Webhook 通知、扫描规则集可扩展。 |
 | 数据自主 | 所有主机信息、监控数据、审计日志均落本地存储，可导出/备份。 |
-| AI 接入 | 通过统一适配层接入，兼容 OpenAI 协议；支持第三方与本地模型；AI 调用可关、可降级、可审计、可限速；敏感数据上送前脱敏。 |
+| AI 接入 | 通过统一适配层接入，兼容 OpenAI 协议；支持第三方与本地模型；AI 调用可关、可降级、可追溯（CallTrace）；应用创建表单上送前脱敏。 |
 
 ---
 
 ## 5. 对比原产品的自研增补点
 
-原 SaaS 停服即全失，自研需额外补齐以下能力，避免重蹈覆辙：
-
-1. **数据自主可控**：监控/审计/配置全部本地存储，支持一键备份与跨机迁移。
-2. **离线可用**：控制端不依赖任何云端鉴权/计费，断网仍可用。
-3. **操作审计**：完整记录登录、终端会话、文件操作、命令下发、高危动作，可导出。
-4. **会话回放（建议）**：终端会话可录制并回放，满足事后追溯。
-5. **高危命令管控（建议）**：可配置命令黑/白名单、高危命令二次确认或拦截，避免误操作。
-6. **部署可移植**：不绑定特定云厂商，任意一台 Linux 机器即可托管控制端。
+原 SaaS 停服即全失，自研需额外补齐以下能力，避免重蹈覆辙：数据自主可控、离线可用、操作审计、会话回放、高危命令管控、部署可移植——具体交付见 §6.1 核心交付能力。
 
 ---
 
@@ -433,7 +415,7 @@
 
 ### 6.1 核心交付能力（自托管完整闭环）
 - **主机接入与生命周期**：控制端 + 跨平台 Agent 基础架构（主动出站回连、鉴权、心跳）；Linux/Windows 一键绑定；主机列表、实时状态探活、分组管理。
-- **监控与网络质量**：资源监控（CPU/内存/网络/磁盘实时吞吐与历史时序曲线）；电信/联通/移动三网 TCP 质量探测；存储挂载点监控；多渠道自定义阈值告警（Webhook/邮件）与静默防抖。
+- **监控与网络质量**：资源监控（CPU/内存/网络/磁盘实时吞吐与历史时序曲线）；电信/联通/移动三网 TCP 质量探测；存储挂载点监控；自定义阈值告警（Webhook）与静默防抖。
 - **系统状态与审计**：进程清单（支持结束进程）、网络监听端口、系统用户账号与登录历史；全生命周期操作审计日志与终端 asciicast v2 录像审计。
 - **在线终端（Web Terminal）**：免密/口令/缺省登录行为；多标签管理、终端主题切换；多角色终端分享（观看/控制模式）；Windows PowerShell/CMD 深度兼容；会话恢复与 60s 断线优雅宽限期。
 - **文件管理**：文件与目录的浏览、创建、移动、复制、删除、文本预览与编辑；大文件分片流式上传下载与进度展示。
@@ -443,13 +425,7 @@
 - **动态组网与按需运维隧道**：Tailscale / Headscale 异地组网打通；无需外网端口的按需 gRPC 运维代理隧道（CLI 直连目标端口）。
 - **统一设置与多角色权限**：系统设置中心统一存储与点分命名空间；多用户隔离与分组授权；宝塔式安全入口保护与面板域名/证书防失联。
 - **AI 智能运维引擎（可选插拔）**：兼容 OpenAI 协议的统一适配层；智能终端助手（自然语言转命令、命令解释与三层高危拦截）；应用创建智能草稿生成与事实探测校验；AI 会话诊断与故障排查。
-- **快照备份与系统安全**：主机快照备份调度、S3 远程存储归档；Mimosa 密封安全基线与漏洞扫描。
-
-### 6.2 规划中扩展能力（生态联动与演进）
-- **多云联动**：主流公有云（阿里云/腾讯云/AWS/Azure）API 凭证对接，云资产自动化发现与实例纳管联动。
-- **多用户企业级 SSO**：支持 OAuth2 / OIDC / LDAP / SAML 等企业统一身份源认证。
-- **AI 巡检与周期性运维报告**：基于定时任务的集群健康度体检、配置漂移检测与自动化运维巡检报告生成。
-- **分布式跨主机编排**：跨多个网络节点的应用联合调度与高级流量调度。
+- **快照备份与系统安全**：主机快照备份调度、S3 远程存储归档；安全基线、入侵痕迹与漏洞扫描。
 
 ---
 
@@ -460,32 +436,27 @@
 ## A.1 推荐架构总览
 
 ```
-[被管机 Agent] ──(出站长连接 / TLS / 443)──▶ [控制端 Server] ◀── [Web 浏览器]
+[被管机 Agent] ──(出站长连接 / TLS / 9090)──▶ [控制端 Server] ◀── [Web 浏览器]
    Go 单二进制            Go 单二进制              Vue3 + xterm.js
    反向回连                内含网关/RPC/隧道        WebSocket 终端
    主动出向，不开入站端口   公网入口，会话锚点/审计
 ```
 
-核心原则：
-- **Agent 主动出站回连控制端，被管机零开放端口**；控制端是唯一公网入口。
-- 所有会话流量经控制端中继，便于审计/录像。
-- 控制端是「会话锚点」：Agent 短暂断连时，控制端保留 PTY 进程与状态，浏览器侧会话不中断、可续接。
-- AI 为增强层，可关可降级，不影响主流程。
+核心原则见 §2.2（Agent 主动出站、控制端唯一公网入口、会话锚点、AI 可关可降级）。
 
 ## A.2 技术栈推荐
 
 | 层 | 选型 | 理由 |
 | --- | --- | --- |
 | 后端语言（控制端 + Agent） | **Go** | 单二进制、跨平台交叉编译、goroutine 适合长连接/多 Agent 并发；1Panel/Tactical RMM/Teleport/frp/Headscale 全是 Go，生态成熟，维护成本最低 |
-| 前端 | **Vue 3 + TS + Element Plus / Naive UI** | 运维类组件库丰富，社区中文资料多，1Panel/JumpServer Luna 均用 Vue |
-| 数据库 | **SQLite（默认）+ 可选 PostgreSQL** | 个人/小规模零运维单文件；规模上来再迁 PG。避免一上来 MySQL+Redis+Celery 三件套 |
-| 缓存/队列（可选） | Redis（小规模可不用） / NATS（中等规模解耦 Agent 控制与批量任务，参考 Tactical RMM） | 按需引入 |
+| 前端 | **Vue 3 + TS + Naive UI** | 运维类组件库丰富，社区中文资料多，1Panel/JumpServer Luna 均用 Vue |
+| 数据存储 | **JSON/JSONL 文件**（`data/` 目录，按模块分文件落盘） | 实际落地形态，见 B.3/B.7.1；无 SQLite/PostgreSQL 依赖 |
 | Web 终端前端 | **xterm.js + addon-fit + addon-webgl + addon-search** | 事实标准（VS Code/JumpServer/1Panel 均用），生态最全，支持 CJK/IME |
 | Agent PTY | Linux/mac：**creack/pty**；Windows：**UserExistsError/conpty**（ConPTY） | 统一 `PTY` 接口 + build tag 分平台 |
 | 控制端 ↔ 浏览器 | **WebSocket**（gorilla/websocket 或 nhooyr.io/websocket） | 浏览器唯一现实选择，xterm.js 生态绑定 |
-| Agent ↔ 控制端 | **gRPC over HTTP/2 + TLS（443）**，或轻量替代 **yamux over TCP+TLS** | gRPC 多 stream 天然多路复用、强类型 `.proto`；443 穿透性最好；yamux 适合砍依赖极致精简 |
+| Agent ↔ 控制端 | **gRPC over HTTP/2 + TLS（:9090）** | gRPC 多 stream 天然多路复用、强类型 `.proto` |
 | 会话录像 | **asciinema cast v2** 格式，控制端实时增量落盘 | 开放格式、现成播放器（asciinema-player）、增量写入断电不丢 |
-| AI 适配层 | **LiteLLM SDK**（应用层统一接口 + fallback）+ 可选 **New-API** 网关 | OpenAI 协议为统一接口；热切换/降级/成本追踪内置 |
+| AI 适配层 | 自研 OpenAI 兼容适配层（见 §3.15） | OpenAI 协议为统一接口；热切换/降级/调用链路追踪内置 |
 | 本地模型引擎 | 开发用 **Ollama**，生产用 **vLLM** | OpenAI 兼容 endpoint，零成本起步 |
 | 组网底座 | **自研 Agent 回连反向隧道（frp 同构）** 为主，按需叠加 **Headscale + 自建 DERP** | 复用 Agent 通道、一键加入组网、稳定穿 NAT；mesh 直连需求出现再叠加 overlay |
 
@@ -493,51 +464,27 @@
 
 ## A.3 Agent ↔ 控制端通信
 
-- **传输**：gRPC bidi-stream over HTTP/2 + TLS（443）；多路复用 = 一个连接上每个业务（终端会话 / 文件传输 / 监控上报 / 命令执行 / Docker 操作）各开一条 stream，互不阻塞。轻量替代：hashicorp/yamux over TCP+TLS，自定二进制帧。
-- **鉴权**：起步「enroll token + TLS + 长连接 Bearer Token」（一机一 token、短 TTL、吊销列表）；后续升级 **mTLS + 证书热轮换**（参考 Tailscale/Teleport）。
-- **心跳/重连**：30s 心跳，3 次失联判定断连；指数退避（1s→2s→4s→…→60s 上限）+ 抖动。
-- **会话恢复**：控制端保留 PTY 进程 ~60s，Agent/浏览器重连按 session_id 续接同一 stream；文件传输按 offset 续传。
+传输、鉴权、心跳/重连与会话恢复见 B.2（`proto/agent.proto`）与 §8.5、§8.6。轻量替代 hashicorp/yamux 未采用；后续可升级 mTLS + 证书热轮换。
 
 ## A.4 Web 终端
 
-- 数据通路：浏览器 xterm.js ↔ WebSocket ↔ 控制端（路由/录制/广播）↔ Agent 长连接 stream ↔ PTY(bash/powershell)。
-- **Windows**：ConPTY（`CreatePseudoConsole`），注意官方坑——通信通道分线程服务、关闭前先排空 output，否则死锁。Go 用 `UserExistsError/conpty`。
-- **跨平台抽象**：Agent 定义统一 `PTY` 接口（Start/Read/Write/Resize/Close），build tag 分平台实现。
-- **终端分享**：控制端做 pub/sub 广播；订阅者带 `controller`/`viewer` 角色，viewer 输入被丢弃，控制权切换记审计（asciicast `"m"` marker）。
-- **终端内文件传输**：参考 ttyd 的 ZMODEM / trzsz，浏览器侧 rz/sz 体验，与独立文件管理面板互补。
-- **参考实现**：直接抄 gotty 的 `pty.Start → io.Copy ↔ websocket` 骨架；精读 1Panel 的 agent 目录（产品形态最接近）与 ttyd 的 WS 帧协议。
+已落地实现见 §3.5、§8.5 与 B.5（数据通路、ConPTY、终端分享、录像）。
 
 ## A.5 文件管理
 
-- **走长连接多路 stream 分片传输**，绝不在 Agent 开 HTTP 端口（守住「不开放被管机端口」约束）。
-- 消息定义 `read/write/stat/list/reume + offset/chunk_seq/sha256`，类 SFTP 语义自实现（不跑 SSH 服务）。
-- **断点续传**：Agent 维护 `.part` + offset，重连 resume；分块 SHA256 + 整体校验。
-- **预览/编辑**：流式给浏览器渲染（文本/图片/PDF）；编辑用 Monaco/CodeMirror，保存经 stream 写回，带版本/etag 校验防覆盖；大文件支持范围读（head/tail/offset）。
+已落地实现见 §3.6 与 B.2（FileOp 协议、分片传输、断点续传、内容嗅探预览/编辑）。
 
 ## A.6 组网 / 内网穿透
 
-- **主路线：自研 Agent 回连反向隧道（frp 同构）**
-  - 控制端内置类 frps 的隧道协调；Agent 复用已有回连通道注册虚拟 IP/端口映射，**不装第二个 VPN 进程**。
-  - 一键加入组网：Web 选中主机 → 下发「加入网络」→ Agent 在回连通道上注册映射规则，零额外配置。
-  - 访问：控制端为每台主机分配虚拟 IP（如 100.64.x.x），用户从控制端发起 SSH 时流量送入对应 Agent 反向隧道，Agent 本地转发到 `127.0.0.1:22` 或目标内网地址。
-  - 加密：Agent↔控制端 TLS/mTLS；隧道内流量端到端加密。
-- **可选增强：主机两两 P2P 直连**时叠加 **Headscale + 自建 DERP**（Tailscale 客户端 + 自托管控制面），控制端调用 Headscale API 编排「下发 auth key → tailscale up」；未出现大流量直连需求前不引入。
+已落地实现见 §3.9、§8.7 与 §3.16（Headscale + 自建 DERP 组网、按需运维隧道）。早期「自研 Agent 回连反向隧道（frp 同构）」主路线已放弃，不再作为方案。
+
 - **不采用**：nps（2021 停更，有安全风险）、WireGuard 原生（无控制面=自造 Tailscale，工程量不划算）、ZeroTier 自建 planet（改造深）。
 
 ## A.7 AI 适配层与模型接入
 
-- **统一适配层**：LiteLLM SDK（`litellm.completion` 统一接口 + 内置重试/fallback/成本追踪）；多 key/额度需求时前置 New-API 网关。OpenAI Chat Completions 协议为统一接口（事实标准）。
-- **Provider 优先级（默认配置顺序）**：
-  1. 本地优先：vLLM/Ollama 跑 `qwen2.5-coder:7b`（命令生成）+ `qwen3:8b` 或 `glm-4:9b`（通用/工具调用/日志解读）。
-  2. 第三方增强（国产合规、需 key、脱敏后）：DeepSeek、智谱 GLM、Kimi、通义千问。
-  3. 兜底：OpenAI（合规允许 + 脱敏后）。
+已落地实现见 §3.15（统一 OpenAI 兼容适配层、模型热切换、表单脱敏、调用链路追踪、降级、三层高危拦截）。早期 LiteLLM SDK 方案未采用；工具调用草案（`list_hosts` 等）未实现。
+
 - **兼容性注意点**：通义千问 `tools` 与 `stream` 互斥（function calling 请求强制非流式）；不支持 tools 的模型降级为「prompt 内嵌工具说明 + 解析 JSON」。
-- **Tool calling 工具集草案**：`list_hosts / get_host_detail / query_metrics / list_alerts / get_sessions / search_audit_logs / get_task_status`；工具调用一律非流式，后端做权限校验（只读优先）。
-- **自然语言转命令**：system prompt 强制 JSON schema `{command, explanation, risk_level, requires_confirm}`；Few-shot 3–6 例；注入主机上下文（OS/发行版/shell/用户/目录）；**三层高危拦截**（黑名单正则预检 + risk_level 分级 + 高危强制人工确认，绝不自动执行）。
-- **长日志/报告**：map-reduce 分段总结 + 向量检索 RAG（本地 embedding 如 bge-m3 / Qwen3-Embedding）+ 结构化字段抽取；优先用长上下文模型。
-- **安全**：默认零外发（含敏感数据任务仅本地模型）；第三方调用前正则+字典脱敏（密钥/token/路径/IP/手机号 → 占位符），回填反向还原；provider 分级（本地=原文，国产合规=脱敏，境外=强脱敏或不送）。
-- **审计**：每次调用记录 call_id/timestamp/user/scenario/provider/model/tokens/cost/latency/risk_level/blocked/fallback 等。
-- **降级**：未配任何模型 key / 本地引擎未启动 → AI 功能静默关闭，堡垒机主流程不受影响。
 
 ## A.8 关键参考仓库（精读优先级）
 
@@ -561,229 +508,128 @@
 采用单仓多模块（monorepo）以便共享 `.proto` 与类型定义。
 
 ```
-watchman/                       # 仓库名（暂定，可改）
-├── go.mod                      # Go 模块根
-├── proto/                      # gRPC IDL（控制端 ↔ Agent 共享）
-│   └── agent.proto
+workbench/
+├── go.mod
+├── proto/agent.proto           # gRPC IDL（控制端 ↔ Agent 共享）
+├── AGENTS.md / API.md / DESIGN.md
 ├── server/                     # 控制端（Go 单二进制）
-│   ├── cmd/watchman/main.go    # 入口
-│   ├── internal/
-│   │   ├── api/                # REST API（Gin/Echo，RESTful + JWT）
-│   │   ├── rpc/                # gRPC server：接收 Agent 回连 stream
-│   │   ├── ws/                 # 浏览器 WebSocket 网关（xterm 终端 / 文件传输）
-│   │   ├── tunnel/            # 反向隧道协调（虚拟 IP/端口映射，组网）
-│   │   ├── audit/              # 操作审计 + 会话录像（asciicast v2）落盘
-│   │   ├── monitor/           # 监控数据入库 + 告警引擎
-│   │   ├── ai/                 # AI 适配层（LiteLLM 封装）+ tool registry
-│   │   ├── auth/               # 用户/JWT/分组权限/RBAC
-│   │   ├── store/              # 存储层（SQLite/PG，GORM 或 sqlc）
-│   │   └── config/             # 配置加载
+│   ├── cmd/watchman/main.go
 │   ├── web/                    # 前端构建产物（嵌入二进制，go:embed）
-│   └── Dockerfile
+│   └── internal/
+│       ├── ai/                 # AI 适配层（OpenAI 兼容）+ 调用链路
+│       ├── alert/              # 告警规则与引擎
+│       ├── api/                # REST API（RESTful + JWT）与审计中间件
+│       ├── apps/               # 应用中心（部署/回滚/迁移/卷备份）
+│       ├── audit/              # 操作审计日志
+│       ├── auth/               # 用户/JWT/分组权限
+│       ├── backup/             # 控制端备份与恢复
+│       ├── cert/               # 证书中心（ACME/签发/续期）
+│       ├── commands/           # 常用命令库
+│       ├── githubapp/          # GitHub App 集成
+│       ├── gitprovider/        # Git 仓库探测
+│       ├── groups/             # 分组与授权
+│       ├── install/            # Agent 安装脚本与二进制下载
+│       ├── metrics/            # 资源监控时序存储与采集
+│       ├── network/            # 动态组网（Headscale）
+│       ├── panelsec/           # 面板域名/SSL/安全入口
+│       ├── policy/             # 命令拦截策略
+│       ├── registry/           # 主机注册与分组可见性
+│       ├── release/            # 版本探测与在线自升级
+│       ├── rpc/                # gRPC server：接收 Agent 回连 stream
+│       ├── scan/               # 安全扫描
+│       ├── secentry/           # 安全入口
+│       ├── session/            # 终端会话与录像（asciicast v2）
+│       ├── settings/           # 统一设置（system/user 双作用域）
+│       ├── snapshots/          # 主机快照备份
+│       ├── vault/              # 凭据保险库（AES-GCM）
+│       └── ws/                 # 浏览器 WebSocket 网关（终端/文件流）
 ├── agent/                      # Agent（Go 单二进制，装在被管机）
 │   ├── cmd/watchman-agent/main.go
-│   ├── internal/
-│   │   ├── conn/               # gRPC 反向回连 + 断线重连 + 心跳
-│   │   ├── pty/                # 统一 PTY 接口（build tag: linux/darwin/windows）
-│   │   ├── shell/              # 终端会话管理
-│   │   ├── file/               # 文件操作（read/write/stat/list/分片）
-│   │   ├── exec/               # 命令/脚本执行
-│   │   ├── sysinfo/            # 系统状态采集（进程/端口/账号/登录/清理预览）
-│   │   ├── monitor/           # 资源监控采集（CPU/内存/磁盘/网络）
-│   │   ├── docker/            # Docker 容器与镜像操作
-│   │   ├── enroll/            # 首次注册（token → 长期凭证）
-│   │   └── config/            # 本地配置 + 凭证存储
-│   └── Dockerfile
-├── web/                        # 前端（Vue3 + TS + Vite）
-│   ├── src/
-│   │   ├── views/             # 主机列表/详情/终端/文件/Docker/监控/设置
-│   │   ├── components/        # xterm.js 终端、文件树、图表等
-│   │   ├── api/               # REST/WS 客户端
-│   │   └── store/             # Pinia 状态
-│   ├── package.json
-│   └── vite.config.ts
-├── deploy/                     # 部署与引导脚本
-│   ├── install.sh             # 控制端一键安装/升级/卸载脚本（单二进制 + systemd）
-│   └── quick_start.sh         # 一键引导脚本（下载最新 install.sh 并透传参数）
-└── docs/
+│   └── internal/
+│       ├── cleanup/            # 系统清理执行
+│       ├── config/             # 本地配置 + 凭证存储
+│       ├── conn/               # gRPC 反向回连 + 断线重连 + 心跳
+│       ├── docker/             # Docker 容器与镜像操作
+│       ├── exec/               # 命令/脚本执行
+│       ├── files/              # 文件操作（read/write/stat/list/分片）
+│       ├── metrics/            # 资源监控采集（CPU/内存/磁盘/网络/三网探测）
+│       ├── pty/                # 统一 PTY 接口（build tag 分平台）
+│       ├── record/             # 终端录像
+│       ├── scan/               # 安全扫描（基线/入侵/漏洞）
+│       ├── shell/              # 终端会话管理
+│       ├── sysinfo/            # 系统状态采集（进程/端口/账号/登录/清理预览）
+│       ├── tunnel/             # 运维隧道腿
+│       ├── uninstall/          # Agent 自卸载
+│       └── upgrade/            # Agent 在线自升级
+├── cmd/watchmanctl/            # 运维隧道 CLI（§3.16）
+├── web/                        # 前端（Vue3 + TS + Vite + Naive UI）
+│   └── src/
+│       ├── views/              # 各页面
+│       ├── components/         # xterm.js 终端、文件树、图表等
+│       ├── api/                # REST/WS 客户端
+│       ├── stores/             # Pinia 状态
+│       ├── router/             # 路由
+│       ├── composables/        # 组合式函数
+│       └── utils/              # 工具（含时间、Markdown 渲染）
+└── deploy/
+    ├── install.sh              # 控制端一键安装/升级/卸载脚本（单二进制 + systemd）
+    └── quick_start.sh          # 一键引导脚本（下载最新 install.sh 并透传参数）
 ```
 
-模块依赖方向：`api/rpc/ws` → `audit/store/auth`；`ai` 独立可裁剪；前端构建产物 `go:embed` 进控制端二进制（单文件部署）。
+模块依赖方向：`api/rpc/ws` → `audit/auth/settings`；`ai` 独立可裁剪；前端构建产物 `go:embed` 进控制端二进制（单文件部署）。
 
 ## B.2 Agent ↔ 控制端协议（gRPC）
 
-`proto/agent.proto` 要点。Agent 主动回连，控制端为 server，Agent 为 client，所有业务通过一条 bidi stream 复用（控制端也可主动下发指令）。
+`proto/agent.proto` 是唯一事实源，以下只列信封与成员对照，字段号与消息定义以 proto 文件为准，禁止从本文档抄字段号。Agent 主动回连，控制端为 server，Agent 为 client，所有业务通过一条 bidi stream 复用（控制端也可主动下发指令）。
 
-```protobuf
-syntax = "proto3";
-package watchman.agent;
-option go_package = "watchman/proto/agentpb";
+`AgentService.Connect(stream AgentMessage) returns (stream ServerMessage)`。Agent 上行 `AgentMessage`：
 
-// 一条双向流承载所有通道（注册/心跳/终端/文件/命令/监控/系统状态/Docker）
-service AgentService {
-  rpc Connect(stream AgentMessage) returns (stream ServerMessage);
-}
+| field | 成员 | 说明 |
+| --- | --- | --- |
+| 1 | register（RegisterRequest） | 首次注册：enroll_token 换 auth_token |
+| 2 | heartbeat（Heartbeat） | 心跳 |
+| 3 | term_out（TerminalOutput） | PTY 输出（带 session_id） |
+| 4 | file_chunk（FileChunk） | 文件传输数据块/读结果 |
+| 5 | exec_result（ExecResult） | 推送命令/脚本执行结果 |
+| 6 | metrics（MetricsSample） | 资源监控上报 |
+| 7 | sysinfo（SysInfoSnapshot） | 进程/端口/账号/登录快照 |
+| 8 | docker（DockerEvent） | Docker 事件上报 |
+| 9 | scan_progress（ScanProgress） | 安全扫描进度/结果 |
+| 10 | upgrade_progress（UpgradeProgress） | Agent 自升级进度 |
+| 11 | tunnel_data（TunnelData） | 反向隧道数据（Agent → 控制端） |
+| 12 | tunnel_close（TunnelClose） | 反向隧道拆除 |
+| 13 | cleanup（CleanupEvent） | 系统清理结果 |
+| 14 | exec_output（ExecOutput） | 流式输出块 |
+| 99 | ack（Ack） | 通用确认 |
 
-message AgentMessage {            // Agent → 控制端
-  oneof payload {
-    RegisterRequest  register  = 1;
-    Heartbeat         heartbeat = 2;
-    TerminalOutput    term_out  = 3;   // PTY 输出（带 session_id）
-    FileChunk         file_chunk= 4;   // 文件传输数据块/读结果
-    ExecResult        exec_result=5;   // 推送命令/脚本执行结果
-    ExecOutput        exec_output=14;  // 流式输出块（见 ExecOutput）
-    MetricsSample     metrics   = 6;  // 资源监控上报
-    SysInfoSnapshot   sysinfo   = 7;  // 进程/端口/账号/登录快照
-    DockerEvent       docker    = 8;  // Docker 事件上报
-    Ack ack = 99;
-  }
-}
+控制端下行 `ServerMessage`：
 
-message ServerMessage {           // 控制端 → Agent
-  oneof payload {
-    RegisterResponse  register  = 1;   // 颁发长期凭证 / 拒绝
-    HeartbeatAck      heartbeat = 2;
-    TerminalInput     term_in   = 3;   // 键盘输入（session_id）
-    TerminalResize    term_resize=4;
-    TerminalOpen      term_open = 5;   // 开新会话：指定 shell/账号/cwd/尺寸
-    TerminalClose     term_close= 6;
-    FileOp            file_op   = 7;   // read/write/stat/list/resume
-    ExecRequest       exec      = 8;   // 下发命令/脚本（shell 类型 bash/sh/cmd/pwsh）
-    SysInfoQuery      sysinfo_q = 9;
-    MetricsQuery      metrics_q = 10;  // 拉取当前/历史
-    DockerOp          docker_op = 11;  // Docker 操作下发
-    ConfigUpdate      config_update=20; // 面板改配置后对在线 Agent 即时下发（重连兜底见 RegisterResponse）
-    ExecCancel        exec_cancel=22;  // 取消在途 exec（见 ExecCancel）
-    TrafficCorrect    traffic_correct=23; // 手动校正月流量累计（见 TrafficCorrect）
-  }
-}
+| field | 成员 | 说明 |
+| --- | --- | --- |
+| 1 | register（RegisterResponse） | 颁发长期凭证 / 拒绝 |
+| 2 | heartbeat（HeartbeatAck） | 心跳确认 |
+| 3 | term_open（TerminalOpen） | 开新会话：shell/账号/cwd/尺寸 |
+| 4 | term_in（TerminalInput） | 键盘输入 |
+| 5 | term_resize（TerminalResize） | 终端尺寸 |
+| 6 | term_close（TerminalClose） | 关会话 |
+| 7 | file_op（FileOp） | 文件操作：read/write/stat/list/mkdir/move/remove/upload/download/chmod |
+| 8 | exec（ExecRequest） | 下发命令/脚本 |
+| 9 | sysinfo_q（SysInfoQuery） | 系统状态查询：process/port/user/login/osinfo/kill/cleanup |
+| 10 | metrics_q（MetricsQuery） | 拉取当前/历史指标 |
+| 11 | docker_op（DockerOp） | Docker 操作下发 |
+| 12 | scan（ScanRequest） | 安全扫描下发 |
+| 13 | upgrade（UpgradeRequest） | Agent 自升级 |
+| 14 | maintenance（MaintenanceNotice） | 维护/重启通知 |
+| 15 | uninstall（UninstallRequest） | 卸载 Agent |
+| 17 | tunnel_open（TunnelOpen） | 反向隧道建腿 |
+| 18 | tunnel_data（TunnelData） | 反向隧道数据 |
+| 19 | tunnel_close（TunnelClose） | 反向隧道拆除 |
+| 20 | config_update（ConfigUpdate） | 面板改配置后对在线 Agent 即时下发（重连兜底见 RegisterResponse） |
+| 21 | cleanup（CleanupRequest） | 系统清理执行 |
+| 22 | exec_cancel（ExecCancel） | 取消在途 exec |
+| 23 | traffic_correct（TrafficCorrect） | 手动校正月流量累计 |
 
-message RegisterRequest {
-  string enroll_token = 1;        // 一次性，首次注册用
-  string agent_id     = 2;        // 本地持久化的 agent 标识
-  string hostname     = 3;
-  string os           = 4;        // linux/windows
-  string arch         = 5;        // amd64/arm64
-  string distro       = 6;
-  string agent_version= 7;
-}
-message RegisterResponse {
-  bool   ok = 1;
-  string agent_id   = 2;
-  string auth_token = 3;          // 长期凭证（后续回连携带）
-  int32  heartbeat_interval_sec = 4;
-  int32  traffic_reset_day = 7;   // 月流量重置日（1~28，每次重连下发）
-  // 三网监控探测目标：键 = 运营商（telecom/unicom/mobile），值 = host[:port]
-  // TCP 端点（端口缺省 80）；仅下发有效目标，空 map = 探测关闭。
-  map<string, string> probe_targets = 9;
-}
-
-// ConfigUpdate 携带面板编辑后的主机级运行时配置，对在线 Agent 经
-// ServerMessage.config_update（field 20）即时下发，语义与 RegisterResponse
-// 同名字段一致；离线 Agent 收不到，下次（重）连时由 RegisterResponse 兜底。
-// 旧 Agent 收到未知 oneof 字段落 default 分支静默忽略，下次重连生效；新 Agent
-// 连旧服务端则永远收不到该消息，同样退化为重连生效——双向组合均无错误。
-message ConfigUpdate {
-  map<string, string> probe_targets = 1; // 语义同 RegisterResponse.probe_targets（空 map = 关闭探测）
-  int32  traffic_reset_day = 2;          // 语义同 RegisterResponse.traffic_reset_day
-}
-
-message TerminalOpen {
-  string session_id = 1;
-  string shell = 2;               // bash/sh/powershell/cmd，或带参数的完整命令行（如 docker exec -it <容器> /bin/sh），Agent 按 shell 词法拆成命令与参数
-  string account = 3;             // 登录账号（可选，空则用默认）
-  string cwd = 4;
-  uint32 cols = 5; uint32 rows = 6;
-  string share_mode = 7;          // none/view/control 终端共享模式
-}
-message TerminalOutput { string session_id=1; bytes data=2; }
-message TerminalInput  { string session_id=1; bytes data=2; }
-message TerminalResize { string session_id=1; uint32 cols=2; uint32 rows=3; }
-message TerminalClose  { string session_id=1; }
-
-message FileOp {
-  string op_id = 1;
-  string op = 2;                  // read/write/stat/list/mkdir/move/remove/upload/download
-  string path = 3;
-  int64  offset = 4;
-  int64  length = 5;
-  int64  total_size = 6;
-  uint32 chunk_seq = 7;
-  bytes  data = 8;
-  bool   overwrite = 9;
-  string dest_path = 10;          // move/copy 目标
-}
-message FileChunk {
-  string op_id = 1; uint32 chunk_seq=2; bytes data=3; int64 offset=4; bool eof=5;
-  string sha256 = 6;              // 校验
-}
-
-message ExecRequest {
-  string exec_id = 1;
-  string shell = 2;               // bash/sh/cmd/powershell
-  string command = 3;             // 单行或脚本
-  bool   is_script = 4;
-  int32  timeout_sec = 5;
-  int32  stall_timeout_sec = 6;    // 失速预算秒，0=关闭；连续无输出超预算即杀整棵进程组（见 §3.7）
-}
-message ExecResult {
-  string exec_id = 1; int32 exit_code=2; bytes stdout=3; bytes stderr=4;
-  int64  duration_ms = 5; string error = 6;
-}
-message ExecOutput {              // 流式输出块：每 ~200ms 或满 4KB 发一次，同时累积进最终 stdout/stderr
-  string exec_id = 1; bytes chunk = 2; string stream = 3; // "stdout"/"stderr"
-}
-message ExecCancel {              // 部署取消 / 服务端等待超时时发给 Agent，杀整棵进程组并回 ExecResult（error "cancelled"）
-  string exec_id = 1;
-}
-
-message MetricsSample {
-  string agent_id = 1;
-  int64  ts = 2;
-  double cpu_usage = 3;
-  double mem_usage = 4;            // 百分比
-  int64  mem_total = 5; int64 mem_used = 6;
-  double net_rx = 7; double net_tx = 8;   // bytes/s
-  double disk_read = 9; double disk_write = 10;
-  repeated Mount mounts = 11;      // 挂载点容量
-  message Mount { string path=1; int64 total=2; int64 used=3; string device=4; string fstype=5; }
-  // 三网监控探测结果：键 = 运营商（telecom/unicom/mobile），至少完成过
-  // 一轮探测才上报对应条目；latency_ms = 0 表示该轮无成功尝试。
-  map<string, ProbeResult> probe_results = 26;
-  message ProbeResult {
-    double latency_ms = 1;         // 成功尝试 RTT 中位数（ms）
-    double loss_pct = 2;           // 失败尝试占比（0~100）
-  }
-}
-
-message SysInfoQuery { string kind=1; }   // process/port/user/login/cleanup（cleanup 为系统清理预览）
-message SysInfoSnapshot {
-  string kind = 1; bytes json_payload = 2; // 结构化 JSON（不同 kind 不同 schema）
-}
-
-// 按需运维隧道数据面（§3.17）：挂在控制端独立 -opgrpc 端口（默认 :9443，
-// 强制 TLS + 面板 JWT），一条 bidi 流代理一条本地 TCP 连接。
-service OperatorService {
-  rpc Connect(stream OperatorMessage) returns (stream OperatorMessage);
-}
-message OperatorMessage {
-  oneof payload {
-    OperatorOpen    open  = 1;   // 客户端首帧（强制）
-    OperatorOpenAck ack   = 2;   // 服务端首帧：ok/error/conn_id
-    OperatorData    data  = 3;   // 双向传输字节
-    OperatorClose   close = 4;   // 任一侧拆除（带 reason）
-  }
-}
-message OperatorOpen {
-  string host_id     = 1;        // 目标主机（app_id 为空时必填）
-  string app_id      = 2;        // 应用定向模式：服务端解析主机 + 端口白名单
-  string target_host = 3;        // 空=自动（127.0.0.1 或组网 IP）；任意值仅 admin
-  uint32 target_port = 4;
-}
-message OperatorOpenAck { bool ok = 1; string error = 2; string conn_id = 3; }
-message OperatorData  { bytes data = 1; }
-message OperatorClose { string reason = 1; }
-```
+运维隧道数据面（§3.16）：独立服务 `OperatorService.Connect`，挂在控制端独立 -opgrpc 端口（默认 :9443，强制 TLS + 面板 JWT），一条 bidi 流代理一条本地 TCP 连接。`OperatorOpen`（客户端首帧）→ `OperatorOpenAck`（服务端首帧：ok/error/conn_id）→ 双向 `OperatorData` → 任一侧 `OperatorClose`（带 reason）。服务端按角色/分组/端口白名单校验每次 open 并审计 open/close/deny。
 
 约定：
 - **鉴权**：首次 `RegisterRequest(enroll_token)` 换 `auth_token`；后续回连在 gRPC metadata 带 `authorization: bearer <auth_token>`。
@@ -796,7 +642,7 @@ message OperatorClose { string reason = 1; }
 
 ## B.3 数据模型（核心表）
 
-存储用 SQLite（默认）/ PostgreSQL。下表为逻辑模型，列名示意。
+存储用 JSON/JSONL 文件（`data/` 目录，按模块分文件落盘，无 SQLite/PostgreSQL 依赖）。下表为逻辑模型，列名示意。
 
 ```
 users(id, username, password_hash, email, role, status, created_at)
@@ -812,11 +658,7 @@ hosts(id, agent_id, hostname, os, arch, distro, agent_version,
   status: online/offline/maintenance
   agent_id 唯一；一台主机 = 一个 agent 注册
 
-accounts(id, host_id, name, type, credential_ref, is_default) # 登录账号配置
-  type: password/key/token；credential_ref 指向加密存储
-
-login_policy(id, host_id, behavior)                           # 禁止/口令/缺省
-  缺省：取 accounts.is_default；单机配置优先于全局
+# 主机登录账号凭证见 B.7.1（vault/credentials）；登录行为（禁止/口令/缺省账号）见 §3.5、§3.12。
 
 term_sessions(id, host_id, user_id, account, shell, cols, rows,
               started_at, ended_at, status, share_mode, recording_path)
@@ -828,7 +670,7 @@ audit_logs(id, ts, user_id, action, target_type, target_id,
 
 metrics(agent_id, ts, cpu, mem_usage, mem_total, net_rx, net_tx,
         disk_read, disk_write)                                # 时序，保留 7 天（可配置）
-  PG 可用 TimescaleDB hypertable；SQLite 用带索引普通表 + 定期清理
+  JSON 文件存储 + 定期清理
 
 alerts(id, host_id, rule_id, severity, title, message,
        status, fired_at, acked_at, acked_by)
@@ -837,156 +679,22 @@ alert_rules(id, name, host_scope, metric, op, threshold,
             window_sec, severity, notify_channels, enabled)
 
 commands_lib(id, user_id, name, shell, content, description, created_at)  # 常用命令
+  # 批量推送命令（/hosts/batch-exec）无任务持久化：执行结果直接返回，不建 exec_tasks 表。
 
-exec_tasks(id, user_id, shell, command, is_script, host_ids json,
-           status, started_at, finished_at)                  # 批量推送命令
-exec_task_results(task_id, host_id, exit_code, stdout, stderr, duration_ms)
-
-ai_configs(id, key, value json)                               # provider/base_url/model/key/开关/限速
-ai_tool_calls(call_id, ts, user_id, scenario, provider, model,
-               prompt_tokens, completion_tokens, cost, latency_ms,
-               tool_names json, risk_level, blocked, status, fallback_info)
+ai_configs(id, key, value json)                               # provider/base_url/model/key/开关
+  # AI 调用链路（CallTrace：步骤/token 用量/耗时）随响应返回，不持久化；无 ai_tool_calls 表。
 
 settings(key, value json)                                     # 通用设置（首选页/提示语等）
 ```
 
 加密：账号凭证用对称加密（AES-GCM，主密钥来自配置/环境变量）存 `credential_ref`，不明文落库。
 
-## B.4 控制端 REST API（节选）
+## B.4 控制端 REST API
 
-风格：RESTful + JWT（`/api/v1`）。WS 端点单独列出。
+接口契约已移至 `API.md`（唯一事实源，按资源分组的表格，含鉴权、角色与审计标注）。
 
-```
-# 认证
-POST   /api/v1/auth/login                 {username,password} → {token}
-POST   /api/v1/auth/logout
-GET    /api/v1/auth/me
-
-# 主机
-GET    /api/v1/hosts?group=&status=&q=
-POST   /api/v1/hosts/enroll                → 生成 enroll_token + 安装命令（install=Linux curl 一键脚本，install_win=Windows irm|iex 一键脚本）
-POST   /api/v1/hosts/:id/unbind
-GET    /api/v1/hosts/:id
-PATCH  /api/v1/hosts/:id  (tags/group)
-
-# Docker（ op 透传给 Agent，清单见 B.8.3 ）
-GET    /api/v1/hosts/:id/docker/ps
-GET    /api/v1/hosts/:id/docker/images
-GET    /api/v1/hosts/:id/docker/all       # 容器+镜像一次往返
-GET    /api/v1/hosts/:id/docker/mirrors   # 获取 Docker daemon registry-mirrors
-PUT    /api/v1/hosts/:id/docker/mirrors   # 更新 Docker registry-mirrors 并 reload daemon
-POST   /api/v1/hosts/:id/docker/:op        # body {container,image,args_json?}；写操作记审计，rm/rmi/prune 为 high risk；pull/run 下发超时 5 分钟
-
-# 系统状态
-GET    /api/v1/hosts/:id/processes
-GET    /api/v1/hosts/:id/ports
-GET    /api/v1/hosts/:id/users
-GET    /api/v1/hosts/:id/logins
-
-# 监控
-GET    /api/v1/hosts/:id/metrics?metric=&from=&to=&live=
-POST   /api/v1/alerts/:id/ack
-
-# 终端（控制面；数据走 WS）
-POST   /api/v1/hosts/:id/terminals          → {session_id, ws_url}
-POST   /api/v1/terminals/:sid/resize
-POST   /api/v1/terminals/:sid/share         # 终端会话分享
-DELETE /api/v1/terminals/:sid
-GET    /api/v1/sessions?host_id=&from=&to=   # 会话历史 + 录像
-
-# 文件
-GET    /api/v1/hosts/:id/files?path=        # list/stat
-GET    /api/v1/hosts/:id/files/content?path=&offset=&length=
-POST   /api/v1/hosts/:id/files               # mkdir/move/copy/remove
-POST   /api/v1/hosts/:id/files/chmod         # {path, mode} 0-07777
-POST   /api/v1/hosts/:id/files/compress      # {path} -> {archive, size} tar.gz，服务端等 120s
-# 上传/下载走 WS（大文件分片 + 断点续传）
-
-# 推送命令
-POST   /api/v1/exec/tasks                    # {shell,command,is_script,host_ids}
-GET    /api/v1/exec/tasks/:id                # 结果聚合
-GET    /api/v1/exec/tasks/:id/results?host_id=
-
-# 分组/权限
-GET/POST/PATCH/DELETE /api/v1/groups
-POST   /api/v1/groups/:id/hosts              # 关联主机
-POST   /api/v1/groups/:id/users             # 授权用户
-GET/POST/PATCH/DELETE /api/v1/users
-
-# 常用命令库
-GET/POST/PATCH/DELETE /api/v1/commands
-
-# 告警规则
-GET/POST/PATCH/DELETE /api/v1/alert-rules
-
-# 设置
-GET/PUT  /api/v1/settings
-GET/PUT  /api/v1/ai/config                   # AI provider/模型/开关/限速（GET 中 api_key 恒为掩码哨兵 "********"；PUT 传哨兵 = 保留原密钥）
-POST   /api/v1/ai/config/key                  # 明文查看已保存的 AI API Key（adminOnly；审计 ai_config_key_reveal / high）
-POST   /api/v1/ai/models                      # 探测端点可用模型列表（OpenAI 兼容 /models / Ollama /api/tags；只读诊断、免审计；表单当前值可直接探测，未保存也可测，空值与密钥哨兵回落已保存配置；模型字段下拉选择或手动输入）
-GET/POST /api/v1/ai/chat                     # 自然语言问答（tool calling；响应含 trace 调用步骤与 usage token 量）
-POST   /api/v1/ai/nl2command                  # 自然语言转命令（带 host_id 上下文）
-POST   /api/v1/ai/app-draft                   # 需求描述 → 创建应用表单草稿（服务端消毒，不创建；响应含事实补齐的 env/volumes 与 sources 参考来源、trace 调用步骤与 usage token 量）
-POST   /api/v1/ai/app-chat                    # 创建页对话辅助（携带表单快照，可返回 form_patch 草稿，patch 同样经事实补齐并带 sources、trace 调用步骤与 usage token 量）
-GET    /api/v1/ai/audit                       # AI 调用审计
-
-# 应用中心
-GET    /api/v1/apps
-POST   /api/v1/apps                       # 创建应用（创建即自动入队首轮部署）
-GET    /api/v1/apps/:id
-PUT    /api/v1/apps/:id                   # 部分更新配置
-DELETE /api/v1/apps/:id?purge=            # 删除应用（可选清除容器与镜像）
-POST   /api/v1/apps/:id/deploy?force=     # 触发部署（force=true 支持终止在途任务并重新部署）
-POST   /api/v1/apps/:id/upgrade         # 升级应用：先拉取最新镜像再重新部署（单条部署记录，trigger=upgrade；见 §3.7「应用升级」）
-POST   /api/v1/apps/:id/deployments/cancel # 终止当前正在进行的部署任务
-POST   /api/v1/apps/:id/rollback          # 版本回滚
-POST   /api/v1/apps/:id/stop
-POST   /api/v1/apps/:id/start
-POST   /api/v1/apps/:id/restart
-GET    /api/v1/apps/:id/deployments        # 列表不含 build_log（正文走单条接口）
-GET    /api/v1/apps/:id/deployments/:depID # 运行中时 build_log 叠加引擎内存缓冲（实时日志）
-POST   /api/v1/apps/:id/deployments/:depID/diagnose # AI 排障
-GET    /api/v1/apps/:id/status
-POST   /api/v1/apps/:id/webhook/sync
-POST   /api/v1/apps/:id/github-app/switch # 切换到 GitHub App 触发（非 github.com 仓库 400；有旧逐仓 hook 时先删，失败 502 不改库）
-# GitHub App（见 §3.7）
-GET    /api/v1/github-app/status
-GET    /api/v1/github-app/installations/repos
-GET    /api/v1/github-app/repos/:owner/:repo/branches
-POST   /api/v1/github-app/manifest        # 生成 Manifest（name 可空 → 自动生成唯一名；state 内存 15 分钟过期）
-POST   /api/v1/github-app/manifest/exchange # 验 state 后换 code 落盘（私钥可用性校验）
-POST   /api/v1/github-app/config          # 手动填写 App ID/私钥/Webhook Secret（私钥可用性校验）
-POST   /api/v1/github-app/installations/sync # 同步安装与仓库清单
-DELETE /api/v1/github-app                # 断开（清配置与安装）
-POST   /api/v1/github-app/webhook         # 公开端点（HMAC-SHA256 验签、delivery 去重、未配置 503）
-POST   /api/v1/apps/inspect-image         # 镜像元数据免拉取只读探测
-POST   /api/v1/apps/inspect-repo          # 仓库元数据只读探测
-GET    /api/v1/apps/:id/volume-backups?volume=&offset=&page_size=  # 挂载卷备份归档列表（登录即可；含 last_restore_at/status/error 与 s3:{ready,target_id,target_name,bucket} 去向块）
-GET    /api/v1/apps/:id/volumes                    # 应用当前挂载卷清单（单容器取声明卷并补挂载点，Compose 取 Agent 在线动态发现；动态发现失败且静态解析无结果时返回错误而非空列表；只读）
-GET    /api/v1/apps/:id/volume-backups/:archiveID/download   # 下载归档（只读、免审计；仅 success，302 到 15 分钟预签名 S3 GET，目标已删除 410）
-POST   /api/v1/apps/:id/volume-backups    # 备份挂载卷（body {volumes?: string[], note?≤200 字, target_id?, consistency_mode?, retention?}，202 异步；归档直传页内所选 S3 目标，target_id 省略时回落默认目标，两者皆无 400，未知 target_id 400；仅已声明卷；retention 缺省/0 = 手动备份不裁剪，显式 1~100 才按窗口裁剪；卷忙/部署中 409、Agent 离线 503）
-POST   /api/v1/apps/:id/volume-backups/:archiveID/restore  # 恢复归档（仅 success；下载 S3 归档并校验 SHA256 后 停机→安全副本→解压→（重）启动——恢复前停着的应用解包成功后同样拉起，裸 tar 按记录的去层数解包，结果写回 last_restore_*）
-POST   /api/v1/apps/:id/volume-backups/upload-scan   # 上传并识别备份文件（multipart 多 file，≤10 份，单份 2GB 上限；流式落盘时服务端算 SHA256，扫 tar 内容自动识别每份文件的目标挂载卷，返回识别/暂存结果供确认）
-POST   /api/v1/apps/:id/volume-backups/upload-commit # 确认配对并批量恢复（body {pairs:[{archive_id, specs[]}]}，≤10 对，202 异步；校验后创建记录（裸 tar 的去层数随记录落盘）并运行一次停机的批量恢复；返回 archive_ids 供轮询各自最近恢复结果）
-GET    /api/v1/volume-uploads/:token   # Agent 一次性下载上传文件（公开、无 JWT，token 即凭证；安全入口豁免）
-DELETE /api/v1/apps/:id/volume-backups/:archiveID          # 删除归档（含 S3 对象与宿主暂存/安全副本；running 归档 409）
-
-# 审计
-GET    /api/v1/audit?user=&action=&from=&to=
-
-# 系统升级与自维护（控制端在线自升级）
-GET    /api/v1/system/check-update?force=&beta=   # 查询官方 Release 最新版本、更新日志与升级包（带通道与缓存）
-POST   /api/v1/system/online-upgrade              # 控制端一键在线自升级（下载官方包、校验SHA-256、原子替换、维护握手平滑重启）
-POST   /api/v1/system/upgrade-server              # 离线上传 watchman-server 单二进制升级
-POST   /api/v1/system/restart                     # 控制端平滑重启（广播维护预告，保护全网 Agent 零误报）
-
-# WebSocket
-WS /api/v1/ws/terminal/:sid          # 终端 IO（浏览器 ↔ 控制端 ↔ Agent）
-WS /api/v1/ws/file/:op_id            # 文件上传/下载分片
-WS /api/v1/ws/agent/:agent_id        # (可选) 调试用 Agent stream 透视
-```
-
-鉴权：除 `auth/login`、`hosts/enroll` 外均需 JWT；按分组权限校验 `host_id` 访问范围；写操作记审计。
+- 风格：RESTful + JWT（`/api/v1`）。WS 端点见 `API.md`「WebSocket」一节。
+- 鉴权：除 `auth/login`、`hosts/enroll` 与公开端点外均需 JWT；按分组权限校验 `host_id` 访问范围；写操作记审计。
 
 ## B.5 终端数据通路（落地细节）
 
@@ -1060,8 +768,8 @@ Agent internal/shell
   - `--uninstall --purge`：完全卸载并彻底清除所有数据。
 
 - **版本解析与升级策略**：
-  - **版本来源唯一真相**：**版本完全由官方 Release 提供，严禁任何自行决定或拼凑版本的行为**。发布包与升级清单必须 100% 来源于 Git tag 触发 GitHub Actions 产出的官方 Release（如 `v1.2.3` / `v1.2.3-beta.1`）以及由 CI 生成的 `manifest.json`；
-  - **正式版与测试版通道**：默认跟踪 GitHub `/releases/latest`（自动排除 pre-release）。测试版改由面板开关控制——在「系统设置 → 系统升级」中开启「加入测试计划」（`system.join_beta_program`），`install.sh` 升级时读取该开关，若开启则取 release 列表前 20 项按 semver 取最大版本（含 pre-release；GitHub 列表不保证按时间排序，不可直接取首项 已因此踩坑）；
+  - **版本来源唯一真相**：见头部维护约定第 3 条与 §B.6.5；发布包与升级清单必须 100% 来源于 Git tag 触发 GitHub Actions 产出的官方 Release（如 `v1.2.3` / `v1.2.3-beta.1`）以及由 CI 生成的 `manifest.json`；
+  - **正式版与测试版通道**：默认跟踪 GitHub `/releases/latest`（自动排除 pre-release）。测试版改由面板开关控制——在「系统设置 → 系统升级」中开启「加入测试计划」（`system.join_beta_program`），`install.sh` 升级时读取该开关，若开启则取 release 列表前 20 项按 semver 取最大版本（含 pre-release）；
   - **安装升级幂等性**：重跑脚本即为平滑升级，同版本默认跳过，保留数据目录与密钥；升级时自动停旧服务、替换二进制、复用凭据并热启动。
   - **控制端在线检查与一键在线自升级（Web 自升级）**：
     - **在线 Release 探测引擎（`server/internal/release/checker.go`）**：控制端后台主动对接 GitHub Releases API，依据用户统一设置 `system.join_beta_program` 自动选择通道（开启测试计划时拉取前 20 个 Release，用 `CompareVersions` 取最大版本，包括 pre-release——GitHub 列表不保证按时间排序，禁止取首项；关闭时拉取 `/releases/latest` 正式稳定版）；内置 5 分钟内存自愈缓存防止触发 GitHub API 频控，支持强制刷新 `force=true`；
@@ -1082,7 +790,7 @@ Agent internal/shell
 控制端对外提供动态安装脚本服务，无需向被控端传输静态脚本文件：
 
 - **控制台生成一键安装命令**：
-  在控制台主机列表点击「添加主机」，控制端通过 `POST /api/v1/hosts/enroll` 签发一次性 `enroll_token`（默认 24h 有效期），并生成跨平台绑定命令：
+  在控制台主机列表点击「添加主机」，控制端通过主机注册接口（见 API.md「主机」）签发一次性 `enroll_token`（默认 24h 有效期），并生成跨平台绑定命令：
   - **Linux 主机**：
     ```bash
     curl -kfsSL 'http://<server-ip>:18789/install?token=<enroll_token>' | sudo bash
@@ -1094,7 +802,7 @@ Agent internal/shell
 
 - **Agent 安装流程（`server/internal/install/install.go`）**：
   1. 安装脚本自动识别目标主机的 OS（Linux / Windows）与架构（amd64 / arm64）；
-  2. 从控制端公开接口 `/api/v1/agent/binary` 下载对应架构的 `watchman-agent` 二进制；
+  2. 从控制端公开接口（见 API.md「安装与下载」）下载对应架构的 `watchman-agent` 二进制；
   3. 服务持久化注册：
      - Linux：安装至 `/opt/watchman/watchman-agent`，注册 `watchman-agent.service` systemd 服务并开机自启；
      - Windows：安装至 `C:\Program Files\Watchman\watchman-agent.exe`，注册名为 `WatchmanAgent` 的计划任务开机启动；
@@ -1109,7 +817,7 @@ Agent internal/shell
 | --- | --- | --- | --- |
 | `-http` | `:18080` (安装脚本设 `:18789`) | `HTTP_PORT` | HTTP 服务监听地址（Web 页面、REST API 与 WS 网关） |
 | `-grpc` | `:9090` | — | gRPC 服务监听地址（供 Agent 主动回连） |
-| `-opgrpc` | `""`（关闭） | — | 按需运维隧道数据面 gRPC 监听地址（§3.17，watchmanctl 数据面，建议 `:9443`）；默认零新开口，启用时强制 TLS——无 `-tls-cert`/`-tls-key` 时拒绝以明文启动该端口 |
+| `-opgrpc` | `""`（关闭） | — | 按需运维隧道数据面 gRPC 监听地址（§3.16，watchmanctl 数据面，建议 `:9443`）；默认零新开口，启用时强制 TLS——无 `-tls-cert`/`-tls-key` 时拒绝以明文启动该端口 |
 | `-data` | `./data` (安装部署为 `/opt/watchman/data`) | `DATA_DIR` | 持久化数据目录（存储用户、会话、录像、统一设置、证书等） |
 | `-jwt-key` | 首次生成并持久化 | `WATCHMAN_JWT_KEY` | JWT 鉴权签名密钥；首次从 CLI 初始化 `data/server-secrets.json`（0600），此后该文件优先，随备份迁移 |
 | `-vault-pass` | 首次生成并持久化 | `WATCHMAN_VAULT_PASS` | 凭据加密与 Agent 升级签名根密钥；首次从 CLI 初始化 `data/server-secrets.json`，此后该文件优先，错误密钥拒绝启动 |
@@ -1129,7 +837,7 @@ Agent internal/shell
 
 系统配置采用点分命名空间注册表统一校验，分 `system`（管理员全局）与 `user`（当前用户独立）双作用域，秘密（AI Key / Git Token）存放于加密 Vault。
 
-**面板对外地址统一解析（唯一链路）**：凡是需要把面板地址交给外部对象的地方——Agent 一键安装命令、Agent 升级与二进制下载 URL、GitHub App Manifest（`url` / `hook_attributes.url` / `redirect_url`）与状态接口 `webhook_url`、逐仓 Git webhook 地址、卷备份恢复回调、组网 CLI 的 `endpoint`、`GET /api/v1/version` 的 `public_url`——统一调用 `settings.BaseURL` / `settings.RequestBaseURL`，**禁止任何模块自建 fallback 链**。配置来源只有一个——绑定的 `security.panel_domain`：
+**面板对外地址统一解析（唯一链路）**：凡是需要把面板地址交给外部对象的地方——Agent 一键安装命令、Agent 升级与二进制下载 URL、GitHub App Manifest（`url` / `hook_attributes.url` / `redirect_url`）与状态接口 `webhook_url`、逐仓 Git webhook 地址、卷备份恢复回调、组网 CLI 的 `endpoint`、版本接口的 `public_url`（见 API.md「系统备份 / 恢复 / 升级」）——统一调用 `settings.BaseURL` / `settings.RequestBaseURL`，**禁止任何模块自建 fallback 链**。配置来源只有一个——绑定的 `security.panel_domain`：
 
 1. 绑定 `security.panel_domain` 时：scheme 与端口取面板实际服务状态（`settings.ServingState`，由 `panelsec` 经 `SetServingStateProvider` 注入，`settings` 不直接 import `panelsec` 以免循环依赖；未接线时只按设置推导）——SSL 开启且 :443 在监听时为 `https://域名`，:80 在监听时为 `http://域名`，两个标准端口都不在监听时为 `<scheme>://域名:主端口`（scheme 跟面板 SSL，主端口是标准端口不可用时的文档化回退入口）；本次请求本身是 https、强制 HTTPS 开启、反代透传 `X-Forwarded-Proto: https` 均不改变该结果。返回 `configured=true`；
 2. 未绑定域名时：取请求的 `scheme://Host`（`https` 仅由直连 TLS 判定，`X-Forwarded-Proto` 永不信任——面板默认就是最外层服务，不为前面再套一层 nginx 反代做设计），**按访问 IP 走**，返回 `configured=false`。
@@ -1138,8 +846,8 @@ Agent internal/shell
 
 | 配置键 (Key) | 作用域 | 默认值 | 校验与说明 |
 | --- | --- | --- | --- |
-| `server.timezone` | `system` | `""` | 面板时区（IANA 名称，如 `Asia/Shanghai`；空 = 跟随服务器系统时区，`time.LoadLocation` 校验）。控制端进程本地时间（日志、API 时间戳）与面板全部时间展示（告警/审计/会话/图表）统一按此时区；经 `GET /version` 的 `timezone` 字段下发给所有登录用户，前端 `utils/time.ts` 统一格式化，未设置时前端回退浏览器本地时区。保存即时生效（启动与每次系统设置保存后 `ApplyTimezone`）。Agent 月流量计费周期仍按各 Agent 主机本地时间，不受此项影响 |
-| `security.panel_domain` | `system` | `""` | 面板绑定域名（主机名格式，如 `panel.example.com`），同时是**面板对外地址的唯一配置来源**：绑定后所有对外 URL 按面板实际服务状态推导（SSL 开启且 :443 在监听时 https，否则 :80 在监听时 http，标准端口都不在监听时回退主端口；请求 scheme 与强制 HTTPS 不改变该结果，见「面板对外地址统一解析」），未绑定则按访问地址推导；同时自动启用严格域名限制并自动监听 `:80`（SSL 开启时另含 `:443`）提供免端口访问；旧版本只配置过 `server.public_url` 的部署在加载时把其中的主机名一次性迁移进该键并删除旧键（该键已从注册表移除；IP 与非标准端口无法迁移，打警告后丢弃）；**变更该值会在同一次原子写入中清除面板 SSL / 强制 HTTPS / 证书绑定（`ssl_mode` 复位 `cert_center`、`ssl_cert_id` 与 custom PEM 清空）**，同值（含仅大小写差异）重写不清除 |
+| `server.timezone` | `system` | `""` | 面板时区（IANA 名称，如 `Asia/Shanghai`；空 = 跟随服务器系统时区，`time.LoadLocation` 校验）。语义见 §3.12「面板时区」。 |
+| `security.panel_domain` | `system` | `""` | 面板绑定域名（主机名格式，如 `panel.example.com`），同时是**面板对外地址的唯一配置来源**（推导规则见「面板对外地址统一解析」）；绑定后自动启用严格域名限制并自动监听 `:80`（SSL 开启时另含 `:443`）提供免端口访问；**变更该值会在同一次原子写入中清除面板 SSL / 强制 HTTPS / 证书绑定（`ssl_mode` 复位 `cert_center`、`ssl_cert_id` 与 custom PEM 清空）**，同值（含仅大小写差异）重写不清除 |
 | `security.panel_ssl_enabled` | `system` | `false` | 面板 SSL / HTTPS 总开关（通过端口级协议动态嗅探实现零停机热重载） |
 | `security.panel_ssl_mode` | `system` | `"cert_center"` | 证书来源模式（`cert_center` 从证书中心选取 / `custom` 自定义 PEM 证书与私钥） |
 | `security.panel_ssl_cert_id` | `system` | `""` | 证书中心证书 ID（`cert_center` 模式下选取） |
@@ -1248,7 +956,7 @@ git push origin "$TAG"
      - `watchman-agent-linux-amd64`：Linux x86_64 被管端 Agent 独立程序
      - `watchman-agent-linux-arm64`：Linux ARM64 被管端 Agent 独立程序
      - `watchman-agent-windows-amd64.exe`：Windows x86_64 被管端可执行程序
-     - `watchmanctl-linux-amd64` / `watchmanctl-linux-arm64`：Linux 运维 CLI（§3.17 按需运维隧道客户端）
+     - `watchmanctl-linux-amd64` / `watchmanctl-linux-arm64`：Linux 运维 CLI（§3.16 按需运维隧道客户端）
      - `watchmanctl-windows-amd64.exe`：Windows x86_64 运维 CLI
      - `watchmanctl-darwin-amd64` / `watchmanctl-darwin-arm64`：macOS（Intel / Apple Silicon）运维 CLI
   2. **完整套件安装包（供 install.sh 脚本与系统化一键部署）**：
@@ -1257,7 +965,7 @@ git push origin "$TAG"
   3. **权威元数据与安全校验**：
      - `manifest.json`：官方发布清单，记录版本号、Commit 与各平台 Agent 二进制权威 SHA-256
      - `CHECKSUMS.txt`：包含上述所有独立单二进制、归档包与清单文件的全局 SHA-256 校验和
-- `manifest.json`：`{version, commit, build_time, agents: {"linux/amd64": {file, sha256}, ...}}`。已落地：控制端启动时读 `-manifest`（默认 `/opt/watchman/manifest.json`，由 install.sh 部署），作为 agent 升级的版本/sha256 基准，替代 server 自身构建版本，解除"最新 = 控制端自己"的闭环；无 manifest 时（dev）回退到 `CurrentAgentVersion`。单台/批量升级的版本判定、sha256（优先 manifest，其次 `install.AgentBinarySha256`）、签名、下载 URL 全部走这套基准。`GET /api/v1/version`（authed）返回 server 构建信息 + `agent_target_version` + `agent_manifest` + `upgrade_pubkey` + `public_url`。
+- `manifest.json`：`{version, commit, build_time, agents: {"linux/amd64": {file, sha256}, ...}}`。已落地：控制端启动时读 `-manifest`（默认 `/opt/watchman/manifest.json`，由 install.sh 部署），作为 agent 升级的版本/sha256 基准，替代 server 自身构建版本，解除"最新 = 控制端自己"的闭环；无 manifest 时（dev）回退到 `CurrentAgentVersion`。单台/批量升级的版本判定、sha256（优先 manifest，其次 `install.AgentBinarySha256`）、签名、下载 URL 全部走这套基准。版本接口（见 API.md「系统备份 / 恢复 / 升级」）返回 server 构建信息 + `agent_target_version` + `agent_manifest` + `upgrade_pubkey` + `public_url`。
 - 控制端单二进制按需自动拉取 Agent 机制：若控制端脱离 `/opt/watchman` 作为独立二进制运行（本地缺少 agent 二进制），在被纳管主机请求下载 Agent 时，控制端自适应依据当前 Release 版本自动从 GitHub Releases 官方下载对应 Agent 并缓存至 `data/bin/`，确保跨机器一键安装命令平滑打通。
 - 版本通道：`stable`（默认，GitHub `/releases/latest`，自动排除 pre-release）、`beta`（releases API 列表第一条，含 pre-release）、`--version` 精确锁定（优先级最高）。
 - 手动触发：workflow_dispatch 只构建打包、上传 artifacts，不创建 Release（正式打 tag 前验证管线用）。
@@ -1295,41 +1003,19 @@ Release 正文的**唯一数据源是本仓库的提交历史**：打版本 tag 
 
 **发版流程**：完整步骤（changelog 生成 → 附注 tag → 本地门禁 → 推送）与红线见 §B.6.5 第 3、5 节，此处不再重复。
 
-`notes-*.md` 已加入 `.gitignore`，避免发版临时文件误入提交。Linux/macOS 首次克隆后若钩子提示无执行权限，执行 `chmod +x scripts/*.sh .githooks/commit-msg`。
-
-## B.7 核心子系统架构与执行流转链路
-
-系统各核心功能模块的设计与执行流转链路如下：
-
-1. **反向回连与生命周期**：控制端启动 gRPC/WebSocket 接入网关，Agent 经主动出向长连接完成 Token 登记、心跳维持与双向 RPC 派发；控制端实时维护节点在线状态池与探活。
-2. **Web 终端全双工通路**：前端 xterm.js 建立 WebSocket 连接 → 控制端 ws.TerminalHandler 鉴权并路由至目标 Agent → Agent 本地 PTY（Linux creack/pty，Windows ConPTY）执行交互 → 旁路实时录制 asciicast v2 并落盘。
-3. **审计录像与可追溯性**：控制端独立协程记录终端 I/O 帧并写入有界存储，支持事后在控制台完整时间轴回放；高危指令与敏感操作全量记入操作审计日志。
-4. **流式文件传输通路**：基于长连接多路复用，通过 `read/write/stat/list` 协议进行分片与断点续传，不暴露任何被管机端口，支持 Monaco 文本编辑与大文件流式上传下载。
-5. **批量命令并发下发**：控制端统一生成 `exec_task`，并发下发至多台目标 Agent，实时聚合各主机标准输出与退出码。
-6. **时序监控与系统画像**：Agent 定期上报 CPU/内存/磁盘/网络与三网 TCP 质量探测指标，控制端完成时序存储与降采样；支持按需拉取进程、网络端口、系统账号与登录历史快照。
-7. **用户权限与多作用域配置**：基于 RBAC 与分组授权实现资源隔离；系统设置中心统一管理 system/user 双作用域配置。
-8. **跨平台兼容与会话恢复**：Linux 与 Windows 双端原生适配，终端会话支持 60s 宽限期优雅重连，节点服务支持崩溃自启与在线升级验签。
-9. **AI 适配与智能辅助**：统一对接 OpenAI 兼容协议，支持智能命令生成（带三层高危拦截）、应用配置真实探测与草稿生成、日志诊断辅助。
-10. **自托管单二进制交付**：控制端将前端静态产物经 `go:embed` 嵌入单二进制文件，内置静态路由与 REST/WS 网关，支持零依赖快速部署。
-
-## B.8 后端架构补充（查漏补缺）
+## B.7 后端架构补充（查漏补缺）
 
 > 对照第 3 节需求清单逐项核对后补充的设计点，覆盖数据模型与存储实现。
 
-### B.8.1 补充数据模型
+### B.7.1 补充数据模型
 
 ```
 # 注册凭证管理
-enroll_tokens(token, host_id_hint, created_by, created_at, expires_at,
-              used_at, used_by_host, revoked)        # 一次性、可吊销、可过期
+# enroll token 为内存票据（rpc.Registry.enroll，落盘持久化）：一次性、默认 24h 过期，用后即删；无独立持久表。
 
 # 主机登录账号凭证（替代/细化 accounts.credential_ref）
 credentials(id, host_id, name, type, secret_enc, created_at, updated_at)
   type: password/key/token；secret_enc = AES-GCM 密文；引用主密钥见 B.6
-
-# 控制端用户登录会话/审计（区别于主机登录历史）
-login_sessions(id, user_id, ip, user_agent, login_at, logout_at, status)
-  status: success/failed/locked；用于 3.15 操作审计的登录部分
 
 # 主机登录历史（来自 Agent sysinfo login kind，缓存/归档）
 host_login_history(id, host_id, username, src_ip, login_type,
@@ -1337,20 +1023,6 @@ host_login_history(id, host_id, username, src_ip, login_type,
 
 # 统一设置（system/user 双作用域，点分键；旧 term_prefs 表已并入，落库以跨设备一致）
 settings(scope, key, value_json)          # 如 user/alice.terminal.theme, user/alice.appearance.theme_mode
-
-# 文件编辑版本/锁（防并发覆盖）
-file_locks(path, host_id, user_id, locked_at, expires_at)
-file_versions(path, host_id, version, etag, size, modified_by, modified_at)
-  # etag 乐观锁与并发版本控制，支持历史版本追溯
-
-# 通知渠道（3.11 告警通知方式可扩展）
-notify_channels(id, type, name, config json, enabled)
-  type: email / webhook / (扩展)；config 如 {url, secret} / {smtp,to}
-notify_rules(channel_id, alert_severity, enabled)
-
-# AI 工具注册表（tool registry，权限 + 开关）
-ai_tools(name, schema json, backend_handler, read_only, enabled, min_role)
-  # list_hosts/get_host_detail/query_metrics 等，见 A.7 草案
 
 # 应用中心（3.7 统一部署入口；模板目录为服务端声明式配置）
 # 持久化实体走 apps.Store 的 Application/Deployment（JSONL 落盘），逻辑模型：
@@ -1376,161 +1048,38 @@ network_nodes(host_id, virtual_ip, status, joined_at)
 network_routes(host_id, dest_host_id, type)          # direct/relay
 ```
 
-### B.8.2 补充控制端 REST API
+### B.7.2 证书挑战验证策略
 
-```
-# 注册凭证
-POST   /api/v1/enroll-tokens              # 生成（含安装命令）
-GET    /api/v1/enroll-tokens
-DELETE /api/v1/enroll-tokens/:token       # 吊销
+补充 REST API 清单已并入 `API.md`（证书中心 / 面板证书 / 手动 DNS-01 各节）。本节只保留不在接口契约里的行为规则：
 
-# 主机登录账号/凭证
-GET/POST/PATCH/DELETE /api/v1/hosts/:id/accounts
-GET/PUT  /api/v1/hosts/:id/login-policy   # 禁止/口令/缺省
+- **挑战验证兼容策略**：普通域名优先 HTTP-01（无需 dns-mng；80 空闲时签发流程临时监听，面板自持 80（绑定域名）时由面板 HTTP 栈对 `/.well-known/acme-challenge/` 共享代答——共享注册表 + `SetSharedHTTP01Probe` 探针，中间件位于安全守卫之前）；80 端口不可用或 HTTP-01 失败时回退 DNS-01（需配置并启用 dns-mng 自动添加解析）；通配符域名仅支持 DNS-01；IP 标识（RFC 8738）仅支持 HTTP-01（DNS-01 对 IP 无效，手动 DNS-01 拒绝 IP）。
+- **跨方式回退**：仅在「仍有其他可用验证方式」时发生，整单换方式重试至多一次（失败的挑战会毒化授权，回退必须重新下单）；显式锁定单一方式或本就只有一种方式可用时，失败直接以真实原因终止（挑战触发非 2xx 即报错并携带 CA problem 文档，不再空等 10 分钟轮询后丢弃原因；也不再以空求解器集重下一张必败订单）。
+- **dns-mng present 不带 ttl**：只传 fqdn + value，由 dns-mng 落到各 provider 自身的默认值（tencentcloud 600 / cloudflare 1=自动 / huaweicloud 300 / desec 3600 …）。固定 TTL 无法对所有厂商合法：旧实现硬编码 300 会被腾讯云 DNSPod 免费套餐以 `LimitExceeded.RecordTtlLimit`（最小 600）拒绝，导致 DNS-01 全流程失败。
+- **手动订单状态机**：`awaiting_dns → verifying → done | error`；本地先做 15s DNS TXT 预检查（未传播不通知 CA，避免浪费验证次数）；error 分两种：预检查/网络/超时失败可直接重新确认（terminal=false，TXT 记录不变）；CA 终态判定（authorization invalid/expired）则 terminal=true，同一订单不可重试、必须新建订单。订单落盘 2 小时 TTL；verifying 中服务重启会转为可重试的 error（不会卡死），面板内存任务不持久化、重启后需重新发起。
+- **签发弹窗验证方式**：签发弹窗与面板一键签发均提供「验证方式」显式选择（自动 / HTTP-01 / DNS-01 / DNS-01 手动解析），显式指定后不再自动回退。
+- **DNS-01 自动验证机制**（批量呈现 + 权威 NS 传播预检 + 统一延迟清理）：见 §3.7「RFC 8555 批量呈现、权威 NS 传播预检与统一延迟清理」。
 
-# 主机登录历史
-GET    /api/v1/hosts/:id/login-history
+### B.7.3 协议补充
 
-# 终端偏好（旧接口 GET/PUT /api/v1/me/term-prefs 已被统一设置取代）
-GET    /api/v1/me/settings                 # 当前用户设置（data + schema + stored_keys），作用域 user
-PUT    /api/v1/me/settings                 # {data: {key: value}} 部分更新，原子校验；落盘失败不污染内存
-GET    /api/v1/settings                    # 全局设置（admin），作用域 system
-PUT    /api/v1/settings                    # {data: {key: value}} 部分更新（admin）
-# 键命名空间（点分）：appearance.theme_mode, appearance.show_tips,
-# terminal.theme, terminal.default_shell, terminal.font_family, terminal.font_size,
-# terminal.cursor_blink, terminal.scrollback, navigation.default_host_tab, files.default_path
-# 秘密（AI key / Git token 等）不进统一设置，留在各自专用存储
-
-# 文件锁/版本
-POST   /api/v1/hosts/:id/files/lock
-GET    /api/v1/hosts/:id/files/versions?path=
-
-# 通知渠道与规则
-GET/POST/PATCH/DELETE /api/v1/notify-channels
-GET/POST/PATCH/DELETE /api/v1/notify-rules
-
-# AI 工具
-GET/PUT /api/v1/ai/tools                  # 开关/权限
-
-# 应用中心（3.7）
-GET    /api/v1/apps                        # 应用列表（全部来源统一管理）
-GET    /api/v1/apps/catalog                # 内置模板目录（声明式 Catalog）
-POST   /api/v1/apps/inspect-image          # 镜像元数据免拉取探测 {image} → Registry V2/OCI 真实端口/环境变量/卷/启动命令（只读）
-POST   /api/v1/apps/inspect-repo           # GitHub 仓库探测 {repo_url} → 默认分支/Dockerfile/Compose/.env.example 解析（只读）
-POST   /api/v1/apps                        # 创建应用 {source_type, host_id, template_id/template_params | image | compose_content | repo_url/branch, mesh_forward_enabled, mesh_forward_host_id, mesh_forward_entry_port, mesh_forward_target_port, ports[{host,container,bind_scope}], ...}
-GET    /api/v1/apps/:id                    # 应用详情
-PUT    /api/v1/apps/:id                    # 部分更新（PATCH 语义）：未提交的键保持原值，显式 false/""/{} 才清空；可改 name/image(仅 image 来源)/healthcheck_url/env_vars/ports/volumes/compose_content/mesh_forward_*/auto_deploy/auth_vault_id 等；host_id/source_type/container_name 不可改
-DELETE /api/v1/apps/:id                    # 删除
-POST   /api/v1/apps/:id/deploy|rollback|upgrade    # 部署 / 回滚 / 升级（upgrade 先拉镜像再部署，见 §3.7「应用升级」）
-POST   /api/v1/apps/:id/migrate            # 跨主机迁移 {target_host_id, migrate_volumes?, clean_source?}；同步校验后 202 返回 Deployment（trigger=migrate），失败自动回滚源主机（见 §3.7「服务迁移」）
-POST   /api/v1/apps/:id/migrate/precheck   # 只读预检 {target_host_id} → {agent_online, docker_running, s3_ready, s3_bucket, volume_count, port_conflicts, warnings}；读组、免审计，问题只以 warnings 上报
-POST   /api/v1/apps/:id/stop|start|restart
-GET    /api/v1/apps/:id/deployments        # 部署历史（分页）
-POST   /api/v1/apps/:id/deployments/:depID/diagnose   # AI 排障
-PUT    /api/v1/apps/:id/proxy              # 绑定域名（全量替换）{domains:[{domain, cert_id?, force_https?}], mode: local|gateway, gateway_host_id?, upstream?, websocket?}（兼容旧单值 domain/cert_id）；cert_id 省略/空 = 服务端按域名自动匹配当前可用证书并在保存时物化具体 ID（auto=true）；force_https 省略/关 = 80 直接明文访问、开 = 80 跳转 https；任一域名无可用证书时整批 400 + {error, missing_domains}，此时未写任何主机；显式 cert_id 仍严格校验存在性/SAN 覆盖/材料；绑定前自动保障系统托管反代容器（ensureProxyNginx，见 §3.7）：Windows 主机 400、Docker 不可用/80-443 被占/镜像拉取失败 → 409 分类提示、其余保障失败 500+日志摘要
-DELETE /api/v1/apps/:id/proxy              # 解绑（同时清理应用主机与网关主机配置）
-POST   /api/v1/apps/webhook/:token         # Git push 自动部署（token 鉴权）
-POST   /api/v1/github-app/webhook          # GitHub App 级 push 事件（公开、HMAC-SHA256 验签、delivery 去重、未配置 503；按 full_name 匹配应用，trigger=github-app）
-GET    /api/v1/github-app/status           # App 配置与安装概览（configured/app_id/slug/webhook_url/installations）
-GET    /api/v1/github-app/installations/repos  # 全部安装的仓库清单（App 令牌取数）
-GET    /api/v1/github-app/repos/:owner/:repo/branches  # 仓库分支（App 令牌取数；不在安装范围 404）
-POST   /api/v1/github-app/manifest|manifest/exchange|config|installations/sync  # Manifest 生成/换 code/手动配置/同步安装（admin + 审计）
-DELETE /api/v1/github-app                 # 断开 GitHub App（admin + 审计）
-POST   /api/v1/apps/:id/github-app/switch  # 应用切换到 GitHub App 触发（admin + 审计 app_github_app_switch；删旧逐仓 hook 失败 502）
-
-# 按需运维隧道（§3.17，控制面；数据面走 -opgrpc 端口的 OperatorService）
-GET    /api/v1/tunnels/client-info          # CLI 引导信息 {enabled, endpoint, cli{各平台 Release 直链}}；authed 读、免审计；enabled 反映数据面监听器真实状态（启动失败 fail-closed 置假），endpoint 推导链：面板对外地址统一解析（绑定域名 → 请求 Host，未绑定域名即用访问 IP，IPv6 去重围括号）
-GET    /api/v1/tunnels/mine                 # 当前用户活动隧道腿（conn_id/目标/建立时间/空闲秒）；authed 读、免审计
-DELETE /api/v1/tunnels/mine/:id             # 强制关闭本人的隧道腿（服务层按用户名过滤，只能关自己的）；写组 + 审计 op_tunnel_close
-
-# 动态组网与网络拓扑
-POST   /api/v1/networks/:id/join          # 选中主机加入
-GET    /api/v1/networks/topology
-DELETE /api/v1/networks/:id/hosts/:hid
-GET    /api/v1/network/nodes/:id/mesh-ip  # 只读实时探测主机组网 IP（live 优先、缓存兜底，返回 source: live|cache|""）；
-                                          # 挂 authed 读分组、免审计（创建页选主机即调，见 §8.7 第 8 条）；实际路由前缀为 /network
-
-# 备份/迁移
-POST   /api/v1/system/backup              # 导出 SQLite/配置/录像打包
-POST   /api/v1/system/restore             # 从备份恢复（离线运维操作）
-GET    /api/v1/system/health              # 自检：DB/AI/Agent 连接数等
-
-# 证书中心（admin 写操作；读操作所有登录角色可见）
-GET    /api/v1/certs                       # 已签发证书列表（响应每行带服务端派生字段 source=acme|manual_dns01|manual_upload 与 account_name，及管理员备注 remark）
-GET    /api/v1/certs/cover?domain=<d>      # 覆盖探测（只读）：{covered, usable, reason?, cert?{id,domains,source,account_name,not_after}}（复用 FindByDomain 同源匹配：精确 SAN 或通配符覆盖子域名；usable 仅当前可用证书为真，reason 说明过期/未生效/缺私钥；PEM 剥离；登录即可、免操作审计；创建页与详情页输入防抖预检用；非法/空/通配符域名 400）
-GET    /api/v1/certs/:id/detail            # 证书详情（只读）：现场解析证书链 leaf（序列号/SHA-256 指纹/密钥与签名算法/链张数）、用途反查（面板绑定/兜底、应用域名匹配）、chain_pem 仅公钥链
-GET    /api/v1/certs/:id/download          # 下载公钥链附件 <主域名>.crt（仅公钥链、不打包私钥；登录即可、只读免操作审计，浏览器导航下载走 ?token= 查询参数惯例）
-POST   /api/v1/certs/:id/key               # 查看私钥明文 {data:{key_pem}}（详情弹窗与证书链并列展示用；adminOnly + 审计 cert_key_reveal/high，与 AI Key 明文查看同惯例；常规响应一律剥离私钥，本端点是唯一显式出口）
-POST   /api/v1/certs/accounts/:id/key      # 查看 ACME 账户 EAB HMAC Key 明文 {data:{eab_hmac_key}}（账户弹窗眼睛预览用；adminOnly + 审计 cert_account_key_reveal/high；列表/创建/更新等常规响应只给掩码，本端点是唯一显式出口；账户未配置 EAB 返回 404）
-POST   /api/v1/certs/issue                 # ACME 签发 {domains[], account_id?, challenge?}（异步，202 受理返回 {ok:true, task_id, cert_id, message}；challenge: ""自动 | "http-01" | "dns-01" | "dns-01-manual"，显式指定后不再自动回退）
-GET    /api/v1/certs/:id/log               # 证书执行日志（只读）：{data:{id, running, log, updated_at}}（优先读取续期中 liveLogs，无活跃任务回退读取落盘 <crt_id>.log；登录即可、免操作审计）
-GET    /api/v1/certs/tasks                 # 签发任务列表（只读）：{data: IssueTask[]}（精简载荷，不含大文本 log；登录即可、免操作审计）
-GET    /api/v1/certs/tasks/:taskID         # 签发任务状态与日志（只读）：{data: IssueTask}（含全量步骤日志，运行中叠加 live log；登录即可、免操作审计）
-POST   /api/v1/certs/import                # 上传已有证书 {cert_pem, key_pem}（服务端校验 PEM 与私钥匹配，入库后进入已签发列表，不自动续期）
-POST   /api/v1/certs/:id/renew             # 续期（ACME 重新签发，按记录存量验证方式；未存则自动）
-POST   /api/v1/certs/:id/reissue           # 按新配置重新签发 {domains, account_id, challenge}（异步任务 202；手动 DNS-01 返回 order 走两阶段确认；adminOnly + 审计 cert_reissue/high）
-PUT    /api/v1/certs/:id/remark            # 编辑管理员备注 {remark}（≤200 字，仅元信息；adminOnly + 审计）
-DELETE /api/v1/certs/:id                   # 删除证书
-GET    /api/v1/certs/config                # dns-mng 集成配置（自动 DNS-01 验证后端）
-PUT    /api/v1/certs/config                # 更新 dns-mng 集成配置
-# 手动 DNS-01（两阶段，管理员自行添加 TXT 解析，不依赖 dns-mng）：
-POST   /api/v1/certs/manual/:id/confirm    # challenge="dns-01-manual" 时 /certs/issue 同步创建 ACME 订单并返回待添加的 TXT 记录 {id, identifiers[], records[{domain,host,type,value}], status, expires_at}（200）；管理员在 DNS 服务商添加解析后调本接口通知 CA 开始验证（异步 202，轮询下条查询进度）
-GET    /api/v1/certs/manual/:id            # 手动订单状态与 TXT 记录 {status: awaiting_dns|verifying|done|error, cert_id?, error?}
-DELETE /api/v1/certs/manual/:id            # 取消待处理的手动订单（verifying 中不可取消；CA 侧订单自然过期）
-# 挑战验证兼容策略：普通域名优先 HTTP-01（无需 dns-mng；80 空闲时签发流程临时监听，面板自持 80（绑定域名）
-# 时由面板 HTTP 栈对 /.well-known/acme-challenge/ 共享代答——共享注册表 + SetSharedHTTP01Probe 探针
-# （panelsec.StandardPortListening(80)），中间件位于安全守卫之前），
-# 80 端口不可用或 HTTP-01 失败时回退 DNS-01（需配置并启用 dns-mng 自动添加解析）；通配符域名仅支持 DNS-01；
-# IP 标识（RFC 8738）仅支持 HTTP-01（DNS-01 对 IP 无效，手动 DNS-01 拒绝 IP）。
-# 跨方式回退仅在「仍有其他可用验证方式」时发生：整单换方式重试至多一次（失败的挑战会毒化授权，回退必须重新下单）；
-# 显式锁定单一方式（applyPreference 已把求解器集收窄为一种）或本就只有一种方式可用时，失败直接以真实原因终止
-# （挑战触发非 2xx 即报错并携带 CA problem 文档，不再空等 10 分钟轮询后丢弃原因；也不再以空求解器集重下一张
-# 必败订单、把真实失败埋成 no usable challenge 无意义错误——那会白白消耗 CA 限频额度）。
-# DNS-01 有两种形态：① 自动（dns-mng）：服务端调用 dns-mng 自动添加/清理 TXT 解析，全程无人值守；
-# ② 手动（dns-01-manual）：服务端只计算并展示 TXT 记录，由管理员手动到 DNS 服务商添加解析后再确认签发。
-# dns-mng present 请求**不携带 ttl**（只传 fqdn + value），由 dns-mng 落到各 provider 自身的默认值
-# （tencentcloud 600 / cloudflare 1=自动 / huaweicloud 300 / desec 3600 …）。固定 TTL 无法对所有厂商合法：
-# 旧实现硬编码 300 会被腾讯云 DNSPod 免费套餐以 LimitExceeded.RecordTtlLimit（最小 600）拒绝，导致 DNS-01 全流程失败。
-# 手动订单状态机：awaiting_dns → verifying → done | error；本地先做 15s DNS TXT 预检查（未传播不通知 CA，避免浪费验证次数）；
-# error 分两种：预检查/网络/超时失败可直接重新确认（terminal=false，TXT 记录不变）；CA 终态判定（authorization invalid/expired）则 terminal=true，
-# 同一订单不可重试、必须新建订单。订单落盘 2 小时 TTL；verifying 中服务重启会转为可重试的 error（不会卡死），面板内存任务不持久化、重启后需重新发起。
-# 手动签发的证书不自动续期（AutoRenew=false；续期走自动验证通道，与管理员选择手动的原因相悖），到期前经告警中心 builtin-cert-expiry 提醒，管理员重新走两阶段签发。
-# 签发弹窗与面板一键签发均提供「验证方式」显式选择（自动 / HTTP-01 / DNS-01 / DNS-01 手动解析），显式指定后不再自动回退。
-# DNS-01 自动验证采用批量呈现 + 权威 NS 传播预检机制（RFC 1035 UDP 直连权威 NS 真实轮询：总预算 dns01PropagationCheckTimeout 600s（10分钟，覆盖阿里云/腾讯云 dnspod 等服务商 NS 集群跨节点分钟级同步收敛的最慢场景，前后端观察窗口统一 10 分钟；窗口只覆盖传播预检，多域名 CA 轮询还可能更久，见 §3.7）、阶梯轮询调度 dns01PollSchedule（0~60s 每 3s、60~180s 每 10s、180s+ 每 30s，平滑探测防刷屏）、单次探测预算 dns01AttemptTimeout 10s、单条查询上限 dns01QueryTimeout 3s、首次防抖 dns01PropagationMinWait 2s；NS 解析整次校验仅一次，每次探测逐条落 [挑战呈现] 日志，超时错误必带探测次数与最后一次原因；dns01AuthoritativeCheck seam 供测试桩化），多数权威 NS 命中且公共解析器复核可见后才统一通知 CA 验证，并在订单完成后延迟批量清理。
-
-# 面板证书（宝塔式一键签发，admin）
-GET    /api/v1/system/panel-cert          # 面板证书状态（ssl_enabled/panel_domain/strict_domain/active/source/subject/issuer/dns_names/days_left/panel_http_port/standard_ports[{port,desired,listening,error?}]）
-POST   /api/v1/system/panel-cert/issue    # 启动异步签发 {mode: domain|ip, ip?, challenge?}；domain 走 HTTP-01 优先（80 空闲时临时监听，面板自持 80（绑定域名）时共享代答，见上方挑战验证兼容策略）、失败或无 80 时回退 DNS-01（需证书中心 dns-mng；通配符仅 DNS-01），ip 走 HTTP-01（未绑定域名即无标准端口监听、80 空闲时临时监听）；challenge 显式指定验证方式（含 "dns-01-manual" 手动两阶段：202 返回 awaiting_dns job 并携带 dns_records）；202 返回 job
-GET    /api/v1/system/panel-cert/issue/:job_id  # 签发任务进度 {status: running|awaiting_dns|done|error, cert_id?, error?, pending_id?, dns_records?}
-POST   /api/v1/system/panel-cert/issue/:job_id/confirm  # 手动 DNS-01 任务：管理员添加 TXT 解析后通知 CA 开始验证（异步 202；成功自动绑定面板并启用 HTTPS）
-DELETE /api/v1/system/panel-cert/issue/:job_id  # 取消手动 DNS-01 签发任务（同时取消证书中心待处理订单）
-GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
-```
-
-### B.8.3 协议补充
-
-- **DockerOp/DockerEvent**：`op` 含 `ps/ps_all/images/start/stop/restart/rm/logs/inspect/remove_image/prune_images/pull/run/system_df/system_prune/volume_prune/prune`；Agent 侧 shelling out to the docker CLI 执行（`agent/internal/docker/docker.go`）。`ps_all` 跑 `docker ps -a --format {{json .}}` 供镜像表「使用状态」列判断镜像是否被任意容器引用（含已停止容器）；只读，不审计，30 秒超时。`system_df` 跑 `docker system df --format {{json .}}` 供深度清理预览；`system_prune`（`prune` 为别名）是复合操作，按容器（带 `label!=watchman.app` 过滤，保护应用中心纳管的已停止容器与 -prev 回滚容器）→ 镜像 `-a` → 网络 → 构建缓存 `-a` 顺序执行，返回 `{"steps":[{"name","reclaimed"}]}`；`volume_prune` 单独清理未使用卷（深度清理弹窗里默认关闭的可选项）。三者与 pull/run 同取 5 分钟超时（服务端 `dockerOpTimeout` 与 Agent `opTimeout` 同步）。`run` 的参数走 `DockerOp.args_json`：`{"name":"...","ports":["hostPort:containerPort"],"volumes":["/host:/container"],"env":["KEY=VALUE"],"restart_policy":"no|on-failure|always|unless-stopped","command":["arg1","arg2"]}`，空值条目跳过；**每个字段先过字符白名单正则（容器名/端口/卷/环境变量键/重启策略/镜像引用，拒绝以 `-` 开头等伪装 docker flag 的载荷）再进 argv，exec 不走 shell**；镜像缺失由 docker CLI 自动拉取，故 `pull/run` 的服务端下发与 agent 执行均取 5 分钟超时。`logs` 的参数同样走 `args_json`：`{"tail":200,"since":"24h","timestamps":true}`（`tail` 1~10000 默认 200；`since` 空或 `all` = 不传 `--since`，其余只接受 `数字+smhd` 的 duration；非法值直接失败、不拼进 argv；容器名为空或以 `-` 开头同样拒绝；老 Agent 忽略 `logs` 的 `args_json`、恒返回 `--tail 200`；服务端 `dockerCall` 对 `logs` 固定返回 `{"ok":true,"raw":<docker logs 原文>}`，不做结构化 `data` 包装，前端按行渲染/着色/搜索/导出，`ps`/`images` 仍做数组规范化）。`logs` 的原文是容器 stdout 与 stderr 合并：docker CLI 把容器 stderr 分流到自身 stderr，Agent 侧对 logs 单独走合并抓取（其余 op 只抓 stdout，stderr 混入会污染 `ps`/`images` 的 NDJSON 解析）；老 Agent 只抓 stdout，写 stderr 的应用日志（如 Go 默认 log）在老 Agent 上继续缺失，直至 Agent 升级。`CleanupRequest`/`CleanupEvent`（系统清理执行，`cleanup` 字段）：`categories` 为 `apt_cache/journal/tmp_stale/logs_old` 子集（服务端与 Agent 双重白名单校验，空/未知/重复直接拒绝）；Agent 逐类跑固定 argv（`apt-get clean`、`journalctl --vacuum-size=500M --vacuum-time=7d`、`find /tmp /var/tmp -type f -atime +10 -delete`（跳过 systemd 私有目录）、`find /var/log -type f -name '*.gz' -mtime +30 -delete`），每步前后量用量算回收量，单步失败不中断其余步，结果为 `{"steps":[{"name","reclaimed","ok","error"}]}`；仅 Debian/Ubuntu（按 /etc/os-release 判定），其余系统直接拒绝；预览走 sysinfo `cleanup` kind（只读，不审计），执行走 `POST /hosts/:id/system-cleanup`（hostWrite 角色，高危审计，5 分钟超时）。
+- **DockerOp/DockerEvent**：`op` 含 `ps/ps_all/images/start/stop/restart/rm/logs/inspect/remove_image/prune_images/pull/run/system_df/system_prune/volume_prune/prune`；Agent 侧 shelling out to the docker CLI 执行（`agent/internal/docker/docker.go`）。`ps_all` 跑 `docker ps -a --format {{json .}}` 供镜像表「使用状态」列判断镜像是否被任意容器引用（含已停止容器）；只读，不审计，30 秒超时。`system_df` 跑 `docker system df --format {{json .}}` 供深度清理预览；`system_prune`（`prune` 为别名）是复合操作，按容器（带 `label!=watchman.app` 过滤，保护应用中心纳管的已停止容器与 -prev 回滚容器）→ 镜像 `-a` → 网络 → 构建缓存 `-a` 顺序执行，返回 `{"steps":[{"name","reclaimed"}]}`；`volume_prune` 单独清理未使用卷（深度清理弹窗里默认关闭的可选项）。三者与 pull/run 同取 5 分钟超时（服务端 `dockerOpTimeout` 与 Agent `opTimeout` 同步）。`run` 的参数走 `DockerOp.args_json`：`{"name":"...","ports":["hostPort:containerPort"],"volumes":["/host:/container"],"env":["KEY=VALUE"],"restart_policy":"no|on-failure|always|unless-stopped","command":["arg1","arg2"]}`，空值条目跳过；**每个字段先过字符白名单正则（容器名/端口/卷/环境变量键/重启策略/镜像引用，拒绝以 `-` 开头等伪装 docker flag 的载荷）再进 argv，exec 不走 shell**；镜像缺失由 docker CLI 自动拉取，故 `pull/run` 的服务端下发与 agent 执行均取 5 分钟超时。`logs` 的参数同样走 `args_json`：`{"tail":200,"since":"24h","timestamps":true}`（`tail` 1~10000 默认 200；`since` 空或 `all` = 不传 `--since`，其余只接受 `数字+smhd` 的 duration；非法值直接失败、不拼进 argv；容器名为空或以 `-` 开头同样拒绝；老 Agent 忽略 `logs` 的 `args_json`、恒返回 `--tail 200`；服务端 `dockerCall` 对 `logs` 固定返回 `{"ok":true,"raw":<docker logs 原文>}`，不做结构化 `data` 包装，前端按行渲染/着色/搜索/导出，`ps`/`images` 仍做数组规范化）。`logs` 的原文是容器 stdout 与 stderr 合并：docker CLI 把容器 stderr 分流到自身 stderr，Agent 侧对 logs 单独走合并抓取（其余 op 只抓 stdout，stderr 混入会污染 `ps`/`images` 的 NDJSON 解析）；老 Agent 只抓 stdout，写 stderr 的应用日志（如 Go 默认 log）在老 Agent 上继续缺失，直至 Agent 升级。`CleanupRequest`/`CleanupEvent`（系统清理执行，`cleanup` 字段）：`categories` 为 `apt_cache/journal/tmp_stale/logs_old` 子集（服务端与 Agent 双重白名单校验，空/未知/重复直接拒绝）；Agent 逐类跑固定 argv（`apt-get clean`、`journalctl --vacuum-size=500M --vacuum-time=7d`、`find /tmp /var/tmp -type f -atime +10 -delete`（跳过 systemd 私有目录）、`find /var/log -type f -name '*.gz' -mtime +30 -delete`），每步前后量用量算回收量，单步失败不中断其余步，结果为 `{"steps":[{"name","reclaimed","ok","error"}]}`；仅 Debian/Ubuntu（按 /etc/os-release 判定），其余系统直接拒绝；预览走 sysinfo `cleanup` kind（只读，不审计），执行走系统清理接口（见 API.md「Docker」），高危审计，5 分钟超时。
 - **终端 PTY 启动（shell 带参数与启动失败回显）**：`TerminalOpen.shell` 可带参数——容器终端下发的是 `docker exec -it <容器> /bin/sh` 整行；Agent 按 shell 词法（空白分隔、单/双引号与反斜杠转义）拆成命令与参数后直接 exec，不走 shell 解释，单字 shell（如 `bash`）行为不变；Windows 沿用 ConPTY 命令行字符串语义。PTY 启动失败时 Agent 把错误文本作为该会话的终端输出回传、随后以空输出标记会话结束，面板显示错误而不是静默挂起（此前失败只记一条 WARN，浏览器侧一直显示已建立、按键还被转发到不存在的会话）。
-- **安全扫描（Mimosa / 基线与漏洞检查）**：新增 `ScanRequest(type, rule_set)` / `ScanResult(progress, findings json, report_ref)`，走 exec + 结果回传，不引入新通道。
-- **Agent 自更新**：新增 `UpgradeRequest(version, url, sha256)` / `UpgradeProgress`，控制端可下发升级，Agent 校验签名后热更新（解耦发布）。升级签名密钥由控制端启动时从 `vault-pass` 经域分隔 SHA-256 派生 Ed25519（重启稳定、无需新密钥文件，`api.InitSigner`），公钥 hex 经 `GET /api/v1/version` 的 `upgrade_pubkey` 公开；agent 安装脚本自动带上 `-upgrade-pubkey`，agent 验签（未配置则跳过，只校验 sha256）。下载 URL 走面板对外地址统一解析（绑定域名 → 请求 Host，解决反代/NAT 下 Host 不可信）。升级进度判定只认 stage：`UpgradeProgress.Error` 仅在 stage 为 `error` 时表示失败，非 error 阶段的 Agent 不得往 Error 字段填状态文案、服务端也不得把非 error 阶段的非空 Error 当失败处理（此前状态文案曾导致每次单台升级都在格式校验步骤被误判失败）。
-- **Agent 卸载**：`UninstallRequest(remove_data)`（proto field 15）。三条路径：① 控制端解绑：`DELETE /api/v1/hosts/:id?uninstall_agent=true`（adminOnly），在线则下发卸载指令并等 agent 下线（15s 超时），离线直接 409（记录不删，提示先上线或去掉勾选）；超时未下线仍删记录但返回 `warning`。② agent 自卸载：`agent/internal/uninstall`，Linux 先 `signal.Ignore(SIGINT/SIGTERM)` 保命（**绝不能 `systemctl stop` 自己**：stop 的 SIGTERM 会杀死当前进程使清理中断；忽略信号后 stop 又会卡到 TimeoutStopSec 才被 SIGKILL），只做 disable + 删 unit + daemon-reload（unit 删掉后 systemd 即便 Restart=always 也无法重启已不存在的 unit）→ 删自身二进制 → remove_data=true 才删 data dir（路径须含 watchman 且非系统根目录）；sysvinit 同理只删脚本不 stop。Windows 删 Scheduled Task `WatchmanAgent`（安装脚本注册的是计划任务**不是** Windows service，`sc.exe` 找不到对象；`schtasks /Delete` 只删任务定义不杀当前运行实例）+ 延迟 cmd 自删（运行中 exe 删不掉，remove_data=false 时不拼 rmdir）。③ 安装脚本：`bash -s -- uninstall` / 落盘后 `& $f -Uninstall`（管道给 iex 传不了 switch 参数），停服务、删二进制与数据目录。
-- **证书轮换**：`RegisterResponse` 增加可选 `client_cert`/`cert_expires_at`；Agent 持有证书，控制端在到期前通过现有 mTLS 通道下发新证书（带签名），Agent 热加载。
+- **安全扫描（基线/入侵痕迹/漏洞检查）**：`ScanRequest(type, rule_set)` / `ScanProgress(progress, done, findings_json, report_ref)`，走 exec + 结果回传，不引入新通道。
+- **Agent 自更新**：新增 `UpgradeRequest(version, url, sha256)` / `UpgradeProgress`，控制端可下发升级，Agent 校验签名后热更新（解耦发布）。升级签名密钥由控制端启动时从 `vault-pass` 经域分隔 SHA-256 派生 Ed25519（重启稳定、无需新密钥文件，`api.InitSigner`），公钥 hex 经版本接口的 `upgrade_pubkey`（见 API.md「系统备份 / 恢复 / 升级」）公开；agent 安装脚本自动带上 `-upgrade-pubkey`，agent 验签（未配置则跳过，只校验 sha256）。下载 URL 走面板对外地址统一解析（绑定域名 → 请求 Host，解决反代/NAT 下 Host 不可信）。升级进度判定只认 stage：`UpgradeProgress.Error` 仅在 stage 为 `error` 时表示失败，非 error 阶段的 Agent 不得往 Error 字段填状态文案、服务端也不得把非 error 阶段的非空 Error 当失败处理（此前状态文案曾导致每次单台升级都在格式校验步骤被误判失败）。
+- **Agent 卸载**：`UninstallRequest(remove_data)`（proto field 15）。三条路径：① 控制端解绑：删除主机接口（见 API.md「主机」）带 `uninstall_agent=true`（adminOnly），在线则下发卸载指令并等 agent 下线（15s 超时），离线直接 409（记录不删，提示先上线或去掉勾选）；超时未下线仍删记录但返回 `warning`。② agent 自卸载：`agent/internal/uninstall`，Linux 先 `signal.Ignore(SIGINT/SIGTERM)` 保命（**绝不能 `systemctl stop` 自己**：stop 的 SIGTERM 会杀死当前进程使清理中断；忽略信号后 stop 又会卡到 TimeoutStopSec 才被 SIGKILL），只做 disable + 删 unit + daemon-reload（unit 删掉后 systemd 即便 Restart=always 也无法重启已不存在的 unit）→ 删自身二进制 → remove_data=true 才删 data dir（路径须含 watchman 且非系统根目录）；sysvinit 同理只删脚本不 stop。Windows 删 Scheduled Task `WatchmanAgent`（安装脚本注册的是计划任务**不是** Windows service，`sc.exe` 找不到对象；`schtasks /Delete` 只删任务定义不杀当前运行实例）+ 延迟 cmd 自删（运行中 exe 删不掉，remove_data=false 时不拼 rmdir）。③ 安装脚本：`bash -s -- uninstall` / 落盘后 `& $f -Uninstall`（管道给 iex 传不了 switch 参数），停服务、删二进制与数据目录。
 
-### B.8.4 安全与运维补充
+### B.7.4 安全与运维补充
 
-- **备份/迁移**：控制端内置 `system/backup` 导出 SQLite 文件 + config.yaml + 录像目录打包（tar.gz），支持 `system/restore` 从备份恢复；满足 5.1「数据自主可控、一键备份与跨机迁移」。定时备份可由系统 cron 或外层 cron 触发。
+- **备份/迁移**：控制端备份与恢复见 §3.12「控制端备份与恢复工程约定」（异步任务、64 GB 上限、S3 副本、跨机密钥延续）。
 - **enroll token 管理**：一次性、可过期、可吊销（`revoked` 标志 + 删除即失效）；一机一 token，注册成功后 `used_at` 置位并失效；防止 token 被多次复用注册。
 - **凭证加密**：`credentials.secret_enc` 用 AES-GCM，主密钥来自 `WATCHMAN_MASTER_KEY` 环境变量（B.6）；主密钥轮换需提供 re-encrypt 命令。
 - **凭证脱敏**：API 返回账号时 `secret` 永不回传，仅返回 `has_secret: true`。
-- **JWT**：access token 短 TTL（如 30min）+ refresh token；写操作记 `audit_logs`。
-- **限流/防爆破**：`auth/login` 按 IP+username 限速 + 失败锁定（`login_sessions.status=locked`）。
-- **数据保留与清理**：定时任务按 `retention.*` 清理 metrics/recordings/audit；Agent 离线超过阈值（如 30 天）的主机可在 UI 标记为 stale，支持归档。
+- **JWT**：access token 有效期 24h，无 refresh token；写操作记 `audit_logs`。
+- **数据保留与清理**：指标数据由 janitor 按 7 天固定保留期清理（每小时跑一次）；审计日志与会话录像无自动清理。
 
-### B.8.5 可观测性（控制端自身）
+### B.7.5 可观测性（控制端自身）
 
-- `/api/v1/system/health`：自检 DB、AI provider 可达性、在线 Agent 数、磁盘占用、录像/DB 体积。
-- 结构化日志（zerolog/zap）+ Prometheus `/metrics`（可选）便于接入监控。
-- Agent 侧：本地日志 + 回连后将关键日志摘要上报控制端（便于远程排障）。
+- 健康自检接口（见 API.md「系统备份 / 恢复 / 升级」）：自检 DB、AI provider 可达性、在线 Agent 数、磁盘占用、录像/DB 体积。
+- 结构化日志（`log/slog`）。
 
 至此后端架构覆盖：目录结构、通信协议、数据模型、REST API、终端通路、部署配置、安全运维、可观测性、数据卷备份恢复与应用跨机迁移，以及 Docker 容器管理、应用中心全生命周期、动态组网、Mimosa 安全扫描、证书自动化轮换与 Agent 在线更新的完整工程实现。
 
@@ -1552,8 +1101,7 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
    - **功能与视觉对齐**：修改完毕后进行自动化与人工视觉 Review，确保 UI 布局契合长亭百川云/牧云控制台风格规范。
 
 4. **版本权威性与唯一来源准则 (Release-Driven Authority)**：
-   - **版本完全由官方 Release 提供，严禁任何自行决定或拼接行为**：系统所有组件（控制端 Server、被管端 Agent、升级清单 Manifest 等）的版本号唯一来源必须是 Git tag 触发的官方 GitHub Release（形如 `v1.2.3` 或 `v1.2.3-beta.1`）。
-   - **绝对禁止私自捏造/拼接版本**：禁止在开发、部署或测试脚本中自行生成伪版本号（例如取本地 git commit hash 拼凑 `0.1.0-<hash>` 或任意自定义后缀）；未经 tag 发布的代码版本一律为开发环境占位（`0.1.0-dev`），线上与测试环境的升级验证必须且只能来源于官方 Release 产物与由 CI 生成的 `manifest.json`，确保版本链路 100% 可追溯。
+   - **版本完全由官方 Release 提供**：见头部维护约定第 3 条与 §B.6.5；未经 tag 发布的代码版本一律为开发环境占位（`0.1.0-dev`），线上与测试环境的升级验证必须且只能来源于官方 Release 产物与由 CI 生成的 `manifest.json`，确保版本链路 100% 可追溯。
    - **打 tag 必须按 §B.6.5 执行**：附注 tag（严禁裸 tag / 轻量 tag）、首行 `release: <tag>`、总述 + `### Added/Changed/Fixed/Security` 分段枚举、本地 `make tag-check` 门禁，逐项要求与完整发版流程见 §B.6.5（唯一权威事实源），提交信息规范见 §B.6.6。
 
 5. **操作审计全覆盖 (Audit Coverage)**：
@@ -1564,7 +1112,7 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
    - **操作列中文标签的唯一事实来源**是 `web/src/api/audit.ts` 的 `actionLabels`（action → 中文）、`actionTypeLabels`（`update`/`install`/`join`/`leave` 等短码按 `action:target_type` 精确匹配，如 `update:system` = 上传控制端二进制、`join:network_node` = 加入异地组网）、`targetTypeLabels`（目标类型）、`riskLabels`/`resultLabels`（风险/结果）；`AuditList.vue` 只消费这些映射，**新增 action 码必须同步补标签**，未登记的动作回落展示原始码（Review 时看到英文 action = 漏登记）。
    - **豁免**：纯读（GET）、诊断/分析类（AI diagnose、部署诊断）、机器对机器回调（Agent enroll、应用 webhook 回调）不记审计；失败请求（HTTP >= 400）由中间件自动跳过，显式埋点自行决定。
    - **风险分级**：删除/恢复/签发/授权变更/流量切换类记 `high`；常规增改记 `medium`；登出、连通性测试、告警确认等记 `low`。
-   - **CSV 导出口径**：`GET /api/v1/audit/export` 导出原始 action 码与字段值（机器消费用），不做中文翻译；中文展示只发生在面板 UI 层。
+   - **CSV 导出口径**：审计导出接口（见 API.md「审计」）导出原始 action 码与字段值（机器消费用），不做中文翻译；中文展示只发生在面板 UI 层。
 
 ---
 
@@ -1663,7 +1211,7 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 
 8. 重连成功后要重新 `sendResize()`，把当前终端尺寸同步给远端 PTY。
 
-9. **显式关闭走 `DELETE /api/v1/terminals/:sid`，不要用它代替正常关标签**。该接口强制关闭一个活着的会话：审计 `End` + `ws.CloseSession`（停掉宽限期定时器、给已连接的浏览器发 `ended` 帧并关 socket）+ 给 Agent 发 `TermClose` + `UnregisterSession`；审计走 `auditMutation` 中间件，规则 `terminal_close`（high，目标 `session`）。只有会话操作人或 admin 能调，审计页 live 行上的「结束」按钮是唯一调用入口。正常关标签只关 WS、走宽限期——**绝不能在组件卸载时调 DELETE**，否则会把正在共享的观众一起踢掉；WS 从未连上过的会话没有审计记录，DELETE 只清 `sessionIdx` 映射、返回 `closed=false`。
+9. **显式关闭走关闭终端会话接口（见 API.md「终端」），不要用它代替正常关标签**。该接口强制关闭一个活着的会话：审计 `End` + `ws.CloseSession`（停掉宽限期定时器、给已连接的浏览器发 `ended` 帧并关 socket）+ 给 Agent 发 `TermClose` + `UnregisterSession`；审计走 `auditMutation` 中间件，规则 `terminal_close`（high，目标 `session`）。只有会话操作人或 admin 能调，审计页 live 行上的「结束」按钮是唯一调用入口。正常关标签只关 WS、走宽限期——**绝不能在组件卸载时调 DELETE**，否则会把正在共享的观众一起踢掉；WS 从未连上过的会话没有审计记录，DELETE 只清 `sessionIdx` 映射、返回 `closed=false`。
 
 ### 8.6 维护握手与告警防抖规范
 
@@ -1681,7 +1229,7 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
    - 控制端拉起后，在维护窗口内连回并携带 `reconnect_reason = "maintenance"` 的 Agent，告警引擎必须静默对齐状态，**严禁触发上线通知**。
 
 3. **被控端在线自升级（Agent 自升级场景）**：
-   - 控制端在 `/api/v1/hosts/:id/upgrade` 发出升级指令前，必须自动调用 `alertMonitor.SetHostMaintenance(hostID, 180s, "agent_upgrade")`，为目标主机开启专属维护静默期；
+   - 控制端在发出 Agent 升级指令（见 API.md「主机」）前，必须自动调用 `alertMonitor.SetHostMaintenance(hostID, 180s, "agent_upgrade")`，为目标主机开启专属维护静默期；
    - 处于维护期内的主机，告警引擎在 `checkRule` 中评估 `RuleOffline` 时直接静默跳过，**严禁触发离线告警**；
    - Agent 在 `upgrade.Manager` 完成二进制自替换、准备 `os.Exit(0)` 重启前，必须将 `reconnect_reason = "upgrade"` 写入本地持久化状态；
    - Agent 重启后发送携带 `reconnect_reason = "upgrade"` 的 `RegisterRequest`；控制端收到后清除维护标记，平滑同步为在线，**严禁触发上线通知**。
@@ -1689,9 +1237,8 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
 4. **一次性理由自愈消费**：
    - Agent 收到服务端的 `RegisterResponse`（即鉴权注册成功）后，必须立即在本地状态文件中清空 `reconnect_reason`，确保后续运行过程中的异常掉线能恢复常规告警感知。
 
-5. **版本号必须是构建产物，不能硬编码，且完全由 Release 提供**：
-   - Agent 上报的 `RegisterRequest.agent_version` 与控制端的 `CurrentAgentVersion` 一律取自 `internal/version`（`version.Get()`），发布时用 `make VERSION=v1.2.3 build-all` 注入（`-ldflags -X watchman/internal/version.Version=...`）。
-   - **版本号完全由官方 Release 提供，绝对禁止自行决定/拼接**：严禁在任何安装、部署、升级或测试脚本中自行生成或捏造版本（例如拼接 commit hash `0.1.0-<hash>`）；所有组件版本与升级清单 `manifest.json` 必须且只能来源于官方 GitHub Releases，确保版本权威性与可复现性。
+5. **版本号必须是构建产物，不能硬编码**：
+   - Agent 上报的 `RegisterRequest.agent_version` 与控制端的 `CurrentAgentVersion` 一律取自 `internal/version`（`version.Get()`），发布时用 `make VERSION=v1.2.3 build-all` 注入（`-ldflags -X watchman/internal/version.Version=...`）；版本来源见头部维护约定第 3 条。
    - 若两处都写死同一个常量（例如都是 `0.1.0-dev`），「哪些 Agent 需要升级」的判定恒为 false，批量升级与前端「需升级」提示会永久失效；此场景可用批量升级接口的 `force=true` 强制重推。
    - Agent 本地状态（含 `reconnect_reason`）只能经 `config.Update` / `SetReconnectReason` 读写（带互斥锁 + 临时文件原子落盘），升级回调、收包协程、注册协程会并发访问。
 
@@ -1723,7 +1270,7 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
    - `shellQuoteArg` 按目标 shell 选择转义：PowerShell 单引号内用 `''` 转义单引号，POSIX 用 `'\''`；无特殊字符的值原样返回。
 
 5. **密钥永不经 GET 接口回显**：
-   - `GET /network/config` 曾明文返回 Tailscale Auth Key，而该接口挂在 `authed` 分组（所有登录用户，含只读 viewer）——viewer 拿 key 就能把自己的设备加进 tailnet，直达所有 100.x 节点。现只返回 `auth_key_set` 布尔值；PUT 空值表示"保持原密钥"（无清除语义，轮换请写入新值）；前端密钥输入框只写不读，保存后清空。
+   - 组网配置接口（见 API.md「动态组网」）曾明文返回 Tailscale Auth Key，而该接口挂在 `authed` 分组（所有登录用户，含只读 viewer）——viewer 拿 key 就能把自己的设备加进 tailnet，直达所有 100.x 节点。现只返回 `auth_key_set` 布尔值；PUT 空值表示"保持原密钥"（无清除语义，轮换请写入新值）；前端密钥输入框只写不读，保存后清空。
 
 6. **部署用 Mesh IP 必须实时探测，缓存只做兜底**：
    - `bind_scope=mesh` 部署时（`apps/deploy.go:resolveMeshIP`）先对目标主机实时执行 `tailscale ip -4`（1 次 exec，无参数、与 shell 无关、无需转义），命中则直接采用并回写 `network.Store` 缓存（网关反代与 UI 同步受益）。
@@ -1734,9 +1281,9 @@ GET    /api/v1/system/panel-cert/public-ip      # 检测服务器公网出口 IP
    - `installNode` 的 `sh` 分支（`buildInstallCommand`）先检查 `/etc/apk/repositories` 是否启用 community（`grep -Eq '^http.*/community$'`），缺失时 `setup-apkrepos -c -1` 自动启用；两者皆无则明确报错退出，不再是泛化的"安装脚本执行失败"。
    - 服务启动用 `rc-service tailscale start || rc-service tailscale restart`（与官方一致走 `start` 优先）：`restart` 在从未启动过的服务上退出码不可靠，曾导致"装好了但 UI 报失败"的误报。
 
-8. **只读实时探测端点 `GET /network/nodes/:id/mesh-ip`**：
+8. **只读实时探测接口**（见 API.md「动态组网」）：
    - 创建应用页选中主机即调用：实时 `tailscale ip -4`（1 次 exec）优先，命中则采用并**回写 Store 缓存**（网关反代与网络列表同步受益）；失败回落缓存 `NodeStatus.IP`，两者皆无返回空。响应 `{ip, source}`，`source` ∈ `live`/`cache`/`""`（未加入组网或探测失败），前端据此标注「实时探测/缓存」。
-   - **必须挂在 authed 读分组、免审计**：`POST /network/nodes/:id/check` 虽能刷新缓存，但在 writeRG（审计），每次选主机都调会灌爆操作审计流；诊断类只读探测按 §7 豁免（与 `ai/nl2command` 同例）。
+   - **必须挂在 authed 读分组、免审计**：组网节点检查接口（见 API.md「动态组网」）虽能刷新缓存，但在 writeRG（审计），每次选主机都调会灌爆操作审计流；诊断类只读探测按 §7 豁免（与 `ai/nl2command` 同例）。
    - 部署侧（`resolveMeshIP`）保持自己的实时探测逻辑不读此端点——部署在 agent 侧执行，与此 API 互为独立实现，均遵循"live 优先、cache 兜底、禁止静默降级公网"。
 
 9. **安装/加入走异步任务 + 轮询，禁止同步长请求**：
@@ -1792,8 +1339,8 @@ AI 运维助手页（`web/src/views/ai/AiChat.vue`）对话输入区采用一体
 - 前端展示时间统一走 `web/src/utils/time.ts`（`fmtDateTime`、`fmtDate`、`fmtTime` 等），严格基于控制端下发的 `server.timezone` 呈现。前端组件严禁手写字符串切割（详见 `DESIGN.md §9.15`）。
 
 **时间范围过滤（统一 RFC3339）**
-- 审计 `GET /api/v1/audit`、`/api/v1/audit/export`：`from` / `to` 为 RFC3339 字符串，`server/internal/audit/handlers.go` 的 `queryFromContext` 用 `time.Parse(time.RFC3339, v)` 解析，格式非法直接 400（`invalid from time: ...`）；`audit.Query.match` 为闭区间，两端都包含，`from > to` 时两个条件互斥、结果为空。
-- 指标历史 `GET /api/v1/hosts/:id/metrics/history`：`from` / `to` 同样按 RFC3339 解析（`router.go:getMetricsHistory` 先试 RFC3339，失败再按 Unix 秒解析以兼容旧调用），`step` 为秒；缺省或非法时回退 `to=now`、`from=to-3600`、`step=15`，不报错（`metrics/store.go:QueryHistory`）。
+- 审计查询与导出接口（见 API.md「审计」）：`from` / `to` 为 RFC3339 字符串，`server/internal/audit/handlers.go` 的 `queryFromContext` 用 `time.Parse(time.RFC3339, v)` 解析，格式非法直接 400（`invalid from time: ...`）；`audit.Query.match` 为闭区间，两端都包含，`from > to` 时两个条件互斥、结果为空。
+- 指标历史接口（见 API.md「监控与告警」）：`from` / `to` 同样按 RFC3339 解析（`router.go:getMetricsHistory` 先试 RFC3339，失败再按 Unix 秒解析以兼容旧调用），`step` 为秒；缺省或非法时回退 `to=now`、`from=to-3600`、`step=15`，不报错（`metrics/store.go:QueryHistory`）。
 
 **前端筛选控件**
 - 统一采用 `NDatePicker type="datetimerange"`（输出标准时间戳区间，清空为 `null`），提交前序列化为 ISO 字符串并重置页码，详见 `DESIGN.md §9.15`。
@@ -1804,16 +1351,4 @@ AI 运维助手页（`web/src/views/ai/AiChat.vue`）对话输入区采用一体
 - 采用纯净暗色深底（`#090d16`）、36px 精密工程蓝图网格、以及 RAF 物理阻尼插值鼠标探照灯网格追踪（仅高精度指针设备激活跟随，移动端保持静态居中降级）；
 - 卡片采用微弱磨砂质感（对应 `#131b2e` 底色）、顶缘微高光流线，不堆砌冗余伪状态或硬编码端口；
 - 顶部 Logo 采用纯净无边框贴合渲染（`.login-logo-img` 42px 直接呈现），保持沉浸通透；
-- 严禁任何自行拼凑版本号的行为，严格遵守版本 100% 来源于官方 Release 的铁律（必读约定 3）。完整设计令牌与 CSS 实现详见 `DESIGN.md §9.14`。
-
-
-
-
-
-
-
-
-
-
-
-
+- 完整设计令牌与 CSS 实现详见 `DESIGN.md §9.14`。

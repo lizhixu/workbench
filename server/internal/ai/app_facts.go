@@ -6,7 +6,7 @@ package ai
 // *before* calling the model and inject it into the prompt, and afterwards
 // reconcile the sanitized draft against those facts. The goal is to keep the
 // AI from inventing ports/variables for software it has never heard of
-// ( AGENTS.md 3.7/3.16.7: drafts grounded in facts, never auto-created).
+// ( AGENTS.md 3.7/3.15.6: drafts grounded in facts, never auto-created).
 
 import (
 	"context"

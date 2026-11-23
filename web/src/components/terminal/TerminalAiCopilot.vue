@@ -2,7 +2,7 @@
 // Terminal AI Copilot: a side panel that turns a natural-language operational
 // intent into an ordered, host-tailored plan and (after confirmation) runs it
 // step by step, echoing colored progress into the live terminal and auto-
-// diagnosing failures. See AGENTS.md 3.16 — AI never auto-runs a high-risk
+// diagnosing failures. See AGENTS.md 3.15 — AI never auto-runs a high-risk
 // step; those pause for explicit human confirmation.
 import { ref, computed, nextTick } from 'vue'
 import { NButton, NIcon, NInput, NSpin, NTag, useMessage } from 'naive-ui'

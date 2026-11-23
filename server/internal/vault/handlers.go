@@ -56,7 +56,7 @@ func (h *Handlers) create(c *gin.Context) {
 }
 
 // get returns a credential's metadata. The stored secret is deliberately not
-// included: AGENTS.md B.8.4 requires the API to answer with has_secret only, so
+// included: AGENTS.md B.7.4 requires the API to answer with has_secret only, so
 // a leaked console token cannot be turned into the host's real password. The
 // plaintext stays available in-process (Store.Get) for terminal login.
 func (h *Handlers) get(c *gin.Context) {

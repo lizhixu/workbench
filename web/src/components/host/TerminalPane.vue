@@ -249,7 +249,7 @@ async function handleAiGenerate() {
       return
     }
     // High-risk commands require explicit human confirmation before sending
-    // (AGENTS.md 3.16.7: AI never auto-runs destructive commands).
+    // (AGENTS.md 3.15.6: AI never auto-runs destructive commands).
     if (res.needs_confirm || res.risk_level === 'high') {
       const ok = window.confirm(
         `AI 生成了高风险命令，请确认后执行：\n\n${res.command}\n\n${res.explanation ? '说明: ' + res.explanation + '\n\n' : ''}点击「确定」发送到终端，「取消」放弃。`

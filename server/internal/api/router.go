@@ -191,7 +191,7 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	// ---- Authenticated routes ----
 	authed := v1.Group("", auth.Middleware(authStore))
 
-	// Role gates. A viewer is read-only by design (AGENTS.md 3.15/B.3), so any
+	// Role gates. A viewer is read-only by design (AGENTS.md 3.14/B.3), so any
 	// route that changes a host — shell, file write, exec, docker, scan — needs
 	// at least operator, and host lifecycle stays with admin.
 	hostWrite := authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator))

@@ -45,79 +45,79 @@ web/
     │   └── routes.ts         # 路由表定义
     ├── api/                  # REST API 客户端 (与 Agent.md B.4 对齐)
     │   ├── http.ts           # Axios 实例、请求/响应拦截器、JWT 逻辑
-    │   ├── auth.ts           # /auth/login, /auth/logout, /auth/me
-    │   ├── hosts.ts          # /hosts, /hosts/enroll, /hosts/:id, /accounts, /login-policy
-    │   ├── terminal.ts       # /hosts/:id/terminals, /terminals/:sid/share, /sessions
-    │   ├── files.ts          # /hosts/:id/files, /files/content, /files/lock, /files/versions
-    │   ├── exec.ts           # /exec/tasks, /commands (常用命令库)
-    │   ├── monitor.ts        # /hosts/:id/metrics, /alerts, /alert-rules
-    │   ├── sysinfo.ts        # /hosts/:id/processes, /ports, /users, /logins
-    │   ├── docker.ts         # /hosts/:id/docker/*, /docker/install-script
-    │   ├── apps.ts           # /apps CRUD/部署/回滚/历史, /apps/catalog, /apps/:id/proxy
-    │   ├── security.ts       # /security/scans, /vulnerabilities
-    │   ├── cloud.ts          # /cloud/accounts, /cloud/assets
-    │   ├── network.ts        # /networks/join, /networks/topology
-    │   ├── groups.ts         # /groups, /groups/:id/hosts, /groups/:id/users
-    │   ├── users.ts          # /users, /me/term-prefs
-    │   ├── audit.ts          # /audit, /sessions/:id/recording
-    │   ├── ai.ts             # /ai/config, /ai/chat, /ai/nl2command, /ai/audit, /ai/tools
-    │   ├── settings.ts       # /settings, /notify-channels, /notify-rules
-    │   ├── system.ts         # /system/health, /system/backup, /system/restore
+    │   ├── auth.ts           # /auth/login
+    │   ├── hosts.ts          # /hosts、/hosts/enroll、/hosts/:id、批量执行、主机级 docker/files/sysinfo/terminals/exec、/sessions、/system/health
+    │   ├── apps.ts           # /apps CRUD/部署/回滚/迁移/升级、卷备份、/apps/catalog、/apps/inspect-repo
+    │   ├── groups.ts         # /groups、/groups/:id/users、/me/groups
+    │   ├── users.ts          # /users、/users/:username/{password, role, reset-password}
+    │   ├── commands.ts       # /commands（常用命令库）
+    │   ├── alerts.ts         # /alerts/rules、/alerts/events、/alerts/webhook
+    │   ├── audit.ts          # /audit
+    │   ├── ai.ts             # /ai/config、/ai/chat、/ai/nl2command、/ai/diagnose、/ai/analyze-exec、/ai/plan、/ai/ops-reports、/ai/app-draft、/ai/app-chat、/ai/models、/ai/test
+    │   ├── scan.ts           # /scans、/hosts/:id/scans、/ai/scan-report
+    │   ├── certs.ts          # /certs、/certs/accounts、/certs/presets、面板证书 /system/panel-cert
+    │   ├── vault.ts          # /vault/credentials
+    │   ├── settings.ts       # /settings、/me/settings、/version
+    │   ├── backup.ts         # /system/backup、/system/backups、/system/restore
+    │   ├── snapshots.ts      # /backups/jobs、/backups/s3-targets
+    │   ├── network.ts        # /network/nodes、/network/config
+    │   ├── tunnels.ts        # /tunnels/mine、/tunnels/client-info
+    │   ├── git.ts            # /git/providers、/git/github、/github-app
+    │   ├── policy.ts         # /policy/command
+    │   ├── upgrade.ts        # /system/upgrade、/system/upgrade-agents、/system/check-update
     │   └── types.ts          # TS DTO 类型契约 (与 Agent.md B.3 数据模型 100% 对齐)
-    ├── ws/                   # WebSocket 客户端
-    │   ├── client.ts         # 通用 WebSocket：指数退避重连、30s 心跳、帧路由
-    │   ├── terminal.ts       # 终端二进制/文本帧处理
-    │   └── file.ts           # 文件 Chunk 分片传输 (256KB~1MB) + 校验
+    # WebSocket 无独立目录：连接在 TerminalSession.vue / SharedTerminal.vue 内直连建立，文件分片传输在 FileManagerPane.vue
     ├── stores/               # Pinia 状态管理
     │   ├── auth.ts           # 用户 token, role (admin/operator/viewer), 组别 Scope
     │   ├── workspace.ts      # 顶部 Multi-Tab 导航工作区状态
     │   ├── hosts.ts          # 主机列表、实时状态 (WS 推送更新)
-    │   ├── messages.ts       # 实时消息列表 (消息列表 99+ 未读与日志流)
-    │   ├── settings.ts       # 全局主题 (dark/light)、终端偏好、AI 配置缓存
-    │   └── sessions.ts       # 活动终端会话、远程协助与终端分享状态
-    ├── composables/          # 组合式 Hook (useTerminal, useMetrics, useFileTree, useAI, useAuth)
+    │   ├── notifications.ts  # 告警事件列表与未读计数
+    │   ├── settings.ts       # 全局主题与 /me/settings 同步
+    │   ├── termPrefs.ts      # 终端偏好（主题/字体/shell），经 /me/settings 的 terminal.* 键同步
+    │   └── systemUpdate.ts   # 系统升级检查与在线升级状态
+    ├── composables/          # 组合式 Hook (useCertIssuance, useIsMobile, useTablePagination)
     ├── components/
-    │   ├── layout/           # AppHeader(顶栏+Tab), Sidebar, HostDetailShell
-    │   ├── host/             # HostHeaderBanner, HostTable, HostFilterBar, MessageListPanel
-    │   ├── terminal/         # TerminalPane, TerminalTabs, RemoteAssistModal, ThemeSelect
-    │   ├── file/             # PathBreadcrumb, FileTable, FileToolbar, FileEditor, UploadProgress
-    │   ├── monitor/          # MetricGrid (4-宫格), MetricCard, TimeRangePicker
-    │   ├── sysinfo/          # ProcessTable, PortList, AccountList, LoginHistoryTable
-    │   ├── docker/           # ContainerTable, ImageTable, DockerInstallModal
-    │   ├── security/         # VulnerabilityStatCard, VulnerabilityTable, ScanTrigger
-    │   ├── cloud/            # CloudAccountModal, CloudAssetDashboard
-    │   ├── exec/             # ExecEditor, HostPicker, ResultViewer, CommandLibModal
-    │   ├── ai/               # AiChat, Nl2Command, CommandConfirm, AiLogInterpreter
-    │   ├── audit/            # AsciinemaPlayer, AuditTable
-    │   └── common/           # ConfirmDialog, EmptyState, TagInput, StatusBadge
+    │   ├── layout/           # AppShell.vue（应用壳：顶栏 + Tab + 侧栏）
+    │   ├── host/             # 主机详情页签：FileManagerPane、MetricsPane、SysInfoPane、TerminalPane、TerminalSession、HostNetworkPane、HostHeaderBanner、MessageListPanel、HostBillingModal
+    │   ├── terminal/         # RemoteAssistModal.vue、TerminalAiCopilot.vue
+    │   ├── tunnels/          # OpsTunnelModal.vue
+    │   ├── ai/               # AiCallTrace.vue（AI 调用链路展示）
+    │   ├── apps/             # AppAiAssistant、AppMigrateModal、AppRuntimeLogs、AppTopologyPreview
+    │   ├── cert/             # CertManager、CertLogModal、CertTimeSettingsModal
+    │   └── common/           # CodeEditor.vue（CodeMirror 6 编辑器）、OsLogo.vue（系统 logo）
     ├── views/
     │   ├── auth/Login.vue
     │   ├── hosts/
     │   │   ├── HostList.vue            # 主机列表 (包含左侧分组树 + 实时消息流)
-    │   │   └── HostDetail.vue          # 主机详情 (固定顶部状态栏 + 左侧二级 Icon 导航)
+    │   │   └── HostDetail.vue          # 主机详情 (固定顶部状态栏 + 左侧二级 Icon 导航；页签见 hostTabs.ts)
     │   ├── hosts/tabs/
-    │   │   ├── Overview.vue            # 4-宫格资源监控 (实时/历史)
-    │   │   ├── Sysinfo.vue             # 进程清单 / 网络端口 / 系统账号 / 登录历史
-    │   │   ├── Terminal.vue            # 多标签终端 + 远程协助 Modal
-    │   │   ├── Files.vue               # 文件导航面包屑 + 虚拟树 + 上传/编辑
-    │   │   ├── Docker.vue              # Docker 容器与镜像管理（观测运维；部署走应用中心）
-    │   │   ├── Vulnerabilities.vue     # 服务器漏洞与安全基线
-    │   │   └── CloudAssets.vue         # 云资产与云账号绑定
+    │   │   ├── SystemCleanup.vue       # 系统清理页签
+    │   │   └── Vulnerabilities.vue     # 服务器漏洞与安全基线
+    │   │   # 其余页签（文件/监控/系统状态/终端/Docker/组网）用 components/host/*Pane.vue；CloudAssets.vue、Overview.vue 为无人引用的死文件
     │   ├── apps/
     │   │   ├── AppList.vue            # 应用中心列表
     │   │   ├── AppCreate.vue          # 统一创建入口（模板/单镜像/Compose/Git）
     │   │   └── AppDetail.vue          # 应用详情（部署历史/域名反代/拓扑）
-    │   ├── exec/ExecPush.vue           # 批量命令推送与常用命令库
-    │   ├── sessions/SessionList.vue    # 会话审计列表 + asciinema 回放
-    │   ├── alerts/
-    │   │   ├── AlertList.vue           # 活跃与历史告警
-    │   │   └── AlertRules.vue          # 告警规则与通知渠道 CRUD
-    │   ├── groups/GroupManage.vue      # 分组树 + 主机/用户授权 (双视角)
-    │   ├── users/UserManage.vue        # 用户管理与 RBAC 角色分配
-    │   ├── audit/AuditList.vue         # 系统全量操作审计日志
-    │   ├── ai/AiChat.vue               # AI 智能运维助手 (Tool Calling 查平台数据)
-    │   ├── settings/Settings.vue       # 通用设置 / 终端偏好 / AI Provider 配置 / 通知渠道
-    │   └── system/Health.vue           # 系统健康自检 / 离线数据备份与恢复
+    │   ├── exec/BatchExec.vue          # 批量命令推送与常用命令库
+    │   ├── audit/
+    │   │   ├── AuditList.vue           # 系统全量操作审计日志
+    │   │   └── SessionList.vue         # 会话审计列表 + asciinema 回放
+    │   ├── alerts/AlertList.vue        # 活跃与历史告警 + 告警规则 CRUD（规则弹窗内）
+    │   ├── groups/GroupList.vue        # 分组树 + 主机/用户授权 (双视角)
+    │   ├── users/
+    │   │   ├── UserList.vue            # 用户管理与 RBAC 角色分配
+    │   │   └── ChangePassword.vue      # 修改密码
+    │   ├── ai/
+    │   │   ├── AiChat.vue              # AI 智能运维助手
+    │   │   └── OpsReport.vue           # AI 运维巡检报告
+    │   ├── settings/SettingsLayout.vue # 设置中心壳 + 12 个 section（见 sections.ts）
+    │   ├── network/NetworkList.vue     # 动态组网节点列表
+    │   ├── vault/CredentialList.vue    # 凭据保险库
+    │   ├── certs/CertList.vue          # 证书中心
+    │   ├── snapshots/SnapshotList.vue  # 快照备份
+    │   ├── docker/Docker.vue           # Docker 容器与镜像管理（观测运维；部署走应用中心）
+    │   ├── files/FileManager.vue       # 独立文件管理页
+    │   └── terminal/SharedTerminal.vue # 终端分享页
     └── styles/               # 主题 CSS 变量 (dark & light)
 ```
 
@@ -129,36 +129,35 @@ web/
 
 ```
 /login                                  Login.vue（公开）
+/share/terminal                          SharedTerminal.vue（终端分享）
 /                                       → /hosts
 /hosts                                  HostList.vue（主机列表与消息流）
-/hosts/:id                              HostDetail.vue（主机详情页壳）
-  ├ /hosts/:id/overview                 Overview.vue（4-宫格资源监控）
-  ├ /hosts/:id/sysinfo                  Sysinfo.vue（系统状态与进程清单）
-  ├ /hosts/:id/terminal                 Terminal.vue（在线终端与远程协助）
-  ├ /hosts/:id/files                    Files.vue（文件管理）
-  ├ /hosts/:id/docker                   Docker.vue（容器/镜像观测运维）
-  ├ /hosts/:id/vulnerabilities          Vulnerabilities.vue
-  └ /hosts/:id/cloud                    CloudAssets.vue
+/hosts/:id                              HostDetail.vue（主机详情页壳；页签由 ?tab= 切换，见 hostTabs.ts）
+/batch-exec                             BatchExec.vue（批量推送命令）
+/files/:id                              FileManager.vue（独立文件管理页）
+/sessions                               SessionList.vue（会话历史与回放）
+/audit                                  AuditList.vue（操作审计）
+/alerts                                 AlertList.vue（告警列表 + 规则 CRUD）
+/vault                                  CredentialList.vue（凭据保险库）
+/network                                NetworkList.vue（动态组网；/networks 重定向至此）
 /apps                                   AppList.vue（应用中心列表）
   ├ /apps/create                        AppCreate.vue（统一创建：模板/单镜像/Compose/Git）
   └ /apps/:id                           AppDetail.vue（应用详情与域名反代）
-/exec                                   ExecPush.vue（批量推送命令）
-/sessions                               SessionList.vue（会话历史与回放）
-/alerts                                 AlertList.vue（告警列表）
-/alerts/rules                           AlertRules.vue（告警规则）
-/groups                                 GroupManage.vue（分组与权限）
-/users                                  UserManage.vue（用户管理）
-/audit                                  AuditList.vue（操作审计）
-/ai                                     AiChat.vue（AI 智能助手）
-/settings                               Settings.vue（全局与 AI 设置）
-/system/health                          Health.vue（系统健康与离线备份）
+/certs                                  CertList.vue（证书中心）
+/snapshots                              SnapshotList.vue（快照备份）
+/docker/:id                             Docker.vue（Docker 管理）
+/groups                                 GroupList.vue（分组与权限）
+/users                                  UserList.vue（用户管理）
+/settings                               SettingsLayout.vue（设置中心，?s= 切 section）
+/ai/chat                                AiChat.vue（AI 智能助手）
+/ai/report                              OpsReport.vue（AI 运维巡检报告）
 ```
 
-### 3.2 导航守卫与权限模型 (与 Agent.md 3.13/3.15 对齐)
+### 3.2 导航守卫与权限模型 (与 Agent.md 3.13/3.14 对齐)
 
 - **路由拦截**：`router.beforeEach` 校验 JWT。如 JWT 缺失跳转 `/login`；如无主机访问权限（按 `user_groups` 组别 Scope 过滤）跳转 `403` 页面。
 - **角色限制 (`meta.minRole`)**：
-  - `admin`：可访问 `/users`、`/system/health`、`/settings` 中的 AI Provider Key 配置与系统备份。
+  - `admin`：可访问 `/users`、`/settings` 中的 AI 大模型配置与系统备份。
   - `operator`：可执行主机控制、终端操作、文件写操作、批量推送命令。
   - `viewer`：仅读视角，禁用写操作按钮（UI 呈 disabled 或隐藏）。
 - **Workspace 多页签联动**：任何路由切换均自动调用 `workspaceStore.openTab()`，在顶部 Header 多页签中维持激活 Tab。
@@ -201,7 +200,6 @@ web/
 │ │ 🚢 容器   │ 3. Docker: 容器列表/镜像管理                                           │ │
 │ │ 📁 文件   │ 4. Files: 面包屑路径 / 导航工具栏 / 虚拟文件表                          │ │
 │ │ 🛡️ 漏洞   │ 5. Terminal: 多 Shell Tab + [远程协助] 授权弹窗                        │ │
-│ │ 🔲 云资产 │ 6. Vulnerabilities / Cloud: 风险指标卡 / [添加云账号] 模态框           │ │
 │ └───────────┴────────────────────────────────────────────────────────────────────────┘ │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -225,24 +223,24 @@ web/
 - `list`：主机对象列表（包含 `agent_id`, `hostname`, `os`, `arch`, `distro`, `status`, `last_seen_at`, `uptime_str`, `internal_ip`, `external_ip`, `location`, `tags`）。
 - **实时同步**：订阅 WebSocket `host_status` 事件，收到 Agent 上/下线或心跳变更时增量更新指定行，无须重刷列表。
 
-### 5.4 `messagesStore`
+### 5.4 `notificationsStore`
+- `events`：告警事件列表（`AlertEvent[]`，来自 `/alerts/events`）。
 - `unreadCount`：未读消息计数 (如 `99+`)。
-- `feed`：实时接收的主机上线、离线、监控告警日志列表。
 
-### 5.5 `sessionsStore` (与 Agent.md 3.5 & B.5 终端与分享对齐)
-- `tabs`：`Array<{ sid, hostId, title, shell, status, termRef, wsRef }>`。
-- `remoteAssist`：`{ active: boolean, code: string, expireMinutes: number, mode: 'view' | 'control', subscribersCount: number }`。
+### 5.5 终端会话状态（组件内状态，无独立 store；与 Agent.md 3.5 & B.5 终端与分享对齐）
+- 多标签终端状态在 `TerminalPane.vue` 内维护（`tabs: TermTab[]`，含 `sid` / `hostId` / `shell` / `status`）。
+- 远程协助状态在 `TerminalPane.vue` / `RemoteAssistModal.vue` 内维护。
 
 ### 5.6 `settingsStore`
 - `theme`：`'dark'` | `'light'` | `'auto'`。
-- `termPrefs`：`{ theme, defaultShell, fontFamily, fontSize }` (拉取并同步 `/me/term-prefs`)。
-- `aiConfig`：`{ enabled, defaultProvider, fallbacks, maskOnExternal }`。
+- 终端偏好由独立的 `termPrefs` store 维护（`{ theme, defaultShell, fontFamily, fontSize }`，经 `/me/settings` 的 `terminal.*` 键拉取并同步）。
+- AI 配置不在 settingsStore 里：`AiConfig.vue` 直接调 `/ai/config`（见 `api/ai.ts`）。
 
 ---
 
 ## 6. 功能模块与页面详细设计 (完整涵盖 Agent.md 需求)
 
-### 6.1 主机绑定与列表管理 `/hosts` (与 Agent.md 3.1 & B.8.2 对齐)
+### 6.1 主机绑定与列表管理 `/hosts` (与 Agent.md 3.1 & B.7.2 对齐)
 
 #### 功能点
 - **一键绑定**：点击顶栏「绑定主机」按钮，弹出 Modal，显示控制端生成的安装命令（内含 `enroll_token`）：
@@ -356,7 +354,7 @@ web/
 
 ---
 
-### 6.9 动态组网 / 内网穿透 `/networks` (与 Agent.md 3.9 & A.6 对齐)
+### 6.9 动态组网 / 内网穿透 `/network` (与 Agent.md 3.9 & A.6 对齐)
 
 #### 功能点
 - **虚拟内网管理**：无需暴露端口，复用 Agent 反向隧道通道，在 Web 端勾选主机一键「加入组网」，自动分配虚拟 IP (`100.64.x.x`)。
@@ -410,18 +408,7 @@ web/
 
 ---
 
-### 6.14 云资产与云账号绑定 `/cloud`（与 Agent.md 3.14 对齐）
-
-#### 功能点
-- **添加云账号模态框 (Add Cloud Account Modal)**：
-  - 厂商 Tabs：`阿里云` | `腾讯云` | `AWS` | `Microsoft Azure`。
-  - 字段：云账号备注、AccessKey ID、AccessKey Secret (带帮助链接 `如何获取AccessKey?`)。
-  - 开关：`自动绑定云账号下的所有主机 (安装牧云主机助手)`。
-- **云资产仪表盘**：自动发现云服务器实例并对比 Agent 绑定状态。
-
----
-
-### 6.15 用户认证与操作审计回放 `/audit` & `/sessions` (与 Agent.md 3.15 对齐)
+### 6.14 用户认证与操作审计回放 `/audit` & `/sessions` (与 Agent.md 3.14 对齐)
 
 #### 功能点
 - **全量操作审计**：记录控制端登录、终端打开、文件读写、批量命令推送、高危操作及 AI 调用的审计日志，支持按时间、用户、动作筛选与导出。
@@ -429,7 +416,7 @@ web/
 
 ---
 
-### 6.16 AI 智能助手体系 (增强层) `/ai` & 全局浮窗 (与 Agent.md 3.16 & A.7 对齐)
+### 6.15 AI 智能助手体系 (增强层) `/ai` & 全局浮窗 (与 Agent.md 3.15 & A.7 对齐)
 
 #### 功能点
 - **后端模型适配与安全**：前端调用 `/api/v1/ai/*`。所有 AI 功能均设可关/可降级逻辑；第三方模型上送前由后端自动脱敏。

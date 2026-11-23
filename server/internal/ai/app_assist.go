@@ -13,7 +13,7 @@ import (
 // requirement into a pre-filled (but never submitted) create-app form draft,
 // and answer follow-up questions with the live form state as context. The
 // model only ever produces drafts — the human reviews and clicks "create"
-// ( AGENTS.md 3.16.7: AI outputs are drafts, high-impact actions always need
+// ( AGENTS.md 3.15.6: AI outputs are drafts, high-impact actions always need
 // manual confirmation).
 
 // appCatalogRef exposes the declarative app template catalog without

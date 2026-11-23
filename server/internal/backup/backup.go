@@ -1,5 +1,5 @@
 // Package backup implements control-plane backup and restore (AGENTS.md 5.1
-// 数据自主可控, B.8.2 system/backup + system/restore).
+// 数据自主可控, B.7.2 system/backup + system/restore).
 //
 // A backup is a gzipped tar of the data directory: user accounts, host
 // registry, terminal recordings, metrics history, audit trail and settings.

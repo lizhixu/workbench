@@ -380,7 +380,7 @@ func (s *Store) writeTree(tw *tar.Writer) (int, error) {
 			return nil
 		}
 		slashRel := filepath.ToSlash(rel)
-		if excluded(slashRel) {
+		if excluded(slashRel) || isTransient(slashRel) {
 			if d.IsDir() {
 				return fs.SkipDir
 			}
@@ -457,6 +457,18 @@ func excluded(name string) bool {
 	name = strings.ToLower(name)
 	first := strings.SplitN(name, "/", 2)[0]
 	return first == backupsDirName || first == "bin" || first == "volume-uploads" || name == manifestName || strings.HasSuffix(name, ".part") || strings.HasSuffix(name, ".tmp") || strings.HasPrefix(filepath.Base(name), ".write-")
+}
+
+// isTransient reports whether name is an atomic-write temp file that can be
+// left behind when the writer dies between CreateTemp and rename (notably an
+// agent exiting right after a self-upgrade, or a killed settings save). Such
+// files carry no real data — the live file is agent-state.json, settings.json
+// or server-secrets.json — so they must never be archived, and an archive
+// that already contains one must still restore by skipping it instead of
+// failing validation on its empty or half-written content.
+func isTransient(name string) bool {
+	base := filepath.Base(strings.ToLower(name))
+	return strings.HasPrefix(base, ".state-") || strings.HasPrefix(base, "settings-") || strings.HasPrefix(base, ".write-")
 }
 
 type limitedWriter struct {

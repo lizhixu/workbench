@@ -91,6 +91,57 @@ func TestRestoreFileChecksStoredHash(t *testing.T) {
 	}
 }
 
+func TestRestoreSkipsTransientTempFiles(t *testing.T) {
+	s, dir := newTestStore(t)
+	writeSeed(t, dir)
+
+	// Regression test: an archive carrying a leftover 0-byte .state-*.json
+	// (an agent state save interrupted between CreateTemp and rename) must
+	// still restore. The temp entry is skipped, including in the manifest
+	// reconciliation, and never lands in the data directory.
+	usersBody := `[{"username":"restored"}]`
+	usersHash := sha256.Sum256([]byte(usersBody))
+	emptyHash := sha256.Sum256(nil)
+	manifestBody := fmt.Sprintf(
+		`{"format":"watchman-control-backup","format_version":1,"files":[{"path":"users.json","size":%d,"sha256":"%x"},{"path":".state-372497254.json","size":0,"sha256":"%x"}]}`,
+		len(usersBody), usersHash, emptyHash)
+	archive := buildArchive(t, map[string]string{
+		"users.json":            usersBody,
+		".state-372497254.json": "",
+		manifestName:            manifestBody,
+	})
+
+	res, err := s.Restore(bytes.NewReader(archive), "admin", "")
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if res.Files != 1 {
+		t.Fatalf("restored Files = %d, want 1 (transient temp file skipped)", res.Files)
+	}
+	if !res.Pending {
+		t.Fatal("restore must be staged until restart")
+	}
+
+	// Simulate a new process, before it has initialized any business stores.
+	s, err = NewStore(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyPending(); err != nil {
+		t.Fatalf("ApplyPending: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "users.json"))
+	if err != nil {
+		t.Fatalf("read restored users.json: %v", err)
+	}
+	if string(got) != usersBody {
+		t.Fatalf("users.json = %q, want the archived content", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".state-372497254.json")); !os.IsNotExist(err) {
+		t.Fatal("transient temp file was restored into the data directory")
+	}
+}
+
 func TestRestoreApplyRollsBackFailedReplacement(t *testing.T) {
 	s, dir := newTestStore(t)
 	for _, name := range []string{"users.json", "settings.json"} {

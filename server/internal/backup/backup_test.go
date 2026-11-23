@@ -111,6 +111,53 @@ func TestCreateSkipsBackupDirSoArchivesDoNotNest(t *testing.T) {
 	}
 }
 
+func TestIsTransient(t *testing.T) {
+	cases := map[string]bool{
+		".state-372497254.json":   true,
+		"settings-123456789.json": true,
+		".write-abcdef":           true,
+		"records/.state-1.json":   true,
+		"settings.json":           false,
+		"agent-state.json":        false,
+		"users.json":              false,
+		"server-secrets.json":     false,
+		"state.json":              false,
+	}
+	for name, want := range cases {
+		if got := isTransient(name); got != want {
+			t.Errorf("isTransient(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestCreateSkipsTransientTempFiles(t *testing.T) {
+	s, dir := newTestStore(t)
+	writeSeed(t, dir)
+
+	// Stray atomic-write temp files left behind by a writer that died
+	// between CreateTemp and rename must never be archived.
+	strays := []string{".state-372497254.json", "settings-123456789.json", ".write-abcdef"}
+	for _, name := range strays {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+	}
+
+	meta, err := s.Create("admin", "with stray temp files", false)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if meta.Files != 2 {
+		t.Fatalf("Files = %d, want 2 (users.json + records/s1.cast)", meta.Files)
+	}
+	names := archiveNames(t, filepath.Join(dir, backupsDirName, meta.Name))
+	for _, name := range strays {
+		if names[name] {
+			t.Fatalf("archive contains transient temp file %q", name)
+		}
+	}
+}
+
 func TestCreatePersistsKindImmediately(t *testing.T) {
 	s, dir := newTestStore(t)
 	writeSeed(t, dir)

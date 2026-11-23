@@ -168,6 +168,13 @@ func (s *Store) prepare(r io.Reader, actor, note, expected, passphrase string) (
 			// staging. Discard those while still validating the gzip stream.
 			continue
 		}
+		if isTransient(name) {
+			// Stray atomic-write temp files (e.g. a leftover .state-*.json
+			// from an agent state save interrupted mid-write) carry no real
+			// data. Older archives may contain one; skip it instead of
+			// failing the whole restore on its empty content.
+			continue
+		}
 		if excluded(name) {
 			return result, fmt.Errorf("refusing 恢复保留目录或暂存文件: %s", name)
 		}
@@ -218,11 +225,20 @@ func (s *Store) prepare(r io.Reader, actor, note, expected, passphrase string) (
 		return result, fmt.Errorf("归档没有可恢复的数据")
 	}
 	if manifest != nil {
-		if manifest.Format != "watchman-control-backup" || manifest.Version != 1 || len(manifest.Files) != len(files) {
+		// Entries skipped above as transient must not count against the
+		// manifest either, or an older archive carrying one would fail the
+		// file-count check instead of restoring.
+		expected := make([]archiveFile, 0, len(manifest.Files))
+		for _, f := range manifest.Files {
+			if !isTransient(f.Path) {
+				expected = append(expected, f)
+			}
+		}
+		if manifest.Format != "watchman-control-backup" || manifest.Version != 1 || len(expected) != len(files) {
 			return result, fmt.Errorf("备份清单格式或文件数量不匹配")
 		}
 		checked := map[string]bool{}
-		for _, f := range manifest.Files {
+		for _, f := range expected {
 			got, ok := files[f.Path]
 			if !ok || checked[f.Path] || got.Size != f.Size || got.SHA256 != f.SHA256 {
 				return result, fmt.Errorf("备份文件校验失败: %s", f.Path)

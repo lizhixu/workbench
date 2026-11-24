@@ -2413,11 +2413,16 @@ func (x *Mount) GetFstype() string {
 
 type SysInfoQuery struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	Kind  string                 `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"` // process / port / user / login / osinfo / kill / cleanup
+	Kind  string                 `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"` // process / port / user / login / osinfo / kill / cleanup / firewall / firewall_allow / firewall_deny / firewall_delete
 	// pid targets a single process; only meaningful for kind="kill".
 	Pid int32 `protobuf:"varint,2,opt,name=pid,proto3" json:"pid,omitempty"`
 	// force selects SIGKILL over SIGTERM (taskkill /F on Windows).
-	Force         bool `protobuf:"varint,3,opt,name=force,proto3" json:"force,omitempty"`
+	Force bool `protobuf:"varint,3,opt,name=force,proto3" json:"force,omitempty"`
+	// port targets a single firewall rule; only meaningful for
+	// kind="firewall_allow" / "firewall_deny" / "firewall_delete".
+	Port int32 `protobuf:"varint,4,opt,name=port,proto3" json:"port,omitempty"`
+	// protocol is "tcp" or "udp"; only meaningful for kind="firewall_*".
+	Protocol      string `protobuf:"bytes,5,opt,name=protocol,proto3" json:"protocol,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2471,6 +2476,20 @@ func (x *SysInfoQuery) GetForce() bool {
 		return x.Force
 	}
 	return false
+}
+
+func (x *SysInfoQuery) GetPort() int32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
+func (x *SysInfoQuery) GetProtocol() string {
+	if x != nil {
+		return x.Protocol
+	}
+	return ""
 }
 
 // MetricsQuery asks the agent for current (or a single historical) metrics.
@@ -4012,11 +4031,13 @@ const file_agent_proto_rawDesc = "" +
 	"\x05total\x18\x02 \x01(\x03R\x05total\x12\x12\n" +
 	"\x04used\x18\x03 \x01(\x03R\x04used\x12\x16\n" +
 	"\x06device\x18\x04 \x01(\tR\x06device\x12\x16\n" +
-	"\x06fstype\x18\x05 \x01(\tR\x06fstype\"J\n" +
+	"\x06fstype\x18\x05 \x01(\tR\x06fstype\"z\n" +
 	"\fSysInfoQuery\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x10\n" +
 	"\x03pid\x18\x02 \x01(\x05R\x03pid\x12\x14\n" +
-	"\x05force\x18\x03 \x01(\bR\x05force\"E\n" +
+	"\x05force\x18\x03 \x01(\bR\x05force\x12\x12\n" +
+	"\x04port\x18\x04 \x01(\x05R\x04port\x12\x1a\n" +
+	"\bprotocol\x18\x05 \x01(\tR\bprotocol\"E\n" +
 	"\fMetricsQuery\x12\x12\n" +
 	"\x04live\x18\x01 \x01(\bR\x04live\x12!\n" +
 	"\finterval_sec\x18\x02 \x01(\x05R\vintervalSec\"H\n" +

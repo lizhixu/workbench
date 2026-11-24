@@ -15,3 +15,17 @@ export interface Port {
   pid: number
   process: string
 }
+
+export interface FirewallRule {
+  port: number
+  protocol: string
+  action: 'allow' | 'deny'
+}
+
+export interface FirewallStatus {
+  supported: boolean
+  backend: 'ufw' | 'firewalld' | 'iptables' | 'none'
+  enabled: boolean
+  rules: FirewallRule[]
+  hint?: string
+}

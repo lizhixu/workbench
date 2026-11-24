@@ -339,11 +339,16 @@ message Mount {
 // ---- System info -----------------------------------------------------
 
 message SysInfoQuery {
-  string kind = 1; // process / port / user / login / osinfo / kill / cleanup
+  string kind = 1; // process / port / user / login / osinfo / kill / cleanup / firewall / firewall_allow / firewall_deny / firewall_delete
   // pid targets a single process; only meaningful for kind="kill".
   int32 pid = 2;
   // force selects SIGKILL over SIGTERM (taskkill /F on Windows).
   bool force = 3;
+  // port targets a single firewall rule; only meaningful for
+  // kind="firewall_allow" / "firewall_deny" / "firewall_delete".
+  int32 port = 4;
+  // protocol is "tcp" or "udp"; only meaningful for kind="firewall_*".
+  string protocol = 5;
 }
 
 // MetricsQuery asks the agent for current (or a single historical) metrics.

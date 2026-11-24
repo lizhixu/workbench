@@ -240,6 +240,16 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	authed.GET("/hosts/:id/sysinfo/:kind", h.getSysInfo)
 	hostWrite.POST("/hosts/:id/processes/:pid/kill", h.killProcess)
 
+	// Firewall port control (Linux v1): list rides the read-only sysinfo
+	// path (GET /hosts/:id/sysinfo/firewall); allow/deny/delete are mutating
+	// hostWrite routes with explicit high-risk audit entries, mirroring
+	// killProcess. The handlers record the audit themselves — port in the
+	// detail, failures included — so these routes must stay out of
+	// deriveAllMutationRules (see TestExplicitAuditRoutesExcludedFromMutationTable).
+	hostWrite.POST("/hosts/:id/firewall/allow", h.firewallAllow)
+	hostWrite.POST("/hosts/:id/firewall/deny", h.firewallDeny)
+	hostWrite.POST("/hosts/:id/firewall/delete", h.firewallDelete)
+
 	// System cleanup: preview rides the read-only sysinfo path
 	// (GET /hosts/:id/sysinfo/cleanup); execution is a mutating hostWrite
 	// route with its own audit entry.
@@ -1556,10 +1566,16 @@ func (h *handlers) getSysInfo(c *gin.Context) {
 		return
 	}
 	kind := c.Param("kind")
-	if kind == "kill" {
+	switch kind {
+	case "kill":
 		// Killing is a mutation and has its own audited route; refuse to reach it
 		// through the read-only sysinfo path.
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请使用 POST /hosts/:id/processes/:pid/kill"})
+		return
+	case "firewall_allow", "firewall_deny", "firewall_delete":
+		// Firewall mutations have their own audited routes; refuse to reach
+		// them through the read-only sysinfo path.
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请使用 POST /hosts/:id/firewall/allow|deny|delete"})
 		return
 	}
 	h.sysInfoQuery(c, hub, &agentpb.SysInfoQuery{Kind: kind})
@@ -1618,6 +1634,98 @@ func (h *handlers) killProcess(c *gin.Context) {
 		return
 	}
 	c.Data(http.StatusOK, "application/json", payload)
+}
+
+// ---- Firewall port control (Linux v1) -------------------------------
+
+// firewallRuleBody is the shared request body for allow/deny/delete.
+type firewallRuleBody struct {
+	Port     int    `json:"port"`
+	Protocol string `json:"protocol"` // tcp | udp, empty defaults to tcp
+}
+
+// validFirewallRule validates a firewall port/protocol pair. Port 9090 is
+// the Agent's dial-back port and is hard-refused on every backend; port 22
+// is only double-confirmed in the UI, not blocked here.
+func validFirewallRule(body firewallRuleBody) (int, string, error) {
+	if body.Port < 1 || body.Port > 65535 {
+		return 0, "", fmt.Errorf("端口须在 1~65535 之间")
+	}
+	if body.Port == 9090 {
+		return 0, "", fmt.Errorf("9090 为 Agent 回连端口，禁止操作")
+	}
+	proto := strings.ToLower(strings.TrimSpace(body.Protocol))
+	if proto == "" {
+		proto = "tcp"
+	}
+	if proto != "tcp" && proto != "udp" {
+		return 0, "", fmt.Errorf("未知协议: %s（仅支持 tcp/udp）", body.Protocol)
+	}
+	return body.Port, proto, nil
+}
+
+// firewallChange runs one firewall mutation (allow/deny/delete) against the
+// target host: host-scoped, audited as a high-risk action with the port in
+// the detail, mirroring killProcess. The agent answers through the sysinfo
+// channel; an old agent that does not know the firewall kinds reports
+// {"error":"unknown sysinfo kind: ..."} and surfaces as a 500 here, which
+// the panel renders as "需升级 Agent".
+func (h *handlers) firewallChange(c *gin.Context, kind, action, verb string) {
+	a := h.reg.GetAgent(c.Param("id"))
+	if a == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "host not found"})
+		return
+	}
+	if !h.canSeeHost(c, a) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权访问该主机所属分组"})
+		return
+	}
+	var body firewallRuleBody
+	_ = c.ShouldBindJSON(&body)
+	port, proto, err := validFirewallRule(body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	hub := h.reg.Hub(c.Param("id"))
+	if hub == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent offline"})
+		return
+	}
+
+	detail := fmt.Sprintf("%s防火墙端口 %d/%s", verb, port, proto)
+	status, payload := h.sysInfoCall(hub, &agentpb.SysInfoQuery{
+		Kind:     kind,
+		Port:     int32(port),
+		Protocol: proto,
+	})
+	result := audit.ResultSuccess
+	if status != http.StatusOK {
+		result = audit.ResultFailed
+	}
+	h.recordAudit(c, action, "host", c.Param("id"), detail, audit.RiskHigh, result)
+	if status != http.StatusOK {
+		c.JSON(status, gin.H{"error": string(payload)})
+		return
+	}
+	c.Data(http.StatusOK, "application/json", payload)
+}
+
+// firewallAllow opens a port on the host firewall (idempotent: re-allowing
+// an existing rule succeeds).
+func (h *handlers) firewallAllow(c *gin.Context) {
+	h.firewallChange(c, "firewall_allow", "firewall_allow", "放行")
+}
+
+// firewallDeny blocks a port on the host firewall (idempotent).
+func (h *handlers) firewallDeny(c *gin.Context) {
+	h.firewallChange(c, "firewall_deny", "firewall_deny", "拒绝")
+}
+
+// firewallDelete removes the firewall rule for a port/protocol pair,
+// whichever action it currently carries.
+func (h *handlers) firewallDelete(c *gin.Context) {
+	h.firewallChange(c, "firewall_delete", "firewall_delete", "删除")
 }
 
 // sysInfoQuery issues a SysInfoQuery and writes the agent's raw JSON payload to

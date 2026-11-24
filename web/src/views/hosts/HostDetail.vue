@@ -18,6 +18,7 @@ defineOptions({ name: 'HostDetail' })
 const FileManagerPane = defineAsyncComponent(() => import('../../components/host/FileManagerPane.vue'))
 const MetricsPane = defineAsyncComponent(() => import('../../components/host/MetricsPane.vue'))
 const SysInfoPane = defineAsyncComponent(() => import('../../components/host/SysInfoPane.vue'))
+const FirewallPane = defineAsyncComponent(() => import('../../components/host/FirewallPane.vue'))
 const TerminalPane = defineAsyncComponent(() => import('../../components/host/TerminalPane.vue'))
 const DockerView = defineAsyncComponent(() => import('../docker/Docker.vue'))
 const SystemCleanupView = defineAsyncComponent(() => import('./tabs/SystemCleanup.vue'))
@@ -222,6 +223,7 @@ onMounted(load)
                 <NTabPane name="port" tab="网络端口" />
                 <NTabPane name="user" tab="系统账号" />
                 <NTabPane name="login" tab="登录历史" />
+                <NTabPane name="firewall" tab="防火墙" />
               </NTabs>
             </div>
           </div>
@@ -246,10 +248,16 @@ onMounted(load)
 
                 <!-- 系统状态与进程 -->
                 <SysInfoPane
-                  v-else-if="activeSubTab === 'sysinfo'"
+                  v-else-if="activeSubTab === 'sysinfo' && sysinfoTab !== 'firewall'"
                   :host-id="host.id"
                   :active-tab="sysinfoTab"
                   @update:active-tab="sysinfoTab = $event"
+                />
+
+                <!-- 防火墙端口控制 -->
+                <FirewallPane
+                  v-else-if="activeSubTab === 'sysinfo' && sysinfoTab === 'firewall'"
+                  :host-id="host.id"
                 />
 
                 <!-- 在线终端 -->

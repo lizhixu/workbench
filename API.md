@@ -56,8 +56,11 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/hosts/:id/sysinfo/:kind` | 系统状态。`kind` = `processes` / `ports` / `users` / `logins` / `cleanup`（清理预览） |
+| GET | `/hosts/:id/sysinfo/:kind` | 系统状态。`kind` = `processes` / `ports` / `users` / `logins` / `cleanup`（清理预览）/ `firewall`（防火墙后端、状态与规则，Linux v1） |
 | POST | `/hosts/:id/processes/:pid/kill` | 结束进程 |
+| POST | `/hosts/:id/firewall/allow` | 放行防火墙端口。Body `{port, protocol?}`（`protocol` = `tcp`/`udp`，缺省 `tcp`）；9090 硬拒；hostWrite 角色，高危审计；重复放行幂等成功 |
+| POST | `/hosts/:id/firewall/deny` | 拒绝防火墙端口。Body 同上；9090 硬拒；hostWrite 角色，高危审计；重复拒绝幂等成功 |
+| POST | `/hosts/:id/firewall/delete` | 删除防火墙规则。Body `{port, protocol?}`，按端口/协议定位规则删除；hostWrite 角色，高危审计 |
 
 ## 监控与告警
 

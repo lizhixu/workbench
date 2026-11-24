@@ -63,6 +63,16 @@ func (m *Manager) Handle(q *agentpb.SysInfoQuery) {
 		payload, err = cleanup.PreviewDefault(context.Background())
 	case "kill":
 		payload, err = m.killProcess(q.GetPid(), q.GetForce())
+	case "firewall":
+		// 防火墙规则列表（只读）。Linux v1：按 ufw → firewalld → iptables
+		// 顺序探测后端；Windows 与无后端主机返回 supported:false。
+		payload, err = m.firewallStatus()
+	case "firewall_allow":
+		payload, err = m.firewallChange("allow", q.GetPort(), q.GetProtocol())
+	case "firewall_deny":
+		payload, err = m.firewallChange("deny", q.GetPort(), q.GetProtocol())
+	case "firewall_delete":
+		payload, err = m.firewallDelete(q.GetPort(), q.GetProtocol())
 	default:
 		err = fmt.Errorf("unknown sysinfo kind: %s", q.GetKind())
 	}

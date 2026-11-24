@@ -1,5 +1,6 @@
 import { http, unwrap } from './http'
 import type { EnrollResponse, HealthResponse, Host, HostBillingConfig, ListResponse, ProbeReading, SessionRecord } from './types'
+import type { FirewallStatus } from '../components/host/sysinfo-types'
 
 export function listHosts() {
   return unwrap<ListResponse<Host>>(http.get('/hosts'))
@@ -336,6 +337,46 @@ export interface KillProcessResult {
 export function killProcess(hostId: string, pid: number, force = false, name = '') {
   return unwrap<KillProcessResult>(
     http.post(`/hosts/${hostId}/processes/${pid}/kill`, { force, name }),
+  )
+}
+
+// ---- Firewall ----
+
+// getFirewall lists the host firewall backend, state and rules. Old agents
+// that do not know the firewall kind answer with an error, which the panel
+// renders as "需升级 Agent".
+export function getFirewall(hostId: string) {
+  return unwrap<FirewallStatus>(http.get(`/hosts/${hostId}/sysinfo/firewall`))
+}
+
+export interface FirewallChangeResult {
+  ok: boolean
+  action: string
+  port: number
+  protocol: string
+  already?: boolean
+  deleted?: number
+  backend: string
+}
+
+// firewallAllow opens a port on the host firewall (idempotent).
+export function firewallAllow(hostId: string, port: number, protocol = 'tcp') {
+  return unwrap<FirewallChangeResult>(
+    http.post(`/hosts/${hostId}/firewall/allow`, { port, protocol }),
+  )
+}
+
+// firewallDeny blocks a port on the host firewall (idempotent).
+export function firewallDeny(hostId: string, port: number, protocol = 'tcp') {
+  return unwrap<FirewallChangeResult>(
+    http.post(`/hosts/${hostId}/firewall/deny`, { port, protocol }),
+  )
+}
+
+// firewallDelete removes the firewall rule for a port/protocol pair.
+export function firewallDelete(hostId: string, port: number, protocol = 'tcp') {
+  return unwrap<FirewallChangeResult>(
+    http.post(`/hosts/${hostId}/firewall/delete`, { port, protocol }),
   )
 }
 

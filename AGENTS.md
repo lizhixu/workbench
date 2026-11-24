@@ -84,6 +84,7 @@
 - **网络端口**：协议、监听地址、进程名等端口信息。
 - **系统账号**：系统用户名、账号状态、UID 等。
 - **登录历史**：登录用户名、登录状态、登录时间等记录。
+- **防火墙端口控制（Linux v1）**：系统状态页签内「防火墙」子页签，按 ufw → firewalld → iptables 顺序探测当前后端与启用状态并展示规则（端口/协议/放行或拒绝）；放行/关闭 = 填端口 + TCP/UDP，Agent 用固定 argv 执行（不拼 shell 字符串），支持删除规则，重复放行幂等算成功；放行与拒绝按端口/协议互斥，切动作时先删反向规则（ufw/firewalld 首条匹配生效，留着反向规则再追加正向规则不会生效）；ufw 只认入方向规则，OUT 方向规则不展示、不参与冲突判断；Agent 侧单次操作整体 8 秒预算（服务端 sysinfo 10 秒超时内作答，超时快速失败并报「请稍后重试」）；9090（Agent 回连端口）前端、服务端与 Agent 三重硬拒，22 二次确认，仅 admin/operator 可操作、viewer 只读，放行/关闭/删除记高危审计，老 Agent 不认新操作时前端显示「需升级 Agent」。审计走 handler 内显式埋点（端口进 detail、失败也记），不在中间件规则表内，测试 TestExplicitAuditRoutesExcludedFromMutationTable 钉死该口径。v1 不做一键启用防火墙（`ufw enable` + 默认拒绝会断 SSH，只显示状态与手动指引）、端口范围、源 IP 限制、Windows。
 
 ### 3.4 Docker 管理
 
@@ -614,7 +615,7 @@ workbench/
 | 6 | term_close（TerminalClose） | 关会话 |
 | 7 | file_op（FileOp） | 文件操作：read/write/stat/list/mkdir/move/remove/upload/download/chmod |
 | 8 | exec（ExecRequest） | 下发命令/脚本 |
-| 9 | sysinfo_q（SysInfoQuery） | 系统状态查询：process/port/user/login/osinfo/kill/cleanup |
+| 9 | sysinfo_q（SysInfoQuery） | 系统状态查询：process/port/user/login/osinfo/kill/cleanup/firewall/firewall_allow/firewall_deny/firewall_delete |
 | 10 | metrics_q（MetricsQuery） | 拉取当前/历史指标 |
 | 11 | docker_op（DockerOp） | Docker 操作下发 |
 | 12 | scan（ScanRequest） | 安全扫描下发 |

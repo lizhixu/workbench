@@ -134,3 +134,29 @@ func TestDeriveMutationActionCoverage(t *testing.T) {
 		}
 	}
 }
+
+// TestExplicitAuditRoutesExcludedFromMutationTable pins the routes that
+// audit themselves inside their handlers instead of through the mutation
+// middleware: firewall allow/deny/delete, killProcess and systemCleanup.
+// They must stay out of deriveAllMutationRules for two reasons. The
+// middleware only records successes (status < 400) with a static desc, while
+// these handlers record failures too and put the port/PID in the detail —
+// moving them into the table would silently drop failure rows and the
+// identifying detail. And if one of these routes were ever wrapped in
+// auditMutation, a table entry would double-record every success. The
+// explicit recordAudit call in each handler is the audit; this test is the
+// guard that keeps the two mechanisms from overlapping.
+func TestExplicitAuditRoutesExcludedFromMutationTable(t *testing.T) {
+	explicit := [][2]string{
+		{http.MethodPost, "/api/v1/hosts/:id/firewall/allow"},
+		{http.MethodPost, "/api/v1/hosts/:id/firewall/deny"},
+		{http.MethodPost, "/api/v1/hosts/:id/firewall/delete"},
+		{http.MethodPost, "/api/v1/hosts/:id/processes/:pid/kill"},
+		{http.MethodPost, "/api/v1/hosts/:id/system-cleanup"},
+	}
+	for _, s := range explicit {
+		if rule, ok := deriveMutationAction(s[0], s[1]); ok {
+			t.Errorf("%s %s: must stay out of the mutation table (audited explicitly in its handler), got action %q", s[0], s[1], rule.action)
+		}
+	}
+}

@@ -366,7 +366,7 @@ const expiryTooltip = computed(() => {
             <span class="spec-value" :title="host.cpu_model ? `处理器型号: ${host.cpu_model}` : ''">{{ cpuCoresDisplay }}</span>
           </div>
           <div class="spec-row">
-            <span class="spec-label">内存总量</span>
+            <span class="spec-label">内存</span>
             <span class="spec-value">{{ formatMem(host.mem_total) }}</span>
           </div>
         </div>

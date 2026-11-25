@@ -1162,7 +1162,7 @@ onUnmounted(() => {
                 <span class="spec-value">{{ (host.cpu_cores || 1) }} 核 ({{ formatArch(host.arch) }})</span>
               </div>
               <div class="spec-line">
-                <span class="spec-label">内存总量</span>
+                <span class="spec-label">内存</span>
                 <span class="spec-value">{{ formatMem(host.mem_total) }}</span>
               </div>
             </div>

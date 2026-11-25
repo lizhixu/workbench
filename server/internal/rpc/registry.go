@@ -83,12 +83,12 @@ type Registry struct {
 	tunnel   *Coordinator             // reverse TCP tunnels (nil = disabled)
 	dataDir  string
 	log      *slog.Logger
-	// RedirectTarget, when set, returns the admin-configured redirect
-	// target (agent.redirect_to) agents should dial. Supplied by the
-	// settings store at startup; nil means no redirect. A provider func
-	// (not a plain string) so the registry always reads the live setting
-	// instead of a stale copy.
-	RedirectTarget func() string
+	// DialTarget, when set, returns the admin-configured address
+	// (agent.grpc_host) agents should dial. Supplied by the
+	// settings store at startup; nil means follow the panel address.
+	// A provider func (not a plain string) so the registry always
+	// reads the live setting instead of a stale copy.
+	DialTarget func() string
 }
 
 type UpgradeState struct {
@@ -477,7 +477,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 			SessionKeepSec:       sessionKeep,
 			TrafficResetDay:      int32(normTrafficResetDay(a.TrafficResetDay)),
 			ProbeTargets:         EffectiveProbeTargets(a),
-			ServerAddr:           r.redirectTo(),
+			ServerAddr:           r.dialTarget(),
 		}, nil
 	}
 
@@ -532,7 +532,7 @@ func (r *Registry) Register(ctx context.Context, req *agentpb.RegisterRequest, a
 		SessionKeepSec:       sessionKeep,
 		TrafficResetDay:      int32(normTrafficResetDay(a.TrafficResetDay)),
 		ProbeTargets:         EffectiveProbeTargets(a),
-		ServerAddr:           r.redirectTo(),
+		ServerAddr:           r.dialTarget(),
 	}, nil
 }
 
@@ -960,22 +960,22 @@ func (r *Registry) SetAgentBilling(id string, b HostBillingConfig) error {
 	return nil
 }
 
-// redirectTo returns the current redirect target ("" = no redirect).
-func (r *Registry) redirectTo() string {
-	if r.RedirectTarget == nil {
+// dialTarget returns the current dial address ("" = follow the panel address).
+func (r *Registry) dialTarget() string {
+	if r.DialTarget == nil {
 		return ""
 	}
-	return strings.TrimSpace(r.RedirectTarget())
+	return strings.TrimSpace(r.DialTarget())
 }
 
 // runtimeConfigFor builds the per-host runtime config the agent applies
-// live (probe targets, traffic reset day) plus the current redirect
-// target, mirroring what RegisterResponse carries on (re)connect.
-func (r *Registry) runtimeConfigFor(a *Agent, redirectTarget string) *agentpb.ConfigUpdate {
+// live (probe targets, traffic reset day) plus the current dial address,
+// mirroring what RegisterResponse carries on (re)connect.
+func (r *Registry) runtimeConfigFor(a *Agent, dialTarget string) *agentpb.ConfigUpdate {
 	return &agentpb.ConfigUpdate{
 		ProbeTargets:    EffectiveProbeTargets(a),
 		TrafficResetDay: int32(normTrafficResetDay(a.TrafficResetDay)),
-		ServerAddr:      redirectTarget,
+		ServerAddr:      dialTarget,
 	}
 }
 
@@ -985,7 +985,7 @@ func (r *Registry) runtimeConfigFor(a *Agent, redirectTarget string) *agentpb.Co
 // for a reconnect. Best-effort: returns false for offline/unknown agents —
 // they pick the config up from RegisterResponse on their next (re)connect.
 func (r *Registry) PushRuntimeConfig(id string) bool {
-	target := r.redirectTo()
+	target := r.dialTarget()
 	r.mu.RLock()
 	a, okA := r.agents[id]
 	hub, okH := r.hubs[id]
@@ -1001,13 +1001,13 @@ func (r *Registry) PushRuntimeConfig(id string) bool {
 }
 
 // BroadcastRuntimeConfig pushes the current runtime config (including
-// the redirect target, if any) to every connected agent. It is fired
-// when agent.redirect_to is saved, so a control-plane move takes effect
+// the dial address, if any) to every connected agent. It is fired
+// when agent.grpc_host is saved, so a control-plane move takes effect
 // immediately instead of waiting for each agent to reconnect; offline
 // agents receive the same value from RegisterResponse on their next
 // (re)connect. Returns how many agents were pushed to.
 func (r *Registry) BroadcastRuntimeConfig() int {
-	target := r.redirectTo()
+	target := r.dialTarget()
 	r.mu.RLock()
 	type pending struct {
 		hub *Hub
@@ -1027,7 +1027,7 @@ func (r *Registry) BroadcastRuntimeConfig() int {
 	if len(pendingList) == 0 {
 		return 0
 	}
-	r.log.Info("broadcasting runtime config", "agents", len(pendingList), "redirect_to", target)
+	r.log.Info("broadcasting runtime config", "agents", len(pendingList), "grpc_host", target)
 
 	done := make(chan struct{})
 	var pushed atomic.Int32

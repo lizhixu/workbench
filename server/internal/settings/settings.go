@@ -204,19 +204,15 @@ var Definitions = []Definition{
 	{Key: "certs.expiry_reminder_days", Scope: ScopeSystem, Kind: KindInt, Title: "手动证书到期提醒提前天数", Default: DefaultCertRenewDays, Min: MinCertDays, Max: MaxCertDays, DefaultOnEmpty: true},
 
 	// Agent 接入（system 域，管理员专属）：
-	// 安装脚本里 Agent 回连控制面的 gRPC 地址。默认空表示跟随面板对外地址
-	// （面板域名或访问 IP）+ :9090；面板域名走 Cloudflare 等不转发 9090 的
-	// 代理时，填服务端直连地址（如 192.255.178.173 或直连域名），安装脚本
-	// 即用该地址生成 -server 参数；保存即时生效，无需重启。
+	// Agent 回连控制面的 gRPC 地址，新装机与已纳管共用同一入口：安装脚本
+	// 用它生成 -server 参数；保存后立即向所有在线 Agent 下发，离线 Agent
+	// 在下次连回旧主控时经 RegisterResponse 收到同一目标。Agent 先 TCP
+	// 预检目标地址，通了才切换拨号地址并持久化，不通则留在原主控。默认空
+	// 表示跟随面板对外地址（面板域名或访问 IP）+ :9090；面板域名走
+	// Cloudflare 等不转发 9090 的代理时，填服务端直连地址（如
+	// direct.example.com 或直连 IP）。保存即时生效，无需重启；重新保存同一
+	// 地址可再次下发。旧 agent.redirect_to 在加载时一次性并入本键。
 	{Key: "agent.grpc_host", Scope: ScopeSystem, Kind: KindString, Title: "Agent 直连接入地址", Default: "",
-		MaxLen: 253, Validate: validateAgentGRPCHost},
-	// 主控地址重定向（system 域，管理员专属）：控制面搬家时填新主控的
-	// gRPC 地址（如新主机 IP 或域名），保存后立即向所有在线 Agent 下发
-	// 重定向；Agent 先 TCP 预检目标地址，通了才切换拨号地址并持久化，
-	// 不通则留在原主控。离线 Agent 在下次连回旧主控时经 RegisterResponse
-	// 收到同一目标。留空表示不重定向；想把已迁走的 Agent 迁回来时，在
-	// 新主控上填回旧地址即可。保存即时生效，无需重启。
-	{Key: "agent.redirect_to", Scope: ScopeSystem, Kind: KindString, Title: "Agent 重定向目标地址", Default: "",
 		MaxLen: 253, Validate: validateAgentGRPCHost},
 }
 
@@ -296,7 +292,7 @@ func validateAgentGRPCHost(v any) error {
 		return nil
 	}
 	if strings.Contains(s, "://") || strings.Contains(s, "/") {
-		return errors.New("Agent 直连接入地址不能包含协议头或路径（如 192.255.178.173 或 direct.example.com:9090）")
+		return errors.New("Agent 直连接入地址不能包含协议头或路径（如 direct.example.com:9090）")
 	}
 	if len(s) > 253 {
 		return errors.New("Agent 直连接入地址长度不能超过 253 个字符")
@@ -305,7 +301,7 @@ func validateAgentGRPCHost(v any) error {
 	if strings.Contains(s, ":") {
 		h, p, err := net.SplitHostPort(s)
 		if err != nil {
-			return errors.New("Agent 直连接入地址格式不正确（如 192.255.178.173 或 direct.example.com:9090，IPv6 请用 [::1]:9090 形式）")
+			return errors.New("Agent 直连接入地址格式不正确（如 direct.example.com:9090，IPv6 请用 [::1]:9090 形式）")
 		}
 		if p == "" {
 			return errors.New("Agent 直连接入地址端口不能为空")
@@ -473,12 +469,12 @@ type Store struct {
 	// wiring uses it to pause auto-renew on orphaned panel IP certificates
 	// the moment the domain binds, instead of waiting for the renewal scan.
 	onPanelDomainChange func(oldDomain, newDomain string)
-	// onAgentRedirectChange, when set, is fired after a committed
-	// system-scope write touches agent.redirect_to (set, change or
+	// onAgentGRPCHostChange, when set, is fired after a committed
+	// system-scope write touches agent.grpc_host (set, change or
 	// clear), outside the store lock. The RPC registry uses it to push
-	// the new redirect target to every connected agent the same instant
+	// the new dial address to every connected agent the same instant
 	// it commits; settings itself stays decoupled from the rpc package.
-	onAgentRedirectChange func()
+	onAgentGRPCHostChange func()
 	// servingProvider reports what the panel actually serves right now
 	// (standard-port listeners + primary port), supplied by the panel
 	// security layer. Nil when not wired (tests, reset tools); BaseURL
@@ -534,7 +530,43 @@ func (s *Store) load() error {
 		s.users = doc.Users
 	}
 	s.migrateRetiredPublicURL()
+	s.migrateRetiredRedirectTo()
 	return nil
+}
+
+// migrateRetiredRedirectTo folds the retired agent.redirect_to setting
+// into agent.grpc_host once, then drops it. The two were merged into one
+// dial address: new installs and already-enrolled agents read the same
+// key, so a leftover redirect target must not silently stop applying.
+// grpc_host wins when both are set; the redirect value is dropped with a
+// warning instead of overwriting an address the operator chose for the
+// surviving key.
+func (s *Store) migrateRetiredRedirectTo() {
+	raw, ok := s.system["agent.redirect_to"]
+	if !ok {
+		return
+	}
+	delete(s.system, "agent.redirect_to")
+
+	var legacy string
+	_ = json.Unmarshal(raw, &legacy)
+	legacy = strings.TrimSpace(legacy)
+	if legacy != "" {
+		var current string
+		_ = json.Unmarshal(s.system["agent.grpc_host"], &current)
+		if strings.TrimSpace(current) == "" {
+			if encoded, err := json.Marshal(legacy); err == nil {
+				s.system["agent.grpc_host"] = encoded
+				s.log.Info("migrated retired agent.redirect_to setting to agent.grpc_host", "target", legacy)
+			}
+		} else {
+			s.log.Warn("retired agent.redirect_to ignored: agent.grpc_host is already set", "redirect_to", legacy, "grpc_host", strings.TrimSpace(current))
+		}
+	}
+
+	if err := s.save(); err != nil {
+		s.log.Warn("drop retired agent.redirect_to setting", "err", err)
+	}
 }
 
 // migrateRetiredPublicURL folds the retired server.public_url setting into
@@ -815,15 +847,15 @@ func (s *Store) SetOnPanelDomainChange(fn func(oldDomain, newDomain string)) {
 	s.onPanelDomainChange = fn
 }
 
-// SetOnAgentRedirectChange registers a callback fired after a committed
-// system-scope write touches agent.redirect_to, outside the store lock.
-// It exists so the RPC registry can push the new redirect target to all
+// SetOnAgentGRPCHostChange registers a callback fired after a committed
+// system-scope write touches agent.grpc_host, outside the store lock.
+// It exists so the RPC registry can push the new dial address to all
 // connected agents the same instant it commits; settings itself stays
 // decoupled from the rpc package.
-func (s *Store) SetOnAgentRedirectChange(fn func()) {
+func (s *Store) SetOnAgentGRPCHostChange(fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.onAgentRedirectChange = fn
+	s.onAgentGRPCHostChange = fn
 }
 
 // SetServingStateProvider registers the callback BaseURL uses to learn what
@@ -924,25 +956,25 @@ func (s *Store) setManyLocked(scope Scope, username string, items map[string]jso
 	}
 	s.system = newSystem
 	s.users = newUsers
-	// A write that touches agent.redirect_to (set, change or clear)
-	// must push the new target to connected agents right away — even a
-	// re-save of the same value is a deliberate "push again".
-	redirectTouched := false
+	// A write that touches agent.grpc_host (set, change or clear)
+	// must push the new dial address to connected agents right away —
+	// even a re-save of the same value is a deliberate "push again".
+	grpcHostTouched := false
 	if scope == ScopeSystem {
-		if _, ok := normed["agent.redirect_to"]; ok {
-			redirectTouched = true
+		if _, ok := normed["agent.grpc_host"]; ok {
+			grpcHostTouched = true
 		}
 	}
-	if !domainChanged && !redirectTouched {
+	if !domainChanged && !grpcHostTouched {
 		return s.onChange, nil
 	}
 	// Compose the post-commit callback: the standard-port reconciliation
-	// keeps its head start, then the domain-change and redirect hooks
+	// keeps its head start, then the domain-change and dial-address hooks
 	// observe the already committed state (all run outside the store
 	// lock via SetMany).
 	onChange := s.onChange
 	onDomainChange := s.onPanelDomainChange
-	onRedirectChange := s.onAgentRedirectChange
+	onGRPCHostChange := s.onAgentGRPCHostChange
 	return func() {
 		if onChange != nil {
 			onChange()
@@ -950,8 +982,8 @@ func (s *Store) setManyLocked(scope Scope, username string, items map[string]jso
 		if domainChanged && onDomainChange != nil {
 			onDomainChange(prevDomain, nextDomain)
 		}
-		if redirectTouched && onRedirectChange != nil {
-			onRedirectChange()
+		if grpcHostTouched && onGRPCHostChange != nil {
+			onGRPCHostChange()
 		}
 	}, nil
 }
@@ -1034,18 +1066,13 @@ func (s *Store) PanelSecurity() PanelSecurityConfig {
 }
 
 // AgentGRPCHost returns the admin-configured direct address agents dial
-// ("" = follow the panel address, see agent.grpc_host).
+// ("" = follow the panel address, see agent.grpc_host). Saving it pushes
+// the new address to every connected agent at once (see
+// SetOnAgentGRPCHostChange); offline agents get it from RegisterResponse
+// on their next reconnect.
 func (s *Store) AgentGRPCHost() string {
 	var v string
 	s.decode(ScopeSystem, "", "agent.grpc_host", &v)
-	return strings.TrimSpace(v)
-}
-
-// AgentRedirectTo returns the admin-configured redirect target agents
-// should dial ("" = no redirect, see agent.redirect_to).
-func (s *Store) AgentRedirectTo() string {
-	var v string
-	s.decode(ScopeSystem, "", "agent.redirect_to", &v)
 	return strings.TrimSpace(v)
 }
 

@@ -56,18 +56,19 @@
 - **主机状态**：在线/离线状态实时显示。
 - **解绑/卸载**：支持从控制端解绑主机，并支持卸载 Agent。
 
-#### 3.1.1 主控地址重定向
+#### 3.1.1 Agent 直连接入地址
 
-主控迁移时让 Agent 自动跟随新地址，无需逐台改 `-server` 旗标：
+Agent 回连控制面的地址，新装机与已纳管共用同一入口；主控迁移时让 Agent 自动跟随新地址，无需逐台改 `-server` 旗标：
 
-- **设置入口**：系统设置 → 安装部署「主控地址重定向」卡片（仅管理员），填 `agent.redirect_to`（`host[:port]`，与 `agent.grpc_host` 同一套校验，留空 = 不重定向）。
-- **下发通道**：保存即经 `ServerMessage.config_update`（field 20，`ConfigUpdate.server_addr`）对在线 Agent 即时广播；离线 Agent 由下次重连时的 `RegisterResponse.server_addr`（field 10）兜底。
-- **空值语义**：服务端下发的空 target = 「无意见」，**绝不清除** Agent 已有重定向——否则刚迁到新主控、新主控设置为空时会被清掉重定向、拨回旧地址无限横跳。重定向的清除只来自：回退、操作员改 `-server` 旗标、或服务端显式推回旧地址。
+- **设置入口**：系统设置 → 安装部署「Agent 直连接入地址」卡片（仅管理员），填 `agent.grpc_host`（`host[:port]`，留空 = 跟随面板地址）。该地址同时是新安装命令的 `-server` 来源。
+- **下发通道**：保存即经 `ServerMessage.config_update`（field 20，`ConfigUpdate.server_addr`）对在线 Agent 即时广播；离线 Agent 由下次重连时的 `RegisterResponse.server_addr`（field 10）兜底。重新保存同一地址可再次下发。
+- **空值语义**：留空 = 跟随面板地址（新装机用面板地址 + :9090）；但对已迁走的 Agent，服务端下发的空 target = 「无意见」，**绝不清除** Agent 已有重定向——否则刚迁到新主控、新主控设置为空时会被清掉重定向、拨回旧地址无限横跳。重定向的清除只来自：回退、操作员改 `-server` 旗标、或服务端显式推回旧地址。
 - **Agent 侧流程**：收到非空 target → 与当前有效地址相同则忽略 → 命中失败冷却（15 分钟）则忽略 → TCP 预检（3 秒）不通则忽略并留守原主控 → 通了才持久化到 `state.json`（`redirect_target` / `redirect_previous` / `redirect_applied_at`）并尽力同步 `agent.conf` 的 `server=` 行，随后断流按新地址重连（1 秒后，不走失败退避）。
 - **回退**：重定向生效后连续失败满 10 分钟且旧地址预检仍通 → 回退旧地址并记失败 target；旧地址也不通则继续死磕新地址（防迁移中途横跳）。同一 target 失败冷却 15 分钟内不重复应用；失败 target 经 `RegisterRequest.redirect_failed_target`（field 16）上报、服务端存主机记录、主机详情横幅展示。
 - **防抖**：5 分钟内收到「回拨上一个地址」的重定向视为两端互指（两侧都留了指向对方的重定向），拒绝并记日志，5 分钟后才接受（人为回迁不受影响）。
 - **启动优先级**：有效地址 = 已持久化的 `redirect_target`（非空时）> `-server` 旗标。启动时旗标 ≠ 上次持久化的 `ServerAddr` 且有重定向 → 自动清除重定向（改 unit/重装自动清重定向，安装流程不受影响）。
 - **面板展示**：主机详情横幅「回连地址」行显示 Agent 当前回连地址（`RegisterRequest.server_addr`，field 15 的回显）；有未处理重定向失败时另显「重定向失败」行。
+- **旧设置迁移**：旧 `agent.redirect_to` 在加载时一次性并入 `agent.grpc_host`（grpc_host 已有值时 redirect_to 被丢弃并记警告），该键已从注册表移除。
 
 ### 3.2 资源监控
 
@@ -639,7 +640,7 @@ workbench/
 - **会话恢复**：控制端按 `session_id` 持有路由表，Agent 短暂断连时保留 PTY ~60s，重连续接。
 - **未开放端口**：Agent 仅出站，不监听任何端口。
 - **维护握手**：控制端重启前下发 `MaintenanceNotice`，Agent 自升级前落盘 `reconnect_reason = "upgrade"`，重连带理由消解告警（见 8.6）。
-- **主控地址重定向**（见 §3.1.1）：`ConfigUpdate.server_addr`（field 3）与 `RegisterResponse.server_addr`（field 10）下发目标地址，`RegisterRequest.server_addr`（field 15）回显 Agent 当前回连地址，`RegisterRequest.redirect_failed_target`（field 16）上报最近一次失败的重定向目标；空 target = 「无意见」，服务端与 Agent 均不得以空值清除已有重定向。
+- **Agent 回连地址**（见 §3.1.1）：`ConfigUpdate.server_addr`（field 3）与 `RegisterResponse.server_addr`（field 10）下发目标地址，`RegisterRequest.server_addr`（field 15）回显 Agent 当前回连地址，`RegisterRequest.redirect_failed_target`（field 16）上报最近一次失败的重定向目标；空 target = 「无意见」，服务端与 Agent 均不得以空值清除已有重定向。
 
 ## B.3 数据模型（核心表）
 
@@ -807,7 +808,7 @@ Agent internal/shell
   3. 服务持久化注册：
      - Linux：安装至 `/opt/watchman/watchman-agent`，注册 `watchman-agent.service` systemd 服务并开机自启；
      - Windows：安装至 `C:\Program Files\Watchman\watchman-agent.exe`，注册名为 `WatchmanAgent` 的计划任务开机启动；
-  4. 携带参数启动：`-server <server-ip:9090> -token <enroll_token> [-upgrade-pubkey <pubkey>]`；其中 `-server` 地址默认由面板对外地址推导（面板域名或访问 IP）+ `:9090`，面板域名走 Cloudflare 等不转发 9090 的代理时新 Agent 连不上控制面、注册失败（安装时表现为反复 `open stream` 超时重试）；系统设置 `agent.grpc_host`（系统设置 → 安装部署，仅管理员）可指定直连地址（如 `192.255.178.173`，裸主机名默认 `:9090`），安装脚本即用它生成 `-server` 参数，保存即时生效、无需重启；安装脚本启动后还会对该地址做 5 秒 TCP 连通性预检，不通只打印 WARNING、不中断安装（Agent 本身仍会继续重试）。Agent 启动时有效回连地址 = 已持久化的重定向（非空时）> `-server` 旗标；改 `-server` 旗标或重装后重定向自动清除（见 §3.1.1）。
+  4. 携带参数启动：`-server <server-ip:9090> -token <enroll_token> [-upgrade-pubkey <pubkey>]`；其中 `-server` 地址默认由面板对外地址推导（面板域名或访问 IP）+ `:9090`，面板域名走 Cloudflare 等不转发 9090 的代理时新 Agent 连不上控制面、注册失败（安装时表现为反复 `open stream` 超时重试）；系统设置 `agent.grpc_host`（系统设置 → 安装部署，仅管理员）可指定直连地址（如 `direct.example.com`，裸主机名默认 `:9090`），安装脚本即用它生成 `-server` 参数，保存即时生效、无需重启；安装脚本启动后还会对该地址做 5 秒 TCP 连通性预检，不通只打印 WARNING、不中断安装（Agent 本身仍会继续重试）。Agent 启动时有效回连地址 = 已持久化的重定向（非空时）> `-server` 旗标；改 `-server` 旗标或重装后重定向自动清除（见 §3.1.1）。
   5. Agent 首次向控制端 gRPC 端口发起 `RegisterRequest` 换取长期凭证 `auth_token` 并持久化到 `agent-state.json`，随后立即清空 `enroll_token` 进入稳定心跳和监控上报状态。
 
 ### B.6.4 控制端命令行参数与运行时配置清单

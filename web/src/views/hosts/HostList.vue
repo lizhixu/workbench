@@ -15,6 +15,7 @@ import {
   useMessage,
   useDialog,
   NIcon,
+  NPagination,
 } from 'naive-ui'
 import {
   AddCircleOutline,
@@ -46,10 +47,12 @@ import { useHostsStore } from '../../stores/hosts'
 import { useWorkspaceStore } from '../../stores/workspace'
 import { useAuthStore } from '../../stores/auth'
 import { enroll, deleteHost, setHostGroup, upgradeAgent } from '../../api/hosts'
+import { batchUpgradeAgents } from '../../api/upgrade'
 import { listNetworkNodes } from '../../api/network'
 import { listGroups, type HostGroup } from '../../api/groups'
 import { copyToClipboard } from '../../utils/clipboard'
 import { formatUpgradeStage } from '../../utils/upgrade'
+import { useIsMobile } from '../../composables/useIsMobile'
 import { FALLBACK_RATES, getCnyRates, toCny, formatMoney, formatCny, type CnyRates } from '../../utils/exchangeRate'
 import type { Host } from '../../api/types'
 import type { NetworkNode } from '../../api/network'
@@ -155,6 +158,268 @@ async function submitGroup() {
   } catch (e: any) {
     message.error(e.message || '设置分组失败')
   }
+}
+
+// ---- 批量操作：多选 + 前端并发编排（3 台同时），零后端改动，复用单机接口
+// （与 NetworkList.vue 同款范式：勾选按 id 跨页保留、行内逐台进度、
+// 失败可重试、完成后给成功/失败汇总；审计走既有单机接口，无需新埋点）。
+const selectedIds = ref<Set<string>>(new Set())
+const BATCH_CONCURRENCY = 3
+type BatchOpPhase = 'queued' | 'running' | 'done' | 'failed'
+const opStatus = ref<Record<string, { phase: BatchOpPhase; message?: string }>>({})
+const batchRunning = ref(false)
+const batchKind = ref<'group' | 'unbind' | 'upgrade' | null>(null)
+const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+
+// 前端分页：主机全量已在内存，按 AGENTS.md §8.2 不定长列表必须分页。
+// 自定义行列表不用 NDataTable，分页条用独立 NPagination + 计算切片
+// （与 NetworkList.vue 同款），数据区滚动、分页条固定在卡片底部。
+const isMobile = useIsMobile()
+const page = ref(1)
+const pageSize = ref(20)
+const pageSizes = [20, 50, 100]
+const pagedHosts = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return filteredHosts.value.slice(start, start + pageSize.value)
+})
+// 搜索/筛选变化回第一页
+watch([search, groupFilter], () => {
+  page.value = 1
+})
+// 页码收敛：筛选收紧导致总行数变少时夹回最大有效页，杜绝空白页
+watch([() => filteredHosts.value.length, pageSize], ([count, size]) => {
+  const maxPage = Math.max(1, Math.ceil(count / size))
+  if (page.value > maxPage) page.value = maxPage
+})
+
+function handlePageChange(p: number) {
+  page.value = p
+}
+function handlePageSizeChange(size: number) {
+  pageSize.value = size
+  page.value = 1
+}
+
+// 批量操作的目标集合：勾选按 id 存、跨页保留，执行时按当时状态过滤。
+const selectedHosts = computed(() => store.hosts.filter((h) => selectedIds.value.has(h.id)))
+const batchOnline = computed(() => selectedHosts.value.filter((h) => h.status === 'online'))
+const batchUpgradable = computed(() => batchOnline.value.filter((h) => h.agent_outdated))
+const pageAllChecked = computed(() =>
+  pagedHosts.value.length > 0 && pagedHosts.value.every((h) => selectedIds.value.has(h.id)),
+)
+const pageSomeChecked = computed(() =>
+  !pageAllChecked.value && pagedHosts.value.some((h) => selectedIds.value.has(h.id)),
+)
+
+function toggleRow(hostId: string, checked: boolean) {
+  if (checked) {
+    selectedIds.value.add(hostId)
+  } else {
+    selectedIds.value.delete(hostId)
+  }
+}
+
+function toggleSelectAllPage() {
+  if (pageAllChecked.value) {
+    pagedHosts.value.forEach((h) => selectedIds.value.delete(h.id))
+  } else {
+    pagedHosts.value.forEach((h) => selectedIds.value.add(h.id))
+  }
+}
+
+function clearSelection() {
+  selectedIds.value.clear()
+  opStatus.value = {}
+  batchSummary.value = null
+  batchKind.value = null
+}
+
+function isOpBusy(hostId: string) {
+  const st = opStatus.value[hostId]
+  return !!st && (st.phase === 'queued' || st.phase === 'running')
+}
+
+// 刷新后清掉已不存在的主机勾选，避免批量操作带上幽灵 ID
+function pruneSelection() {
+  const alive = new Set(store.hosts.map((h) => h.id))
+  selectedIds.value.forEach((id) => {
+    if (!alive.has(id)) selectedIds.value.delete(id)
+  })
+}
+
+// 逐台并发执行器：改分组 / 解绑共用。每台独立链路，失败一台不影响其他。
+async function runBatchPerHost(
+  kind: 'group' | 'unbind',
+  targets: Host[],
+  fn: (host: Host) => Promise<unknown>,
+) {
+  // 改分组/解绑不过滤目标：skipped 恒为 0（重试只重跑失败主机，不把已成功
+  // 的计为跳过；升级的 skipped 另在 dispatchBatchUpgrade 里算）。
+  const skipped = 0
+  if (targets.length === 0) {
+    message.warning('所选主机中没有可执行的目标')
+    return
+  }
+  batchRunning.value = true
+  batchKind.value = kind
+  batchSummary.value = null
+  opStatus.value = {}
+  targets.forEach((h) => {
+    opStatus.value[h.id] = { phase: 'queued' }
+  })
+  let done = 0
+  let failed = 0
+  const queue = [...targets]
+  async function worker() {
+    while (queue.length > 0) {
+      const host = queue.shift()!
+      opStatus.value[host.id] = { phase: 'running' }
+      try {
+        await fn(host)
+        opStatus.value[host.id] = { phase: 'done' }
+        done += 1
+      } catch (e: any) {
+        let msg = e.message || '执行出错'
+        // 解绑时离线主机勾了卸载会报 agent offline：行内给中文原因，
+        // 不直接展示服务端原文。
+        if (kind === 'unbind' && msg.includes('agent offline')) {
+          msg = '主机离线，无法远程卸载 Agent'
+        }
+        opStatus.value[host.id] = { phase: 'failed', message: msg }
+        failed += 1
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(BATCH_CONCURRENCY, queue.length) }, () => worker()),
+  )
+  batchRunning.value = false
+  batchSummary.value = { done, failed, skipped }
+  const verb = kind === 'group' ? '改分组' : '解绑'
+  const skipText = skipped > 0 ? `，跳过 ${skipped} 台` : ''
+  if (failed === 0) {
+    message.success(`批量${verb}完成：成功 ${done} 台${skipText}`)
+  } else {
+    message.warning(`批量${verb}完成：成功 ${done} 台，失败 ${failed} 台${skipText}，可点「重试失败」只重跑失败的主机`)
+  }
+  await Promise.all([store.fetchList(), loadGroups(), loadNetworkNodes()])
+  pruneSelection()
+  checkPolling()
+}
+
+function retryBatchFailed() {
+  if (!batchKind.value || !batchSummary.value || batchSummary.value.failed === 0) return
+  const failedIds = Object.entries(opStatus.value)
+    .filter(([, st]) => st.phase === 'failed')
+    .map(([id]) => id)
+  const targets = store.hosts.filter((h) => failedIds.includes(h.id))
+  if (targets.length === 0) return
+  if (batchKind.value === 'group') {
+    runBatchPerHost('group', targets, (host) => setHostGroup(host.id, lastBatchGroupChoice.value))
+  } else if (batchKind.value === 'unbind') {
+    runBatchPerHost('unbind', targets, (host) => deleteHost(host.id, lastBatchUninstall.value))
+  } else if (batchKind.value === 'upgrade') {
+    dispatchBatchUpgrade(targets)
+  }
+}
+
+// ---- 批量改分组：弹窗选分组，逐台复用单机 setHostGroup
+const showBatchGroupModal = ref(false)
+const batchGroupChoice = ref<string[]>([])
+const lastBatchGroupChoice = ref<string[]>([])
+
+function openBatchGroupModal() {
+  batchGroupChoice.value = []
+  showBatchGroupModal.value = true
+}
+
+async function submitBatchGroup() {
+  const groups = [...batchGroupChoice.value]
+  lastBatchGroupChoice.value = groups
+  showBatchGroupModal.value = false
+  await runBatchPerHost('group', selectedHosts.value, (host) => setHostGroup(host.id, groups))
+}
+
+// ---- 批量解绑：弹窗内就地二次确认（DESIGN.md §9.17），逐台复用单机 deleteHost
+const showBatchUnbindModal = ref(false)
+const batchUninstallAgent = ref(false)
+const lastBatchUninstall = ref(false)
+
+function openBatchUnbindModal() {
+  batchUninstallAgent.value = false
+  showBatchUnbindModal.value = true
+}
+
+async function submitBatchUnbind() {
+  const uninstall = batchUninstallAgent.value
+  lastBatchUninstall.value = uninstall
+  showBatchUnbindModal.value = false
+  await runBatchPerHost('unbind', selectedHosts.value, (host) => deleteHost(host.id, uninstall))
+}
+
+// ---- 批量升级：复用系统升级页的批量升级模式（POST /system/upgrade-agents，
+// 服务端一次下发到已选在线且版本过旧的主机；离线或已是最新版的跳过）。
+function confirmBatchUpgrade() {
+  const targets = batchUpgradable.value
+  const skipped = selectedHosts.value.length - targets.length
+  if (targets.length === 0) {
+    message.warning('所选主机中没有可升级的（须在线且 Agent 版本过旧）')
+    return
+  }
+  dialog.info({
+    title: '批量升级 Agent 确认',
+    content: `确定将 ${targets.length} 台主机的 Agent 升级至控制端最新版本吗？${skipped > 0 ? `其余 ${skipped} 台（离线或已是最新版）将跳过。` : ''}升级过程中 Agent 将下载最新对应平台二进制，校验并平滑重启服务。`,
+    positiveText: '开始升级',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      await dispatchBatchUpgrade(targets, skipped)
+    },
+  })
+}
+
+async function dispatchBatchUpgrade(targets: Host[], skipped = 0) {
+  batchRunning.value = true
+  batchKind.value = 'upgrade'
+  batchSummary.value = null
+  opStatus.value = {}
+  targets.forEach((h) => {
+    opStatus.value[h.id] = { phase: 'running' }
+  })
+  try {
+    const res = await batchUpgradeAgents(targets.map((h) => h.id), false)
+    targets.forEach((h) => {
+      opStatus.value[h.id] = { phase: 'done' }
+    })
+    batchSummary.value = { done: targets.length, failed: 0, skipped }
+    message.success(res.message || `已下发 ${targets.length} 台主机的升级任务`)
+    await Promise.all([store.fetchList(), loadGroups(), loadNetworkNodes()])
+    pruneSelection()
+    checkPolling()
+  } catch (e: any) {
+    targets.forEach((h) => {
+      opStatus.value[h.id] = { phase: 'failed', message: e.message || '下发失败' }
+    })
+    batchSummary.value = { done: 0, failed: targets.length, skipped }
+    message.error(e.message || '批量升级失败')
+  } finally {
+    batchRunning.value = false
+  }
+}
+
+// ---- 批量执行：跳到批量执行页并带上已选主机（不另造执行通道）。
+// 单台走既有 host_id 参数；多台用 host_ids（逗号分隔），
+// 待 BatchExec.vue 接上该参数后预选全部已选主机。
+function goBatchExec() {
+  const ids = selectedHosts.value.map((h) => h.id)
+  if (ids.length === 0) return
+  const query = ids.length === 1 ? `?host_id=${ids[0]}` : `?host_ids=${ids.join(',')}`
+  workspace.openTab({
+    key: '/batch-exec',
+    title: '推送命令',
+    path: `/batch-exec${query}`,
+    closable: true,
+  })
+  router.push(`/batch-exec${query}`)
 }
 
 
@@ -625,6 +890,13 @@ watch(isAnyUpgrading, () => {
 
 async function refresh() {
   await Promise.all([store.fetchList(), loadGroups(), loadNetworkNodes()])
+  pruneSelection()
+  // 手动刷新拿到的是最新状态，旧的操作进度（已完成/失败）不再对应当前行；
+  // 批量进行中时不动，等本轮跑完再由执行器收尾。
+  if (!batchRunning.value) {
+    opStatus.value = {}
+    batchSummary.value = null
+  }
   checkPolling()
 }
 
@@ -632,6 +904,7 @@ onMounted(() => {
   workspace.setActiveKey('/hosts')
   store.fetchList().catch((e) => message.error(e.message)).finally(() => {
     listLoaded.value = true
+    pruneSelection()
     checkPolling()
   })
   loadGroups()
@@ -670,6 +943,14 @@ onUnmounted(() => {
       <!-- 顶部工具栏 Toolbar -->
       <div class="toolbar-bar">
         <div class="toolbar-left">
+          <NCheckbox
+            :checked="pageAllChecked"
+            :indeterminate="pageSomeChecked"
+            :disabled="batchRunning"
+            @update:checked="toggleSelectAllPage"
+          >
+            全选本页
+          </NCheckbox>
           <NInput
             v-model:value="search"
             placeholder="快速搜索"
@@ -733,6 +1014,65 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐台显示进度 -->
+      <div v-if="selectedIds.size > 0" class="batch-bar">
+        <span class="batch-info">
+          已选 {{ selectedIds.size }} 台
+          <span class="text-muted">（在线 {{ batchOnline.length }} 台 · 可升级 {{ batchUpgradable.length }} 台）</span>
+        </span>
+        <NButton
+          size="small"
+          type="primary"
+          secondary
+          :disabled="batchRunning || batchOnline.length === 0"
+          @click="goBatchExec"
+        >
+          批量执行
+        </NButton>
+        <NButton
+          size="small"
+          type="primary"
+          secondary
+          :loading="batchRunning && batchKind === 'upgrade'"
+          :disabled="batchRunning || batchUpgradable.length === 0"
+          @click="confirmBatchUpgrade"
+        >
+          批量升级
+        </NButton>
+        <NButton
+          size="small"
+          :disabled="batchRunning"
+          @click="openBatchGroupModal"
+        >
+          改分组
+        </NButton>
+        <NButton
+          size="small"
+          type="error"
+          secondary
+          :disabled="batchRunning"
+          @click="openBatchUnbindModal"
+        >
+          批量解绑
+        </NButton>
+        <NButton
+          v-if="batchSummary && batchSummary.failed > 0"
+          size="small"
+          type="warning"
+          secondary
+          :disabled="batchRunning"
+          @click="retryBatchFailed"
+        >
+          重试失败（{{ batchSummary.failed }}）
+        </NButton>
+        <span v-if="batchSummary" class="batch-summary">
+          成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}<span v-if="batchSummary.skipped > 0"> · 跳过 {{ batchSummary.skipped }}</span>
+        </span>
+        <NButton size="small" quaternary :disabled="batchRunning" @click="clearSelection">
+          取消选择
+        </NButton>
+      </div>
+
       <!-- 主机列表卡片容器 -->
       <div class="host-list-container">
         <NSpin v-if="store.loading && store.hosts.length === 0" style="padding: 40px" />
@@ -744,11 +1084,20 @@ onUnmounted(() => {
 
         <div v-else class="host-row-list">
           <div
-            v-for="host in filteredHosts"
+            v-for="host in pagedHosts"
             :key="host.id"
-            class="host-row-item"
+            :class="['host-row-item', { 'is-op-busy': isOpBusy(host.id) }]"
             @click="goDetail(host)"
           >
+            <!-- 0. 批量勾选列：28px 窄列，共享列宽不变（见 DESIGN.md §9.20） -->
+            <div class="col-check" @click.stop>
+              <NCheckbox
+                :checked="selectedIds.has(host.id)"
+                :disabled="batchRunning"
+                @update:checked="(v: boolean) => toggleRow(host.id, v)"
+              />
+            </div>
+
 	            <!-- 1. OS Logo 图标 -->
 	            <div class="col-os-logo">
 	              <OsLogo :os="host.os" :distro="host.distro" :size="28" />
@@ -791,6 +1140,18 @@ onUnmounted(() => {
                 :class="{ 'is-online': host.status === 'online', 'is-offline': host.status !== 'online' }"
               >
                 {{ host.status === 'online' ? `已开机 ${fmtUptime(host)}` : '当前已离线' }}
+              </div>
+              <!-- 批量进度：执行期间逐行显示当前阶段，失败时显示原因（悬停看全文） -->
+              <div
+                v-if="opStatus[host.id]"
+                class="op-progress"
+                :class="`is-${opStatus[host.id].phase}`"
+                :title="opStatus[host.id].message || ''"
+              >
+                <template v-if="opStatus[host.id].phase === 'queued'">排队中…</template>
+                <template v-else-if="opStatus[host.id].phase === 'running'">执行中…</template>
+                <template v-else-if="opStatus[host.id].phase === 'done'">已完成</template>
+                <template v-else>失败：{{ opStatus[host.id].message || '执行出错' }}</template>
               </div>
             </div>
 
@@ -891,6 +1252,21 @@ onUnmounted(() => {
           </div>
         </div>
       </div>
+
+      <!-- 前端分页：自定义行列表不用 NDataTable 的 pagination，独立 NPagination
+           固定在卡片底部（见 DESIGN.md §9.20），数据区滚动、分页条不参与滚动 -->
+      <div v-if="filteredHosts.length > 0" class="table-pagination-bar">
+        <NPagination
+          :page="page"
+          :page-size="pageSize"
+          :item-count="filteredHosts.length"
+          :page-sizes="pageSizes"
+          :simple="isMobile"
+          show-size-picker
+          @update:page="handlePageChange"
+          @update:page-size="handlePageSizeChange"
+        />
+      </div>
     </div>
 
     <!-- 绑定主机 Modal -->
@@ -962,6 +1338,59 @@ onUnmounted(() => {
         <NSpace justify="end">
           <NButton @click="showGroupModal = false">取消</NButton>
           <NButton type="primary" @click="submitGroup">保存</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- 批量改分组 Modal -->
+    <NModal
+      v-model:show="showBatchGroupModal"
+      preset="card"
+      title="批量改分组"
+      style="width: 440px"
+    >
+      <NSpace vertical :size="12">
+        <p class="guide-text">
+          将已选 {{ selectedIds.size }} 台主机归入分组（可多选），用于按分组给用户授权访问；不选即移出全部分组。
+        </p>
+        <NSelect v-model:value="batchGroupChoice" :options="groupAssignOptions" multiple placeholder="选择分组" />
+        <p v-if="!groups.length" class="guide-text">
+          暂无可用分组，请先在「分组权限」页面创建分组。
+        </p>
+      </NSpace>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showBatchGroupModal = false">取消</NButton>
+          <NButton type="primary" :loading="batchRunning" @click="submitBatchGroup">保存</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- 批量解绑 Modal：危险操作，弹窗内就地二次确认（DESIGN.md §9.17） -->
+    <NModal
+      v-model:show="showBatchUnbindModal"
+      preset="card"
+      title="批量解绑主机"
+      style="width: 520px"
+    >
+      <NSpace vertical :size="12">
+        <p class="guide-text">
+          确定要解绑以下 {{ selectedIds.size }} 台主机吗？解绑后这些主机将从控制台移除。
+        </p>
+        <div class="batch-unbind-list">
+          <div v-for="h in selectedHosts" :key="h.id">{{ h.hostname }}（{{ h.id }}）</div>
+        </div>
+        <NCheckbox v-model:checked="batchUninstallAgent">
+          同时卸载 Agent 并清除其数据（不可恢复，需主机在线）
+        </NCheckbox>
+        <p v-if="batchUninstallAgent" class="guide-text">
+          离线主机无法远程卸载，将记为失败，可稍后重试。
+        </p>
+      </NSpace>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showBatchUnbindModal = false">取消</NButton>
+          <NButton type="error" :loading="batchRunning" @click="submitBatchUnbind">确认解绑</NButton>
         </NSpace>
       </template>
     </NModal>
@@ -1062,8 +1491,38 @@ onUnmounted(() => {
       }
     }
 
+    // 批量操作栏：有勾选时出现，贴在工具栏下方、列表上方（与 NetworkList.vue 同款）
+    .batch-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      background: var(--n-color-modal);
+      border: 1px solid var(--n-border-color);
+      border-radius: 8px;
+      padding: 8px 12px;
+
+      .batch-info {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text-primary);
+
+        .text-muted {
+          color: var(--n-text-color-3);
+          font-size: 12px;
+          font-weight: 400;
+        }
+      }
+
+      .batch-summary {
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+    }
+
     .host-list-container {
       flex: 1;
+      min-height: 0;
       overflow-y: auto;
 
       .empty-placeholder {
@@ -1092,6 +1551,22 @@ onUnmounted(() => {
 
           &:last-child {
             border-bottom: none;
+          }
+
+          // 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突
+          &.is-op-busy {
+            .col-actions {
+              pointer-events: none;
+              opacity: 0.5;
+            }
+          }
+
+          // 0. 批量勾选列：28px 窄列，共享列宽不变（见 DESIGN.md §9.20）
+          .col-check {
+            flex: 0 0 28px;
+            min-width: 0;
+            display: flex;
+            align-items: center;
           }
 
           // 1. OS Logo
@@ -1152,9 +1627,35 @@ onUnmounted(() => {
           // 3. 运行时间 Pill 标签
           .col-status {
             flex: 0 0 170px;
+            min-width: 0;
             display: flex;
-            align-items: center;
+            flex-direction: column;
+            align-items: flex-start;
+            justify-content: center;
+            gap: 2px;
             padding-right: 12px;
+
+            // 批量进度行：单行省略号、失败原因悬停看全文
+            .op-progress {
+              font-size: 12px;
+              max-width: 100%;
+              white-space: nowrap;
+              overflow: hidden;
+              text-overflow: ellipsis;
+
+              &.is-queued,
+              &.is-running {
+                color: #3b82f6;
+              }
+
+              &.is-done {
+                color: #059669;
+              }
+
+              &.is-failed {
+                color: #dc2626;
+              }
+            }
 
             .uptime-pill {
               display: inline-flex;
@@ -1427,6 +1928,16 @@ onUnmounted(() => {
     }
   }
 
+  .batch-unbind-list {
+    max-height: 200px;
+    overflow-y: auto;
+    font-size: 13px;
+    color: var(--text-secondary);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
   .enroll-modal-content {
     display: flex;
     flex-direction: column;
@@ -1517,6 +2028,11 @@ onUnmounted(() => {
           }
 
           /* 重排：第一行 logo + 主机名 + 更多按钮；第二行 pill/规格；第三行 IP */
+          .col-check {
+            order: 0;
+            flex: 0 0 28px;
+          }
+
           .col-os-logo {
             order: 1;
             flex: 0 0 44px;

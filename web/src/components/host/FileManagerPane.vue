@@ -71,6 +71,9 @@ const props = defineProps<{
   os?: string
   /** 从应用挂载卷等入口直达某个目录：优先于设置里的默认路径。 */
   initialPath?: string
+  /** 批量操作开关：仅独立文件管理页（/files/:id）开启；主机详情文件页签
+      复用本面板但不在本批范围，保持原样（不传即关闭）。 */
+  batchEnabled?: boolean
 }>()
 
 const message = useMessage()
@@ -95,6 +98,48 @@ const currentPath = ref(isWindows.value ? 'C:\\' : '/root')
 const pathInput = ref(currentPath.value)
 const isEditingPath = ref(false)
 const files = ref<FileInfo[]>([])
+
+// ---- 批量操作（删除 / 下载 / 移动）--------------------------------------
+// 范式同 NetworkList.vue：勾选按 path 跨页保留、3 台并发、复用单机接口、
+// 执行期间逐行显示进度、失败可重试、完成后给成功/失败汇总。
+// 选择集只在当前目录内有效：目录切换或刷新后清理已不存在的勾选（见 load）。
+const selectedFiles = ref(new Map<string, FileInfo>())
+const BATCH_CONCURRENCY = 3
+type BatchOpPhase = 'queued' | 'removing' | 'downloading' | 'moving' | 'done' | 'failed'
+const batchOpStatus = ref<Record<string, { phase: BatchOpPhase; message?: string }>>({})
+const batchRunning = ref(false)
+const batchKind = ref<'remove' | 'download' | 'move' | null>(null)
+const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+// 批量删除确认弹窗（危险操作，弹窗内就地确认）与批量移动目标目录弹窗
+const showBatchRemove = ref(false)
+const showBatchMove = ref(false)
+const batchMoveTarget = ref('')
+const batchMoveTargetResolved = ref('')
+
+const selectedList = computed(() => [...selectedFiles.value.values()])
+const selectedFileCount = computed(() => selectedList.value.filter((f) => !f.is_dir).length)
+const selectedDirCount = computed(() => selectedList.value.filter((f) => f.is_dir).length)
+// NDataTable 全量数据已在内存：checked-row-keys 传全部已选 key，
+// 翻页时其他页的勾选态由该数组维持；onCheckedRowKeys 按全量 files 合并。
+const pageCheckedKeys = computed(() =>
+  files.value.filter((f) => selectedFiles.value.has(f.path)).map((f) => f.path),
+)
+
+function onCheckedRowKeys(keys: Array<string | number>) {
+  const keySet = new Set(keys.map((k) => String(k)))
+  files.value.forEach((f) => {
+    if (keySet.has(f.path)) selectedFiles.value.set(f.path, f)
+    else selectedFiles.value.delete(f.path)
+  })
+}
+
+function clearBatchSelection() {
+  selectedFiles.value.clear()
+  batchOpStatus.value = {}
+  batchSummary.value = null
+  batchKind.value = null
+}
+
 
 // 目录里可能有上千个条目（AGENTS.md 8.2）：分页后表头与分页条固定，只有
 // 数据区滚动，切换目录回到第一页。
@@ -212,6 +257,15 @@ async function load(silent = false): Promise<string | null> {
     files.value = data || []
     resetPage()
     pathInput.value = currentPath.value
+    // 清理已不存在的勾选：目录切换/刷新后，只保留仍在当前目录列表里的已选项
+    const alive = new Set(files.value.map((f) => f.path))
+    selectedFiles.value.forEach((_, p) => {
+      if (!alive.has(p)) selectedFiles.value.delete(p)
+    })
+    // 非批量进行中、且无待重试的批量结果时，旧的行内进度不再对应当前列表
+    if (!batchRunning.value && !batchSummary.value) {
+      batchOpStatus.value = {}
+    }
     return null
   } catch (e: any) {
     const msg = e.message || '获取文件列表失败'
@@ -439,6 +493,124 @@ function confirmRemove(file: FileInfo) {
       }
     },
   })
+}
+
+// ---- 批量删除 / 下载 / 移动 --------------------------------------------
+// 前端并发编排（3 路并发），复用单文件接口，不新开后端批量接口；
+// 写操作审计走既有单机接口的审计，无需新埋点。
+async function runBatch(kind: 'remove' | 'download' | 'move', targets: FileInfo[]) {
+  // 下载只针对文件：目录没有单文件下载接口，跳过并计入 skipped
+  let eligible = targets
+  let skipped = 0
+  if (kind === 'download') {
+    eligible = targets.filter((f) => !f.is_dir)
+    skipped = targets.length - eligible.length
+  }
+  if (eligible.length === 0) {
+    message.warning(
+      kind === 'download' ? '所选项目中没有可下载的文件（目录不支持下载）' : '没有可执行的目标',
+    )
+    return
+  }
+
+  batchRunning.value = true
+  batchKind.value = kind
+  batchSummary.value = null
+  batchOpStatus.value = {}
+  eligible.forEach((f) => {
+    batchOpStatus.value[f.path] = { phase: 'queued' }
+  })
+  let done = 0
+  let failed = 0
+
+  if (kind === 'download') {
+    // 下载复用单文件下载链接逐个触发：同步连续触发、不加 await 延迟——
+    // 离开点击手势的异步回调会被浏览器拦截为弹窗。浏览器是否真正落盘
+    // 不可观测，行内只标记「已触发」；被拦截时浏览器地址栏有提示。
+    eligible.forEach((f) => {
+      batchOpStatus.value[f.path] = { phase: 'downloading' }
+    })
+    eligible.forEach((f) => downloadFile(f.path))
+    eligible.forEach((f) => {
+      batchOpStatus.value[f.path] = { phase: 'done' }
+    })
+    done = eligible.length
+  } else {
+    const queue = [...eligible]
+    async function worker() {
+      while (queue.length > 0) {
+        const file = queue.shift()!
+        try {
+          if (kind === 'remove') {
+            batchOpStatus.value[file.path] = { phase: 'removing' }
+            await fileRemove(props.hostId, file.path)
+          } else {
+            batchOpStatus.value[file.path] = { phase: 'moving' }
+            await fileMove(props.hostId, file.path, joinPath(batchMoveTargetResolved.value, file.name))
+          }
+          batchOpStatus.value[file.path] = { phase: 'done' }
+          done += 1
+        } catch (e: any) {
+          batchOpStatus.value[file.path] = { phase: 'failed', message: e.message || '执行出错' }
+          failed += 1
+        }
+      }
+    }
+    await Promise.all(
+      Array.from({ length: Math.min(BATCH_CONCURRENCY, eligible.length) }, () => worker()),
+    )
+  }
+
+  batchRunning.value = false
+  batchSummary.value = { done, failed, skipped }
+  const verb = kind === 'remove' ? '删除' : kind === 'download' ? '下载' : '移动'
+  const skipText = skipped > 0 ? `，跳过 ${skipped} 项（目录不支持下载）` : ''
+  if (failed === 0) {
+    message.success(`批量${verb}完成：成功 ${done} 项${skipText}`)
+  } else {
+    message.warning(
+      `批量${verb}完成：成功 ${done} 项，失败 ${failed} 项${skipText}，可点「重试失败」只重跑失败的项目`,
+    )
+  }
+  // 刷新一次列表：已删/已移走的项随之消失，勾选由 load() 的清理逻辑同步剪掉；
+  // 失败项仍在列表里、保持勾选，可直接重试。
+  await load()
+}
+
+function retryBatchFailed() {
+  if (!batchKind.value || !batchSummary.value || batchSummary.value.failed === 0) return
+  const failedPaths = new Set(
+    Object.entries(batchOpStatus.value)
+      .filter(([, st]) => st.phase === 'failed')
+      .map(([p]) => p),
+  )
+  const targets = files.value.filter((f) => failedPaths.has(f.path))
+  runBatch(batchKind.value, targets)
+}
+
+function openBatchMove() {
+  batchMoveTarget.value = currentPath.value
+  showBatchMove.value = true
+}
+
+async function confirmBatchMove() {
+  const dest = resolveTarget(batchMoveTarget.value)
+  if (!dest) {
+    message.warning('请填写目标目录')
+    return
+  }
+  if (dest === currentPath.value) {
+    message.warning('目标目录与当前目录相同，无需移动')
+    return
+  }
+  batchMoveTargetResolved.value = dest
+  showBatchMove.value = false
+  await runBatch('move', selectedList.value)
+}
+
+async function confirmBatchRemove() {
+  showBatchRemove.value = false
+  await runBatch('remove', selectedList.value)
 }
 
 // ---- 编辑权限（chmod）-------------------------------------------------
@@ -720,7 +892,7 @@ function handleRowMenu(key: string, row: FileInfo) {
   }
 }
 
-const columns: DataTableColumns<FileInfo> = [
+const baseColumns: DataTableColumns<FileInfo> = [
   {
     title: '名称',
     key: 'name',
@@ -833,6 +1005,42 @@ const columns: DataTableColumns<FileInfo> = [
     },
   },
 ]
+
+// 批量列：勾选列（NDataTable 勾选列宽 40px，BatchExec.vue 同款；28px 是
+// DESIGN.md §9.20 自定义行列表的口径）与批量状态列只在独立文件管理页
+// 开启；执行期间本页勾选框禁用，防批量进行中手动改勾选。
+const columns = computed<DataTableColumns<FileInfo>>(() => {
+  const cols: DataTableColumns<FileInfo> = [...baseColumns]
+  if (!props.batchEnabled) return cols
+  cols.unshift({
+    type: 'selection',
+    width: 40,
+    disabled: () => batchRunning.value,
+  })
+  cols.push({
+    title: '批量状态',
+    key: '__batch_status',
+    width: 110,
+    render(row) {
+      const st = batchOpStatus.value[row.path]
+      if (!st) return ''
+      const text =
+        st.phase === 'queued'
+          ? '排队中…'
+          : st.phase === 'removing'
+            ? '删除中…'
+            : st.phase === 'downloading'
+              ? '下载中…'
+              : st.phase === 'moving'
+                ? '移动中…'
+                : st.phase === 'done'
+                  ? '已完成'
+                  : `失败：${st.message || '执行出错'}`
+      return h('span', { class: `batch-status is-${st.phase}`, title: st.message || '' }, text)
+    },
+  })
+  return cols
+})
 
 // 初始路径优先级：显式 initialPath > 设置默认路径 > OS 默认。
 async function initPathAndLoad() {
@@ -949,6 +1157,62 @@ onMounted(async () => {
       </div>
     </div>
 
+    <!-- 批量操作栏：有勾选时出现（仅独立文件管理页，主机详情文件页签不开启） -->
+    <div v-if="batchEnabled && selectedFiles.size > 0" class="batch-bar">
+      <span class="batch-info">
+        已选 {{ selectedFiles.size }} 项
+        <span class="batch-sub">（文件 {{ selectedFileCount }} 个 · 目录 {{ selectedDirCount }} 个）</span>
+      </span>
+      <NButton
+        size="small"
+        type="primary"
+        secondary
+        :loading="batchRunning && batchKind === 'download'"
+        :disabled="batchRunning || selectedFileCount === 0"
+        @click="runBatch('download', selectedList)"
+      >
+        批量下载
+      </NButton>
+      <NButton
+        v-if="canWrite"
+        size="small"
+        type="primary"
+        secondary
+        :loading="batchRunning && batchKind === 'move'"
+        :disabled="batchRunning"
+        @click="openBatchMove"
+      >
+        批量移动
+      </NButton>
+      <NButton
+        v-if="canWrite"
+        size="small"
+        type="error"
+        secondary
+        :loading="batchRunning && batchKind === 'remove'"
+        :disabled="batchRunning"
+        @click="showBatchRemove = true"
+      >
+        批量删除
+      </NButton>
+      <NButton
+        v-if="batchSummary && batchSummary.failed > 0"
+        size="small"
+        type="warning"
+        secondary
+        :disabled="batchRunning"
+        @click="retryBatchFailed"
+      >
+        重试失败（{{ batchSummary.failed }}）
+      </NButton>
+      <span v-if="batchSummary" class="batch-summary">
+        成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}<span v-if="batchSummary.skipped > 0"> · 跳过 {{ batchSummary.skipped }}</span>
+      </span>
+      <NButton size="small" quaternary :disabled="batchRunning" @click="clearBatchSelection">
+        取消选择
+      </NButton>
+    </div>
+
     <!-- 文件数据表格：表头固定，仅数据区滚动（AGENTS.md 8.2） -->
     <NSpin v-if="loading" class="spin-center" />
     <div v-else class="file-table-container">
@@ -958,8 +1222,11 @@ onMounted(async () => {
         :data="files"
         :pagination="pagination"
         :bordered="false"
-        :scroll-x="600"
+        :scroll-x="750"
         size="small"
+        :row-key="(row: FileInfo) => row.path"
+        :checked-row-keys="pageCheckedKeys"
+        @update:checked-row-keys="onCheckedRowKeys"
       />
     </div>
 
@@ -1024,6 +1291,68 @@ onMounted(async () => {
             <NButton @click="showTransfer = false">取消</NButton>
             <NButton type="primary" :loading="transferBusy" @click="submitTransfer">
               确定
+            </NButton>
+          </NSpace>
+        </NForm>
+      </div>
+    </NModal>
+
+    <!-- 批量删除 Modal：危险操作，弹窗内就地确认 -->
+    <NModal
+      v-model:show="showBatchRemove"
+      preset="card"
+      title="批量删除"
+      style="width: 520px; max-width: 90vw"
+    >
+      <div class="batch-confirm-body">
+        <NAlert type="warning" :bordered="false">
+          确认删除以下 {{ selectedFiles.size }} 项吗？目录会递归删除全部内容，此操作不可恢复。
+        </NAlert>
+        <div class="batch-confirm-list">
+          <div v-for="f in selectedList.slice(0, 8)" :key="f.path" class="batch-confirm-item">
+            {{ f.name }}<span class="batch-confirm-path">{{ f.path }}</span>
+          </div>
+          <div v-if="selectedFiles.size > 8" class="batch-confirm-more">
+            等 {{ selectedFiles.size - 8 }} 项…
+          </div>
+        </div>
+      </div>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showBatchRemove = false">取消</NButton>
+          <NButton type="error" @click="confirmBatchRemove">
+            确认删除（{{ selectedFiles.size }} 项）
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- 批量移动 Modal：目标目录选择，文件名保持不变 -->
+    <NModal
+      v-model:show="showBatchMove"
+      preset="card"
+      title="批量移动"
+      style="width: 520px; max-width: 90vw"
+    >
+      <div class="batch-confirm-body">
+        <NAlert type="default" :bordered="false">
+          将 {{ selectedFiles.size }} 项移动到目标目录，文件名保持不变。
+        </NAlert>
+        <NForm label-placement="top">
+          <NFormItem label="目标目录">
+            <NInput
+              v-model:value="batchMoveTarget"
+              placeholder="输入完整目标目录路径"
+              @keyup.enter="confirmBatchMove"
+            />
+          </NFormItem>
+          <div class="transfer-hint">
+            填写相对名称时，将解析为当前目录 <code>{{ currentPath }}</code> 下的路径。
+          </div>
+          <NSpace justify="end">
+            <NButton @click="showBatchMove = false">取消</NButton>
+            <NButton type="primary" @click="confirmBatchMove">
+              确认移动
             </NButton>
           </NSpace>
         </NForm>
@@ -1177,6 +1506,36 @@ onMounted(async () => {
     }
   }
 
+  /* 批量操作栏：与 NetworkList.vue 同款（有勾选时出现，贴在导航栏下方） */
+  .batch-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    background: var(--n-color-modal);
+    border: 1px solid var(--n-border-color);
+    border-radius: 8px;
+    padding: 8px 12px;
+    flex-shrink: 0;
+
+    .batch-info {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .batch-sub {
+      font-size: 12px;
+      font-weight: 400;
+      color: var(--text-secondary);
+    }
+
+    .batch-summary {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+  }
+
   .file-table-container {
     flex: 1;
     /* min-height:0 让容器可收缩，滚动交给表格自身的 flex-height */
@@ -1229,6 +1588,29 @@ onMounted(async () => {
       align-items: center;
       gap: 2px;
     }
+
+    /* 批量状态列：render 生成的节点，用 :deep 穿透（与 .file-name-cell 同款） */
+    :deep(.batch-status) {
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+
+      &.is-queued,
+      &.is-removing,
+      &.is-downloading,
+      &.is-moving {
+        color: #3b82f6;
+      }
+
+      &.is-done {
+        color: #059669;
+      }
+
+      &.is-failed {
+        color: #ef4444;
+      }
+    }
   }
 
   .spin-center {
@@ -1253,6 +1635,46 @@ onMounted(async () => {
         border-radius: 3px;
       }
     }
+  }
+}
+
+/* 批量删除 / 移动确认弹窗（与 .transfer-modal-body 同款顶层样式；
+   NModal 内容 teleport 到 body，仍由本组件渲染、作用域属性跟随节点） */
+.batch-confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+
+  .batch-confirm-list {
+    max-height: 240px;
+    overflow-y: auto;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 4px 12px;
+  }
+
+  .batch-confirm-item {
+    font-size: 13px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border-color);
+
+    &:last-child {
+      border-bottom: none;
+    }
+  }
+
+  .batch-confirm-path {
+    display: block;
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-family: 'SFMono-Regular', Consolas, monospace;
+    word-break: break-all;
+  }
+
+  .batch-confirm-more {
+    font-size: 12px;
+    color: var(--text-secondary);
+    padding: 6px 0;
   }
 }
 

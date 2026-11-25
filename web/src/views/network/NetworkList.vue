@@ -71,11 +71,14 @@ const leavingIds = ref<Record<string, boolean>>({})
 // 批量安装 / 加入：多选 + 并发编排（3 台同时），零后端改动，复用单机接口。
 const selectedIds = ref<Set<string>>(new Set())
 const BATCH_CONCURRENCY = 3
-type OpPhase = 'queued' | 'installing' | 'joining' | 'done' | 'failed'
+type OpPhase = 'queued' | 'installing' | 'joining' | 'leaving' | 'done' | 'failed'
 const opStatus = ref<Record<string, { phase: OpPhase; message?: string }>>({})
 const batchRunning = ref(false)
-const batchKind = ref<'install' | 'join' | null>(null)
+const batchKind = ref<'install' | 'join' | 'leave' | null>(null)
 const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+
+// 批量离开确认弹窗：危险操作，弹窗内就地确认（不直接执行）
+const showBatchLeaveModal = ref(false)
 
 // 拓扑统计
 const stats = computed(() => {
@@ -92,6 +95,10 @@ const batchInstallable = computed(() =>
 )
 const batchJoinable = computed(() =>
   selectedNodes.value.filter((n) => n.agent_online && !n.online),
+)
+// 批量离开的目标：在网的在线节点（离线节点调离开接口只会失败，提前过滤）
+const batchLeavable = computed(() =>
+  selectedNodes.value.filter((n) => n.agent_online && n.online),
 )
 const pageAllChecked = computed(() =>
   pagedNodes.value.length > 0 && pagedNodes.value.every((n) => selectedIds.value.has(n.host_id)),
@@ -334,7 +341,7 @@ function clearSelection() {
 
 function isOpBusy(hostId: string) {
   const st = opStatus.value[hostId]
-  return !!st && (st.phase === 'queued' || st.phase === 'installing' || st.phase === 'joining')
+  return !!st && (st.phase === 'queued' || st.phase === 'installing' || st.phase === 'joining' || st.phase === 'leaving')
 }
 
 // 批量加入沿用单机弹窗的默认值：密钥留空走服务端预设、reset 恒 false
@@ -350,7 +357,7 @@ function batchJoinParams() {
   }
 }
 
-async function runBatch(kind: 'install' | 'join', targets: NetworkNode[]) {
+async function runBatch(kind: 'install' | 'join' | 'leave', targets: NetworkNode[]) {
   if (kind === 'join') {
     // 密钥 GET 永不回显，但接口返回 auth_key_set 布尔值：未配置时逐台都会 400，
     // 提前拦截比跑完一圈失败更清楚。
@@ -363,14 +370,20 @@ async function runBatch(kind: 'install' | 'join', targets: NetworkNode[]) {
       return
     }
   }
+  // 离开不涉及 --reset（那是加入才有的显式授权开关），只复用单机离开接口
+  //（默认 action=down：断开虚拟局域网，Tailscale 客户端保留、可随时重新加入）。
   const eligible = kind === 'install'
     ? targets.filter((n) => n.agent_online && !n.installed)
-    : targets.filter((n) => n.agent_online && !n.online)
+    : kind === 'join'
+      ? targets.filter((n) => n.agent_online && !n.online)
+      : targets.filter((n) => n.agent_online && n.online)
   const skipped = targets.length - eligible.length
   if (eligible.length === 0) {
     message.warning(kind === 'install'
       ? '所选主机中没有可安装的（须在线且未安装）'
-      : '所选主机中没有可加入的（须在线且未加入组网）')
+      : kind === 'join'
+        ? '所选主机中没有可加入的（须在线且未加入组网）'
+        : '所选主机中没有可离开的（须在线且已加入组网）')
     return
   }
 
@@ -385,24 +398,31 @@ async function runBatch(kind: 'install' | 'join', targets: NetworkNode[]) {
   let failed = 0
   let ipChanged = 0
 
-  // 每台独立链路：安装 →（加入时）加入；3 台并发，失败一台不影响其他。
+  // 每台独立链路：安装 →（加入时）加入；（离开时）离开；3 台并发，失败一台不影响其他。
   // install/join 都是异步任务：先 POST 拿 task_id 再轮询，不再挂长请求。
+  // 离开是同步短接口（tailscale down），直接调单机接口、复用同一套逐行进度。
   const queue = [...eligible]
   async function worker() {
     while (queue.length > 0) {
       const node = queue.shift()!
       try {
-        if (!node.installed) {
-          opStatus.value[node.host_id] = { phase: 'installing' }
-          await runNetworkTask(node.host_id, () => startInstallNetworkNode(node.host_id))
-          node.installed = true
-        }
-        if (kind === 'join') {
-          opStatus.value[node.host_id] = { phase: 'joining' }
-          const task = await runNetworkTask(node.host_id, () =>
-            startJoinNetworkNode(node.host_id, batchJoinParams()),
-          )
-          if (task.ip_changed) ipChanged += 1
+        if (kind === 'leave') {
+          opStatus.value[node.host_id] = { phase: 'leaving' }
+          await leaveNetworkNode(node.host_id, 'down')
+          node.online = false
+        } else {
+          if (!node.installed) {
+            opStatus.value[node.host_id] = { phase: 'installing' }
+            await runNetworkTask(node.host_id, () => startInstallNetworkNode(node.host_id))
+            node.installed = true
+          }
+          if (kind === 'join') {
+            opStatus.value[node.host_id] = { phase: 'joining' }
+            const task = await runNetworkTask(node.host_id, () =>
+              startJoinNetworkNode(node.host_id, batchJoinParams()),
+            )
+            if (task.ip_changed) ipChanged += 1
+          }
         }
         // 成功后探活一次，把行内状态（installed/online/IP）刷新为准；
         // 探活本身失败不影响已完成的结果。
@@ -424,7 +444,7 @@ async function runBatch(kind: 'install' | 'join', targets: NetworkNode[]) {
   )
   batchRunning.value = false
   batchSummary.value = { done, failed, skipped }
-  const verb = kind === 'install' ? '安装' : '加入'
+  const verb = kind === 'install' ? '安装' : kind === 'join' ? '加入' : '离开'
   const skipText = skipped > 0 ? `，跳过 ${skipped} 台` : ''
   const ipText = ipChanged > 0 ? `，其中 ${ipChanged} 台组网 IP 已变化` : ''
   if (failed === 0) {
@@ -441,6 +461,13 @@ function retryBatchFailed() {
     .map(([id]) => id)
   const targets = nodes.value.filter((n) => failedIds.includes(n.host_id))
   runBatch(batchKind.value, targets)
+}
+
+// 批量离开：弹窗内确认后才执行，确认时以当时状态重新过滤目标
+//（弹窗打开后若有节点掉线，runBatch 会按 agent_online && online 再过滤一次）。
+async function confirmBatchLeave() {
+  showBatchLeaveModal.value = false
+  await runBatch('leave', selectedNodes.value)
 }
 
 function openPingModal(node: NetworkNode) {
@@ -586,7 +613,7 @@ onMounted(loadData)
       <div v-if="selectedIds.size > 0" class="batch-bar">
         <span class="batch-info">
           已选 {{ selectedIds.size }} 台
-          <span class="text-muted">（可安装 {{ batchInstallable.length }} 台 · 可加入 {{ batchJoinable.length }} 台）</span>
+          <span class="text-muted">（可安装 {{ batchInstallable.length }} 台 · 可加入 {{ batchJoinable.length }} 台 · 可离开 {{ batchLeavable.length }} 台）</span>
         </span>
         <NButton
           size="small"
@@ -606,6 +633,16 @@ onMounted(loadData)
           @click="runBatch('join', selectedNodes)"
         >
           批量加入
+        </NButton>
+        <NButton
+          size="small"
+          type="warning"
+          secondary
+          :loading="batchRunning && batchKind === 'leave'"
+          :disabled="batchRunning || batchLeavable.length === 0"
+          @click="showBatchLeaveModal = true"
+        >
+          批量离开
         </NButton>
         <NButton
           v-if="batchSummary && batchSummary.failed > 0"
@@ -696,6 +733,7 @@ onMounted(loadData)
               <template v-if="opStatus[row.host_id].phase === 'queued'">排队中…</template>
               <template v-else-if="opStatus[row.host_id].phase === 'installing'">安装中…</template>
               <template v-else-if="opStatus[row.host_id].phase === 'joining'">加入中…</template>
+              <template v-else-if="opStatus[row.host_id].phase === 'leaving'">离开中…</template>
               <template v-else-if="opStatus[row.host_id].phase === 'done'">已完成</template>
               <template v-else>失败：{{ opStatus[row.host_id].message || '执行出错' }}</template>
             </div>
@@ -841,6 +879,36 @@ onMounted(loadData)
         />
       </div>
     </div>
+
+    <!-- 弹窗 0: 批量离开组网（危险操作，弹窗内就地确认） -->
+    <NModal
+      v-model:show="showBatchLeaveModal"
+      preset="card"
+      title="批量离开组网"
+      style="width: 520px; max-width: 90vw"
+    >
+      <div class="batch-leave-body">
+        <NAlert type="warning" :bordered="false">
+          确认将以下 {{ batchLeavable.length }} 台主机从虚拟局域网断开吗？断开后主机不再能通过虚拟组网 IP 访问，Tailscale 客户端保留在主机上，可随时重新加入。
+        </NAlert>
+        <div class="batch-leave-list">
+          <div v-for="n in batchLeavable" :key="n.host_id" class="batch-leave-item">
+            {{ n.hostname }}<span class="batch-leave-ip">{{ n.ip ? `（${n.ip}）` : '' }}</span>
+          </div>
+        </div>
+        <div v-if="selectedNodes.length > batchLeavable.length" class="batch-leave-note">
+          另有 {{ selectedNodes.length - batchLeavable.length }} 台因离线或未加入组网不在本次操作范围内。
+        </div>
+      </div>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showBatchLeaveModal = false">取消</NButton>
+          <NButton type="warning" @click="confirmBatchLeave">
+            确认离开（{{ batchLeavable.length }} 台）
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
 
     <!-- 弹窗 1: 控制面设置 -->
     <NModal
@@ -1171,6 +1239,40 @@ onMounted(loadData)
   }
 }
 
+// 批量离开确认弹窗：目标清单内部滚动，行数多也不撑出视口
+.batch-leave-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+
+  .batch-leave-list {
+    max-height: 240px;
+    overflow-y: auto;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 4px 12px;
+  }
+
+  .batch-leave-item {
+    font-size: 13px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border-color);
+
+    &:last-child {
+      border-bottom: none;
+    }
+  }
+
+  .batch-leave-ip {
+    color: var(--text-secondary);
+  }
+
+  .batch-leave-note {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+}
+
 .network-card-wrap {
   flex: 1;
   min-height: 0;
@@ -1353,7 +1455,8 @@ onMounted(loadData)
 
           &.is-queued,
           &.is-installing,
-          &.is-joining {
+          &.is-joining,
+          &.is-leaving {
             color: #3b82f6;
           }
 

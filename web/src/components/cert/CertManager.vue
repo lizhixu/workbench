@@ -50,6 +50,18 @@ const issueDomains = ref('')
 const selectedIssueAccountID = ref<string>('')
 const issueChallenge = ref<ChallengeMode>('')
 
+// ---- 批量删除 / 批量续期（范式见 NetworkList.vue） ----
+// 勾选按证书 id 存、跨页保留；执行期 3 路并发、逐行显示进度、失败可重试。
+const selectedCertIds = ref<Set<string>>(new Set())
+const BATCH_CONCURRENCY = 3
+type BatchPhase = 'queued' | 'running' | 'done' | 'failed'
+const opStatus = ref<Record<string, { phase: BatchPhase; message?: string }>>({})
+const batchRunning = ref(false)
+const batchKind = ref<'delete' | 'renew' | null>(null)
+const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+const showBatchDeleteModal = ref(false)
+const batchDeleteForce = ref(false)
+
 // ---- 手动 DNS-01（管理员手动添加 TXT 解析） ----
 const showManual = ref(false)
 const manualOrder = ref<ManualDNSOrder | null>(null)
@@ -161,13 +173,21 @@ function onLogModalCompleted(_certId?: string) {
 const daysLeft = (cert: Certificate) =>
   Math.max(0, Math.floor((new Date(cert.not_after).getTime() - Date.now()) / 86400000))
 
-// 证书列表列（宝塔式 11 列）：域名 / 其他域名 / 申请方式 / ACME 账号 / 状态 /
-// 日志 / 颁发组织 / 备注 / 自动续签 / 过期时间 / 操作。
+// 证书列表列（宝塔式 12 列）：勾选 / 域名 / 其他域名 / 申请方式 / ACME 账号 /
+// 状态 / 日志 / 颁发组织 / 备注 / 自动续签 / 过期时间 / 操作。
 // 列宽按内容贴合：ACME 账号与颁发组织放得下「Google Trust Services」
 // （21 字符）、申请方式放得下「手动 DNS-01 签发」标签、过期时间单行
-// 放得下天数标签 + 日期、操作列放得下 5 个按钮；11 列宽合计 1680，
+// 放得下天数标签 + 日期、操作列放得下 5 个按钮；12 列宽合计 1720，
 // 与模板 :scroll-x 一致，改任一列宽时同步改 scroll-x。
 const certColumns = computed<DataTableColumns<Certificate>>(() => [
+  {
+    // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
+    // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
+    type: 'selection',
+    width: 40,
+    fixed: 'left',
+    disabled: () => batchRunning.value,
+  },
   {
     title: '域名',
     key: 'domains',
@@ -211,7 +231,10 @@ const certColumns = computed<DataTableColumns<Certificate>>(() => [
     width: 90,
     render: (r) => {
       const s = certStatus(r)
-      return h(NTag, { size: 'small', type: s.type, bordered: false }, { default: () => s.text })
+      return h('div', null, [
+        h(NTag, { size: 'small', type: s.type, bordered: false }, { default: () => s.text }),
+        batchProgressNode(r),
+      ])
     },
   },
   {
@@ -765,6 +788,12 @@ async function loadCerts() {
   loadingCerts.value = true
   try {
     certs.value = (await listCerts()) as Certificate[]
+    // 刷新清掉上一批的旧进度；批量执行中不清除（runBatch 在执行完才刷新，
+    // 此时 batchRunning 仍为 true，进度得以保留到汇总展示）。
+    if (!batchRunning.value) {
+      opStatus.value = {}
+      batchSummary.value = null
+    }
   } catch (e: any) {
     message.error(e.message || '获取证书列表失败')
   } finally {
@@ -1171,6 +1200,151 @@ async function doDelete(cert: Certificate) {
   }
 }
 
+// ---- 批量删除 / 批量续期（NetworkList.vue 范式：前端并发编排、复用单机接口） ----
+
+// 批量执行行内进度（NetworkList .op-progress 同款文案与色板）：render 函数由
+// NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透（见文末样式）。
+function batchProgressNode(row: { id: string }) {
+  const st = opStatus.value[row.id]
+  if (!st) return null
+  const text =
+    st.phase === 'queued' ? '排队中…'
+    : st.phase === 'running' ? '执行中…'
+    : st.phase === 'done' ? '已完成'
+    : `失败：${st.message || '执行出错'}`
+  return h('div', { class: ['batch-op-progress', `is-${st.phase}`], title: st.message || '' }, text)
+}
+
+const selectedCerts = computed(() => certs.value.filter((c) => selectedCertIds.value.has(c.id)))
+// 手动上传的证书没有 ACME 账户、签发中的证书不可重复申请，单机「申请」按钮
+// 同款准入（见 certColumns 操作列），批量续期沿用同一条判据。
+const batchRenewable = computed(() =>
+  selectedCerts.value.filter((c) => c.source !== 'manual_upload' && c.status !== 'pending' && !c.renewing),
+)
+
+// 当前页证书（前端分页切片）：勾选同步以当前页为基准合并，跨页已选保持不变。
+const pagedCerts = computed(() => {
+  const start = (certPagination.page - 1) * certPagination.pageSize
+  return certs.value.slice(start, start + certPagination.pageSize)
+})
+
+function onCertChecked(keys: (string | number)[]) {
+  const pageIds = new Set(pagedCerts.value.map((c) => c.id))
+  const next = new Set([...selectedCertIds.value].filter((id) => !pageIds.has(id)))
+  keys.forEach((k) => {
+    if (pageIds.has(String(k))) next.add(String(k))
+  })
+  selectedCertIds.value = next
+}
+
+// 筛选/刷新后清理已不存在的勾选与进度（翻页/筛选变化时清理无效勾选）。
+watch(certs, (list) => {
+  const alive = new Set(list.map((c) => c.id))
+  selectedCertIds.value = new Set([...selectedCertIds.value].filter((id) => alive.has(id)))
+  Object.keys(opStatus.value).forEach((id) => {
+    if (!alive.has(id)) delete opStatus.value[id]
+  })
+})
+
+// 批量删除中因「已被应用绑定」失败的证书：单机删除同款强制删除路径
+// （doDelete 的 dialog 兜底），只对失败项二次确认后强制删除。
+function isBindConflict(msg: string) {
+  return msg.includes('已被') || msg.includes('绑定') || msg.includes('force=true') || msg.includes('仍被应用')
+}
+const batchBindFailed = computed(() =>
+  Object.entries(opStatus.value)
+    .filter(([, st]) => st.phase === 'failed' && isBindConflict(st.message || ''))
+    .map(([id]) => id),
+)
+
+async function runBatch(kind: 'delete' | 'renew', targets: Certificate[], force = false) {
+  const eligible = kind === 'delete'
+    ? targets
+    : targets.filter((c) => c.source !== 'manual_upload' && c.status !== 'pending' && !c.renewing)
+  const skipped = targets.length - eligible.length
+  if (eligible.length === 0) {
+    message.warning(kind === 'delete'
+      ? '所选证书中没有可删除的'
+      : '所选证书中没有可续期的（手动上传的证书与签发中的证书不可续期）')
+    return
+  }
+  batchRunning.value = true
+  batchKind.value = kind
+  batchSummary.value = null
+  opStatus.value = {}
+  eligible.forEach((c) => {
+    opStatus.value[c.id] = { phase: 'queued' }
+  })
+  let done = 0
+  let failed = 0
+  const queue = [...eligible]
+  async function worker() {
+    while (queue.length > 0) {
+      const cert = queue.shift()!
+      opStatus.value[cert.id] = { phase: 'running' }
+      try {
+        if (kind === 'delete') {
+          // 删除守卫：被应用反代引用的证书服务端回 409，逐条记失败原因、
+          // 不得让一条失败静默吞掉整批（见 runBatch 末尾的汇总与重试）。
+          await deleteCert(cert.id, force)
+        } else {
+          await renewCert(cert.id)
+          const local = certs.value.find((c) => c.id === cert.id)
+          if (local) local.renewing = true
+        }
+        opStatus.value[cert.id] = { phase: 'done' }
+        done += 1
+      } catch (e: any) {
+        opStatus.value[cert.id] = { phase: 'failed', message: e.message || '执行出错' }
+        failed += 1
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(BATCH_CONCURRENCY, eligible.length) }, () => worker()),
+  )
+  // 批量执行完再刷新列表（batchRunning 仍为 true，loadCerts 的清进度守卫
+  // 不触发）：成功删除的行随之消失，失败行保留进度供重试。
+  await loadCerts()
+  batchRunning.value = false
+  batchSummary.value = { done, failed, skipped }
+  const verb = kind === 'delete' ? '删除' : '续期'
+  const skipText = skipped > 0 ? `，跳过 ${skipped} 个` : ''
+  if (failed === 0) {
+    message.success(`批量${verb}完成：成功 ${done} 个${skipText}`)
+  } else {
+    message.warning(`批量${verb}完成：成功 ${done} 个，失败 ${failed} 个${skipText}，可点「重试失败」只重跑失败的证书`)
+  }
+}
+
+function retryBatchFailed() {
+  if (!batchKind.value || !batchSummary.value || batchSummary.value.failed === 0) return
+  const failedIds = Object.entries(opStatus.value)
+    .filter(([, st]) => st.phase === 'failed')
+    .map(([id]) => id)
+  runBatch(batchKind.value, certs.value.filter((c) => failedIds.includes(c.id)))
+}
+
+function openBatchDelete(force: boolean) {
+  batchDeleteForce.value = force
+  showBatchDeleteModal.value = true
+}
+
+function confirmBatchDelete() {
+  showBatchDeleteModal.value = false
+  const targets = batchDeleteForce.value
+    ? certs.value.filter((c) => batchBindFailed.value.includes(c.id))
+    : selectedCerts.value
+  runBatch('delete', targets, batchDeleteForce.value)
+}
+
+function clearBatchSelection() {
+  selectedCertIds.value = new Set()
+  opStatus.value = {}
+  batchSummary.value = null
+  batchKind.value = null
+}
+
 function startPolling() {
   if (pollTimer) return
   pollTimer = setInterval(loadCerts, 30000)
@@ -1269,16 +1443,71 @@ onUnmounted(() => {
       <NTabs v-model:value="activeMainTab" type="line">
         <NTabPane name="certs" tab="已签发证书">
           <div class="tab-pane-content">
+            <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐行显示进度 -->
+            <div v-if="selectedCertIds.size > 0" class="batch-bar">
+              <span class="batch-info">
+                已选 {{ selectedCertIds.size }} 个证书
+                <span class="text-muted">（可续期 {{ batchRenewable.length }} 个）</span>
+              </span>
+              <NButton
+                size="small"
+                type="primary"
+                secondary
+                :loading="batchRunning && batchKind === 'renew'"
+                :disabled="batchRunning || batchRenewable.length === 0"
+                @click="runBatch('renew', selectedCerts)"
+              >
+                批量续期
+              </NButton>
+              <NButton
+                size="small"
+                type="error"
+                secondary
+                :loading="batchRunning && batchKind === 'delete'"
+                :disabled="batchRunning"
+                @click="openBatchDelete(false)"
+              >
+                批量删除
+              </NButton>
+              <NButton
+                v-if="batchSummary && batchSummary.failed > 0"
+                size="small"
+                type="warning"
+                secondary
+                :disabled="batchRunning"
+                @click="retryBatchFailed"
+              >
+                重试失败（{{ batchSummary.failed }}）
+              </NButton>
+              <NButton
+                v-if="batchBindFailed.length > 0"
+                size="small"
+                type="error"
+                secondary
+                :disabled="batchRunning"
+                @click="openBatchDelete(true)"
+              >
+                强制删除失败项（{{ batchBindFailed.length }}）
+              </NButton>
+              <span v-if="batchSummary" class="batch-summary">
+                成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}<span v-if="batchSummary.skipped > 0"> · 跳过 {{ batchSummary.skipped }}</span>
+              </span>
+              <NButton size="small" quaternary :disabled="batchRunning" @click="clearBatchSelection">
+                取消选择
+              </NButton>
+            </div>
             <NCard :bordered="false" class="table-flex-fill">
               <NDataTable
                 flex-height
                 :columns="certColumns"
                 :data="certs"
                 :row-key="(r: Certificate) => r.id"
+                :checked-row-keys="[...selectedCertIds]"
                 :pagination="certPagination"
                 :bordered="false"
-                :scroll-x="1680"
+                :scroll-x="1720"
                 size="small"
+                @update:checked-row-keys="onCertChecked"
               />
             </NCard>
           </div>
@@ -1850,6 +2079,46 @@ onUnmounted(() => {
       :domains="logModalDomains"
       @completed="onLogModalCompleted"
     />
+
+    <!-- 批量删除二次确认（DESIGN.md §9.17：破坏性确认在弹窗内就地展开） -->
+    <NModal
+      v-model:show="showBatchDeleteModal"
+      preset="card"
+      :title="batchDeleteForce ? '强制删除失败的证书' : `批量删除证书（${selectedCerts.length} 个）`"
+      style="width: 520px"
+    >
+      <div class="batch-confirm-body">
+        <div class="batch-target-list">
+          <div
+            v-for="c in (batchDeleteForce ? certs.filter((x) => batchBindFailed.includes(x.id)) : selectedCerts).slice(0, 5)"
+            :key="c.id"
+            class="batch-target-row"
+          >
+            {{ c.domains[0] || c.id }}
+          </div>
+          <div
+            v-if="(batchDeleteForce ? batchBindFailed.length : selectedCerts.length) > 5"
+            class="batch-target-row muted"
+          >
+            等 {{ (batchDeleteForce ? batchBindFailed.length : selectedCerts.length) - 5 }} 个…
+          </div>
+        </div>
+        <p v-if="!batchDeleteForce" class="field-hint">
+          已被应用反代绑定的证书将删除失败（服务端 409），完成后可对失败项选择强制删除；强制删除将解除相关应用的显式证书绑定。
+        </p>
+        <p v-else class="field-hint">
+          强制删除将解除相关应用的显式证书绑定，被解绑的域名将回落为待重新绑定；面板绑定的证书不受 force 影响，仍会被守卫拦截。
+        </p>
+      </div>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showBatchDeleteModal = false">取消</NButton>
+          <NButton type="error" :loading="batchRunning" @click="confirmBatchDelete">
+            {{ batchDeleteForce ? '确认强制删除' : '确认删除' }}
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
   </div>
 </template>
 
@@ -2120,5 +2389,85 @@ onUnmounted(() => {
 @keyframes spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
+}
+
+// 批量操作栏（NetworkList.vue 同款）
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--n-color-modal);
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+
+  .batch-info {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .text-muted {
+    color: var(--text-secondary);
+    font-weight: 400;
+  }
+
+  .batch-summary {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+}
+
+// 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口
+.batch-confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.batch-target-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 10px;
+
+  .batch-target-row {
+    padding: 3px 0;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &.muted {
+      color: var(--text-secondary);
+    }
+  }
+}
+
+// 批量执行行内进度（NetworkList .op-progress 同款色板；render 函数由
+// NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透）。
+:deep(.batch-op-progress) {
+  font-size: 12px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  &.is-queued,
+  &.is-running {
+    color: #3b82f6;
+  }
+
+  &.is-done {
+    color: #059669;
+  }
+
+  &.is-failed {
+    color: #dc2626;
+  }
 }
 </style>

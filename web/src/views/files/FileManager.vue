@@ -63,9 +63,10 @@ onMounted(async () => {
       <!-- 主机头部信息栏（与主机详情页同款）：文件管理默认收起规格区 -->
       <HostHeaderBanner :host="host" :default-expanded="false" @refresh="load" />
       <!-- 主机已取到才挂载面板，并把 os 传进去：面板不再为判 OS 另调一次
-           getHost，挂载后直接进入文件列表加载态。 -->
+           getHost，挂载后直接进入文件列表加载态。独立页开启批量操作
+           （删除/下载/移动），主机详情文件页签复用面板但不开启。 -->
       <div class="file-pane-wrap">
-        <FileManagerPane :host-id="host.id" :os="host.os" :initial-path="initialPath" />
+        <FileManagerPane :host-id="host.id" :os="host.os" :initial-path="initialPath" :batch-enabled="true" />
       </div>
     </template>
     <template v-else>

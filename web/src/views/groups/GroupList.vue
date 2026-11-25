@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onActivated, onMounted, ref, h } from 'vue'
+import { computed, onActivated, onMounted, ref, watch, h } from 'vue'
 import {
   NCard, NButton, NSpace, NTable, NTag, NModal, NForm, NFormItem, NDataTable,
   NInput, NSelect, NPopconfirm, NEmpty, NIcon, NDrawer, NDrawerContent,
@@ -55,12 +55,24 @@ const hostsLoading = ref(false)
 const groupCount = computed(() => groups.value.length)
 const { pagination, resetPage } = useTablePagination({ pageSize: 20, rowCount: groupCount })
 
+// ---- 批量删除（范式见 NetworkList.vue） ----
+// 勾选按分组 id 存、跨页保留；执行期 3 路并发、逐行显示进度、失败可重试。
+// 删除分组是 admin 专属操作（单机删除按钮同款准入），非 admin 的行不可选。
+const selectedGroupIds = ref<Set<string>>(new Set())
+const BATCH_CONCURRENCY = 3
+type BatchPhase = 'queued' | 'running' | 'done' | 'failed'
+const opStatus = ref<Record<string, { phase: BatchPhase; message?: string }>>({})
+const batchRunning = ref(false)
+const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+const showBatchDeleteModal = ref(false)
+
 const isMobile = useIsMobile()
 // 移动端隐藏次要列（上级分组/描述/创建时间），只留分组名称、计数与操作，
 // 横向滚动范围随之收窄（scroll-x 1000 → 640）。
+// 无 key 的列（如批量勾选列）一律保留，key 过滤只针对具名数据列。
 const visibleColumns = computed(() =>
   isMobile.value
-    ? columns.value.filter((c) => 'key' in c && !['parent_id', 'description', 'created_at'].includes(c.key as string))
+    ? columns.value.filter((c) => !('key' in c) || !['parent_id', 'description', 'created_at'].includes(c.key as string))
     : columns.value,
 )
 // 移动端分页切紧凑形态（仅上一页/页码输入/下一页），避免每页条数选择器撑出视口。
@@ -91,7 +103,22 @@ function groupNameById(id?: string): string {
 
 
 const columns = computed<DataTableColumns<HostGroup>>(() => [
-  { title: '分组名称', key: 'name', minWidth: 150, render: (g) => h('span', { class: 'group-name', title: g.name }, g.name) },
+  {
+    // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
+    // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
+    type: 'selection',
+    width: 40,
+    disabled: () => !isAdmin.value || batchRunning.value,
+  },
+  {
+    title: '分组名称',
+    key: 'name',
+    minWidth: 150,
+    render: (g) => h('div', null, [
+      h('span', { class: 'group-name', title: g.name }, g.name),
+      batchProgressNode(g),
+    ]),
+  },
   { title: '上级分组', key: 'parent_id', width: 130, render: (g) => h('span', { class: 'muted' }, groupNameById(g.parent_id)) },
   { title: '描述', key: 'description', minWidth: 180, ellipsis: { tooltip: true }, render: (g) => h('span', { class: 'muted' }, g.description || '-') },
   {
@@ -143,6 +170,12 @@ async function refresh() {
   loading.value = true
   try {
     groups.value = await listGroups()
+    // 刷新清掉上一批的旧进度；批量执行中不清除（runBatch 在执行完才刷新，
+    // 此时 batchRunning 仍为 true，进度得以保留到汇总展示）。
+    if (!batchRunning.value) {
+      opStatus.value = {}
+      batchSummary.value = null
+    }
     resetPage()
   } catch (e: any) {
     message.error(e.message || '加载分组失败')
@@ -201,10 +234,116 @@ async function doDelete(g: HostGroup) {
         ? `分组已删除，${res.hosts_cleared} 台主机已移出该分组`
         : '分组已删除',
     )
+    selectedGroupIds.value.delete(g.id)
     await refresh()
   } catch (e: any) {
     message.error(e.message || '删除分组失败')
   }
+}
+
+// ---- 批量删除（NetworkList.vue 范式：前端并发编排、复用单机接口） ----
+
+// 批量执行行内进度（NetworkList .op-progress 同款文案与色板）：render 函数由
+// NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透（见文末样式）。
+function batchProgressNode(row: { id: string }) {
+  const st = opStatus.value[row.id]
+  if (!st) return null
+  const text =
+    st.phase === 'queued' ? '排队中…'
+    : st.phase === 'running' ? '执行中…'
+    : st.phase === 'done' ? '已完成'
+    : `失败：${st.message || '执行出错'}`
+  return h('div', { class: ['batch-op-progress', `is-${st.phase}`], title: st.message || '' }, text)
+}
+
+const selectedGroups = computed(() => groups.value.filter((g) => selectedGroupIds.value.has(g.id)))
+
+// 当前页分组（前端分页切片）：勾选同步以当前页为基准合并，跨页已选保持不变。
+const pagedGroups = computed(() => {
+  const start = (pagination.page - 1) * pagination.pageSize
+  return groups.value.slice(start, start + pagination.pageSize)
+})
+
+function onGroupChecked(keys: (string | number)[]) {
+  const pageIds = new Set(pagedGroups.value.map((g) => g.id))
+  const next = new Set([...selectedGroupIds.value].filter((id) => !pageIds.has(id)))
+  keys.forEach((k) => {
+    if (pageIds.has(String(k))) next.add(String(k))
+  })
+  selectedGroupIds.value = next
+}
+
+// 分组在列表里消失（被删除）后清理对应的勾选与进度。
+watch(groups, (list) => {
+  const alive = new Set(list.map((g) => g.id))
+  selectedGroupIds.value = new Set([...selectedGroupIds.value].filter((id) => alive.has(id)))
+  Object.keys(opStatus.value).forEach((id) => {
+    if (!alive.has(id)) delete opStatus.value[id]
+  })
+})
+
+async function runBatchDelete(targets: HostGroup[]) {
+  if (targets.length === 0) {
+    message.warning('所选分组中没有可删除的')
+    return
+  }
+  batchRunning.value = true
+  batchSummary.value = null
+  opStatus.value = {}
+  targets.forEach((g) => {
+    opStatus.value[g.id] = { phase: 'queued' }
+  })
+  let done = 0
+  let failed = 0
+  const queue = [...targets]
+  async function worker() {
+    while (queue.length > 0) {
+      const group = queue.shift()!
+      opStatus.value[group.id] = { phase: 'running' }
+      try {
+        // 复用单机删除接口：改名/删分组时批量改写各主机记录的分组列表
+        // 是服务端已有行为（见 AGENTS.md B.3），审计走既有单机接口的审计。
+        await deleteGroup(group.id)
+        opStatus.value[group.id] = { phase: 'done' }
+        done += 1
+      } catch (e: any) {
+        opStatus.value[group.id] = { phase: 'failed', message: e.message || '执行出错' }
+        failed += 1
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(BATCH_CONCURRENCY, targets.length) }, () => worker()),
+  )
+  // 批量执行完再刷新列表（batchRunning 仍为 true，refresh 的清进度守卫
+  // 不触发）：成功删除的行随之消失，失败行保留进度供重试。
+  await refresh()
+  batchRunning.value = false
+  batchSummary.value = { done, failed, skipped: 0 }
+  if (failed === 0) {
+    message.success(`批量删除完成：成功 ${done} 个分组`)
+  } else {
+    message.warning(`批量删除完成：成功 ${done} 个，失败 ${failed} 个，可点「重试失败」只重跑失败的分组`)
+  }
+}
+
+function retryBatchFailed() {
+  if (!batchSummary.value || batchSummary.value.failed === 0) return
+  const failedIds = Object.entries(opStatus.value)
+    .filter(([, st]) => st.phase === 'failed')
+    .map(([id]) => id)
+  runBatchDelete(groups.value.filter((g) => failedIds.includes(g.id)))
+}
+
+function confirmBatchDelete() {
+  showBatchDeleteModal.value = false
+  runBatchDelete(selectedGroups.value)
+}
+
+function clearBatchSelection() {
+  selectedGroupIds.value = new Set()
+  opStatus.value = {}
+  batchSummary.value = null
 }
 
 // ---------- 分组用户授权 ----------
@@ -333,6 +472,37 @@ onActivated(() => {
       </NSpace>
     </div>
 
+    <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐行显示进度 -->
+    <div v-if="isAdmin && selectedGroupIds.size > 0" class="batch-bar">
+      <span class="batch-info">已选 {{ selectedGroupIds.size }} 个分组</span>
+      <NButton
+        size="small"
+        type="error"
+        secondary
+        :loading="batchRunning"
+        :disabled="batchRunning"
+        @click="showBatchDeleteModal = true"
+      >
+        批量删除
+      </NButton>
+      <NButton
+        v-if="batchSummary && batchSummary.failed > 0"
+        size="small"
+        type="warning"
+        secondary
+        :disabled="batchRunning"
+        @click="retryBatchFailed"
+      >
+        重试失败（{{ batchSummary.failed }}）
+      </NButton>
+      <span v-if="batchSummary" class="batch-summary">
+        成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}
+      </span>
+      <NButton size="small" quaternary :disabled="batchRunning" @click="clearBatchSelection">
+        取消选择
+      </NButton>
+    </div>
+
     <NCard :bordered="false" class="table-flex-fill">
       <NDataTable
         flex-height
@@ -343,7 +513,9 @@ onActivated(() => {
         :bordered="false"
         size="small"
         :row-key="(g: HostGroup) => g.id"
+        :checked-row-keys="[...selectedGroupIds]"
         :scroll-x="isMobile ? 640 : 1000"
+        @update:checked-row-keys="onGroupChecked"
       >
         <template #empty>
           <NEmpty description="暂无分组。创建分组后可关联主机并给用户授权，实现主机访问隔离。" />
@@ -376,6 +548,38 @@ onActivated(() => {
         </NSpace>
       </template>
     </NModal>
+    <!-- 批量删除二次确认（DESIGN.md §9.17：破坏性确认在弹窗内就地展开） -->
+    <NModal
+      v-model:show="showBatchDeleteModal"
+      preset="card"
+      :title="`批量删除分组（${selectedGroups.length} 个）`"
+      style="width: 520px"
+    >
+      <div class="batch-confirm-body">
+        <div class="batch-target-list">
+          <div
+            v-for="g in selectedGroups.slice(0, 5)"
+            :key="g.id"
+            class="batch-target-row"
+          >
+            {{ g.name }}（{{ g.host_count }} 台主机）
+          </div>
+          <div v-if="selectedGroups.length > 5" class="batch-target-row muted">
+            等 {{ selectedGroups.length - 5 }} 个…
+          </div>
+        </div>
+        <p class="field-hint">删除分组后，该分组下主机将被移出分组，用户授权同时失效，请确认。</p>
+      </div>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showBatchDeleteModal = false">取消</NButton>
+          <NButton type="error" :loading="batchRunning" @click="confirmBatchDelete">
+            确认删除
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
     <!-- 分组用户授权 -->
     <NDrawer v-model:show="showGrants" :width="520" placement="right">
       <NDrawerContent :title="`授权用户 - ${grantGroup?.name ?? ''}`" closable>
@@ -582,6 +786,87 @@ onActivated(() => {
   }
   .grants-table-wrap {
     overflow-x: auto;
+  }
+}
+
+// 批量操作栏（NetworkList.vue 同款）
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--n-color-modal);
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  padding: 8px 12px;
+  flex-shrink: 0;
+
+  .batch-info {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .batch-summary {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+}
+
+// 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口
+.batch-confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.batch-target-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 10px;
+
+  .batch-target-row {
+    padding: 3px 0;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &.muted {
+      color: var(--text-secondary);
+    }
+  }
+}
+
+.field-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+// 批量执行行内进度（NetworkList .op-progress 同款色板；render 函数由
+// NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透）。
+:deep(.batch-op-progress) {
+  font-size: 12px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  &.is-queued,
+  &.is-running {
+    color: #3b82f6;
+  }
+
+  &.is-done {
+    color: #059669;
+  }
+
+  &.is-failed {
+    color: #dc2626;
   }
 }
 </style>

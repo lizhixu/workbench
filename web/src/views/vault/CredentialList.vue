@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, computed, h } from 'vue'
+import { onMounted, ref, computed, watch, h } from 'vue'
 import {
   NCard, NButton, NSpace, NTag, NModal, NForm, NFormItem, NDataTable,
   NInput, NSelect, NPopconfirm, NEmpty, useMessage, NIcon, NTooltip,
@@ -118,7 +118,24 @@ const filteredCreds = computed(() => {
 const credCount = computed(() => filteredCreds.value.length)
 const { pagination, resetPage } = useTablePagination({ pageSize: 20, rowCount: credCount })
 
+// ---- 批量删除（范式见 NetworkList.vue） ----
+// 勾选按凭据 id 存、跨页保留；执行期 3 路并发、逐行显示进度、失败可重试。
+const selectedCredIds = ref<Set<string>>(new Set())
+const BATCH_CONCURRENCY = 3
+type BatchPhase = 'queued' | 'running' | 'done' | 'failed'
+const opStatus = ref<Record<string, { phase: BatchPhase; message?: string }>>({})
+const batchRunning = ref(false)
+const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+const showBatchDeleteModal = ref(false)
+
 const columns = computed<DataTableColumns<Credential>>(() => [
+  {
+    // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
+    // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
+    type: 'selection',
+    width: 40,
+    disabled: () => batchRunning.value,
+  },
   {
     title: '名称 / 描述',
     key: 'name',
@@ -132,6 +149,7 @@ const columns = computed<DataTableColumns<Credential>>(() => [
         c.description
           ? h('div', { class: 'cred-desc-text' }, c.description)
           : null,
+        batchProgressNode(c),
       ]),
   },
   {
@@ -257,6 +275,12 @@ async function refresh() {
       label: `${h.hostname} (${h.internal_ip || h.public_ip || h.id.slice(0, 8)})`,
       value: h.hostname || h.id,
     }))
+    // 刷新清掉上一批的旧进度；批量执行中不清除（runBatchDelete 在执行完才刷新，
+    // 此时 batchRunning 仍为 true，进度得以保留到汇总展示）。
+    if (!batchRunning.value) {
+      opStatus.value = {}
+      batchSummary.value = null
+    }
     resetPage()
   } catch (e: any) {
     message.error(e.message || '加载凭据失败')
@@ -323,10 +347,117 @@ async function doDelete(id: string) {
   try {
     await deleteCredential(id)
     message.success('凭据已彻底销毁')
+    selectedCredIds.value.delete(id)
     refresh()
   } catch (e: any) {
     message.error(e.message || '删除凭据失败')
   }
+}
+
+// ---- 批量删除（NetworkList.vue 范式：前端并发编排、复用单机接口） ----
+
+// 批量执行行内进度（NetworkList .op-progress 同款文案与色板）：render 函数由
+// NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透（见文末样式）。
+function batchProgressNode(row: { id: string }) {
+  const st = opStatus.value[row.id]
+  if (!st) return null
+  const text =
+    st.phase === 'queued' ? '排队中…'
+    : st.phase === 'running' ? '执行中…'
+    : st.phase === 'done' ? '已完成'
+    : `失败：${st.message || '执行出错'}`
+  return h('div', { class: ['batch-op-progress', `is-${st.phase}`], title: st.message || '' }, text)
+}
+
+const selectedCreds = computed(() => creds.value.filter((c) => selectedCredIds.value.has(c.id)))
+
+// 当前页凭据（前端分页切片）：勾选同步以当前页为基准合并，跨页已选保持不变。
+// 注意：筛选后的当前页按 filteredCreds 切片，勾选清理则以全量 creds 为准
+// （被筛掉的行依然存在，勾选保留）。
+const pagedCreds = computed(() => {
+  const start = (pagination.page - 1) * pagination.pageSize
+  return filteredCreds.value.slice(start, start + pagination.pageSize)
+})
+
+function onCredChecked(keys: (string | number)[]) {
+  const pageIds = new Set(pagedCreds.value.map((c) => c.id))
+  const next = new Set([...selectedCredIds.value].filter((id) => !pageIds.has(id)))
+  keys.forEach((k) => {
+    if (pageIds.has(String(k))) next.add(String(k))
+  })
+  selectedCredIds.value = next
+}
+
+// 凭据在全量列表里消失（被删除）后清理对应的勾选与进度。
+watch(creds, (list) => {
+  const alive = new Set(list.map((c) => c.id))
+  selectedCredIds.value = new Set([...selectedCredIds.value].filter((id) => alive.has(id)))
+  Object.keys(opStatus.value).forEach((id) => {
+    if (!alive.has(id)) delete opStatus.value[id]
+  })
+})
+
+async function runBatchDelete(targets: Credential[]) {
+  if (targets.length === 0) {
+    message.warning('所选凭据中没有可删除的')
+    return
+  }
+  batchRunning.value = true
+  batchSummary.value = null
+  opStatus.value = {}
+  targets.forEach((c) => {
+    opStatus.value[c.id] = { phase: 'queued' }
+  })
+  let done = 0
+  let failed = 0
+  const queue = [...targets]
+  async function worker() {
+    while (queue.length > 0) {
+      const cred = queue.shift()!
+      opStatus.value[cred.id] = { phase: 'running' }
+      try {
+        // 复用单机删除接口，审计走既有单机接口的审计，无需新埋点。
+        await deleteCredential(cred.id)
+        opStatus.value[cred.id] = { phase: 'done' }
+        done += 1
+      } catch (e: any) {
+        opStatus.value[cred.id] = { phase: 'failed', message: e.message || '执行出错' }
+        failed += 1
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(BATCH_CONCURRENCY, targets.length) }, () => worker()),
+  )
+  // 批量执行完再刷新列表（batchRunning 仍为 true，refresh 的清进度守卫
+  // 不触发）：成功删除的行随之消失，失败行保留进度供重试。
+  await refresh()
+  batchRunning.value = false
+  batchSummary.value = { done, failed, skipped: 0 }
+  if (failed === 0) {
+    message.success(`批量删除完成：成功 ${done} 条凭据`)
+  } else {
+    message.warning(`批量删除完成：成功 ${done} 条，失败 ${failed} 条，可点「重试失败」只重跑失败的凭据`)
+  }
+}
+
+function retryBatchFailed() {
+  if (!batchSummary.value || batchSummary.value.failed === 0) return
+  const failedIds = Object.entries(opStatus.value)
+    .filter(([, st]) => st.phase === 'failed')
+    .map(([id]) => id)
+  runBatchDelete(creds.value.filter((c) => failedIds.includes(c.id)))
+}
+
+function confirmBatchDelete() {
+  showBatchDeleteModal.value = false
+  runBatchDelete(selectedCreds.value)
+}
+
+function clearBatchSelection() {
+  selectedCredIds.value = new Set()
+  opStatus.value = {}
+  batchSummary.value = null
 }
 
 onMounted(refresh)
@@ -383,6 +514,37 @@ onMounted(refresh)
     </div>
 
     <!-- Table 卡片 -->
+    <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐行显示进度 -->
+    <div v-if="selectedCredIds.size > 0" class="batch-bar">
+      <span class="batch-info">已选 {{ selectedCredIds.size }} 条凭据</span>
+      <NButton
+        size="small"
+        type="error"
+        secondary
+        :loading="batchRunning"
+        :disabled="batchRunning"
+        @click="showBatchDeleteModal = true"
+      >
+        批量删除
+      </NButton>
+      <NButton
+        v-if="batchSummary && batchSummary.failed > 0"
+        size="small"
+        type="warning"
+        secondary
+        :disabled="batchRunning"
+        @click="retryBatchFailed"
+      >
+        重试失败（{{ batchSummary.failed }}）
+      </NButton>
+      <span v-if="batchSummary" class="batch-summary">
+        成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}
+      </span>
+      <NButton size="small" quaternary :disabled="batchRunning" @click="clearBatchSelection">
+        取消选择
+      </NButton>
+    </div>
+
     <NCard class="table-card table-flex-fill" size="small">
       <NDataTable
         flex-height
@@ -393,7 +555,9 @@ onMounted(refresh)
         :bordered="false"
         size="small"
         :row-key="(c: Credential) => c.id"
+        :checked-row-keys="[...selectedCredIds]"
         :scroll-x="960"
+        @update:checked-row-keys="onCredChecked"
       >
         <template #empty>
           <NEmpty description="暂无符合条件的凭据。点击右上角「新增凭据」添加首个加密凭据。" />
@@ -401,6 +565,38 @@ onMounted(refresh)
       </NDataTable>
     </NCard>
   </div>
+
+  <!-- 批量删除二次确认（DESIGN.md §9.17：破坏性确认在弹窗内就地展开） -->
+  <NModal
+    v-model:show="showBatchDeleteModal"
+    preset="card"
+    :title="`批量删除凭据（${selectedCreds.length} 条）`"
+    style="width: 520px"
+  >
+    <div class="batch-confirm-body">
+      <div class="batch-target-list">
+        <div
+          v-for="c in selectedCreds.slice(0, 5)"
+          :key="c.id"
+          class="batch-target-row"
+        >
+          {{ c.name }}<span v-if="c.username"> · {{ c.username }}</span>
+        </div>
+        <div v-if="selectedCreds.length > 5" class="batch-target-row muted">
+          等 {{ selectedCreds.length - 5 }} 条…
+        </div>
+      </div>
+      <p class="field-hint">凭据删除后无法恢复，关联服务可能会失去鉴权能力，请确认。</p>
+    </div>
+    <template #footer>
+      <NSpace justify="end">
+        <NButton @click="showBatchDeleteModal = false">取消</NButton>
+        <NButton type="error" :loading="batchRunning" @click="confirmBatchDelete">
+          确认删除
+        </NButton>
+      </NSpace>
+    </template>
+  </NModal>
 
   <!-- Create / Edit Modal -->
   <NModal
@@ -696,5 +892,86 @@ onMounted(refresh)
   font-size: 12px;
   line-height: 1.6;
   color: var(--text-secondary);
+}
+
+// 批量操作栏（NetworkList.vue 同款）
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--n-color-modal);
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  padding: 8px 12px;
+  flex-shrink: 0;
+
+  .batch-info {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .batch-summary {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+}
+
+// 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口
+.batch-confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.batch-target-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 10px;
+
+  .batch-target-row {
+    padding: 3px 0;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &.muted {
+      color: var(--text-secondary);
+    }
+  }
+}
+
+.field-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+// 批量执行行内进度（NetworkList .op-progress 同款色板；render 函数由
+// NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透）。
+:deep(.batch-op-progress) {
+  font-size: 12px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  &.is-queued,
+  &.is-running {
+    color: #3b82f6;
+  }
+
+  &.is-done {
+    color: #059669;
+  }
+
+  &.is-failed {
+    color: #dc2626;
+  }
 }
 </style>

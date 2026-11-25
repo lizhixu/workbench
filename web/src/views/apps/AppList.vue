@@ -11,7 +11,8 @@ import {
   TrashOutline,
 } from '@vicons/ionicons5'
 import {
-  deleteApp, getAppStatus, listApps, type AppEntity, type AppStatus,
+  deleteApp, deployApp, getAppStatus, listApps, restartApp, startApp, stopApp,
+  type AppEntity, type AppStatus,
 } from '../../api/apps'
 import { listHosts } from '../../api/hosts'
 import { useWorkspaceStore } from '../../stores/workspace'
@@ -39,6 +40,149 @@ const hostnameById = ref<Map<string, string>>(new Map())
 let statusTimer: ReturnType<typeof setInterval> | null = null
 
 const canWrite = computed(() => auth.role === 'admin' || auth.role === 'operator')
+
+// ---- 批量操作：多选 + 前端并发编排（3 个同时），零后端改动，复用单机接口
+// （与 NetworkList.vue 同款范式：勾选按 id 跨页保留、状态列逐台显示进度、
+// 失败可重试、完成后给成功/失败汇总；审计走既有单机接口，无需新埋点）。
+// NDataTable 的 checked-row-keys 由本页全量数据驱动，翻页不丢勾选。
+const checkedRowKeys = ref<string[]>([])
+const BATCH_CONCURRENCY = 3
+type BatchOpPhase = 'queued' | 'running' | 'done' | 'failed'
+const opStatus = ref<Record<string, { phase: BatchOpPhase; message?: string }>>({})
+const batchRunning = ref(false)
+const batchKind = ref<'start' | 'stop' | 'restart' | 'deploy' | 'delete' | null>(null)
+const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+
+const selectedApps = computed(() => apps.value.filter((a) => checkedRowKeys.value.includes(a.id)))
+// 状态按需拉取、可能尚未就绪：状态未知时先放行、由服务端裁决，失败逐台记录；
+// 部署中（deploying）的一律排除，避免与在途部署冲突。
+const appState = (id: string) => statuses.value[id]
+const batchStartable = computed(() =>
+  selectedApps.value.filter((a) => {
+    const st = appState(a.id)
+    if (st?.deploying) return false
+    return !st || st.state === 'exited' || st.state === 'dead'
+  }),
+)
+const batchStoppable = computed(() =>
+  selectedApps.value.filter((a) => {
+    const st = appState(a.id)
+    if (st?.deploying) return false
+    return !st || st.state === 'running'
+  }),
+)
+const batchRestartable = computed(() => batchStoppable.value)
+const batchDeployable = computed(() =>
+  selectedApps.value.filter((a) => !appState(a.id)?.deploying),
+)
+
+function clearSelection() {
+  checkedRowKeys.value = []
+  opStatus.value = {}
+  batchSummary.value = null
+  batchKind.value = null
+}
+
+// NDataTable 的勾选回调给 string | number 混型 key，本页 row-key 全是 string。
+function onCheckedRowKeysChange(keys: (string | number)[]) {
+  checkedRowKeys.value = keys.map(String)
+}
+
+function isOpBusy(id: string) {
+  const st = opStatus.value[id]
+  return !!st && (st.phase === 'queued' || st.phase === 'running')
+}
+
+// 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突
+function rowClassName(row: AppEntity) {
+  return isOpBusy(row.id) ? 'batch-row-busy' : ''
+}
+
+// 逐台并发执行器：启停/重启/重新部署/删除共用。每台独立链路，失败一台不影响其他。
+async function runBatchPerApp(
+  kind: 'start' | 'stop' | 'restart' | 'deploy' | 'delete',
+  targets: AppEntity[],
+  fn: (app: AppEntity) => Promise<unknown>,
+  // skipped 由调用方按「已选 − 本轮目标」传入；重试只重跑失败应用、传 0，
+  // 不把上一轮已成功的计为跳过。
+  skipped = 0,
+) {
+  if (targets.length === 0) {
+    message.warning('所选应用中没有可执行的目标')
+    return
+  }
+  batchRunning.value = true
+  batchKind.value = kind
+  batchSummary.value = null
+  opStatus.value = {}
+  targets.forEach((a) => {
+    opStatus.value[a.id] = { phase: 'queued' }
+  })
+  let done = 0
+  let failed = 0
+  const queue = [...targets]
+  async function worker() {
+    while (queue.length > 0) {
+      const app = queue.shift()!
+      opStatus.value[app.id] = { phase: 'running' }
+      try {
+        await fn(app)
+        opStatus.value[app.id] = { phase: 'done' }
+        done += 1
+      } catch (e: any) {
+        opStatus.value[app.id] = { phase: 'failed', message: e.message || '执行出错' }
+        failed += 1
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(BATCH_CONCURRENCY, queue.length) }, () => worker()),
+  )
+  batchRunning.value = false
+  batchSummary.value = { done, failed, skipped }
+  const verb = { start: '启动', stop: '停止', restart: '重启', deploy: '重新部署', delete: '删除' }[kind]
+  const skipText = skipped > 0 ? `，跳过 ${skipped} 个` : ''
+  if (failed === 0) {
+    message.success(`批量${verb}完成：成功 ${done} 个${skipText}`)
+  } else {
+    message.warning(`批量${verb}完成：成功 ${done} 个，失败 ${failed} 个${skipText}，可点「重试失败」只重跑失败的应用`)
+  }
+  // 刷新列表与状态；进度与汇总保留在行内/批量栏，手动刷新时再清空。
+  await loadData()
+  await refreshStatuses()
+}
+
+function retryBatchFailed() {
+  if (!batchKind.value || !batchSummary.value || batchSummary.value.failed === 0) return
+  const failedIds = Object.entries(opStatus.value)
+    .filter(([, st]) => st.phase === 'failed')
+    .map(([id]) => id)
+  const targets = apps.value.filter((a) => failedIds.includes(a.id))
+  if (targets.length === 0) return
+  const kind = batchKind.value
+  if (kind === 'start') runBatchPerApp('start', targets, (a) => startApp(a.id))
+  else if (kind === 'stop') runBatchPerApp('stop', targets, (a) => stopApp(a.id))
+  else if (kind === 'restart') runBatchPerApp('restart', targets, (a) => restartApp(a.id))
+  else if (kind === 'deploy') runBatchPerApp('deploy', targets, (a) => deployApp(a.id))
+  else if (kind === 'delete') runBatchPerApp('delete', targets, (a) => deleteApp(a.id, lastBatchPurge.value))
+}
+
+// ---- 批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17），
+// 复用单机删除接口与「同时删除应用内容」选项。
+const showBatchDeleteModal = ref(false)
+const batchPurgeContent = ref(false)
+const lastBatchPurge = ref(false)
+
+function openBatchDeleteModal() {
+  batchPurgeContent.value = false
+  showBatchDeleteModal.value = true
+}
+
+async function confirmBatchDelete() {
+  lastBatchPurge.value = batchPurgeContent.value
+  showBatchDeleteModal.value = false
+  await runBatchPerApp('delete', selectedApps.value, (a) => deleteApp(a.id, lastBatchPurge.value))
+}
 
 const hostLabel = (row: AppEntity) => hostnameById.value.get(row.host_id) || row.host_id || '-'
 
@@ -108,6 +252,22 @@ const { pagination, resetPage } = useTablePagination({ pageSize: 20, pageSizes: 
 watch(searchKeyword, () => resetPage())
 
 const stateTag = (a: AppEntity) => {
+  // 批量进度：执行期间状态格逐台显示当前阶段，失败时显示原因（悬停看全文）
+  const op = opStatus.value[a.id]
+  if (op) {
+    const text = op.phase === 'queued'
+      ? '排队中…'
+      : op.phase === 'running'
+        ? '执行中…'
+        : op.phase === 'done'
+          ? '已完成'
+          : `失败：${op.message || '执行出错'}`
+    const color = op.phase === 'done' ? '#059669' : op.phase === 'failed' ? '#dc2626' : '#3b82f6'
+    return h('span', {
+      style: `font-size: 12px; color: ${color}; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: inline-block; vertical-align: middle;`,
+      title: op.message || '',
+    }, text)
+  }
   const st = statuses.value[a.id]
   if (!st) {
     // 加载期内不渲染确定性文案：状态尚未取回时「未知」是误导（走查：
@@ -138,6 +298,11 @@ const stateTag = (a: AppEntity) => {
 
 const columns = computed<DataTableColumns<AppEntity>>(() => [
   {
+    type: 'selection',
+    width: 40,
+    disabled: () => batchRunning.value,
+  },
+  {
     title: '应用名称',
     key: 'name',
     width: 180,
@@ -156,7 +321,7 @@ const columns = computed<DataTableColumns<AppEntity>>(() => [
     title: '来源',
     key: 'source_type',
     // 此列原先无 width，独自吸走全部剩余宽度（约 600px 空白的根因）；
-    // 各列现全部定宽，合计 1310，配 :scroll-x="1310"。
+    // 各列现全部定宽，合计 1350，配 :scroll-x="1350"。
     width: 240,
     // 仓库 URL 是无空格长 token：弹层限宽 + 任意断行，否则单行铺开被视口裁掉（DESIGN §9.4）。
     ellipsis: {
@@ -241,6 +406,9 @@ async function loadData() {
       listHosts().catch(() => ({ data: [] as { id: string; hostname: string }[], total: 0 })),
     ])
     apps.value = appList
+    // 刷新后清掉已不存在的应用勾选，避免批量操作带上幽灵 ID
+    const alive = new Set(appList.map((a) => a.id))
+    checkedRowKeys.value = checkedRowKeys.value.filter((id) => alive.has(id))
     const map = new Map<string, string>()
     for (const h of hostResp.data) map.set(h.id, h.hostname)
     hostnameById.value = map
@@ -262,6 +430,16 @@ async function refreshStatuses() {
     }
   } finally {
     statusesLoading.value = false
+  }
+}
+
+async function refreshAll() {
+  await loadData().then(refreshStatuses)
+  // 手动刷新拿到的是最新状态，旧的操作进度（已完成/失败）不再对应当前行；
+  // 批量进行中时不动，等本轮跑完再由执行器收尾。
+  if (!batchRunning.value) {
+    opStatus.value = {}
+    batchSummary.value = null
   }
 }
 
@@ -372,7 +550,7 @@ onDeactivated(() => {
           clearable
           style="width: 260px"
         />
-        <NButton :loading="loading" @click="loadData().then(refreshStatuses)">
+        <NButton :loading="loading" @click="refreshAll">
           <template #icon>
             <NIcon><RefreshOutline /></NIcon>
           </template>
@@ -388,6 +566,84 @@ onDeactivated(() => {
       </NButton>
     </div>
 
+    <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、状态列逐台显示进度 -->
+    <div v-if="checkedRowKeys.length > 0" class="batch-bar">
+      <span class="batch-info">
+        已选 {{ checkedRowKeys.length }} 个
+        <span class="text-muted">（可启动 {{ batchStartable.length }} · 可停止 {{ batchStoppable.length }} · 可重启 {{ batchRestartable.length }} · 可重新部署 {{ batchDeployable.length }}）</span>
+      </span>
+      <NButton
+        v-if="canWrite"
+        size="small"
+        type="primary"
+        secondary
+        :loading="batchRunning && batchKind === 'start'"
+        :disabled="batchRunning || batchStartable.length === 0"
+        @click="runBatchPerApp('start', batchStartable, (a) => startApp(a.id), selectedApps.length - batchStartable.length)"
+      >
+        批量启动
+      </NButton>
+      <NButton
+        v-if="canWrite"
+        size="small"
+        type="primary"
+        secondary
+        :loading="batchRunning && batchKind === 'stop'"
+        :disabled="batchRunning || batchStoppable.length === 0"
+        @click="runBatchPerApp('stop', batchStoppable, (a) => stopApp(a.id), selectedApps.length - batchStoppable.length)"
+      >
+        批量停止
+      </NButton>
+      <NButton
+        v-if="canWrite"
+        size="small"
+        type="primary"
+        secondary
+        :loading="batchRunning && batchKind === 'restart'"
+        :disabled="batchRunning || batchRestartable.length === 0"
+        @click="runBatchPerApp('restart', batchRestartable, (a) => restartApp(a.id), selectedApps.length - batchRestartable.length)"
+      >
+        批量重启
+      </NButton>
+      <NButton
+        v-if="canWrite"
+        size="small"
+        type="primary"
+        secondary
+        :loading="batchRunning && batchKind === 'deploy'"
+        :disabled="batchRunning || batchDeployable.length === 0"
+        @click="runBatchPerApp('deploy', batchDeployable, (a) => deployApp(a.id), selectedApps.length - batchDeployable.length)"
+      >
+        批量重新部署
+      </NButton>
+      <NButton
+        v-if="canWrite"
+        size="small"
+        type="error"
+        secondary
+        :disabled="batchRunning"
+        @click="openBatchDeleteModal"
+      >
+        批量删除
+      </NButton>
+      <NButton
+        v-if="batchSummary && batchSummary.failed > 0"
+        size="small"
+        type="warning"
+        secondary
+        :disabled="batchRunning"
+        @click="retryBatchFailed"
+      >
+        重试失败（{{ batchSummary.failed }}）
+      </NButton>
+      <span v-if="batchSummary" class="batch-summary">
+        成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}<span v-if="batchSummary.skipped > 0"> · 跳过 {{ batchSummary.skipped }}</span>
+      </span>
+      <NButton size="small" quaternary :disabled="batchRunning" @click="clearSelection">
+        取消选择
+      </NButton>
+    </div>
+
     <div class="table-card table-flex-fill">
       <NDataTable
         v-if="apps.length > 0"
@@ -395,8 +651,11 @@ onDeactivated(() => {
         :columns="columns"
         :data="filteredApps"
         :row-key="(row: AppEntity) => row.id"
+        :checked-row-keys="checkedRowKeys"
+        :row-class-name="rowClassName"
         :pagination="pagination"
-        :scroll-x="1310"
+        :scroll-x="1350"
+        @update:checked-row-keys="onCheckedRowKeysChange"
       />
       <NEmpty
         v-else-if="!loading"
@@ -433,6 +692,34 @@ onDeactivated(() => {
         <NAlert v-if="purgeContent" type="warning" :show-icon="false" style="font-size: 12px">
           将在主机上销毁该应用的容器/Compose 栈、命名数据卷、构建镜像及域名代理配置，数据不可恢复。
           若主机离线，删除会被拒绝（避免内容被静默遗留）。
+        </NAlert>
+        <div v-else style="font-size: 12px; color: var(--n-text-color-disabled, #999)">
+          仅删除面板中的应用记录，主机上的容器、数据卷等内容不会被销毁。
+        </div>
+      </NSpace>
+    </NModal>
+
+    <!-- 批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17） -->
+    <NModal
+      v-model:show="showBatchDeleteModal"
+      preset="dialog"
+      title="批量删除应用"
+      positive-text="删除"
+      negative-text="取消"
+      type="error"
+      @positive-click="confirmBatchDelete"
+    >
+      <NSpace vertical :size="12">
+        <div>确定删除以下 {{ selectedApps.length }} 个应用吗？</div>
+        <div class="batch-delete-list">
+          <div v-for="a in selectedApps" :key="a.id">{{ a.name }}（{{ hostLabel(a) }}）</div>
+        </div>
+        <NCheckbox v-model:checked="batchPurgeContent">
+          同时删除应用内容（容器、数据卷、镜像、代理配置等）
+        </NCheckbox>
+        <NAlert v-if="batchPurgeContent" type="warning" :show-icon="false" style="font-size: 12px">
+          将在主机上销毁各应用的容器/Compose 栈、命名数据卷、构建镜像及域名代理配置，数据不可恢复。
+          若主机离线，删除会被拒绝（避免内容被静默遗留），记为失败、可稍后重试。
         </NAlert>
         <div v-else style="font-size: 12px; color: var(--n-text-color-disabled, #999)">
           仅删除面板中的应用记录，主机上的容器、数据卷等内容不会被销毁。
@@ -477,6 +764,54 @@ onDeactivated(() => {
   color: var(--text-secondary);
   font-size: 13px;
   white-space: nowrap;
+}
+
+// 批量操作栏：有勾选时出现，贴在工具栏下方、表格上方（与 NetworkList.vue 同款）
+.batch-bar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--n-color-modal);
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  padding: 8px 12px;
+
+  .batch-info {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+
+    .text-muted {
+      color: var(--n-text-color-3);
+      font-size: 12px;
+      font-weight: 400;
+    }
+  }
+
+  .batch-summary {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+}
+
+.batch-delete-list {
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 13px;
+  color: var(--text-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+// 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突
+:deep(.batch-row-busy) {
+  .n-button {
+    pointer-events: none;
+    opacity: 0.5;
+  }
 }
 
 .table-card {

@@ -68,6 +68,18 @@ const filterOptions = [{ label: '全部 Shell', value: '' }, ...shellOptions]
 
 const isAdmin = computed(() => auth.role === 'admin')
 
+// ---- 批量删除（范式见 NetworkList.vue） ----
+// 勾选按命令 id 存；执行期 3 路并发、逐行显示进度、失败可重试。
+// 本表是 AGENTS.md §8.2 例外的小表（限高不分页），只加勾选与批量栏，
+// 不改分页口径。删除准入沿用单机 canMutate（admin 或本人创建）。
+const selectedCommandIds = ref<Set<string>>(new Set())
+const BATCH_CONCURRENCY = 3
+type BatchPhase = 'queued' | 'running' | 'done' | 'failed'
+const opStatus = ref<Record<string, { phase: BatchPhase; message?: string }>>({})
+const batchRunning = ref(false)
+const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+const showBatchDeleteModal = ref(false)
+
 function shellLabel(s: string): string {
   return shellOptions.find((o) => o.value === s)?.label || s
 }
@@ -84,6 +96,12 @@ async function refresh() {
       shell: shellFilter.value || undefined,
       q: keyword.value.trim() || undefined,
     })
+    // 刷新清掉上一批的旧进度；批量执行中不清除（runBatchDelete 在执行完才刷新，
+    // 此时 batchRunning 仍为 true，进度得以保留到汇总展示）。
+    if (!batchRunning.value) {
+      opStatus.value = {}
+      batchSummary.value = null
+    }
   } catch (e: any) {
     message.error(e.message || '加载常用命令失败')
   } finally {
@@ -148,10 +166,107 @@ async function remove(row: CommandEntry) {
   try {
     await deleteCommand(row.id)
     message.success('已删除')
+    selectedCommandIds.value.delete(row.id)
     await refresh()
   } catch (e: any) {
     message.error(e.message || '删除失败')
   }
+}
+
+// ---- 批量删除（NetworkList.vue 范式：前端并发编排、复用单机接口） ----
+
+// 批量执行行内进度（NetworkList .op-progress 同款文案与色板）：render 函数由
+// NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透（见文末样式）。
+function batchProgressNode(row: { id: string }) {
+  const st = opStatus.value[row.id]
+  if (!st) return null
+  const text =
+    st.phase === 'queued' ? '排队中…'
+    : st.phase === 'running' ? '执行中…'
+    : st.phase === 'done' ? '已完成'
+    : `失败：${st.message || '执行出错'}`
+  return h('div', { class: ['batch-op-progress', `is-${st.phase}`], title: st.message || '' }, text)
+}
+
+const selectedCommands = computed(() => entries.value.filter((e) => selectedCommandIds.value.has(e.id)))
+// 只有本人创建的命令或 admin 能删（单机删除按钮同款 canMutate 准入），
+// 他人的命令不参与执行、计入跳过。
+const batchDeletable = computed(() => selectedCommands.value.filter((e) => canMutate(e)))
+
+function onCommandChecked(keys: (string | number)[]) {
+  // 本表不分页：naive-ui 回传的即全量勾选集合，直接替换。
+  selectedCommandIds.value = new Set(keys.map((k) => String(k)))
+}
+
+async function runBatchDelete(targets: CommandEntry[]) {
+  const eligible = targets.filter((e) => canMutate(e))
+  const skipped = targets.length - eligible.length
+  if (eligible.length === 0) {
+    message.warning('所选命令中没有可删除的（仅本人创建的命令或管理员可删除）')
+    return
+  }
+  batchRunning.value = true
+  batchSummary.value = null
+  opStatus.value = {}
+  eligible.forEach((e) => {
+    opStatus.value[e.id] = { phase: 'queued' }
+  })
+  let done = 0
+  let failed = 0
+  const queue = [...eligible]
+  async function worker() {
+    while (queue.length > 0) {
+      const entry = queue.shift()!
+      opStatus.value[entry.id] = { phase: 'running' }
+      try {
+        // 复用单机删除接口，审计走既有单机接口的审计，无需新埋点。
+        await deleteCommand(entry.id)
+        opStatus.value[entry.id] = { phase: 'done' }
+        done += 1
+      } catch (e: any) {
+        opStatus.value[entry.id] = { phase: 'failed', message: e.message || '执行出错' }
+        failed += 1
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(BATCH_CONCURRENCY, eligible.length) }, () => worker()),
+  )
+  // 本表 entries 是服务端按关键词过滤的，刷新无法核验勾选行是否还存在，
+  // 故不在刷新时清理勾选；删除成功即已知不存在，直接从勾选中移除。
+  Object.entries(opStatus.value).forEach(([id, st]) => {
+    if (st.phase === 'done') selectedCommandIds.value.delete(id)
+  })
+  // 批量执行完再刷新列表（batchRunning 仍为 true，refresh 的清进度守卫
+  // 不触发）：成功删除的行随之消失，失败行保留进度供重试。
+  await refresh()
+  batchRunning.value = false
+  batchSummary.value = { done, failed, skipped }
+  const skipText = skipped > 0 ? `，跳过 ${skipped} 条（无删除权限）` : ''
+  if (failed === 0) {
+    message.success(`批量删除完成：成功 ${done} 条${skipText}`)
+  } else {
+    message.warning(`批量删除完成：成功 ${done} 条，失败 ${failed} 条${skipText}，可点「重试失败」只重跑失败的命令`)
+  }
+}
+
+function retryBatchFailed() {
+  if (!batchSummary.value || batchSummary.value.failed === 0) return
+  const failedIds = Object.entries(opStatus.value)
+    .filter(([, st]) => st.phase === 'failed')
+    .map(([id]) => id)
+  runBatchDelete(entries.value.filter((e) => failedIds.includes(e.id)))
+}
+
+function confirmBatchDelete() {
+  showBatchDeleteModal.value = false
+  runBatchDelete(selectedCommands.value)
+}
+
+function clearBatchSelection() {
+  selectedCommandIds.value = new Set()
+  opStatus.value = {}
+  batchSummary.value = null
 }
 
 async function copyContent(row: CommandEntry) {
@@ -164,7 +279,24 @@ async function copyContent(row: CommandEntry) {
 }
 
 const columns = [
-  { title: '名称', key: 'name', width: 170, ellipsis: { tooltip: true } },
+  {
+    // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
+    // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
+    type: 'selection' as const,
+    width: 40,
+    disabled: () => batchRunning.value,
+  },
+  {
+    title: '名称',
+    key: 'name',
+    width: 170,
+    ellipsis: { tooltip: true },
+    render: (r: CommandEntry) =>
+      h('div', null, [
+        h('span', null, r.name),
+        batchProgressNode(r),
+      ]),
+  },
   {
     title: 'Shell',
     key: 'shell',
@@ -268,6 +400,40 @@ onMounted(refresh)
         命令库在「推送命令」页面可直接选取套用。内置命令与管理员发布的共享命令对所有人可见，个人命令仅本人可见；使用次数高的排在前面。
       </p>
 
+      <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐行显示进度 -->
+      <div v-if="selectedCommandIds.size > 0" class="batch-bar">
+        <span class="batch-info">
+          已选 {{ selectedCommandIds.size }} 条
+          <span class="text-muted">（可删除 {{ batchDeletable.length }} 条）</span>
+        </span>
+        <NButton
+          size="small"
+          type="error"
+          secondary
+          :loading="batchRunning"
+          :disabled="batchRunning || batchDeletable.length === 0"
+          @click="showBatchDeleteModal = true"
+        >
+          批量删除
+        </NButton>
+        <NButton
+          v-if="batchSummary && batchSummary.failed > 0"
+          size="small"
+          type="warning"
+          secondary
+          :disabled="batchRunning"
+          @click="retryBatchFailed"
+        >
+          重试失败（{{ batchSummary.failed }}）
+        </NButton>
+        <span v-if="batchSummary" class="batch-summary">
+          成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}<span v-if="batchSummary.skipped > 0"> · 跳过 {{ batchSummary.skipped }}</span>
+        </span>
+        <NButton size="small" quaternary :disabled="batchRunning" @click="clearBatchSelection">
+          取消选择
+        </NButton>
+      </div>
+
       <!-- 常用命令库：辅助性小表格，限高不分页（AGENTS.md 8.2 例外） -->
       <NDataTable
         :columns="columns"
@@ -276,7 +442,9 @@ onMounted(refresh)
         size="small"
         :bordered="false"
         :row-key="(r: CommandEntry) => r.id"
+        :checked-row-keys="[...selectedCommandIds]"
         :max-height="360"
+        @update:checked-row-keys="onCommandChecked"
       >
         <template #empty>
           <NEmpty v-if="!loading" description="暂无常用命令，点击右上角新增" />
@@ -284,6 +452,41 @@ onMounted(refresh)
       </NDataTable>
     </NSpace>
   </NCard>
+
+  <!-- 批量删除二次确认（DESIGN.md §9.17：破坏性确认在弹窗内就地展开） -->
+  <NModal
+    v-model:show="showBatchDeleteModal"
+    preset="card"
+    :title="`批量删除常用命令（${batchDeletable.length} 条）`"
+    style="width: 520px"
+  >
+    <div class="batch-confirm-body">
+      <div class="batch-target-list">
+        <div
+          v-for="e in batchDeletable.slice(0, 5)"
+          :key="e.id"
+          class="batch-target-row"
+        >
+          {{ e.name }}
+        </div>
+        <div v-if="batchDeletable.length > 5" class="batch-target-row muted">
+          等 {{ batchDeletable.length - 5 }} 条…
+        </div>
+      </div>
+      <p v-if="selectedCommands.length > batchDeletable.length" class="field-hint">
+        其中 {{ selectedCommands.length - batchDeletable.length }} 条为他人创建的命令，无删除权限，将跳过不执行。
+      </p>
+      <p v-else class="field-hint">删除后命令无法恢复，请确认。</p>
+    </div>
+    <template #footer>
+      <NSpace justify="end">
+        <NButton @click="showBatchDeleteModal = false">取消</NButton>
+        <NButton type="error" :loading="batchRunning" @click="confirmBatchDelete">
+          确认删除
+        </NButton>
+      </NSpace>
+    </template>
+  </NModal>
 
   <NModal
     v-model:show="showEditor"
@@ -331,5 +534,91 @@ onMounted(refresh)
 .muted {
   color: var(--text-secondary);
   font-size: 13px;
+}
+
+// 批量操作栏（NetworkList.vue 同款）
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--n-color-modal);
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  padding: 8px 12px;
+  flex-shrink: 0;
+
+  .batch-info {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .text-muted {
+    color: var(--text-secondary);
+    font-weight: 400;
+  }
+
+  .batch-summary {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+}
+
+// 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口
+.batch-confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.batch-target-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 10px;
+
+  .batch-target-row {
+    padding: 3px 0;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &.muted {
+      color: var(--text-secondary);
+    }
+  }
+}
+
+.field-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+// 批量执行行内进度（NetworkList .op-progress 同款色板；render 函数由
+// NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透）。
+:deep(.batch-op-progress) {
+  font-size: 12px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  &.is-queued,
+  &.is-running {
+    color: #3b82f6;
+  }
+
+  &.is-done {
+    color: #059669;
+  }
+
+  &.is-failed {
+    color: #dc2626;
+  }
 }
 </style>

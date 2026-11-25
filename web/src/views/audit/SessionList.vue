@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import {
   NCard, NDataTable, NEmpty, NButton, NModal, NSpace, NTag,
   NPopconfirm, useMessage, NIcon, NPagination, NSpin, NSwitch,
@@ -21,6 +21,21 @@ const loading = ref(false)
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
+
+// ---- 批量结束 / 批量删除（范式见 NetworkList.vue） ----
+// 勾选按会话 id 存、跨页保留；执行期 3 路并发、逐行显示进度、失败可重试。
+// 服务端分页：全量行不在内存，勾选时把行快照进 selectedRows，批量执行才能
+// 覆盖跨页已选；切回某页时 load() 的数据会刷新快照里的 live 状态；
+// 跨页行的 live 快照可能过期，服务端会以真实状态拒绝（逐条记失败原因）。
+const selectedRows = ref(new Map<string, SessionRecord>())
+const selectedSessionIds = computed(() => new Set(selectedRows.value.keys()))
+const BATCH_CONCURRENCY = 3
+type BatchPhase = 'queued' | 'running' | 'done' | 'failed'
+const opStatus = ref<Record<string, { phase: BatchPhase; message?: string }>>({})
+const batchRunning = ref(false)
+const batchKind = ref<'close' | 'delete' | null>(null)
+const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+const showBatchDeleteModal = ref(false)
 
 // Replay modal & Player controls
 const showReplay = ref(false)
@@ -60,6 +75,13 @@ function fmtDuration(sec: number): string {
 }
 
 const columns = [
+  {
+    // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
+    // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
+    type: 'selection' as const,
+    width: 40,
+    disabled: () => batchRunning.value,
+  },
   { title: '主机', key: 'hostname', width: 150, ellipsis: { tooltip: true } },
   { title: '操作者', key: 'operator', width: 100 },
   {
@@ -67,9 +89,12 @@ const columns = [
     key: 'live',
     width: 80,
     render: (row: SessionRecord) =>
-      row.live
-        ? h(NTag, { type: 'success', size: 'small', round: true }, { default: () => '进行中' })
-        : h(NTag, { type: 'default', size: 'small', round: true }, { default: () => '已结束' }),
+      h('div', null, [
+        row.live
+          ? h(NTag, { type: 'success', size: 'small', round: true }, { default: () => '进行中' })
+          : h(NTag, { type: 'default', size: 'small', round: true }, { default: () => '已结束' }),
+        batchProgressNode(row),
+      ]),
   },
   { title: '开始时间', key: 'started_at', width: 170, render: (row: SessionRecord) => fmtDateTime(row.started_at) },
   { title: '结束时间', key: 'ended_at', width: 170, render: (row: SessionRecord) => fmtDateTime(row.ended_at) },
@@ -116,6 +141,16 @@ async function load() {
     const res = await listSessions({ offset: (page.value - 1) * pageSize.value, page_size: pageSize.value })
     sessions.value = res.data || []
     total.value = res.total || 0
+    // 切回某页时用最新数据刷新勾选快照里的 live 状态。
+    sessions.value.forEach((s) => {
+      if (selectedRows.value.has(s.id)) selectedRows.value.set(s.id, s)
+    })
+    // 刷新清掉上一批的旧进度；批量执行中不清除（runBatch 在执行完才刷新，
+    // 此时 batchRunning 仍为 true，进度得以保留到汇总展示）。
+    if (!batchRunning.value) {
+      opStatus.value = {}
+      batchSummary.value = null
+    }
   } catch (e: any) {
     message.error(e.message)
   } finally {
@@ -281,6 +316,7 @@ async function doClose(id: string) {
   try {
     await closeTerminal(id)
     message.success('会话已结束')
+    selectedRows.value.delete(id)
     load()
   } catch (e: any) {
     message.error(e.message)
@@ -291,6 +327,7 @@ async function doDelete(id: string) {
   try {
     await deleteSession(id)
     message.success('已删除')
+    selectedRows.value.delete(id)
     // If the last row on a non-first page was removed, step back a page.
     if (sessions.value.length === 1 && page.value > 1) {
       page.value -= 1
@@ -299,6 +336,123 @@ async function doDelete(id: string) {
   } catch (e: any) {
     message.error(e.message)
   }
+}
+
+// ---- 批量结束 / 批量删除（NetworkList.vue 范式：前端并发编排、复用单机接口） ----
+
+// 批量执行行内进度（NetworkList .op-progress 同款文案与色板）：render 函数由
+// NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透（见文末样式）。
+function batchProgressNode(row: { id: string }) {
+  const st = opStatus.value[row.id]
+  if (!st) return null
+  const text =
+    st.phase === 'queued' ? '排队中…'
+    : st.phase === 'running' ? '执行中…'
+    : st.phase === 'done' ? '已完成'
+    : `失败：${st.message || '执行出错'}`
+  return h('div', { class: ['batch-op-progress', `is-${st.phase}`], title: st.message || '' }, text)
+}
+
+const selectedSessions = computed(() => [...selectedRows.value.values()])
+// 只有进行中的会话能结束，单机「结束」按钮同款准入（见 columns 操作列）。
+// 跨页行的 live 取勾选时的快照，过期时由服务端最终校验、逐条记失败原因。
+const batchCloseable = computed(() => selectedSessions.value.filter((s) => s.live))
+
+function onSessionChecked(keys: (string | number)[]) {
+  const checked = new Set(keys.map((k) => String(k)))
+  sessions.value.forEach((s) => {
+    if (checked.has(s.id)) selectedRows.value.set(s.id, s)
+    else selectedRows.value.delete(s.id)
+  })
+}
+
+async function runBatch(kind: 'close' | 'delete', targets: SessionRecord[]) {
+  const eligible = kind === 'close' ? targets.filter((s) => s.live) : targets
+  const skipped = targets.length - eligible.length
+  if (eligible.length === 0) {
+    message.warning(kind === 'close' ? '所选会话中没有进行中的（只有进行中的会话能结束）' : '所选会话中没有可删除的')
+    return
+  }
+  batchRunning.value = true
+  batchKind.value = kind
+  batchSummary.value = null
+  opStatus.value = {}
+  eligible.forEach((s) => {
+    opStatus.value[s.id] = { phase: 'queued' }
+  })
+  let done = 0
+  let failed = 0
+  const queue = [...eligible]
+  async function worker() {
+    while (queue.length > 0) {
+      const session = queue.shift()!
+      opStatus.value[session.id] = { phase: 'running' }
+      try {
+        // 结束走既有关闭终端会话接口（AGENTS.md §8.5 第 9 条：只有会话
+        // 操作人或 admin 能调，越权时服务端 403、逐条记失败原因）；
+        // 删除与结束的审计走既有单机接口的审计，无需新埋点。
+        if (kind === 'close') await closeTerminal(session.id)
+        else await deleteSession(session.id)
+        opStatus.value[session.id] = { phase: 'done' }
+        done += 1
+      } catch (e: any) {
+        opStatus.value[session.id] = { phase: 'failed', message: e.message || '执行出错' }
+        failed += 1
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(BATCH_CONCURRENCY, eligible.length) }, () => worker()),
+  )
+  // 批量执行完再刷新列表（batchRunning 仍为 true，load 的清进度守卫不触发）。
+  // 删除成功后已删 id 从勾选中移除（服务端分页无法靠刷新核验远端是否存在，
+  // 成功即已知不存在）；结束成功后行保留在列表内，勾选不动。
+  if (kind === 'delete') {
+    Object.entries(opStatus.value).forEach(([id, st]) => {
+      if (st.phase === 'done') selectedRows.value.delete(id)
+    })
+  }
+  await load()
+  // 删空当前页时退回上一页，避免空白页（单机 doDelete 同款处理）。
+  if (sessions.value.length === 0 && page.value > 1) {
+    page.value -= 1
+    await load()
+  }
+  batchRunning.value = false
+  batchSummary.value = { done, failed, skipped }
+  const verb = kind === 'close' ? '结束' : '删除'
+  const skipText = skipped > 0 ? `，跳过 ${skipped} 条` : ''
+  if (failed === 0) {
+    message.success(`批量${verb}完成：成功 ${done} 条${skipText}`)
+  } else {
+    message.warning(`批量${verb}完成：成功 ${done} 条，失败 ${failed} 条${skipText}，可点「重试失败」只重跑失败的会话`)
+  }
+}
+
+function retryBatchFailed() {
+  if (!batchKind.value || !batchSummary.value || batchSummary.value.failed === 0) return
+  const failedIds = Object.entries(opStatus.value)
+    .filter(([, st]) => st.phase === 'failed')
+    .map(([id]) => id)
+  // 重试只重跑失败项：快照里有的直接取，当前页新出现失败行时以页内行为准。
+  const failedRows = sessions.value.filter((s) => failedIds.includes(s.id))
+  const snapshotRows = selectedSessions.value.filter((s) => failedIds.includes(s.id))
+  const merged = new Map<string, SessionRecord>()
+  snapshotRows.forEach((s) => merged.set(s.id, s))
+  failedRows.forEach((s) => merged.set(s.id, s))
+  runBatch(batchKind.value, [...merged.values()])
+}
+
+function confirmBatchDelete() {
+  showBatchDeleteModal.value = false
+  runBatch('delete', selectedSessions.value)
+}
+
+function clearBatchSelection() {
+  selectedRows.value.clear()
+  opStatus.value = {}
+  batchSummary.value = null
+  batchKind.value = null
 }
 
 onMounted(load)
@@ -324,6 +478,50 @@ onBeforeUnmount(() => {
       </NSpace>
     </div>
 
+    <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐行显示进度 -->
+    <div v-if="selectedSessionIds.size > 0" class="batch-bar">
+      <span class="batch-info">
+        已选 {{ selectedSessionIds.size }} 条会话
+        <span class="text-muted">（进行中 {{ batchCloseable.length }} 条）</span>
+      </span>
+      <NButton
+        size="small"
+        type="primary"
+        secondary
+        :loading="batchRunning && batchKind === 'close'"
+        :disabled="batchRunning || batchCloseable.length === 0"
+        @click="runBatch('close', selectedSessions)"
+      >
+        批量结束
+      </NButton>
+      <NButton
+        size="small"
+        type="error"
+        secondary
+        :loading="batchRunning && batchKind === 'delete'"
+        :disabled="batchRunning"
+        @click="showBatchDeleteModal = true"
+      >
+        批量删除
+      </NButton>
+      <NButton
+        v-if="batchSummary && batchSummary.failed > 0"
+        size="small"
+        type="warning"
+        secondary
+        :disabled="batchRunning"
+        @click="retryBatchFailed"
+      >
+        重试失败（{{ batchSummary.failed }}）
+      </NButton>
+      <span v-if="batchSummary" class="batch-summary">
+        成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}<span v-if="batchSummary.skipped > 0"> · 跳过 {{ batchSummary.skipped }}</span>
+      </span>
+      <NButton size="small" quaternary :disabled="batchRunning" @click="clearBatchSelection">
+        取消选择
+      </NButton>
+    </div>
+
     <NCard class="table-flex-fill">
       <NDataTable
         flex-height
@@ -332,6 +530,9 @@ onBeforeUnmount(() => {
         :bordered="false"
         size="small"
         :loading="loading"
+        :row-key="(row: SessionRecord) => row.id"
+        :checked-row-keys="[...selectedSessionIds]"
+        @update:checked-row-keys="onSessionChecked"
       >
         <template #empty>
           <NEmpty description="暂无会话记录。打开终端会话后，录像将自动出现在这里。" />
@@ -434,6 +635,38 @@ onBeforeUnmount(() => {
         </span>
       </div>
     </div>
+  </NModal>
+
+  <!-- 批量删除二次确认（DESIGN.md §9.17：破坏性确认在弹窗内就地展开） -->
+  <NModal
+    v-model:show="showBatchDeleteModal"
+    preset="card"
+    :title="`批量删除会话记录（${selectedSessions.length} 条）`"
+    style="width: 520px"
+  >
+    <div class="batch-confirm-body">
+      <div class="batch-target-list">
+        <div
+          v-for="s in selectedSessions.slice(0, 5)"
+          :key="s.id"
+          class="batch-target-row"
+        >
+          {{ s.hostname }} · {{ s.operator }} · {{ fmtDateTime(s.started_at) }}
+        </div>
+        <div v-if="selectedSessions.length > 5" class="batch-target-row muted">
+          等 {{ selectedSessions.length - 5 }} 条…
+        </div>
+      </div>
+      <p class="field-hint">删除后会话记录与录像无法恢复，请确认。</p>
+    </div>
+    <template #footer>
+      <NSpace justify="end">
+        <NButton @click="showBatchDeleteModal = false">取消</NButton>
+        <NButton type="error" :loading="batchRunning" @click="confirmBatchDelete">
+          确认删除
+        </NButton>
+      </NSpace>
+    </template>
   </NModal>
 </template>
 
@@ -581,6 +814,92 @@ onBeforeUnmount(() => {
   .skip-hint {
     color: #f59e0b;
     font-size: 12px;
+  }
+}
+
+// 批量操作栏（NetworkList.vue 同款）
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--n-color-modal);
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  padding: 8px 12px;
+  flex-shrink: 0;
+
+  .batch-info {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .text-muted {
+    color: var(--text-secondary);
+    font-weight: 400;
+  }
+
+  .batch-summary {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+}
+
+// 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口
+.batch-confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.batch-target-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 10px;
+
+  .batch-target-row {
+    padding: 3px 0;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &.muted {
+      color: var(--text-secondary);
+    }
+  }
+}
+
+.field-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+// 批量执行行内进度（NetworkList .op-progress 同款色板；render 函数由
+// NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透）。
+:deep(.batch-op-progress) {
+  font-size: 12px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  &.is-queued,
+  &.is-running {
+    color: #3b82f6;
+  }
+
+  &.is-done {
+    color: #059669;
+  }
+
+  &.is-failed {
+    color: #dc2626;
   }
 }
 </style>

@@ -89,6 +89,178 @@ const imageCount = computed(() => images.value.length)
 const { pagination: containerPagination } = useTablePagination({ pageSize: 20, rowCount: containerCount })
 const { pagination: imagePagination } = useTablePagination({ pageSize: 20, rowCount: imageCount })
 
+// ---- 批量操作：多选 + 前端并发编排（3 个同时），零后端改动，复用单机 dockerOp
+// （与 NetworkList.vue 同款范式：勾选按 key 跨页保留、状态列逐台显示进度、
+// 失败可重试、完成后给成功/失败汇总；审计走既有单机接口，无需新埋点）。
+// AGENTS.md §3.4 写容器支持批量操作，但本页此前并无勾选列——此处补齐。
+// NDataTable 的 checked-row-keys 由本页全量数据驱动，翻页不丢勾选。
+const BATCH_CONCURRENCY = 3
+type BatchOpPhase = 'queued' | 'running' | 'done' | 'failed'
+const opStatus = ref<Record<string, { phase: BatchOpPhase; message?: string }>>({})
+const batchRunning = ref(false)
+const batchKind = ref<'c-start' | 'c-stop' | 'c-rm' | 'i-rm' | null>(null)
+const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+
+// 容器 key：docker ps 的 Names 带前导 /，归一后作勾选 key 与进度 key。
+const containerKey = (row: any) => (row.Names || row.ID || '').replace(/^\//, '')
+const imageKey = (row: any) => row.ID || row.Id || `${row.Repository || ''}:${row.Tag || ''}`
+const checkedContainerKeys = ref<string[]>([])
+const checkedImageKeys = ref<string[]>([])
+
+const selectedContainers = computed(() => containers.value.filter((c) => checkedContainerKeys.value.includes(containerKey(c))))
+const selectedImages = computed(() => images.value.filter((i) => checkedImageKeys.value.includes(imageKey(i))))
+const isContainerRunning = (row: any) => row.Status?.includes('Up') || row.State === 'running'
+const batchContainerStartable = computed(() => selectedContainers.value.filter((c) => !isContainerRunning(c)))
+const batchContainerStoppable = computed(() => selectedContainers.value.filter((c) => isContainerRunning(c)))
+
+function clearContainerSelection() {
+  checkedContainerKeys.value = []
+  opStatus.value = {}
+  batchSummary.value = null
+  batchKind.value = null
+}
+
+function clearImageSelection() {
+  checkedImageKeys.value = []
+  opStatus.value = {}
+  batchSummary.value = null
+  batchKind.value = null
+}
+
+function isOpBusy(key: string) {
+  const st = opStatus.value[key]
+  return !!st && (st.phase === 'queued' || st.phase === 'running')
+}
+
+// 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突
+function rowClassName(row: any) {
+  const key = row.Names !== undefined ? `c:${containerKey(row)}` : `i:${imageKey(row)}`
+  return isOpBusy(key) ? 'batch-row-busy' : ''
+}
+
+function pruneSelections() {
+  const aliveC = new Set(containers.value.map((c) => containerKey(c)))
+  checkedContainerKeys.value = checkedContainerKeys.value.filter((k) => aliveC.has(k))
+  const aliveI = new Set(images.value.map((i) => imageKey(i)))
+  checkedImageKeys.value = checkedImageKeys.value.filter((k) => aliveI.has(k))
+}
+
+// NDataTable 的勾选回调给 string | number 混型 key，本页 row-key 全是 string。
+function onCheckedContainerKeysChange(keys: (string | number)[]) {
+  checkedContainerKeys.value = keys.map(String)
+}
+
+function onCheckedImageKeysChange(keys: (string | number)[]) {
+  checkedImageKeys.value = keys.map(String)
+}
+
+// 逐台并发执行器：容器启停/删除与镜像删除共用。每台独立链路，失败一台不影响其他。
+// keyFn 把行映射为进度 key（c:容器名 / i:镜像 ID），fn 复用单机 dockerOp。
+async function runBatchPerRow<T>(
+  kind: 'c-start' | 'c-stop' | 'c-rm' | 'i-rm',
+  targets: T[],
+  keyFn: (row: T) => string,
+  fn: (row: T) => Promise<unknown>,
+  after: () => Promise<void>,
+  // skipped 由调用方按「已选 − 本轮目标」传入；重试只重跑失败行、传 0，
+  // 不把上一轮已成功的计为跳过。
+  skipped = 0,
+) {
+  if (targets.length === 0) {
+    message.warning('所选行中没有可执行的目标')
+    return
+  }
+  batchRunning.value = true
+  batchKind.value = kind
+  batchSummary.value = null
+  opStatus.value = {}
+  targets.forEach((row) => {
+    opStatus.value[keyFn(row)] = { phase: 'queued' }
+  })
+  let done = 0
+  let failed = 0
+  const queue = [...targets]
+  async function worker() {
+    while (queue.length > 0) {
+      const row = queue.shift()!
+      const key = keyFn(row)
+      opStatus.value[key] = { phase: 'running' }
+      try {
+        await fn(row)
+        opStatus.value[key] = { phase: 'done' }
+        done += 1
+      } catch (e: any) {
+        opStatus.value[key] = { phase: 'failed', message: e.message || '执行出错' }
+        failed += 1
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(BATCH_CONCURRENCY, queue.length) }, () => worker()),
+  )
+  batchRunning.value = false
+  batchSummary.value = { done, failed, skipped }
+  const verb = { 'c-start': '启动', 'c-stop': '停止', 'c-rm': '删除', 'i-rm': '删除' }[kind]
+  const skipText = skipped > 0 ? `，跳过 ${skipped} 个` : ''
+  if (failed === 0) {
+    message.success(`批量${verb}完成：成功 ${done} 个${skipText}`)
+  } else {
+    message.warning(`批量${verb}完成：成功 ${done} 个，失败 ${failed} 个${skipText}，可点「重试失败」只重跑失败的行`)
+  }
+  await after()
+  pruneSelections()
+}
+
+function retryBatchFailed() {
+  if (!batchKind.value || !batchSummary.value || batchSummary.value.failed === 0) return
+  const kind = batchKind.value
+  const failedKeys = new Set(
+    Object.entries(opStatus.value)
+      .filter(([, st]) => st.phase === 'failed')
+      .map(([k]) => k),
+  )
+  if (kind === 'c-start' || kind === 'c-stop' || kind === 'c-rm') {
+    const op = kind.slice(2)
+    const targets = containers.value.filter((c) => failedKeys.has(`c:${containerKey(c)}`))
+    if (targets.length === 0) return
+    runBatchPerRow(kind, targets, (c) => `c:${containerKey(c)}`,
+      (c) => dockerOp(hostId, op, c.Names || c.ID), () => loadAll())
+  } else {
+    const targets = images.value.filter((i) => failedKeys.has(`i:${imageKey(i)}`))
+    if (targets.length === 0) return
+    runBatchPerRow('i-rm', targets, (i) => `i:${imageKey(i)}`,
+      (i) => dockerOp(hostId, 'remove_image', '', i.ID || i.Id), () => loadImages())
+  }
+}
+
+// ---- 容器批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17）
+const showBatchRmModal = ref(false)
+
+function openBatchRmModal() {
+  showBatchRmModal.value = true
+}
+
+async function confirmBatchRm() {
+  showBatchRmModal.value = false
+  await runBatchPerRow('c-rm', selectedContainers.value,
+    (c) => `c:${containerKey(c)}`,
+    (c) => dockerOp(hostId, 'rm', c.Names || c.ID), () => loadAll())
+}
+
+// ---- 镜像批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17）
+const showBatchImageRmModal = ref(false)
+
+function openBatchImageRmModal() {
+  showBatchImageRmModal.value = true
+}
+
+async function confirmBatchImageRm() {
+  showBatchImageRmModal.value = false
+  await runBatchPerRow('i-rm', selectedImages.value,
+    (i) => `i:${imageKey(i)}`,
+    (i) => dockerOp(hostId, 'remove_image', '', i.ID || i.Id), () => loadImages())
+}
+
 // Container Terminal Modal state
 const showContainerTerm = ref(false)
 const targetContainer = ref('')
@@ -134,6 +306,8 @@ async function loadAll() {
     }
   } finally {
     loading.value = false
+    // 刷新后清掉已不存在的行勾选，避免批量操作带上幽灵 key
+    pruneSelections()
   }
 }
 
@@ -584,6 +758,11 @@ function localizeContainerStatus(status: string): string {
 
 const containerColumns = [
   {
+    type: 'selection' as const,
+    width: 40,
+    disabled: () => batchRunning.value,
+  },
+  {
     title: '名称',
     key: 'Names',
     width: 140,
@@ -606,7 +785,7 @@ const containerColumns = [
     width: 180,
     render: (row: any) => {
       const running = row.Status?.includes('Up') || row.State === 'running'
-      return h(
+      const tag = h(
         NTag,
         { type: running ? 'success' : 'default', size: 'small', round: true, class: 'container-status-tag' },
         {
@@ -614,6 +793,24 @@ const containerColumns = [
             h(NEllipsis, { tooltip: true }, { default: () => localizeContainerStatus(row.Status || row.State || '') }),
         },
       )
+      // 批量进度：执行期间状态格下方逐台显示当前阶段，失败时显示原因（悬停看全文）
+      const op = opStatus.value[`c:${containerKey(row)}`]
+      if (!op) return tag
+      const text = op.phase === 'queued'
+        ? '排队中…'
+        : op.phase === 'running'
+          ? '执行中…'
+          : op.phase === 'done'
+            ? '已完成'
+            : `失败：${op.message || '执行出错'}`
+      const color = op.phase === 'done' ? '#059669' : op.phase === 'failed' ? '#dc2626' : '#3b82f6'
+      return h('div', { style: 'display: flex; flex-direction: column; gap: 2px; min-width: 0;' }, [
+        tag,
+        h('span', {
+          style: `font-size: 12px; color: ${color}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;`,
+          title: op.message || '',
+        }, text),
+      ])
     },
   },
   { title: '端口', key: 'Ports', ellipsis: { tooltip: true } },
@@ -691,6 +888,11 @@ const containerColumns = [
 ]
 
 const imageColumns = [
+  {
+    type: 'selection' as const,
+    width: 40,
+    disabled: () => batchRunning.value,
+  },
   { title: '仓库', key: 'Repository', ellipsis: { tooltip: true } },
   { title: '标签', key: 'Tag', width: 100 },
   { title: 'ID', key: 'ID', width: 80, ellipsis: { tooltip: true } },
@@ -701,12 +903,32 @@ const imageColumns = [
     width: 90,
     render: (row: any) => {
       // 使用状态取数失败时显示 —：宁可未知，不把镜像错标成未使用。
+      let usage: any
       if (!usageLoaded.value) {
-        return h('span', { style: 'color: var(--text-color-3)' }, '—')
+        usage = h('span', { style: 'color: var(--text-color-3)' }, '—')
+      } else {
+        usage = imageUsed(row)
+          ? h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => '使用中' })
+          : h(NTag, { size: 'small', bordered: false }, { default: () => '未使用' })
       }
-      return imageUsed(row)
-        ? h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => '使用中' })
-        : h(NTag, { size: 'small', bordered: false }, { default: () => '未使用' })
+      // 批量进度：执行期间状态格下方逐台显示当前阶段，失败时显示原因（悬停看全文）
+      const op = opStatus.value[`i:${imageKey(row)}`]
+      if (!op) return usage
+      const text = op.phase === 'queued'
+        ? '排队中…'
+        : op.phase === 'running'
+          ? '执行中…'
+          : op.phase === 'done'
+            ? '已完成'
+            : `失败：${op.message || '执行出错'}`
+      const color = op.phase === 'done' ? '#059669' : op.phase === 'failed' ? '#dc2626' : '#3b82f6'
+      return h('div', { style: 'display: flex; flex-direction: column; gap: 2px; min-width: 0;' }, [
+        usage,
+        h('span', {
+          style: `font-size: 12px; color: ${color}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;`,
+          title: op.message || '',
+        }, text),
+      ])
     },
   },
   {
@@ -826,15 +1048,71 @@ onMounted(() => {
                     一键安装 Docker
                   </NButton>
                 </NSpace>
+                <!-- 容器批量操作栏：有勾选时出现，执行期间按钮禁用、状态列逐台显示进度 -->
+                <div v-if="checkedContainerKeys.length > 0" class="batch-bar">
+                  <span class="batch-info">
+                    已选 {{ checkedContainerKeys.length }} 个容器
+                    <span class="text-muted">（可启动 {{ batchContainerStartable.length }} · 可停止 {{ batchContainerStoppable.length }}）</span>
+                  </span>
+                  <NButton
+                    size="small"
+                    type="primary"
+                    secondary
+                    :loading="batchRunning && batchKind === 'c-start'"
+                    :disabled="batchRunning || batchContainerStartable.length === 0"
+                    @click="runBatchPerRow('c-start', batchContainerStartable, (c) => `c:${containerKey(c)}`, (c) => dockerOp(hostId, 'start', c.Names || c.ID), () => loadAll(), selectedContainers.length - batchContainerStartable.length)"
+                  >
+                    批量启动
+                  </NButton>
+                  <NButton
+                    size="small"
+                    type="primary"
+                    secondary
+                    :loading="batchRunning && batchKind === 'c-stop'"
+                    :disabled="batchRunning || batchContainerStoppable.length === 0"
+                    @click="runBatchPerRow('c-stop', batchContainerStoppable, (c) => `c:${containerKey(c)}`, (c) => dockerOp(hostId, 'stop', c.Names || c.ID), () => loadAll(), selectedContainers.length - batchContainerStoppable.length)"
+                  >
+                    批量停止
+                  </NButton>
+                  <NButton
+                    size="small"
+                    type="error"
+                    secondary
+                    :disabled="batchRunning"
+                    @click="openBatchRmModal"
+                  >
+                    批量删除
+                  </NButton>
+                  <NButton
+                    v-if="batchSummary && batchSummary.failed > 0"
+                    size="small"
+                    type="warning"
+                    secondary
+                    :disabled="batchRunning"
+                    @click="retryBatchFailed"
+                  >
+                    重试失败（{{ batchSummary.failed }}）
+                  </NButton>
+                  <span v-if="batchSummary" class="batch-summary">
+                    成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}<span v-if="batchSummary.skipped > 0"> · 跳过 {{ batchSummary.skipped }}</span>
+                  </span>
+                  <NButton size="small" quaternary :disabled="batchRunning" @click="clearContainerSelection">
+                    取消选择
+                  </NButton>
+                </div>
                 <NDataTable
                   flex-height
                   :columns="containerColumns"
                   :data="containers"
+                  :row-key="(row: any) => containerKey(row)"
+                  :checked-row-keys="checkedContainerKeys"
+                  :row-class-name="rowClassName"
                   :pagination="containerPagination"
                   :bordered="false"
                   size="small"
                   :loading="loading"
-                  :scroll-x="900"
+                  :scroll-x="940"
+                  @update:checked-row-keys="onCheckedContainerKeysChange"
                 >
                   <template #empty>无容器或 Docker 未运行</template>
                 </NDataTable>
@@ -883,14 +1161,49 @@ onMounted(() => {
                     镜像加速
                   </NButton>
                 </NSpace>
+                <!-- 镜像批量操作栏：有勾选时出现；清理悬空镜像仍走工具栏的单按钮 -->
+                <div v-if="checkedImageKeys.length > 0" class="batch-bar">
+                  <span class="batch-info">
+                    已选 {{ checkedImageKeys.length }} 个镜像
+                  </span>
+                  <NButton
+                    size="small"
+                    type="error"
+                    secondary
+                    :disabled="batchRunning"
+                    @click="openBatchImageRmModal"
+                  >
+                    批量删除
+                  </NButton>
+                  <NButton
+                    v-if="batchSummary && batchSummary.failed > 0"
+                    size="small"
+                    type="warning"
+                    secondary
+                    :disabled="batchRunning"
+                    @click="retryBatchFailed"
+                  >
+                    重试失败（{{ batchSummary.failed }}）
+                  </NButton>
+                  <span v-if="batchSummary" class="batch-summary">
+                    成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}<span v-if="batchSummary.skipped > 0"> · 跳过 {{ batchSummary.skipped }}</span>
+                  </span>
+                  <NButton size="small" quaternary :disabled="batchRunning" @click="clearImageSelection">
+                    取消选择
+                  </NButton>
+                </div>
                 <NDataTable
                   flex-height
                   :columns="imageColumns"
                   :data="images"
+                  :row-key="(row: any) => imageKey(row)"
+                  :checked-row-keys="checkedImageKeys"
+                  :row-class-name="rowClassName"
                   :pagination="imagePagination"
                   :bordered="false"
                   size="small"
                   :loading="loading"
+                  @update:checked-row-keys="onCheckedImageKeysChange"
                 >
                   <template #empty>无镜像或 Docker 未运行</template>
                 </NDataTable>
@@ -996,6 +1309,42 @@ onMounted(() => {
           </NButton>
         </NSpace>
       </template>
+    </NModal>
+
+    <!-- 容器批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17） -->
+    <NModal
+      v-model:show="showBatchRmModal"
+      preset="dialog"
+      title="批量删除容器"
+      positive-text="删除"
+      negative-text="取消"
+      type="error"
+      @positive-click="confirmBatchRm"
+    >
+      <NSpace vertical :size="12">
+        <div>确定删除以下 {{ selectedContainers.length }} 个容器吗？数据不可恢复。</div>
+        <div class="batch-rm-list">
+          <div v-for="c in selectedContainers" :key="containerKey(c)">{{ containerKey(c) }}</div>
+        </div>
+      </NSpace>
+    </NModal>
+
+    <!-- 镜像批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17） -->
+    <NModal
+      v-model:show="showBatchImageRmModal"
+      preset="dialog"
+      title="批量删除镜像"
+      positive-text="删除"
+      negative-text="取消"
+      type="error"
+      @positive-click="confirmBatchImageRm"
+    >
+      <NSpace vertical :size="12">
+        <div>确定删除以下 {{ selectedImages.length }} 个镜像吗？被容器引用的镜像删除会失败、记为失败，可稍后重试。</div>
+        <div class="batch-rm-list">
+          <div v-for="i in selectedImages" :key="imageKey(i)">{{ i.Repository }}:{{ i.Tag }}</div>
+        </div>
+      </NSpace>
     </NModal>
 
     <!-- Docker 深度清理弹窗 -->
@@ -1118,6 +1467,54 @@ onMounted(() => {
   :deep(.n-data-table) {
     flex: 1;
     min-height: 0;
+  }
+}
+
+/* 批量操作栏：有勾选时出现，贴在工具栏下方、表格上方（与 NetworkList.vue 同款） */
+.batch-bar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--n-color-modal);
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  padding: 8px 12px;
+
+  .batch-info {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+
+    .text-muted {
+      color: var(--n-text-color-3);
+      font-size: 12px;
+      font-weight: 400;
+    }
+  }
+
+  .batch-summary {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+}
+
+.batch-rm-list {
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 13px;
+  color: var(--text-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突 */
+:deep(.batch-row-busy) {
+  .n-button {
+    pointer-events: none;
+    opacity: 0.5;
   }
 }
 

@@ -161,12 +161,141 @@ watch(filteredEvents, (list) => {
   if (page.value > maxPage) page.value = maxPage
 })
 
+// ---- 批量确认 / 批量删除（范式见 NetworkList.vue） ----
+// 勾选按消息 id 存、跨页保留；执行期 3 路并发、逐行显示进度、失败可重试。
+const selectedEventIds = ref<Set<string>>(new Set())
+const BATCH_CONCURRENCY = 3
+type BatchPhase = 'queued' | 'running' | 'done' | 'failed'
+const opStatus = ref<Record<string, { phase: BatchPhase; message?: string }>>({})
+const batchRunning = ref(false)
+const batchKind = ref<'ack' | 'delete' | null>(null)
+const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+const showBatchDeleteModal = ref(false)
+
+const selectedEvents = computed(() => notifStore.events.filter((e) => selectedEventIds.value.has(e.id)))
+// 已恢复的消息无需再次确认，单机「解决」按钮同款准入（见 eventColumns 操作列）。
+const batchAckable = computed(() => selectedEvents.value.filter((e) => !e.resolved))
+
+// 当前页消息（前端分页切片）：勾选同步以当前页为基准合并，跨页已选保持不变。
+const pagedEvents = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return filteredEvents.value.slice(start, start + pageSize.value)
+})
+
+function onEventChecked(keys: (string | number)[]) {
+  const pageIds = new Set(pagedEvents.value.map((e) => e.id))
+  const next = new Set([...selectedEventIds.value].filter((id) => !pageIds.has(id)))
+  keys.forEach((k) => {
+    if (pageIds.has(String(k))) next.add(String(k))
+  })
+  selectedEventIds.value = next
+}
+
+// 消息在 store 里消失（被删除或被清空）后清理对应的勾选与进度。
+watch(() => notifStore.events, (list) => {
+  const alive = new Set(list.map((e) => e.id))
+  selectedEventIds.value = new Set([...selectedEventIds.value].filter((id) => alive.has(id)))
+  Object.keys(opStatus.value).forEach((id) => {
+    if (!alive.has(id)) delete opStatus.value[id]
+  })
+})
+
+// 批量执行行内进度（NetworkList .op-progress 同款文案与色板）：render 函数由
+// NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透（见文末样式）。
+function batchProgressNode(row: { id: string }) {
+  const st = opStatus.value[row.id]
+  if (!st) return null
+  const text =
+    st.phase === 'queued' ? '排队中…'
+    : st.phase === 'running' ? '执行中…'
+    : st.phase === 'done' ? '已完成'
+    : `失败：${st.message || '执行出错'}`
+  return h('div', { class: ['batch-op-progress', `is-${st.phase}`], title: st.message || '' }, text)
+}
+
+async function runBatch(kind: 'ack' | 'delete', targets: AlertEvent[]) {
+  const eligible = kind === 'ack'
+    ? targets.filter((e) => !e.resolved)
+    : targets
+  const skipped = targets.length - eligible.length
+  if (eligible.length === 0) {
+    message.warning(kind === 'ack' ? '所选消息中没有待确认的（均为已恢复）' : '所选消息中没有可删除的')
+    return
+  }
+  batchRunning.value = true
+  batchKind.value = kind
+  batchSummary.value = null
+  opStatus.value = {}
+  eligible.forEach((e) => {
+    opStatus.value[e.id] = { phase: 'queued' }
+  })
+  let done = 0
+  let failed = 0
+  const queue = [...eligible]
+  async function worker() {
+    while (queue.length > 0) {
+      const event = queue.shift()!
+      opStatus.value[event.id] = { phase: 'running' }
+      try {
+        // 复用单机确认/删除接口（notifStore.markAsRead / removeEvent），
+        // 审计走既有单机接口的审计，无需新埋点。
+        if (kind === 'ack') await notifStore.markAsRead(event.id)
+        else await notifStore.removeEvent(event.id)
+        opStatus.value[event.id] = { phase: 'done' }
+        done += 1
+      } catch (e: any) {
+        opStatus.value[event.id] = { phase: 'failed', message: e.message || '执行出错' }
+        failed += 1
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(BATCH_CONCURRENCY, eligible.length) }, () => worker()),
+  )
+  batchRunning.value = false
+  batchSummary.value = { done, failed, skipped }
+  const verb = kind === 'ack' ? '确认' : '删除'
+  const skipText = skipped > 0 ? `，跳过 ${skipped} 条` : ''
+  if (failed === 0) {
+    message.success(`批量${verb}完成：成功 ${done} 条${skipText}`)
+  } else {
+    message.warning(`批量${verb}完成：成功 ${done} 条，失败 ${failed} 条${skipText}，可点「重试失败」只重跑失败的消息`)
+  }
+}
+
+function retryBatchFailed() {
+  if (!batchKind.value || !batchSummary.value || batchSummary.value.failed === 0) return
+  const failedIds = Object.entries(opStatus.value)
+    .filter(([, st]) => st.phase === 'failed')
+    .map(([id]) => id)
+  runBatch(batchKind.value, notifStore.events.filter((e) => failedIds.includes(e.id)))
+}
+
+function confirmBatchDelete() {
+  showBatchDeleteModal.value = false
+  runBatch('delete', selectedEvents.value)
+}
+
+function clearBatchSelection() {
+  selectedEventIds.value = new Set()
+  opStatus.value = {}
+  batchSummary.value = null
+  batchKind.value = null
+}
+
 function handlePageSizeChange(ps: number) {
   pageSize.value = ps
   page.value = 1
 }
 
 const eventColumns = computed<DataTableColumns<AlertEvent>>(() => [
+  {
+    // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
+    // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
+    type: 'selection',
+    width: 40,
+    disabled: () => batchRunning.value,
+  },
   {
     title: '级别',
     key: 'severity',
@@ -242,9 +371,12 @@ const eventColumns = computed<DataTableColumns<AlertEvent>>(() => [
     key: 'resolved',
     width: 80,
     render: (e) =>
-      h(NTag, { type: e.resolved ? 'default' : 'error', size: 'small', round: true }, {
-        default: () => (e.resolved ? '已恢复' : '告警中'),
-      }),
+      h('div', null, [
+        h(NTag, { type: e.resolved ? 'default' : 'error', size: 'small', round: true }, {
+          default: () => (e.resolved ? '已恢复' : '告警中'),
+        }),
+        batchProgressNode(e),
+      ]),
   },
   {
     title: '操作',
@@ -427,6 +559,12 @@ async function loadWebhook() {
 
 async function refreshAll() {
   loading.value = true
+  // 手动刷新清掉上一批的旧进度；批量执行中不清除（执行完不调 refreshAll，
+  // 进度得以保留到汇总展示）。
+  if (!batchRunning.value) {
+    opStatus.value = {}
+    batchSummary.value = null
+  }
   await Promise.all([notifStore.fetchEvents(), loadRules(), loadWebhook()])
   loading.value = false
 }
@@ -762,6 +900,50 @@ onMounted(() => {
               </div>
             </div>
 
+            <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐行显示进度 -->
+            <div v-if="selectedEventIds.size > 0" class="batch-bar">
+              <span class="batch-info">
+                已选 {{ selectedEventIds.size }} 条
+                <span class="text-muted">（待确认 {{ batchAckable.length }} 条）</span>
+              </span>
+              <NButton
+                size="small"
+                type="primary"
+                secondary
+                :loading="batchRunning && batchKind === 'ack'"
+                :disabled="batchRunning || batchAckable.length === 0"
+                @click="runBatch('ack', selectedEvents)"
+              >
+                批量确认
+              </NButton>
+              <NButton
+                size="small"
+                type="error"
+                secondary
+                :loading="batchRunning && batchKind === 'delete'"
+                :disabled="batchRunning"
+                @click="showBatchDeleteModal = true"
+              >
+                批量删除
+              </NButton>
+              <NButton
+                v-if="batchSummary && batchSummary.failed > 0"
+                size="small"
+                type="warning"
+                secondary
+                :disabled="batchRunning"
+                @click="retryBatchFailed"
+              >
+                重试失败（{{ batchSummary.failed }}）
+              </NButton>
+              <span v-if="batchSummary" class="batch-summary">
+                成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}<span v-if="batchSummary.skipped > 0"> · 跳过 {{ batchSummary.skipped }}</span>
+              </span>
+              <NButton size="small" quaternary :disabled="batchRunning" @click="clearBatchSelection">
+                取消选择
+              </NButton>
+            </div>
+
             <!-- Events List Table：表头与分页固定，仅数据区滚动（AGENTS.md 8.2） -->
             <div class="table-card table-flex-fill">
               <NDataTable
@@ -772,8 +954,10 @@ onMounted(() => {
                 :bordered="false"
                 size="small"
                 :row-key="(e: AlertEvent) => e.id"
+                :checked-row-keys="[...selectedEventIds]"
                 :row-class-name="(e: AlertEvent) => (e.resolved ? '' : 'unread-row')"
                 :scroll-x="1000"
+                @update:checked-row-keys="onEventChecked"
               >
                 <template #empty>
                   <NEmpty description="暂无符合条件的消息通知" />
@@ -928,6 +1112,38 @@ onMounted(() => {
         </NTabPane>
       </NTabs>
     </div>
+
+    <!-- 批量删除二次确认（DESIGN.md §9.17：破坏性确认在弹窗内就地展开） -->
+    <NModal
+      v-model:show="showBatchDeleteModal"
+      preset="card"
+      :title="`批量删除消息（${selectedEvents.length} 条）`"
+      style="width: 520px"
+    >
+      <div class="batch-confirm-body">
+        <div class="batch-target-list">
+          <div
+            v-for="e in selectedEvents.slice(0, 5)"
+            :key="e.id"
+            class="batch-target-row"
+          >
+            {{ e.message || e.rule_name || e.id }}
+          </div>
+          <div v-if="selectedEvents.length > 5" class="batch-target-row muted">
+            等 {{ selectedEvents.length - 5 }} 条…
+          </div>
+        </div>
+        <p class="field-hint">删除后消息记录无法恢复，请确认。</p>
+      </div>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showBatchDeleteModal = false">取消</NButton>
+          <NButton type="error" :loading="batchRunning" @click="confirmBatchDelete">
+            确认删除
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
 
     <!-- Rule modal -->
     <NModal
@@ -1346,6 +1562,93 @@ onMounted(() => {
         }
       }
     }
+  }
+}
+
+// 批量操作栏（NetworkList.vue 同款）
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--n-color-modal);
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+
+  .batch-info {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .text-muted {
+    color: var(--text-secondary);
+    font-weight: 400;
+  }
+
+  .batch-summary {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+}
+
+// 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口
+.batch-confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.batch-target-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 10px;
+
+  .batch-target-row {
+    padding: 3px 0;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &.muted {
+      color: var(--text-secondary);
+    }
+  }
+}
+
+.field-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+// 批量执行行内进度（NetworkList .op-progress 同款色板；render 函数由
+// NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透）。
+:deep(.batch-op-progress) {
+  font-size: 12px;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  &.is-queued,
+  &.is-running {
+    color: #3b82f6;
+  }
+
+  &.is-done {
+    color: #059669;
+  }
+
+  &.is-failed {
+    color: #dc2626;
   }
 }
 </style>

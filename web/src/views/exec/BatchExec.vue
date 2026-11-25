@@ -269,7 +269,14 @@ function applyRouteQuery() {
   if (route.query.shell) {
     shell.value = String(route.query.shell)
   }
-  if (route.query.host_id) {
+  if (route.query.host_ids) {
+    // 多台：逗号分隔的 id 列表；已知离线的主机不预选（离线不可执行）
+    const ids = String(route.query.host_ids).split(',').map((s) => s.trim()).filter(Boolean)
+    selectedHostIds.value = ids.filter((id) => {
+      const t = hosts.value.find((h) => h.id === id)
+      return t && t.status === 'online'
+    })
+  } else if (route.query.host_id) {
     const hid = String(route.query.host_id)
     // 已知离线的主机不预选（离线不可执行）
     const target = hosts.value.find((h) => h.id === hid)

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { h, onMounted, ref } from 'vue'
+import { computed, h, onMounted, ref } from 'vue'
 import {
   NButton,
   NCard,
@@ -137,6 +137,9 @@ function riskTag(risk: string) {
 }
 
 const columns: DataTableColumns<AuditEntry> = [
+  // 批量勾选列：NDataTable 勾选列宽 40px（BatchExec.vue 同款；28px 是
+  // DESIGN.md §9.20 自定义行列表的口径，NDataTable 复选框 + 单元格内边距放不下）。
+  { type: 'selection', width: 40 },
   {
     title: '时间',
     key: 'timestamp',
@@ -255,6 +258,8 @@ async function load() {
 
 function search() {
   page.value = 1
+  // 筛选条件变化：已勾选的行可能已不在结果集内，按口径清空勾选
+  clearSelection()
   load()
 }
 
@@ -265,6 +270,7 @@ function resetFilters() {
   filterRisk.value = ''
   filterRange.value = null
   page.value = 1
+  clearSelection()
   load()
 }
 
@@ -276,6 +282,80 @@ function handlePageChange(p: number) {
 function exportCSV() {
   const url = auditExportUrl(buildQuery(0))
   window.open(url, '_blank')
+}
+
+// ---- 批量导出（只导出已勾选的行，不做批量删除）-------------------------
+// 服务端导出接口只支持时间范围等过滤、不支持按 id 导出，故批量导出在
+// 前端对已选行生成 CSV；字段口径与服务端 ToCSV 完全一致（原始 action 码
+// 与字段值，不做中文翻译；user_agent 不进导出列）。
+// 勾选按 id 跨页保留：服务端分页下当前页只渲染本页勾选态，翻页不丢已选；
+// 筛选条件变化时清空（search/resetFilters 里调 clearSelection）。
+const selectedEntries = ref(new Map<string, AuditEntry>())
+const selectedCount = computed(() => selectedEntries.value.size)
+const pageCheckedKeys = computed(() =>
+  entries.value.filter((e) => selectedEntries.value.has(e.id)).map((e) => e.id),
+)
+
+function onCheckedRowKeys(keys: Array<string | number>) {
+  const keySet = new Set(keys.map((k) => String(k)))
+  entries.value.forEach((e) => {
+    if (keySet.has(e.id)) selectedEntries.value.set(e.id, e)
+    else selectedEntries.value.delete(e.id)
+  })
+}
+
+function clearSelection() {
+  selectedEntries.value.clear()
+}
+
+// 服务端 ToCSV 同款字段引用规则：含逗号/引号/换行才加引号，引号双写。
+function csvField(s: string): string {
+  if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+    return '"' + s.replaceAll('"', '""') + '"'
+  }
+  return s
+}
+
+// 服务端导出时间取 RFC3339（秒级）：去掉列表接口可能带的小数秒，保留原时区偏移。
+function csvTimestamp(ts: string): string {
+  return ts.replace(/\.\d+/, '')
+}
+
+function exportSelectedCSV() {
+  if (selectedEntries.value.size === 0) return
+  const header = 'id,timestamp,username,action,target_type,target_id,risk_level,result,ip,detail'
+  const rows = [...selectedEntries.value.values()].sort((a, b) =>
+    a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
+  )
+  const lines = rows.map((e) =>
+    [
+      e.id,
+      csvTimestamp(e.timestamp),
+      e.username,
+      e.action,
+      e.target_type,
+      e.target_id || '',
+      e.risk_level,
+      e.result,
+      e.ip || '',
+      e.detail || '',
+    ]
+      .map(csvField)
+      .join(','),
+  )
+  // UTF-8 BOM，与服务端导出一致，保证 Excel 打开中文不乱码。
+  const blob = new Blob(['\uFEFF' + header + '\n' + lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  const now = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  a.href = url
+  a.download = `watchman-audit-selected-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.csv`
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+  message.success(`已导出 ${rows.length} 条勾选记录`)
 }
 
 function showDetail(row: AuditEntry) {
@@ -342,6 +422,21 @@ onMounted(load)
       <NButton size="small" @click="resetFilters">重置</NButton>
     </div>
 
+    <!-- 批量操作栏：有勾选时出现，只做批量导出（批量删审计是高危操作，明确排除） -->
+    <div v-if="selectedCount > 0" class="batch-bar">
+      <span class="batch-info">
+        已选 {{ selectedCount }} 条
+        <span class="batch-sub">（勾选跨页保留，切换筛选条件会清空）</span>
+      </span>
+      <NButton size="small" type="primary" @click="exportSelectedCSV">
+        <template #icon><NIcon><DownloadOutline /></NIcon></template>
+        导出选中（{{ selectedCount }} 条）
+      </NButton>
+      <NButton size="small" quaternary @click="clearSelection">
+        取消选择
+      </NButton>
+    </div>
+
     <!-- Table：表头与分页固定，仅数据区滚动（AGENTS.md 8.2） -->
     <NCard size="small" class="table-card table-flex-fill">
       <NDataTable
@@ -351,8 +446,11 @@ onMounted(load)
         :loading="loading"
         :bordered="false"
         size="small"
-        :row-props="(row: AuditEntry) => ({ style: 'cursor: pointer', onClick: () => showDetail(row) })"
-        :scroll-x="1130"
+        :row-key="(row: AuditEntry) => row.id"
+        :checked-row-keys="pageCheckedKeys"
+        :row-props="(row: AuditEntry) => ({ style: 'cursor: pointer', onClick: (e: MouseEvent) => { if ((e.target as HTMLElement).closest('.n-checkbox')) return; showDetail(row) } })"
+        :scroll-x="1170"
+        @update:checked-row-keys="onCheckedRowKeys"
       />
       <div class="table-pagination-bar">
         <NPagination
@@ -448,6 +546,31 @@ onMounted(load)
     &.stat-fail .stat-value {
       color: #f59e0b;
     }
+  }
+}
+
+/* 批量操作栏：与 NetworkList.vue 同款（有勾选时出现，贴在筛选条下方） */
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--n-color-modal);
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  padding: 8px 12px;
+  flex-shrink: 0;
+
+  .batch-info {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .batch-sub {
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-secondary);
   }
 }
 

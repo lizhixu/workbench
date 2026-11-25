@@ -476,7 +476,7 @@ function handleUser(key: string) {
           <!-- 消息中心 -->
           <NTooltip trigger="hover">
             <template #trigger>
-              <NBadge :value="notifications.unreadCount" :max="99">
+              <NBadge :value="notifications.unreadCount" :max="99" class="msg-badge">
                 <NButton
                   quaternary
                   circle
@@ -840,6 +840,19 @@ function handleUser(key: string) {
       height: 16px;
       line-height: 16px;
       padding: 0 4px;
+    }
+
+    // 消息徽标：Naive 2.44 的 n-badge-sup 没有 min-width，个位数时
+    // 宽 ≈ 19px（12px 数字 + 两侧 6px padding）、高 18px，成横向小
+    // 椭圆。定 18px 下限 + padding 收 5px 后个位数正好 18×18 成圆，
+    // 两位数以上仍按内容横向拉长。Naive 自身没给 sup 设 box-sizing，
+    // 这里显式 border-box，否则 content-box 下 min-width 会再叠加
+    // padding、反而更宽；数字在下限生效时靠 justify-content 居中。
+    .msg-badge :deep(.n-badge-sup) {
+      box-sizing: border-box;
+      min-width: 18px;
+      padding: 0 5px;
+      justify-content: center;
     }
   }
 }

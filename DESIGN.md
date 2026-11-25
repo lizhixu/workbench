@@ -472,6 +472,7 @@ web/
 - **核心原则**：所有视图与交互设计中，**一律优先使用 Naive UI 原生组件库**（`NCard`, `NDataTable`, `NTabs`, `NTabPane`, `NButton`, `NSpace`, `NTag`, `NModal`, `NAlert`, `NInput`, `NSelect`, `NRadioGroup` 等），**非必要绝不二次封装**或手写自定义 `div` 模拟组件结构。
 - **杜绝低效套壳**：严禁无意义地对 Naive UI 原生控件包一层壳作为私有组件；业务组件仅在跨多页面复用高度特化业务逻辑时方可封装（如终端 `TerminalPane`、资源曲线 `MetricsPane` 等）。
 - **统一主题感知**：原生组件深度绑定 Naive UI 的运行时暗色/亮色主题与 CSS 变量（如 `--bg-card`, `--border-color`, `--text-primary` 等），杜绝因私自定义类脱离主题变量而导致的色彩断层或样式漂移。
+- **数字徽标（NBadge）个位数须为正圆**：Naive 2.44 的 `n-badge-sup` 没有 `min-width`，个位数时宽约 19px、高 18px 成横向小椭圆。用法是在调用处给 `NBadge` 加 class、用 `:deep(.n-badge-sup)` 覆盖：`box-sizing: border-box; min-width: 18px; padding: 0 5px; justify-content: center`（`box-sizing` 必须显式写，Naive 自身没设、content-box 下 `min-width` 会再叠加 padding；`padding` 须收至 5px，6px 时个位数仍宽于 18px）。两位数以上仍按内容横向拉长成胶囊。
 
 ### 9.2 页面留白与布局间距体系
 - **全局外层内边距**：路由页面的外层内边距由 `AppShell` 的 `.app-body` 统一施加，统一绑定 CSS 变量 `--page-padding`（桌面端 `16px` / 窄屏移动端 `10px`）。

@@ -353,8 +353,10 @@ function exportSelectedCSV() {
   a.download = `watchman-audit-selected-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.csv`
   document.body.appendChild(a)
   a.click()
-  document.body.removeChild(a)
-  URL.revokeObjectURL(url)
+  window.setTimeout(() => {
+    a.remove()
+    URL.revokeObjectURL(url)
+  }, 0)
   message.success(`已导出 ${rows.length} 条勾选记录`)
 }
 
@@ -555,8 +557,8 @@ onMounted(load)
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 8px 12px;
   flex-shrink: 0;

@@ -19,12 +19,15 @@ import {
 } from '../../api/snapshots'
 import { listHosts } from '../../api/hosts'
 import { listApps, type AppEntity } from '../../api/apps'
+import { useAuthStore } from '../../stores/auth'
 import { useTablePagination } from '../../composables/useTablePagination'
 import { fmtDateTimeMinute } from '../../utils/time'
 
 defineOptions({ name: 'SnapshotList' })
 
 const message = useMessage()
+const auth = useAuthStore()
+const canWrite = computed(() => auth.role === 'admin' || auth.role === 'operator')
 
 const activeTab = ref<'jobs' | 's3'>('jobs')
 
@@ -229,13 +232,15 @@ function onS3ProviderChange(val: string) {
 }
 
 const columns = computed<DataTableColumns<BackupJob>>(() => [
-  {
-    // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
-    // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
-    type: 'selection',
-    width: 40,
-    disabled: () => batchRunning.value,
-  },
+  ...(canWrite.value
+    ? [{
+        // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
+        // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
+        type: 'selection' as const,
+        width: 40,
+        disabled: () => batchRunning.value,
+      }]
+    : []),
   {
     title: '任务名称',
     key: 'name',
@@ -603,7 +608,7 @@ function formatBytes(b: number) {
   return `${(b / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`
 }
 
-async function loadData() {
+async function loadData(resetPageOnLoad = false) {
   loading.value = true
   try {
     jobs.value = await listBackupJobs()
@@ -613,13 +618,24 @@ async function loadData() {
       opStatus.value = {}
       batchSummary.value = null
     }
-    // 刷新后回第 1 页（§9.4：刷新、切页签或筛选变更时复位页码）。
-    resetJobPage()
+    // 手动刷新回第 1 页（§9.4）；批量后或单次操作后刷新保留当前页并由 rowCount 自动夹回有效页。
+    if (resetPageOnLoad) {
+      resetJobPage()
+    }
   } catch (e: any) {
     message.error(e.message || '获取备份任务失败')
   } finally {
     loading.value = false
   }
+}
+
+function isOpBusy(id: string) {
+  const st = opStatus.value[id]
+  return !!st && (st.phase === 'queued' || st.phase === 'running')
+}
+
+function batchRowClassName(row: BackupJob) {
+  return isOpBusy(row.id) ? 'batch-row-busy' : ''
 }
 
 async function loadS3() {
@@ -1016,7 +1032,7 @@ onActivated(() => {
       </div>
       <div class="header-right">
         <NSpace align="center" :size="10">
-          <NButton :loading="loading || loadingS3" @click="() => { loadData(); loadS3() }">
+          <NButton :loading="loading || loadingS3" @click="() => { loadData(true); loadS3() }">
             <template #icon>
               <NIcon><RefreshOutline /></NIcon>
             </template>
@@ -1046,7 +1062,7 @@ onActivated(() => {
         <NTabPane name="jobs" tab="备份任务列表">
           <div class="tab-pane-content">
             <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐行显示进度 -->
-            <div v-if="selectedJobIds.size > 0" class="batch-bar">
+            <div v-if="canWrite && selectedJobIds.size > 0" class="batch-bar">
               <span class="batch-info">已选 {{ selectedJobIds.size }} 个备份任务</span>
               <NButton
                 size="small"
@@ -1085,7 +1101,8 @@ onActivated(() => {
                 :data="sortedJobs"
                 :row-key="(r: BackupJob) => r.id"
                 :checked-row-keys="[...selectedJobIds]"
-                :scroll-x="1200"
+                :row-class-name="batchRowClassName"
+                :scroll-x="canWrite ? 1200 : 1160"
                 :pagination="jobPagination"
                 :bordered="false"
                 size="small"
@@ -1475,8 +1492,8 @@ onActivated(() => {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 8px 12px;
   flex-shrink: 0;
@@ -1491,6 +1508,12 @@ onActivated(() => {
     font-size: 12px;
     color: var(--text-secondary);
   }
+}
+
+/* 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突（DESIGN.md §9.22） */
+:deep(.batch-row-busy [data-col-key="actions"]) {
+  pointer-events: none;
+  opacity: 0.5;
 }
 
 // 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口

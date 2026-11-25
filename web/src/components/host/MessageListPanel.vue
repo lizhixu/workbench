@@ -50,7 +50,7 @@ onMounted(() => {
       <div class="header-left">
         <NIcon size="16" color="#6366f1"><NotificationsOutline /></NIcon>
         <span class="panel-title">消息列表</span>
-        <NBadge :value="unreadCount" :max="99" type="error" />
+        <NBadge :value="unreadCount" :max="99" type="error" class="msg-badge" />
       </div>
       <div class="header-right">
         <NIcon size="14" class="toggle-icon">
@@ -107,6 +107,14 @@ onMounted(() => {
         font-size: 13px;
         font-weight: 600;
         color: var(--text-primary);
+      }
+
+      // 数字徽标个位数正圆（DESIGN.md §9.1 / AppShell.vue 同款）
+      .msg-badge :deep(.n-badge-sup) {
+        box-sizing: border-box;
+        min-width: 18px;
+        padding: 0 5px;
+        justify-content: center;
       }
     }
 

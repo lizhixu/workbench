@@ -102,14 +102,25 @@ function groupNameById(id?: string): string {
 }
 
 
+function isOpBusy(id: string) {
+  const st = opStatus.value[id]
+  return !!st && (st.phase === 'queued' || st.phase === 'running')
+}
+
+function batchRowClassName(g: HostGroup) {
+  return isOpBusy(g.id) ? 'batch-row-busy' : ''
+}
+
 const columns = computed<DataTableColumns<HostGroup>>(() => [
-  {
-    // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
-    // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
-    type: 'selection',
-    width: 40,
-    disabled: () => !isAdmin.value || batchRunning.value,
-  },
+  ...(isAdmin.value
+    ? [{
+        // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
+        // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
+        type: 'selection' as const,
+        width: 40,
+        disabled: () => batchRunning.value,
+      }]
+    : []),
   {
     title: '分组名称',
     key: 'name',
@@ -166,7 +177,7 @@ const columns = computed<DataTableColumns<HostGroup>>(() => [
   },
 ])
 
-async function refresh() {
+async function refresh(manual = false) {
   loading.value = true
   try {
     groups.value = await listGroups()
@@ -176,7 +187,9 @@ async function refresh() {
       opStatus.value = {}
       batchSummary.value = null
     }
-    resetPage()
+    if (manual) {
+      resetPage()
+    }
   } catch (e: any) {
     message.error(e.message || '加载分组失败')
   } finally {
@@ -461,7 +474,7 @@ onActivated(() => {
       <h2 class="page-title">分组与权限</h2>
       <NSpace align="center" :size="12">
         <span class="muted group-count-text">共 {{ groupCount }} 个分组</span>
-        <NButton :loading="loading" @click="refresh">
+        <NButton :loading="loading" @click="() => refresh(true)">
           <template #icon><NIcon :component="RefreshOutline" /></template>
           刷新
         </NButton>
@@ -514,7 +527,8 @@ onActivated(() => {
         size="small"
         :row-key="(g: HostGroup) => g.id"
         :checked-row-keys="[...selectedGroupIds]"
-        :scroll-x="isMobile ? 640 : 1000"
+        :row-class-name="batchRowClassName"
+        :scroll-x="isMobile ? 640 : (isAdmin ? 1000 : 960)"
         @update:checked-row-keys="onGroupChecked"
       >
         <template #empty>
@@ -795,8 +809,8 @@ onActivated(() => {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 8px 12px;
   flex-shrink: 0;
@@ -811,6 +825,12 @@ onActivated(() => {
     font-size: 12px;
     color: var(--text-secondary);
   }
+}
+
+/* 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突（DESIGN.md §9.22） */
+:deep(.batch-row-busy [data-col-key="actions"]) {
+  pointer-events: none;
+  opacity: 0.5;
 }
 
 // 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口

@@ -19,10 +19,13 @@ import {
 } from '../../api/network'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useIsMobile } from '../../composables/useIsMobile'
+import { useAuthStore } from '../../stores/auth'
 
 defineOptions({ name: 'NetworkList' })
 
 const message = useMessage()
+const auth = useAuthStore()
+const canWrite = computed(() => auth.role === 'admin' || auth.role === 'operator')
 const nodes = ref<NetworkNode[]>([])
 const loading = ref(false)
 const searchKeyword = ref('')
@@ -560,6 +563,7 @@ onMounted(loadData)
       <div class="network-toolbar">
         <NSpace align="center" :size="12">
           <NCheckbox
+            v-if="canWrite"
             :checked="pageAllChecked"
             :indeterminate="pageSomeChecked"
             :disabled="batchRunning"
@@ -609,8 +613,8 @@ onMounted(loadData)
         </NSpace>
       </div>
 
-      <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐台显示进度 -->
-      <div v-if="selectedIds.size > 0" class="batch-bar">
+      <!-- 批量操作栏：仅具备写权限且有勾选时出现，执行期间按钮禁用、行内逐台显示进度 -->
+      <div v-if="canWrite && selectedIds.size > 0" class="batch-bar">
         <span class="batch-info">
           已选 {{ selectedIds.size }} 台
           <span class="text-muted">（可安装 {{ batchInstallable.length }} 台 · 可加入 {{ batchJoinable.length }} 台 · 可离开 {{ batchLeavable.length }} 台）</span>
@@ -674,7 +678,7 @@ onMounted(loadData)
           :class="['node-row', { 'is-op-busy': isOpBusy(row.host_id) }]"
         >
           <!-- 0. 批量勾选列：28px 窄列，共享列宽不变（见 DESIGN.md §9.20） -->
-          <div class="col-check">
+          <div v-if="canWrite" class="col-check">
             <NCheckbox
               :checked="selectedIds.has(row.host_id)"
               :disabled="batchRunning"
@@ -892,8 +896,11 @@ onMounted(loadData)
           确认将以下 {{ batchLeavable.length }} 台主机从虚拟局域网断开吗？断开后主机不再能通过虚拟组网 IP 访问，Tailscale 客户端保留在主机上，可随时重新加入。
         </NAlert>
         <div class="batch-leave-list">
-          <div v-for="n in batchLeavable" :key="n.host_id" class="batch-leave-item">
+          <div v-for="n in batchLeavable.slice(0, 5)" :key="n.host_id" class="batch-leave-item">
             {{ n.hostname }}<span class="batch-leave-ip">{{ n.ip ? `（${n.ip}）` : '' }}</span>
+          </div>
+          <div v-if="batchLeavable.length > 5" class="batch-leave-item muted">
+            等 {{ batchLeavable.length - 5 }} 台…
           </div>
         </div>
         <div v-if="selectedNodes.length > batchLeavable.length" class="batch-leave-note">
@@ -1149,8 +1156,8 @@ onMounted(loadData)
 .stat-group {
   display: flex;
   align-items: center;
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 6px 14px;
   gap: 12px;
@@ -1175,7 +1182,7 @@ onMounted(loadData)
   .stat-sep {
     width: 1px;
     height: 22px;
-    background: var(--n-border-color);
+    background: var(--border-color);
   }
 }
 
@@ -1186,8 +1193,8 @@ onMounted(loadData)
 
   .filter-pills {
     display: flex;
-    background: var(--n-color-modal);
-    border: 1px solid var(--n-border-color);
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
     border-radius: 8px;
     padding: 3px;
     gap: 4px;
@@ -1222,8 +1229,8 @@ onMounted(loadData)
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 8px 12px;
 
@@ -1239,14 +1246,14 @@ onMounted(loadData)
   }
 }
 
-// 批量离开确认弹窗：目标清单内部滚动，行数多也不撑出视口
+// 批量离开确认弹窗：目标清单内部滚动，行数多也不撑出视口（DESIGN.md §9.22）
 .batch-leave-body {
   display: flex;
   flex-direction: column;
   gap: 12px;
 
   .batch-leave-list {
-    max-height: 240px;
+    max-height: 180px;
     overflow-y: auto;
     border: 1px solid var(--border-color);
     border-radius: 6px;
@@ -1257,9 +1264,16 @@ onMounted(loadData)
     font-size: 13px;
     padding: 6px 0;
     border-bottom: 1px solid var(--border-color);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 
     &:last-child {
       border-bottom: none;
+    }
+
+    &.muted {
+      color: var(--text-secondary);
     }
   }
 
@@ -1339,7 +1353,7 @@ onMounted(loadData)
           width: 38px;
           height: 38px;
           border-radius: 8px;
-          background: var(--n-color-modal);
+          background: var(--bg-card-subtle);
           border: 1px solid var(--border-color);
           display: flex;
           align-items: center;
@@ -1581,8 +1595,8 @@ onMounted(loadData)
 }
 
 .ping-result-box {
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card-subtle);
+  border: 1px solid var(--border-color);
   border-radius: 6px;
   padding: 10px;
 

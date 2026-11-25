@@ -297,11 +297,13 @@ const stateTag = (a: AppEntity) => {
 }
 
 const columns = computed<DataTableColumns<AppEntity>>(() => [
-  {
-    type: 'selection',
-    width: 40,
-    disabled: () => batchRunning.value,
-  },
+  ...(canWrite.value
+    ? [{
+        type: 'selection' as const,
+        width: 40,
+        disabled: () => batchRunning.value,
+      }]
+    : []),
   {
     title: '应用名称',
     key: 'name',
@@ -567,13 +569,12 @@ onDeactivated(() => {
     </div>
 
     <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、状态列逐台显示进度 -->
-    <div v-if="checkedRowKeys.length > 0" class="batch-bar">
+    <div v-if="canWrite && checkedRowKeys.length > 0" class="batch-bar">
       <span class="batch-info">
         已选 {{ checkedRowKeys.length }} 个
         <span class="text-muted">（可启动 {{ batchStartable.length }} · 可停止 {{ batchStoppable.length }} · 可重启 {{ batchRestartable.length }} · 可重新部署 {{ batchDeployable.length }}）</span>
       </span>
       <NButton
-        v-if="canWrite"
         size="small"
         type="primary"
         secondary
@@ -584,7 +585,6 @@ onDeactivated(() => {
         批量启动
       </NButton>
       <NButton
-        v-if="canWrite"
         size="small"
         type="primary"
         secondary
@@ -595,7 +595,6 @@ onDeactivated(() => {
         批量停止
       </NButton>
       <NButton
-        v-if="canWrite"
         size="small"
         type="primary"
         secondary
@@ -606,7 +605,6 @@ onDeactivated(() => {
         批量重启
       </NButton>
       <NButton
-        v-if="canWrite"
         size="small"
         type="primary"
         secondary
@@ -617,7 +615,6 @@ onDeactivated(() => {
         批量重新部署
       </NButton>
       <NButton
-        v-if="canWrite"
         size="small"
         type="error"
         secondary
@@ -699,20 +696,21 @@ onDeactivated(() => {
       </NSpace>
     </NModal>
 
-    <!-- 批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17） -->
+    <!-- 批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17 / §9.22） -->
     <NModal
       v-model:show="showBatchDeleteModal"
-      preset="dialog"
-      title="批量删除应用"
-      positive-text="删除"
-      negative-text="取消"
-      type="error"
-      @positive-click="confirmBatchDelete"
+      preset="card"
+      :title="`批量删除应用（${selectedApps.length} 个）`"
+      style="width: 520px"
     >
-      <NSpace vertical :size="12">
-        <div>确定删除以下 {{ selectedApps.length }} 个应用吗？</div>
-        <div class="batch-delete-list">
-          <div v-for="a in selectedApps" :key="a.id">{{ a.name }}（{{ hostLabel(a) }}）</div>
+      <div class="batch-confirm-body">
+        <div class="batch-target-list">
+          <div v-for="a in selectedApps.slice(0, 5)" :key="a.id" class="batch-target-row">
+            {{ a.name }}（{{ hostLabel(a) }}）
+          </div>
+          <div v-if="selectedApps.length > 5" class="batch-target-row muted">
+            等 {{ selectedApps.length - 5 }} 个…
+          </div>
         </div>
         <NCheckbox v-model:checked="batchPurgeContent">
           同时删除应用内容（容器、数据卷、镜像、代理配置等）
@@ -721,10 +719,16 @@ onDeactivated(() => {
           将在主机上销毁各应用的容器/Compose 栈、命名数据卷、构建镜像及域名代理配置，数据不可恢复。
           若主机离线，删除会被拒绝（避免内容被静默遗留），记为失败、可稍后重试。
         </NAlert>
-        <div v-else style="font-size: 12px; color: var(--n-text-color-disabled, #999)">
+        <div v-else class="field-hint">
           仅删除面板中的应用记录，主机上的容器、数据卷等内容不会被销毁。
         </div>
-      </NSpace>
+      </div>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showBatchDeleteModal = false">取消</NButton>
+          <NButton type="error" :loading="batchRunning" @click="confirmBatchDelete">确认删除</NButton>
+        </NSpace>
+      </template>
     </NModal>
   </div>
 </template>
@@ -773,8 +777,8 @@ onDeactivated(() => {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 8px 12px;
 
@@ -796,22 +800,43 @@ onDeactivated(() => {
   }
 }
 
-.batch-delete-list {
-  max-height: 200px;
-  overflow-y: auto;
-  font-size: 13px;
-  color: var(--text-secondary);
+.batch-confirm-body {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 12px;
 }
 
-// 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突
-:deep(.batch-row-busy) {
-  .n-button {
-    pointer-events: none;
-    opacity: 0.5;
+.batch-target-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 10px;
+
+  .batch-target-row {
+    padding: 3px 0;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &.muted {
+      color: var(--text-secondary);
+    }
   }
+}
+
+.field-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+// 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突（DESIGN.md §9.22）
+:deep(.batch-row-busy [data-col-key="actions"]) {
+  pointer-events: none;
+  opacity: 0.5;
 }
 
 .table-card {

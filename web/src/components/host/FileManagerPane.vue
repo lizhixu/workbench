@@ -98,6 +98,8 @@ const currentPath = ref(isWindows.value ? 'C:\\' : '/root')
 const pathInput = ref(currentPath.value)
 const isEditingPath = ref(false)
 const files = ref<FileInfo[]>([])
+// 记录最近一次已加载完成的目录：目录切换时清空上一目录的批量选择、进度与汇总。
+let lastLoadedPath = ''
 
 // ---- 批量操作（删除 / 下载 / 移动）--------------------------------------
 // 范式同 NetworkList.vue：勾选按 path 跨页保留、3 台并发、复用单机接口、
@@ -138,6 +140,19 @@ function clearBatchSelection() {
   batchOpStatus.value = {}
   batchSummary.value = null
   batchKind.value = null
+}
+
+function isOpBusy(path: string) {
+  const st = batchOpStatus.value[path]
+  return (
+    !!st &&
+    (st.phase === 'queued' || st.phase === 'removing' || st.phase === 'downloading' || st.phase === 'moving')
+  )
+}
+
+// 批量执行中的行：操作列置灰禁用，防单行操作与批量并发冲突（DESIGN.md §9.22）
+function batchRowClassName(row: FileInfo) {
+  return isOpBusy(row.path) ? 'batch-row-busy' : ''
 }
 
 
@@ -250,21 +265,39 @@ async function detectOS() {
   }
 }
 
-async function load(silent = false): Promise<string | null> {
+async function load(silent = false, preservePage = false): Promise<string | null> {
   loading.value = true
   try {
     const data = await fileList(props.hostId, currentPath.value)
+    const pathChanged = currentPath.value !== lastLoadedPath
+    lastLoadedPath = currentPath.value
     files.value = data || []
-    resetPage()
+    if (pathChanged || !preservePage) {
+      resetPage()
+    }
     pathInput.value = currentPath.value
-    // 清理已不存在的勾选：目录切换/刷新后，只保留仍在当前目录列表里的已选项
-    const alive = new Set(files.value.map((f) => f.path))
-    selectedFiles.value.forEach((_, p) => {
-      if (!alive.has(p)) selectedFiles.value.delete(p)
-    })
-    // 非批量进行中、且无待重试的批量结果时，旧的行内进度不再对应当前列表
-    if (!batchRunning.value && !batchSummary.value) {
+    if (pathChanged && !batchRunning.value) {
+      // 切换目录后，上一目录的批量选择、进度与待重试汇总不再有效，彻底清空
+      selectedFiles.value.clear()
       batchOpStatus.value = {}
+      batchSummary.value = null
+      batchKind.value = null
+    } else {
+      // 清理已不存在的勾选：同目录刷新只保留仍在当前目录列表里的已选项
+      const alive = new Set(files.value.map((f) => f.path))
+      selectedFiles.value.forEach((_, p) => {
+        if (!alive.has(p)) selectedFiles.value.delete(p)
+      })
+      if (batchRunning.value) {
+        Object.keys(batchOpStatus.value).forEach((p) => {
+          if (!alive.has(p)) delete batchOpStatus.value[p]
+        })
+      } else {
+        // 非批量进行中（手动刷新/单行操作刷新）：旧的行内进度不再对应当前列表
+        batchOpStatus.value = {}
+        batchSummary.value = null
+        batchKind.value = null
+      }
     }
     return null
   } catch (e: any) {
@@ -561,6 +594,9 @@ async function runBatch(kind: 'remove' | 'download' | 'move', targets: FileInfo[
     )
   }
 
+  // 批量执行完再刷新一次列表（batchRunning 仍为 true，保持失败项进度并保留
+  // 当前页码；已删/已移走的项从选中与进度中同步清理）。
+  await load(false, true)
   batchRunning.value = false
   batchSummary.value = { done, failed, skipped }
   const verb = kind === 'remove' ? '删除' : kind === 'download' ? '下载' : '移动'
@@ -572,9 +608,6 @@ async function runBatch(kind: 'remove' | 'download' | 'move', targets: FileInfo[
       `批量${verb}完成：成功 ${done} 项，失败 ${failed} 项${skipText}，可点「重试失败」只重跑失败的项目`,
     )
   }
-  // 刷新一次列表：已删/已移走的项随之消失，勾选由 load() 的清理逻辑同步剪掉；
-  // 失败项仍在列表里、保持勾选，可直接重试。
-  await load()
 }
 
 function retryBatchFailed() {
@@ -1226,6 +1259,7 @@ onMounted(async () => {
         size="small"
         :row-key="(row: FileInfo) => row.path"
         :checked-row-keys="pageCheckedKeys"
+        :row-class-name="batchRowClassName"
         @update:checked-row-keys="onCheckedRowKeys"
       />
     </div>
@@ -1309,11 +1343,11 @@ onMounted(async () => {
           确认删除以下 {{ selectedFiles.size }} 项吗？目录会递归删除全部内容，此操作不可恢复。
         </NAlert>
         <div class="batch-confirm-list">
-          <div v-for="f in selectedList.slice(0, 8)" :key="f.path" class="batch-confirm-item">
+          <div v-for="f in selectedList.slice(0, 5)" :key="f.path" class="batch-confirm-item">
             {{ f.name }}<span class="batch-confirm-path">{{ f.path }}</span>
           </div>
-          <div v-if="selectedFiles.size > 8" class="batch-confirm-more">
-            等 {{ selectedFiles.size - 8 }} 项…
+          <div v-if="selectedFiles.size > 5" class="batch-confirm-more">
+            等 {{ selectedFiles.size - 5 }} 项…
           </div>
         </div>
       </div>
@@ -1512,8 +1546,8 @@ onMounted(async () => {
     align-items: center;
     gap: 10px;
     flex-wrap: wrap;
-    background: var(--n-color-modal);
-    border: 1px solid var(--n-border-color);
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
     border-radius: 8px;
     padding: 8px 12px;
     flex-shrink: 0;
@@ -1589,6 +1623,12 @@ onMounted(async () => {
       gap: 2px;
     }
 
+    /* 批量执行中的行：操作列置灰禁用，防单行操作与批量并发冲突（DESIGN.md §9.22） */
+    :deep(.batch-row-busy [data-col-key="actions"]) {
+      pointer-events: none;
+      opacity: 0.5;
+    }
+
     /* 批量状态列：render 生成的节点，用 :deep 穿透（与 .file-name-cell 同款） */
     :deep(.batch-status) {
       font-size: 12px;
@@ -1646,7 +1686,7 @@ onMounted(async () => {
   gap: 12px;
 
   .batch-confirm-list {
-    max-height: 240px;
+    max-height: 180px;
     overflow-y: auto;
     border: 1px solid var(--border-color);
     border-radius: 6px;

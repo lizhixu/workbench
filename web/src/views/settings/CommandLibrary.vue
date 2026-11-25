@@ -69,10 +69,12 @@ const filterOptions = [{ label: '全部 Shell', value: '' }, ...shellOptions]
 const isAdmin = computed(() => auth.role === 'admin')
 
 // ---- 批量删除（范式见 NetworkList.vue） ----
-// 勾选按命令 id 存；执行期 3 路并发、逐行显示进度、失败可重试。
+// 勾选按命令快照存（服务端按关键字/Shell 过滤时保留已勾但被筛掉的条目）；
+// 执行期 3 路并发、逐行显示进度、失败可重试。
 // 本表是 AGENTS.md §8.2 例外的小表（限高不分页），只加勾选与批量栏，
 // 不改分页口径。删除准入沿用单机 canMutate（admin 或本人创建）。
-const selectedCommandIds = ref<Set<string>>(new Set())
+const selectedRows = ref(new Map<string, CommandEntry>())
+const selectedCommandIds = computed(() => new Set(selectedRows.value.keys()))
 const BATCH_CONCURRENCY = 3
 type BatchPhase = 'queued' | 'running' | 'done' | 'failed'
 const opStatus = ref<Record<string, { phase: BatchPhase; message?: string }>>({})
@@ -92,9 +94,22 @@ function canMutate(row: CommandEntry): boolean {
 async function refresh() {
   loading.value = true
   try {
+    const q = keyword.value.trim()
+    const sh = shellFilter.value
     entries.value = await listCommands({
-      shell: shellFilter.value || undefined,
-      q: keyword.value.trim() || undefined,
+      shell: sh || undefined,
+      q: q || undefined,
+    })
+    const alive = new Set(entries.value.map((e) => e.id))
+    if (!q && !sh) {
+      // 无过滤条件下拿到全量列表：可安全清理已不存在的勾选快照
+      selectedRows.value.forEach((_, id) => {
+        if (!alive.has(id)) selectedRows.value.delete(id)
+      })
+    }
+    // 同步当前可见行的最新快照
+    entries.value.forEach((e) => {
+      if (selectedRows.value.has(e.id)) selectedRows.value.set(e.id, e)
     })
     // 刷新清掉上一批的旧进度；批量执行中不清除（runBatchDelete 在执行完才刷新，
     // 此时 batchRunning 仍为 true，进度得以保留到汇总展示）。
@@ -166,7 +181,7 @@ async function remove(row: CommandEntry) {
   try {
     await deleteCommand(row.id)
     message.success('已删除')
-    selectedCommandIds.value.delete(row.id)
+    selectedRows.value.delete(row.id)
     await refresh()
   } catch (e: any) {
     message.error(e.message || '删除失败')
@@ -188,14 +203,27 @@ function batchProgressNode(row: { id: string }) {
   return h('div', { class: ['batch-op-progress', `is-${st.phase}`], title: st.message || '' }, text)
 }
 
-const selectedCommands = computed(() => entries.value.filter((e) => selectedCommandIds.value.has(e.id)))
+function isOpBusy(id: string) {
+  const st = opStatus.value[id]
+  return !!st && (st.phase === 'queued' || st.phase === 'running')
+}
+
+function batchRowClassName(row: CommandEntry) {
+  return isOpBusy(row.id) ? 'batch-row-busy' : ''
+}
+
+const selectedCommands = computed(() => [...selectedRows.value.values()])
 // 只有本人创建的命令或 admin 能删（单机删除按钮同款 canMutate 准入），
 // 他人的命令不参与执行、计入跳过。
 const batchDeletable = computed(() => selectedCommands.value.filter((e) => canMutate(e)))
 
 function onCommandChecked(keys: (string | number)[]) {
-  // 本表不分页：naive-ui 回传的即全量勾选集合，直接替换。
-  selectedCommandIds.value = new Set(keys.map((k) => String(k)))
+  // 服务端按关键字/Shell 过滤：只更新当前列表 entries 中的勾选，保留被筛选条件隐藏的已选快照
+  const keySet = new Set(keys.map((k) => String(k)))
+  entries.value.forEach((e) => {
+    if (keySet.has(e.id)) selectedRows.value.set(e.id, e)
+    else selectedRows.value.delete(e.id)
+  })
 }
 
 async function runBatchDelete(targets: CommandEntry[]) {
@@ -235,7 +263,7 @@ async function runBatchDelete(targets: CommandEntry[]) {
   // 本表 entries 是服务端按关键词过滤的，刷新无法核验勾选行是否还存在，
   // 故不在刷新时清理勾选；删除成功即已知不存在，直接从勾选中移除。
   Object.entries(opStatus.value).forEach(([id, st]) => {
-    if (st.phase === 'done') selectedCommandIds.value.delete(id)
+    if (st.phase === 'done') selectedRows.value.delete(id)
   })
   // 批量执行完再刷新列表（batchRunning 仍为 true，refresh 的清进度守卫
   // 不触发）：成功删除的行随之消失，失败行保留进度供重试。
@@ -255,7 +283,14 @@ function retryBatchFailed() {
   const failedIds = Object.entries(opStatus.value)
     .filter(([, st]) => st.phase === 'failed')
     .map(([id]) => id)
-  runBatchDelete(entries.value.filter((e) => failedIds.includes(e.id)))
+  const merged = new Map<string, CommandEntry>()
+  selectedCommands.value.forEach((e) => {
+    if (failedIds.includes(e.id)) merged.set(e.id, e)
+  })
+  entries.value.forEach((e) => {
+    if (failedIds.includes(e.id)) merged.set(e.id, e)
+  })
+  runBatchDelete([...merged.values()])
 }
 
 function confirmBatchDelete() {
@@ -264,7 +299,7 @@ function confirmBatchDelete() {
 }
 
 function clearBatchSelection() {
-  selectedCommandIds.value = new Set()
+  selectedRows.value.clear()
   opStatus.value = {}
   batchSummary.value = null
 }
@@ -443,6 +478,7 @@ onMounted(refresh)
         :bordered="false"
         :row-key="(r: CommandEntry) => r.id"
         :checked-row-keys="[...selectedCommandIds]"
+        :row-class-name="batchRowClassName"
         :max-height="360"
         @update:checked-row-keys="onCommandChecked"
       >
@@ -542,8 +578,8 @@ onMounted(refresh)
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card-subtle);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 8px 12px;
   flex-shrink: 0;
@@ -563,6 +599,12 @@ onMounted(refresh)
     font-size: 12px;
     color: var(--text-secondary);
   }
+}
+
+/* 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突（DESIGN.md §9.22） */
+:deep(.batch-row-busy [data-col-key="actions"]) {
+  pointer-events: none;
+  opacity: 0.5;
 }
 
 // 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口

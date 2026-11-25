@@ -62,8 +62,13 @@ async function loadGrpcHost() {
 async function saveGrpcHost() {
   grpcSaving.value = true
   try {
-    await saveSystemSettings({ [SETTING_KEYS.agentGRPCHost]: grpcHost.value.trim() })
-    message.success('已保存，已向在线 Agent 下发新地址，新安装的 Agent 也将使用该地址回连')
+    const trimmed = grpcHost.value.trim()
+    await saveSystemSettings({ [SETTING_KEYS.agentGRPCHost]: trimmed })
+    if (trimmed) {
+      message.success('已保存，已向在线 Agent 下发新地址，新安装的 Agent 也将使用该地址回连')
+    } else {
+      message.success('已保存：新安装的 Agent 将默认跟随面板地址回连（已迁走或已重定向的 Agent 保持原回连地址不变）')
+    }
   } catch (e: any) {
     message.error(e.message || '保存失败')
   } finally {

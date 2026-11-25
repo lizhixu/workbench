@@ -10,12 +10,16 @@ import {
 } from '@vicons/ionicons5'
 import { listSessions, deleteSession, closeTerminal, sessionRecordingUrl } from '../../api/hosts'
 import type { SessionRecord } from '../../api/types'
+import { useAuthStore } from '../../stores/auth'
 import { fmtDateTime } from '../../utils/time'
 
 // KeepAlive 按组件名缓存页签视图，名字必须与 AppShell 里登记的一致
 defineOptions({ name: 'SessionList' })
 
 const message = useMessage()
+const auth = useAuthStore()
+const isAdmin = computed(() => auth.role === 'admin')
+const canWrite = computed(() => auth.role === 'admin' || auth.role === 'operator')
 const sessions = ref<SessionRecord[]>([])
 const loading = ref(false)
 const total = ref(0)
@@ -74,14 +78,25 @@ function fmtDuration(sec: number): string {
   return `${h}h${m % 60}m`
 }
 
-const columns = [
-  {
-    // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
-    // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
-    type: 'selection' as const,
-    width: 40,
-    disabled: () => batchRunning.value,
-  },
+function isOpBusy(id: string) {
+  const st = opStatus.value[id]
+  return !!st && (st.phase === 'queued' || st.phase === 'running')
+}
+
+function batchRowClassName(row: SessionRecord) {
+  return isOpBusy(row.id) ? 'batch-row-busy' : ''
+}
+
+const columns = computed(() => [
+  ...(canWrite.value || isAdmin.value
+    ? [{
+        // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
+        // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
+        type: 'selection' as const,
+        width: 40,
+        disabled: () => batchRunning.value,
+      }]
+    : []),
   { title: '主机', key: 'hostname', width: 150, ellipsis: { tooltip: true } },
   { title: '操作者', key: 'operator', width: 100 },
   {
@@ -131,7 +146,7 @@ const columns = [
         ],
       }),
   },
-]
+])
 
 import { h } from 'vue'
 
@@ -479,12 +494,13 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐行显示进度 -->
-    <div v-if="selectedSessionIds.size > 0" class="batch-bar">
+    <div v-if="(canWrite || isAdmin) && selectedSessionIds.size > 0" class="batch-bar">
       <span class="batch-info">
         已选 {{ selectedSessionIds.size }} 条会话
         <span class="text-muted">（进行中 {{ batchCloseable.length }} 条）</span>
       </span>
       <NButton
+        v-if="canWrite"
         size="small"
         type="primary"
         secondary
@@ -495,6 +511,7 @@ onBeforeUnmount(() => {
         批量结束
       </NButton>
       <NButton
+        v-if="isAdmin"
         size="small"
         type="error"
         secondary
@@ -532,6 +549,7 @@ onBeforeUnmount(() => {
         :loading="loading"
         :row-key="(row: SessionRecord) => row.id"
         :checked-row-keys="[...selectedSessionIds]"
+        :row-class-name="batchRowClassName"
         @update:checked-row-keys="onSessionChecked"
       >
         <template #empty>
@@ -823,8 +841,8 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 8px 12px;
   flex-shrink: 0;
@@ -844,6 +862,12 @@ onBeforeUnmount(() => {
     font-size: 12px;
     color: var(--text-secondary);
   }
+}
+
+/* 批量执行中的行：操作列整体置灰禁用，防单行操作与批量并发冲突（DESIGN.md §9.22） */
+:deep(.batch-row-busy [data-col-key="actions"]) {
+  pointer-events: none;
+  opacity: 0.5;
 }
 
 // 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口

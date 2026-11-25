@@ -180,14 +180,16 @@ const daysLeft = (cert: Certificate) =>
 // 放得下天数标签 + 日期、操作列放得下 5 个按钮；12 列宽合计 1720，
 // 与模板 :scroll-x 一致，改任一列宽时同步改 scroll-x。
 const certColumns = computed<DataTableColumns<Certificate>>(() => [
-  {
-    // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
-    // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
-    type: 'selection',
-    width: 40,
-    fixed: 'left',
-    disabled: () => batchRunning.value,
-  },
+  ...(isAdmin.value
+    ? [{
+        // 批量勾选列：NDataTable 复选框列取 40px（BatchExec.vue 同款口径；
+        // DESIGN.md §9.20 的 28px 是 flex 行列表口径，复选框 + 单元格内边距放不下）。
+        type: 'selection' as const,
+        width: 40,
+        fixed: 'left' as const,
+        disabled: () => batchRunning.value,
+      }]
+    : []),
   {
     title: '域名',
     key: 'domains',
@@ -784,15 +786,15 @@ async function loadAccounts() {
   }
 }
 
-async function loadCerts() {
+async function loadCerts(clearBatch = false) {
   loadingCerts.value = true
   try {
     certs.value = (await listCerts()) as Certificate[]
-    // 刷新清掉上一批的旧进度；批量执行中不清除（runBatch 在执行完才刷新，
-    // 此时 batchRunning 仍为 true，进度得以保留到汇总展示）。
-    if (!batchRunning.value) {
+    // 手动刷新时清除上一批的旧进度（30s 自动轮询与签发轮询保留失败进度供重试/强删）
+    if (clearBatch && !batchRunning.value) {
       opStatus.value = {}
       batchSummary.value = null
+      batchKind.value = null
     }
   } catch (e: any) {
     message.error(e.message || '获取证书列表失败')
@@ -1247,15 +1249,28 @@ watch(certs, (list) => {
 })
 
 // 批量删除中因「已被应用绑定」失败的证书：单机删除同款强制删除路径
-// （doDelete 的 dialog 兜底），只对失败项二次确认后强制删除。
+// （doDelete 的 dialog 兜底），只对失败项二次确认后强制删除；
+// 面板证书绑定不受 force 参数影响，不得纳入可强删列表。
 function isBindConflict(msg: string) {
+  if (msg.includes('面板证书绑定') || msg.includes('force 参数不适用于面板绑定证书')) return false
   return msg.includes('已被') || msg.includes('绑定') || msg.includes('force=true') || msg.includes('仍被应用')
 }
 const batchBindFailed = computed(() =>
-  Object.entries(opStatus.value)
-    .filter(([, st]) => st.phase === 'failed' && isBindConflict(st.message || ''))
-    .map(([id]) => id),
+  batchKind.value === 'delete'
+    ? Object.entries(opStatus.value)
+        .filter(([, st]) => st.phase === 'failed' && isBindConflict(st.message || ''))
+        .map(([id]) => id)
+    : [],
 )
+
+function isOpBusy(id: string) {
+  const st = opStatus.value[id]
+  return !!st && (st.phase === 'queued' || st.phase === 'running')
+}
+
+function batchRowClassName(row: Certificate) {
+  return isOpBusy(row.id) ? 'batch-row-busy' : ''
+}
 
 async function runBatch(kind: 'delete' | 'renew', targets: Certificate[], force = false) {
   const eligible = kind === 'delete'
@@ -1347,7 +1362,7 @@ function clearBatchSelection() {
 
 function startPolling() {
   if (pollTimer) return
-  pollTimer = setInterval(loadCerts, 30000)
+  pollTimer = setInterval(() => loadCerts(), 30000)
 }
 
 function stopPolling() {
@@ -1406,7 +1421,7 @@ onUnmounted(() => {
             </template>
             证书时间设置
           </NButton>
-          <NButton :loading="loadingCerts || loadingAccounts" @click="() => { loadAccounts(); loadCerts() }">
+          <NButton :loading="loadingCerts || loadingAccounts" @click="() => { loadAccounts(); loadCerts(true) }">
             <template #icon>
               <NIcon><RefreshOutline /></NIcon>
             </template>
@@ -1443,8 +1458,8 @@ onUnmounted(() => {
       <NTabs v-model:value="activeMainTab" type="line">
         <NTabPane name="certs" tab="已签发证书">
           <div class="tab-pane-content">
-            <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐行显示进度 -->
-            <div v-if="selectedCertIds.size > 0" class="batch-bar">
+            <!-- 批量操作栏：仅 admin 可见，有勾选时出现，执行期间按钮禁用、行内逐行显示进度 -->
+            <div v-if="isAdmin && selectedCertIds.size > 0" class="batch-bar">
               <span class="batch-info">
                 已选 {{ selectedCertIds.size }} 个证书
                 <span class="text-muted">（可续期 {{ batchRenewable.length }} 个）</span>
@@ -1503,9 +1518,10 @@ onUnmounted(() => {
                 :data="certs"
                 :row-key="(r: Certificate) => r.id"
                 :checked-row-keys="[...selectedCertIds]"
+                :row-class-name="batchRowClassName"
                 :pagination="certPagination"
                 :bordered="false"
-                :scroll-x="1720"
+                :scroll-x="isAdmin ? 1720 : 1680"
                 size="small"
                 @update:checked-row-keys="onCertChecked"
               />
@@ -2397,8 +2413,8 @@ onUnmounted(() => {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 8px 12px;
   margin-bottom: 12px;
@@ -2419,6 +2435,12 @@ onUnmounted(() => {
     font-size: 12px;
     color: var(--text-secondary);
   }
+}
+
+/* 批量执行中的行：操作列整体置灰禁用，防单行操作与批量并发冲突（DESIGN.md §9.22） */
+:deep(.batch-row-busy [data-col-key="actions"]) {
+  pointer-events: none;
+  opacity: 0.5;
 }
 
 // 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口

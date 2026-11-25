@@ -263,7 +263,16 @@ const columns = computed<DataTableColumns<Credential>>(() => [
   },
 ])
 
-async function refresh() {
+function isOpBusy(id: string) {
+  const st = opStatus.value[id]
+  return !!st && (st.phase === 'queued' || st.phase === 'running')
+}
+
+function batchRowClassName(c: Credential) {
+  return isOpBusy(c.id) ? 'batch-row-busy' : ''
+}
+
+async function refresh(manual = false) {
   loading.value = true
   try {
     const [cList, hList] = await Promise.all([
@@ -281,7 +290,9 @@ async function refresh() {
       opStatus.value = {}
       batchSummary.value = null
     }
-    resetPage()
+    if (manual) {
+      resetPage()
+    }
   } catch (e: any) {
     message.error(e.message || '加载凭据失败')
   } finally {
@@ -473,7 +484,7 @@ onMounted(refresh)
       <div class="header-right">
         <NSpace align="center" :size="10">
           <NTag size="small" :bordered="false" round type="info">AES-256-GCM 硬件加密</NTag>
-          <NButton :loading="loading" @click="refresh">
+          <NButton :loading="loading" @click="() => refresh(true)">
             <template #icon><NIcon :component="RefreshOutline" /></template>
             刷新
           </NButton>
@@ -556,6 +567,7 @@ onMounted(refresh)
         size="small"
         :row-key="(c: Credential) => c.id"
         :checked-row-keys="[...selectedCredIds]"
+        :row-class-name="batchRowClassName"
         :scroll-x="960"
         @update:checked-row-keys="onCredChecked"
       >
@@ -900,8 +912,8 @@ onMounted(refresh)
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 8px 12px;
   flex-shrink: 0;
@@ -916,6 +928,12 @@ onMounted(refresh)
     font-size: 12px;
     color: var(--text-secondary);
   }
+}
+
+/* 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突（DESIGN.md §9.22） */
+:deep(.batch-row-busy [data-col-key="actions"]) {
+  pointer-events: none;
+  opacity: 0.5;
 }
 
 // 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口

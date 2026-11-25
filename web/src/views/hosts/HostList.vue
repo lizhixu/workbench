@@ -453,8 +453,7 @@ async function dispatchBatchUpgrade(targets: Host[], skipped = 0) {
 }
 
 // ---- 批量执行：跳到批量执行页并带上已选主机（不另造执行通道）。
-// 单台走既有 host_id 参数；多台用 host_ids（逗号分隔），
-// 待 BatchExec.vue 接上该参数后预选全部已选主机。
+// 单台走既有 host_id 参数；多台用 host_ids（逗号分隔），BatchExec.vue 按此预选在线主机。
 function goBatchExec() {
   const ids = selectedHosts.value.map((h) => h.id)
   if (ids.length === 0) return
@@ -678,6 +677,7 @@ function goAiReport() {
 }
 
 const isAdmin = computed(() => auth.role === 'admin')
+const canWrite = computed(() => auth.role === 'admin' || auth.role === 'operator')
 
 function goAudit() {
   workspace.openTab({
@@ -990,6 +990,7 @@ onUnmounted(() => {
       <div class="toolbar-bar">
         <div class="toolbar-left">
           <NCheckbox
+            v-if="canWrite"
             :checked="pageAllChecked"
             :indeterminate="pageSomeChecked"
             :disabled="batchRunning"
@@ -1081,11 +1082,11 @@ onUnmounted(() => {
         </NButton>
       </div>
 
-      <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐台显示进度 -->
-      <div v-if="selectedIds.size > 0" class="batch-bar">
+      <!-- 批量操作栏：仅具备写/管理权限且有勾选时出现，执行期间按钮禁用、行内逐台显示进度 -->
+      <div v-if="canWrite && selectedIds.size > 0" class="batch-bar">
         <span class="batch-info">
           已选 {{ selectedIds.size }} 台
-          <span class="text-muted">（在线 {{ batchOnline.length }} 台 · 可升级 {{ batchUpgradable.length }} 台）</span>
+          <span class="text-muted">（在线 {{ batchOnline.length }} 台<template v-if="isAdmin"> · 可升级 {{ batchUpgradable.length }} 台</template>）</span>
         </span>
         <NButton
           size="small"
@@ -1097,6 +1098,7 @@ onUnmounted(() => {
           批量执行
         </NButton>
         <NButton
+          v-if="isAdmin"
           size="small"
           type="primary"
           secondary
@@ -1107,6 +1109,7 @@ onUnmounted(() => {
           批量升级
         </NButton>
         <NButton
+          v-if="isAdmin"
           size="small"
           :disabled="batchRunning"
           @click="openBatchGroupModal"
@@ -1114,6 +1117,7 @@ onUnmounted(() => {
           改分组
         </NButton>
         <NButton
+          v-if="isAdmin"
           size="small"
           type="error"
           secondary
@@ -1157,7 +1161,7 @@ onUnmounted(() => {
             @click="goDetail(host)"
           >
             <!-- 0. 批量勾选列：28px 窄列，共享列宽不变（见 DESIGN.md §9.20） -->
-            <div class="col-check" @click.stop>
+            <div v-if="canWrite" class="col-check" @click.stop>
               <NCheckbox
                 :checked="selectedIds.has(host.id)"
                 :disabled="batchRunning"
@@ -1469,19 +1473,24 @@ onUnmounted(() => {
       </template>
     </NModal>
 
-    <!-- 批量解绑 Modal：危险操作，弹窗内就地二次确认（DESIGN.md §9.17） -->
+    <!-- 批量解绑 Modal：危险操作，弹窗内就地二次确认（DESIGN.md §9.17 / §9.22） -->
     <NModal
       v-model:show="showBatchUnbindModal"
       preset="card"
-      title="批量解绑主机"
+      :title="`批量解绑主机（${selectedHosts.length} 台）`"
       style="width: 520px"
     >
-      <NSpace vertical :size="12">
+      <div class="batch-confirm-body">
         <p class="guide-text">
-          确定要解绑以下 {{ selectedIds.size }} 台主机吗？解绑后这些主机将从控制台移除。
+          确定要解绑以下 {{ selectedHosts.length }} 台主机吗？解绑后这些主机将从控制台移除。
         </p>
-        <div class="batch-unbind-list">
-          <div v-for="h in selectedHosts" :key="h.id">{{ h.hostname }}（{{ h.id }}）</div>
+        <div class="batch-target-list">
+          <div v-for="h in selectedHosts.slice(0, 5)" :key="h.id" class="batch-target-row">
+            {{ h.hostname }}（{{ h.id }}）
+          </div>
+          <div v-if="selectedHosts.length > 5" class="batch-target-row muted">
+            等 {{ selectedHosts.length - 5 }} 台…
+          </div>
         </div>
         <NCheckbox v-model:checked="batchUninstallAgent">
           同时卸载 Agent 并清除其数据（不可恢复，需主机在线）
@@ -1489,7 +1498,7 @@ onUnmounted(() => {
         <p v-if="batchUninstallAgent" class="guide-text">
           离线主机无法远程卸载，将记为失败，可稍后重试。
         </p>
-      </NSpace>
+      </div>
       <template #footer>
         <NSpace justify="end">
           <NButton @click="showBatchUnbindModal = false">取消</NButton>
@@ -1600,8 +1609,8 @@ onUnmounted(() => {
       align-items: center;
       gap: 10px;
       flex-wrap: wrap;
-      background: var(--n-color-modal);
-      border: 1px solid var(--n-border-color);
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
       border-radius: 8px;
       padding: 8px 12px;
 
@@ -1749,6 +1758,10 @@ onUnmounted(() => {
               color: var(--text-secondary);
               cursor: pointer;
               width: fit-content;
+              max-width: 100%;
+              overflow: hidden;
+              text-overflow: ellipsis;
+              white-space: nowrap;
               border-radius: 4px;
               padding: 0 4px;
               margin-left: -4px;
@@ -2094,16 +2107,6 @@ onUnmounted(() => {
     }
   }
 
-  .batch-unbind-list {
-    max-height: 200px;
-    overflow-y: auto;
-    font-size: 13px;
-    color: var(--text-secondary);
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-
   .enroll-modal-content {
     display: flex;
     flex-direction: column;
@@ -2296,6 +2299,39 @@ onUnmounted(() => {
           }
         }
       }
+    }
+  }
+}
+
+.batch-confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+
+  .guide-text {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+  }
+}
+
+.batch-target-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 10px;
+
+  .batch-target-row {
+    padding: 3px 0;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &.muted {
+      color: var(--text-secondary);
     }
   }
 }

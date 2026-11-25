@@ -200,6 +200,15 @@ watch(() => notifStore.events, (list) => {
   })
 })
 
+function isOpBusy(id: string) {
+  const st = opStatus.value[id]
+  return !!st && (st.phase === 'queued' || st.phase === 'running')
+}
+
+function eventRowClassName(e: AlertEvent) {
+  return [e.resolved ? '' : 'unread-row', isOpBusy(e.id) ? 'batch-row-busy' : ''].filter(Boolean).join(' ')
+}
+
 // 批量执行行内进度（NetworkList .op-progress 同款文案与色板）：render 函数由
 // NDataTable 在子组件渲染上下文里调用，样式须走 :deep 穿透（见文末样式）。
 function batchProgressNode(row: { id: string }) {
@@ -860,6 +869,7 @@ onMounted(() => {
                 :value="notifStore.unreadCount"
                 :max="99"
                 type="error"
+                class="msg-badge"
               />
             </NSpace>
           </template>
@@ -955,7 +965,7 @@ onMounted(() => {
                 size="small"
                 :row-key="(e: AlertEvent) => e.id"
                 :checked-row-keys="[...selectedEventIds]"
-                :row-class-name="(e: AlertEvent) => (e.resolved ? '' : 'unread-row')"
+                :row-class-name="eventRowClassName"
                 :scroll-x="1000"
                 @update:checked-row-keys="onEventChecked"
               >
@@ -1565,14 +1575,22 @@ onMounted(() => {
   }
 }
 
+// 数字徽标个位数正圆（DESIGN.md §9.1 / AppShell.vue 同款）
+.msg-badge :deep(.n-badge-sup) {
+  box-sizing: border-box;
+  min-width: 18px;
+  padding: 0 5px;
+  justify-content: center;
+}
+
 // 批量操作栏（NetworkList.vue 同款）
 .batch-bar {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 8px 12px;
   margin-bottom: 12px;
@@ -1593,6 +1611,12 @@ onMounted(() => {
     font-size: 12px;
     color: var(--text-secondary);
   }
+}
+
+/* 批量执行中的行：操作列整体置灰禁用，防单行操作与批量并发冲突（DESIGN.md §9.22） */
+:deep(.batch-row-busy [data-col-key="actions"]) {
+  pointer-events: none;
+  opacity: 0.5;
 }
 
 // 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口

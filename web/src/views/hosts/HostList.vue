@@ -108,6 +108,48 @@ const groupFilterOptions = computed(() => [
 
 const groupAssignOptions = computed(() => groups.value.map((g) => ({ label: g.name, value: g.name })))
 
+// 卡片栏目点击快速筛选：状态 / 系统版本 / 位置三个维度与搜索、分组同源，
+// 都落在 filteredHosts 里，不另起一套列表状态；再点同一值即清除。
+type StatusFilterKey = '' | 'online' | 'offline' | 'upgrading' | 'error'
+const statusFilter = ref<StatusFilterKey>('')
+const distroFilter = ref('')
+const locationFilter = ref('')
+const statusFilterOptions = [
+  { label: '全部状态', value: '' },
+  { label: '在线', value: 'online' },
+  { label: '离线', value: 'offline' },
+  { label: '升级中', value: 'upgrading' },
+  { label: '升级失败', value: 'error' },
+]
+
+function displayDistro(h: Host): string {
+  return h.distro || h.os || 'Linux'
+}
+
+// 与状态 pill 的渲染分支同序：升级中 / 升级失败优先于在线/离线。
+function statusKey(h: Host): Exclude<StatusFilterKey, ''> {
+  if (h.upgrading && h.upgrade_stage !== 'error') return 'upgrading'
+  if (h.upgrade_stage === 'error') return 'error'
+  return h.status === 'online' ? 'online' : 'offline'
+}
+
+function toggleStatusFilter(key: Exclude<StatusFilterKey, ''>) {
+  statusFilter.value = statusFilter.value === key ? '' : key
+}
+function toggleGroupFilter(name: string) {
+  groupFilter.value = groupFilter.value === name ? '' : name
+}
+function toggleDistroFilter(value: string) {
+  distroFilter.value = distroFilter.value === value ? '' : value
+}
+function toggleLocationFilter(value: string) {
+  locationFilter.value = locationFilter.value === value ? '' : value
+}
+function clearDistroLocationFilters() {
+  distroFilter.value = ''
+  locationFilter.value = ''
+}
+
 const filteredHosts = computed(() => {
   const q = search.value.trim().toLowerCase()
   const gf = groupFilter.value
@@ -115,6 +157,9 @@ const filteredHosts = computed(() => {
     const groups = h.groups || []
     if (gf === '__none__' && groups.length > 0) return false
     if (gf && gf !== '__none__' && !groups.includes(gf)) return false
+    if (statusFilter.value && statusKey(h) !== statusFilter.value) return false
+    if (distroFilter.value && displayDistro(h) !== distroFilter.value) return false
+    if (locationFilter.value && (h.location || '') !== locationFilter.value) return false
     if (!q) return true
     return (
       h.hostname.toLowerCase().includes(q) ||
@@ -123,6 +168,7 @@ const filteredHosts = computed(() => {
       (h.distro || '').toLowerCase().includes(q) ||
       (h.internal_ip || '').toLowerCase().includes(q) ||
       (h.public_ip || '').toLowerCase().includes(q) ||
+      (h.location || '').toLowerCase().includes(q) ||
       groups.some((g) => g.toLowerCase().includes(q)) ||
       (h.notes || '').toLowerCase().includes(q)
     )
@@ -183,7 +229,7 @@ const pagedHosts = computed(() => {
   return filteredHosts.value.slice(start, start + pageSize.value)
 })
 // 搜索/筛选变化回第一页
-watch([search, groupFilter], () => {
+watch([search, groupFilter, statusFilter, distroFilter, locationFilter], () => {
   page.value = 1
 })
 // 页码收敛：筛选收紧导致总行数变少时夹回最大有效页，杜绝空白页
@@ -968,6 +1014,12 @@ onUnmounted(() => {
             size="small"
             style="width: 170px"
           />
+          <NSelect
+            v-model:value="statusFilter"
+            :options="statusFilterOptions"
+            size="small"
+            style="width: 120px"
+          />
         </div>
 
         <div class="toolbar-right">
@@ -1012,6 +1064,21 @@ onUnmounted(() => {
             </template>
           </NButton>
         </div>
+      </div>
+
+      <!-- 快速筛选提示条：系统版本与位置没有工具栏下拉，只有筛中时才出现，
+           点 × 或再点一次卡片上的同一值即可清除；不新增常驻占位元素 -->
+      <div v-if="distroFilter || locationFilter" class="quick-filter-bar">
+        <span class="quick-filter-label">快速筛选：</span>
+        <NTag v-if="distroFilter" size="small" closable @close="distroFilter = ''">
+          系统：{{ distroFilter }}
+        </NTag>
+        <NTag v-if="locationFilter" size="small" closable @close="locationFilter = ''">
+          位置：{{ locationFilter }}
+        </NTag>
+        <NButton size="small" quaternary @click="clearDistroLocationFilters">
+          清除
+        </NButton>
       </div>
 
       <!-- 批量操作栏：有勾选时出现，执行期间按钮禁用、行内逐台显示进度 -->
@@ -1108,11 +1175,31 @@ onUnmounted(() => {
               <div class="host-name-row">
                 <span class="host-name" :title="host.hostname">{{ host.hostname }}</span>
                 <span v-if="host.groups?.length" class="group-tags">
-                  <NTag v-for="g in host.groups" :key="g" size="tiny" :bordered="false" type="info">{{ g }}</NTag>
+                  <!-- NTag 自身不透传 onClick，点筛选必须包一层 span 拦截，
+                       否则点击会冒泡到整行进详情 -->
+                  <span
+                    v-for="g in host.groups"
+                    :key="g"
+                    class="group-tag-click"
+                    :title="`点击筛选：仅看 ${g} 分组`"
+                    @click.stop="toggleGroupFilter(g)"
+                  >
+                    <NTag
+                      size="tiny"
+                      :bordered="false"
+                      type="info"
+                      :class="{ 'is-filter-active': groupFilter === g }"
+                    >{{ g }}</NTag>
+                  </span>
                 </span>
               </div>
-              <div class="host-distro">
-                {{ host.distro || host.os || 'Linux' }}
+              <div
+                class="host-distro"
+                :class="{ 'is-filter-active': distroFilter === displayDistro(host) }"
+                :title="`点击筛选：仅看 ${displayDistro(host)}`"
+                @click.stop="toggleDistroFilter(displayDistro(host))"
+              >
+                {{ displayDistro(host) }}
               </div>
             </div>
 
@@ -1121,7 +1208,9 @@ onUnmounted(() => {
               <div
                 v-if="host.upgrading && host.upgrade_stage !== 'error'"
                 class="uptime-pill is-upgrading"
-                :title="`Agent 正在升级至 ${host.upgrade_target || '最新版'}${host.upgrade_stage ? ` (${formatUpgradeStage(host.upgrade_stage)})` : ''}`"
+                :class="{ 'is-filter-active': statusFilter === 'upgrading' }"
+                :title="`Agent 正在升级至 ${host.upgrade_target || '最新版'}${host.upgrade_stage ? ` (${formatUpgradeStage(host.upgrade_stage)})` : ''}（点击筛选：仅看升级中的主机）`"
+                @click.stop="toggleStatusFilter('upgrading')"
               >
                 <NSpin :size="12" style="margin-right: 4px;" />
                 升级中{{ host.upgrade_stage ? ` (${formatUpgradeStage(host.upgrade_stage)})` : '' }}
@@ -1129,7 +1218,9 @@ onUnmounted(() => {
               <div
                 v-else-if="host.upgrade_stage === 'error'"
                 class="uptime-pill is-error"
-                :title="`Agent 升级失败: ${host.upgrade_error || '未知错误'}`"
+                :class="{ 'is-filter-active': statusFilter === 'error' }"
+                :title="`Agent 升级失败: ${host.upgrade_error || '未知错误'}（点击筛选：仅看升级失败的主机）`"
+                @click.stop="toggleStatusFilter('error')"
               >
                 <NIcon :component="AlertCircleOutline" style="margin-right: 4px;" />
                 升级失败
@@ -1137,7 +1228,13 @@ onUnmounted(() => {
               <div
                 v-else
                 class="uptime-pill"
-                :class="{ 'is-online': host.status === 'online', 'is-offline': host.status !== 'online' }"
+                :class="{
+                  'is-online': host.status === 'online',
+                  'is-offline': host.status !== 'online',
+                  'is-filter-active': statusFilter === statusKey(host),
+                }"
+                :title="host.status === 'online' ? '点击筛选：仅看在线主机' : '点击筛选：仅看离线主机'"
+                @click.stop="toggleStatusFilter(statusKey(host))"
               >
                 {{ host.status === 'online' ? `已开机 ${fmtUptime(host)}` : '当前已离线' }}
               </div>
@@ -1196,7 +1293,13 @@ onUnmounted(() => {
                 <span class="ip-label">外</span>
                 <span class="ip-value">
                   {{ host.public_ip || '-' }}
-                  <span v-if="host.location" class="ip-location">({{ host.location }})</span>
+                  <span
+                    v-if="host.location"
+                    class="ip-location"
+                    :class="{ 'is-filter-active': locationFilter === host.location }"
+                    :title="`点击筛选：仅看 ${host.location} 的主机`"
+                    @click.stop="toggleLocationFilter(host.location)"
+                  >({{ host.location }})</span>
                 </span>
               </div>
             </div>
@@ -1520,6 +1623,16 @@ onUnmounted(() => {
       }
     }
 
+    // 快速筛选提示条：只在系统版本/位置筛中时出现，不常驻占位
+    .quick-filter-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
     .host-list-container {
       flex: 1;
       min-height: 0;
@@ -1615,12 +1728,41 @@ onUnmounted(() => {
                 flex-wrap: wrap;
                 gap: 4px;
                 flex-shrink: 0;
+
+                // 分组标签可点筛选：悬停给手型，再点同一分组即清除
+                .group-tag-click {
+                  cursor: pointer;
+                  display: inline-flex;
+                }
+
+                .n-tag {
+                  &.is-filter-active {
+                    outline: 1px solid #6366f1;
+                    outline-offset: 1px;
+                  }
+                }
               }
             }
 
             .host-distro {
               font-size: 12px;
               color: var(--text-secondary);
+              cursor: pointer;
+              width: fit-content;
+              border-radius: 4px;
+              padding: 0 4px;
+              margin-left: -4px;
+
+              &:hover {
+                color: #6366f1;
+                background-color: rgba(99, 102, 241, 0.08);
+              }
+
+              &.is-filter-active {
+                color: #6366f1;
+                background-color: rgba(99, 102, 241, 0.12);
+                font-weight: 600;
+              }
             }
           }
 
@@ -1665,6 +1807,16 @@ onUnmounted(() => {
               border-radius: 14px;
               font-size: 12px;
               font-weight: 500;
+              cursor: pointer;
+
+              &:hover {
+                filter: brightness(0.92);
+              }
+
+              &.is-filter-active {
+                outline: 2px solid currentColor;
+                outline-offset: 1px;
+              }
 
               &.is-online {
                 background-color: rgba(16, 185, 129, 0.12);
@@ -1784,6 +1936,20 @@ onUnmounted(() => {
                   color: var(--text-secondary);
                   margin-left: 4px;
                   font-size: 12px;
+                  cursor: pointer;
+                  border-radius: 3px;
+                  padding: 0 2px;
+
+                  &:hover {
+                    color: #6366f1;
+                    text-decoration: underline;
+                  }
+
+                  &.is-filter-active {
+                    color: #6366f1;
+                    font-weight: 600;
+                    background-color: rgba(99, 102, 241, 0.12);
+                  }
                 }
               }
             }

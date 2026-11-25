@@ -108,6 +108,9 @@ do_uninstall() {
   rm -f /etc/systemd/system/watchman-server.service /etc/systemd/system/watchman-agent.service
   systemctl daemon-reload 2>/dev/null || true
 
+  # 安装时建的快捷方式（--purge 也删不到它，它不在 $INSTALL_DIR 下）
+  rm -f /usr/local/bin/watchman-server
+
   # 旧版残留的 nginx 站点（2026-09-28 起不再需要 nginx）
   if [[ -f /etc/nginx/sites-enabled/watchman || -f /etc/nginx/sites-available/watchman ]]; then
     rm -f /etc/nginx/sites-enabled/watchman /etc/nginx/sites-available/watchman
@@ -250,6 +253,13 @@ extract_tarball() {
   # 把安装脚本自身留一份，方便以后重跑升级
   cp "$0" "$INSTALL_DIR/install.sh" 2>/dev/null || true
   log_ok "文件已落盘"
+}
+
+link_server_binary() {
+  # 救援开关（-reset-panel-domain 等）按文档用裸命令调用：
+  # 安装脚本负责把服务端二进制链进 /usr/local/bin，否则每次都要拼全路径。
+  ln -sf "$INSTALL_DIR/bin/watchman-server" /usr/local/bin/watchman-server
+  log_ok "已创建快捷方式 /usr/local/bin/watchman-server"
 }
 
 provision_secrets() {
@@ -451,6 +461,7 @@ main() {
   stop_services
   remove_legacy_nginx
   extract_tarball
+  link_server_binary
   remove_legacy_webdir
   provision_secrets
   write_systemd_server

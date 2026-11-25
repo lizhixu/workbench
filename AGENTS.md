@@ -734,6 +734,7 @@ Agent internal/shell
 - **文件与目录布局**：
   - 安装根目录：`/opt/watchman`
   - 程序文件：`/opt/watchman/bin/watchman-server`、`/opt/watchman/bin/watchman-agent-*`
+  - 快捷方式：`/usr/local/bin/watchman-server` → `/opt/watchman/bin/watchman-server`（安装脚本创建，卸载时移除；`-reset-*` 救援开关直接用 `watchman-server` 调用）
   - 数据目录：`/opt/watchman/data`（存储用户凭据 `users.json`、设置中心 `settings.json`、终端会话与录像 `sessions/`、发布清单 `manifest.json` 等）
   - 密钥环境文件：`/opt/watchman/watchman.env`（`WATCHMAN_JWT_KEY` 与 `WATCHMAN_VAULT_PASS`，权限 `0600`，重装与平滑升级时持久化复用）
 - **Systemd 托管规范**：

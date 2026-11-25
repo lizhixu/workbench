@@ -1956,43 +1956,40 @@ func (h *handlers) dockerCall(c *gin.Context, op, container, image string, argsJ
 			c.JSON(http.StatusInternalServerError, gin.H{"error": ev.GetError()})
 			return
 		}
-		// Parse the payload JSON for a structured response. Docker's
-		// --format {{json .}} emits NDJSON (one object per line), which is
-		// not a single JSON document, so try line-by-line parsing as a
-		// fallback before returning the raw text.
-		payload := ev.GetPayloadJson()
-		// ps/images are lists. `docker --format {{json .}}` prints one object per
-		// line, so a single container is a valid standalone JSON object while two
-		// or more are NDJSON. Parsing the document first would hand the browser
-		// an object in the one-container case and render an empty table, so list
-		// ops are always normalised to an array.
-		if op == "ps" || op == "images" {
-			rows := parseNDJSON(payload)
-			if rows == nil {
-				rows = []any{}
-			}
-			c.JSON(http.StatusOK, gin.H{"ok": true, "data": rows})
-			return
-		}
-		// logs is plain text (one log line per row). Structured wrapping makes
-		// the frontend re-stringify it with indentation/brackets/commas and
-		// break line semantics (colouring, timestamp parsing, search, copy).
-		// Return raw text; ps/images above still need array normalisation.
-		if op == "logs" {
-			c.JSON(http.StatusOK, gin.H{"ok": true, "raw": string(payload)})
-			return
-		}
-		var parsed any
-		if json.Unmarshal(payload, &parsed) == nil {
-			c.JSON(http.StatusOK, gin.H{"ok": true, "data": parsed})
-		} else if rows := parseNDJSON(payload); rows != nil {
-			c.JSON(http.StatusOK, gin.H{"ok": true, "data": rows})
-		} else {
-			c.JSON(http.StatusOK, gin.H{"ok": true, "raw": string(payload)})
-		}
+		body := formatDockerPayload(op, ev.GetPayloadJson())
+		c.JSON(http.StatusOK, body)
 	case <-time.After(dockerOpTimeout(op)):
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "docker timeout"})
 	}
+}
+
+// formatDockerPayload turns raw agent DockerEvent payload bytes into the JSON
+// response envelope. List ops (`ps`, `ps_all`, `images`) emit NDJSON (one
+// JSON object per line), so 0/1/N items must all normalize to a JSON array;
+// `logs` returns raw plain text; everything else parses as JSON with NDJSON /
+// raw fallback.
+func formatDockerPayload(op string, payload []byte) gin.H {
+	if op == "ps" || op == "ps_all" || op == "images" {
+		rows := parseNDJSON(payload)
+		if rows == nil {
+			rows = []any{}
+		}
+		return gin.H{"ok": true, "data": rows}
+	}
+	// logs is plain text (one log line per row). Structured wrapping makes
+	// the frontend re-stringify it with indentation/brackets/commas and
+	// break line semantics (colouring, timestamp parsing, search, copy).
+	if op == "logs" {
+		return gin.H{"ok": true, "raw": string(payload)}
+	}
+	var parsed any
+	if json.Unmarshal(payload, &parsed) == nil {
+		return gin.H{"ok": true, "data": parsed}
+	}
+	if rows := parseNDJSON(payload); rows != nil {
+		return gin.H{"ok": true, "data": rows}
+	}
+	return gin.H{"ok": true, "raw": string(payload)}
 }
 
 // dockerOpTimeout returns the HTTP-side wait budget for a docker op. Pulls can

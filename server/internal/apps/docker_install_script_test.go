@@ -58,3 +58,12 @@ func TestDockerInstallScriptFailsLoudly(t *testing.T) {
 		t.Error("install script must start the daemon on both systemd and sysvinit hosts")
 	}
 }
+
+func TestDockerInstallScriptSupportsAlinux3(t *testing.T) {
+	if !strings.Contains(dockerInstallScript, "alinux") {
+		t.Fatal("docker_repo_distro must map alinux (Alibaba Cloud Linux 3) to the centos tree")
+	}
+	if !strings.Contains(dockerInstallScript, `s/\$releasever/8/g`) {
+		t.Error("install_rpm must pin $releasever to 8 in docker-ce.repo on Alibaba Cloud Linux 3")
+	}
+}

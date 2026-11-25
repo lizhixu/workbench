@@ -135,8 +135,9 @@ async function loadAppTerminalContainers() {
       if (labels['watchman.app'] !== app.value.id && labels['com.docker.compose.project'] !== `watchman-${app.value.id}`) {
         continue
       }
+      const rawName = Array.isArray(c.Names) ? c.Names[0] : c.Names
       found.push({
-        name: (c.Names || c.ID || '').replace(/^\//, ''),
+        name: String(rawName || c.ID || c.Id || '').replace(/^\//, ''),
         status: c.Status || '',
         service: labels['com.docker.compose.service'] || '',
       })

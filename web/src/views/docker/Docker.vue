@@ -96,14 +96,91 @@ const { pagination: imagePagination } = useTablePagination({ pageSize: 20, rowCo
 // NDataTable 的 checked-row-keys 由本页全量数据驱动，翻页不丢勾选。
 const BATCH_CONCURRENCY = 3
 type BatchOpPhase = 'queued' | 'running' | 'done' | 'failed'
-const opStatus = ref<Record<string, { phase: BatchOpPhase; message?: string }>>({})
-const batchRunning = ref(false)
-const batchKind = ref<'c-start' | 'c-stop' | 'c-rm' | 'i-rm' | null>(null)
-const batchSummary = ref<{ done: number; failed: number; skipped: number } | null>(null)
+type BatchOpKind = 'start' | 'stop' | 'rm' | 'remove_image'
+interface TabBatchState {
+  opStatus: Record<string, { phase: BatchOpPhase; message?: string }>
+  running: boolean
+  kind: BatchOpKind | null
+  summary: { done: number; failed: number; skipped: number } | null
+}
+const createBatchState = (): TabBatchState => ({
+  opStatus: {},
+  running: false,
+  kind: null,
+  summary: null,
+})
+// 容器与镜像页签各自持有独立的批量状态，互不串扰
+const containerBatch = ref<TabBatchState>(createBatchState())
+const imageBatch = ref<TabBatchState>(createBatchState())
 
-// 容器 key：docker ps 的 Names 带前导 /，归一后作勾选 key 与进度 key。
-const containerKey = (row: any) => (row.Names || row.ID || '').replace(/^\//, '')
-const imageKey = (row: any) => row.ID || row.Id || `${row.Repository || ''}:${row.Tag || ''}`
+// 容器 key：docker ps 的 Names 带前导 /，podman-docker 的 Names 可能为数组；
+// 统一提取主名称作勾选 key、进度 key 与后续容器操作标识，避免数组调用 .replace 崩溃。
+function containerNameStr(row: any): string {
+  const raw = row?.Names
+  const name = Array.isArray(raw) ? raw[0] : raw
+  return String(name || row?.ID || row?.Id || '').replace(/^\//, '')
+}
+
+function imageRefPair(row: any): { repo: string; tag: string } {
+  if (row?.Repository || row?.Tag) {
+    return { repo: String(row.Repository || '<none>'), tag: String(row.Tag || '<none>') }
+  }
+  const list = Array.isArray(row?.RepoTags) ? row.RepoTags : Array.isArray(row?.Names) ? row.Names : []
+  const first = typeof list[0] === 'string' ? list[0] : ''
+  if (!first) return { repo: '<none>', tag: '<none>' }
+  const slash = first.lastIndexOf('/')
+  const colon = first.lastIndexOf(':')
+  if (colon > slash) {
+    return { repo: first.slice(0, colon), tag: first.slice(colon + 1) }
+  }
+  return { repo: first, tag: '<none>' }
+}
+
+function formatImageSize(sz: unknown): string {
+  if (typeof sz === 'number' && Number.isFinite(sz)) {
+    if (sz <= 0) return '0 B'
+    const units = ['B', 'KB', 'MB', 'GB', 'TB']
+    let v = sz
+    let idx = 0
+    while (v >= 1024 && idx < units.length - 1) {
+      v /= 1024
+      idx += 1
+    }
+    return `${v.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`
+  }
+  return sz ? String(sz) : '-'
+}
+
+function formatContainerPorts(ports: unknown): string {
+  if (!ports) return ''
+  if (typeof ports === 'string') return ports
+  if (Array.isArray(ports)) {
+    return ports
+      .map((p: any) => {
+        if (typeof p === 'string') return p
+        if (p && typeof p === 'object') {
+          const hp = p.host_port ?? p.hostPort
+          const cp = p.container_port ?? p.containerPort
+          const proto = p.protocol || 'tcp'
+          const ip = p.host_ip ?? p.hostIP ?? '0.0.0.0'
+          if (hp && cp) return `${ip}:${hp}->${cp}/${proto}`
+          if (cp) return `${cp}/${proto}`
+        }
+        return ''
+      })
+      .filter(Boolean)
+      .join(', ')
+  }
+  return String(ports)
+}
+
+const containerKey = (row: any) => containerNameStr(row)
+const imageKey = (row: any) => {
+  const id = row?.ID || row?.Id
+  if (id) return String(id)
+  const { repo, tag } = imageRefPair(row)
+  return `${repo}:${tag}`
+}
 const checkedContainerKeys = ref<string[]>([])
 const checkedImageKeys = ref<string[]>([])
 
@@ -113,29 +190,54 @@ const isContainerRunning = (row: any) => row.Status?.includes('Up') || row.State
 const batchContainerStartable = computed(() => selectedContainers.value.filter((c) => !isContainerRunning(c)))
 const batchContainerStoppable = computed(() => selectedContainers.value.filter((c) => isContainerRunning(c)))
 
+function resetBatchState(stateRef: { value: TabBatchState }) {
+  stateRef.value.opStatus = {}
+  stateRef.value.summary = null
+  stateRef.value.kind = null
+}
+
 function clearContainerSelection() {
   checkedContainerKeys.value = []
-  opStatus.value = {}
-  batchSummary.value = null
-  batchKind.value = null
+  resetBatchState(containerBatch)
 }
 
 function clearImageSelection() {
   checkedImageKeys.value = []
-  opStatus.value = {}
-  batchSummary.value = null
-  batchKind.value = null
+  resetBatchState(imageBatch)
 }
 
-function isOpBusy(key: string) {
-  const st = opStatus.value[key]
+function isRowBusy(state: TabBatchState, key: string) {
+  const st = state.opStatus[key]
   return !!st && (st.phase === 'queued' || st.phase === 'running')
 }
 
-// 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突
-function rowClassName(row: any) {
-  const key = row.Names !== undefined ? `c:${containerKey(row)}` : `i:${imageKey(row)}`
-  return isOpBusy(key) ? 'batch-row-busy' : ''
+// 批量执行中的行：操作列置灰禁用，防单机操作与批量并发冲突
+function containerRowClassName(row: any) {
+  return isRowBusy(containerBatch.value, containerKey(row)) ? 'batch-row-busy' : ''
+}
+
+function imageRowClassName(row: any) {
+  return isRowBusy(imageBatch.value, imageKey(row)) ? 'batch-row-busy' : ''
+}
+
+function renderBatchOpNode(state: TabBatchState, key: string, baseNode: any) {
+  const op = state.opStatus[key]
+  if (!op) return baseNode
+  const text = op.phase === 'queued'
+    ? '排队中…'
+    : op.phase === 'running'
+      ? '执行中…'
+      : op.phase === 'done'
+        ? '已完成'
+        : `失败：${op.message || '执行出错'}`
+  const color = op.phase === 'done' ? '#059669' : op.phase === 'failed' ? '#dc2626' : '#3b82f6'
+  return h('div', { style: 'display: flex; flex-direction: column; gap: 2px; min-width: 0;' }, [
+    baseNode,
+    h('span', {
+      style: `font-size: 12px; color: ${color}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;`,
+      title: op.message || '',
+    }, text),
+  ])
 }
 
 function pruneSelections() {
@@ -154,10 +256,10 @@ function onCheckedImageKeysChange(keys: (string | number)[]) {
   checkedImageKeys.value = keys.map(String)
 }
 
-// 逐台并发执行器：容器启停/删除与镜像删除共用。每台独立链路，失败一台不影响其他。
-// keyFn 把行映射为进度 key（c:容器名 / i:镜像 ID），fn 复用单机 dockerOp。
+// 逐台并发执行器：容器启停/删除与镜像删除共用，按所属页签状态独立运行。
 async function runBatchPerRow<T>(
-  kind: 'c-start' | 'c-stop' | 'c-rm' | 'i-rm',
+  stateRef: { value: TabBatchState },
+  kind: BatchOpKind,
   targets: T[],
   keyFn: (row: T) => string,
   fn: (row: T) => Promise<unknown>,
@@ -170,67 +272,98 @@ async function runBatchPerRow<T>(
     message.warning('所选行中没有可执行的目标')
     return
   }
-  batchRunning.value = true
-  batchKind.value = kind
-  batchSummary.value = null
-  opStatus.value = {}
+  stateRef.value.running = true
+  stateRef.value.kind = kind
+  stateRef.value.summary = null
+  stateRef.value.opStatus = {}
   targets.forEach((row) => {
-    opStatus.value[keyFn(row)] = { phase: 'queued' }
+    stateRef.value.opStatus[keyFn(row)] = { phase: 'queued' }
   })
   let done = 0
   let failed = 0
-  const queue = [...targets]
-  async function worker() {
-    while (queue.length > 0) {
-      const row = queue.shift()!
-      const key = keyFn(row)
-      opStatus.value[key] = { phase: 'running' }
-      try {
-        await fn(row)
-        opStatus.value[key] = { phase: 'done' }
-        done += 1
-      } catch (e: any) {
-        opStatus.value[key] = { phase: 'failed', message: e.message || '执行出错' }
-        failed += 1
+  try {
+    const queue = [...targets]
+    async function worker() {
+      while (queue.length > 0) {
+        const row = queue.shift()!
+        const key = keyFn(row)
+        stateRef.value.opStatus[key] = { phase: 'running' }
+        try {
+          await fn(row)
+          stateRef.value.opStatus[key] = { phase: 'done' }
+          done += 1
+        } catch (e: any) {
+          stateRef.value.opStatus[key] = { phase: 'failed', message: e.message || '执行出错' }
+          failed += 1
+        }
       }
     }
+    await Promise.all(
+      Array.from({ length: Math.min(BATCH_CONCURRENCY, queue.length) }, () => worker()),
+    )
+    await after()
+    pruneSelections()
+  } finally {
+    stateRef.value.running = false
   }
-  await Promise.all(
-    Array.from({ length: Math.min(BATCH_CONCURRENCY, queue.length) }, () => worker()),
-  )
-  batchRunning.value = false
-  batchSummary.value = { done, failed, skipped }
-  const verb = { 'c-start': '启动', 'c-stop': '停止', 'c-rm': '删除', 'i-rm': '删除' }[kind]
+  stateRef.value.summary = { done, failed, skipped }
+  const verb = { start: '启动', stop: '停止', rm: '删除', remove_image: '删除' }[kind]
   const skipText = skipped > 0 ? `，跳过 ${skipped} 个` : ''
   if (failed === 0) {
     message.success(`批量${verb}完成：成功 ${done} 个${skipText}`)
   } else {
     message.warning(`批量${verb}完成：成功 ${done} 个，失败 ${failed} 个${skipText}，可点「重试失败」只重跑失败的行`)
   }
-  await after()
-  pruneSelections()
 }
 
-function retryBatchFailed() {
-  if (!batchKind.value || !batchSummary.value || batchSummary.value.failed === 0) return
-  const kind = batchKind.value
-  const failedKeys = new Set(
-    Object.entries(opStatus.value)
-      .filter(([, st]) => st.phase === 'failed')
-      .map(([k]) => k),
+function startOrStopContainers(op: 'start' | 'stop') {
+  const targets = op === 'start' ? batchContainerStartable.value : batchContainerStoppable.value
+  return runBatchPerRow(
+    containerBatch,
+    op,
+    targets,
+    containerKey,
+    (c) => dockerOp(hostId, op, containerKey(c)),
+    () => loadAll(true),
+    selectedContainers.value.length - targets.length,
   )
-  if (kind === 'c-start' || kind === 'c-stop' || kind === 'c-rm') {
-    const op = kind.slice(2)
-    const targets = containers.value.filter((c) => failedKeys.has(`c:${containerKey(c)}`))
-    if (targets.length === 0) return
-    runBatchPerRow(kind, targets, (c) => `c:${containerKey(c)}`,
-      (c) => dockerOp(hostId, op, c.Names || c.ID), () => loadAll())
-  } else {
-    const targets = images.value.filter((i) => failedKeys.has(`i:${imageKey(i)}`))
-    if (targets.length === 0) return
-    runBatchPerRow('i-rm', targets, (i) => `i:${imageKey(i)}`,
-      (i) => dockerOp(hostId, 'remove_image', '', i.ID || i.Id), () => loadImages())
-  }
+}
+
+function retryContainerBatchFailed() {
+  const st = containerBatch.value
+  if (!st.kind || !st.summary || st.summary.failed === 0 || st.kind === 'remove_image') return
+  const failedKeys = new Set(
+    Object.entries(st.opStatus).filter(([, s]) => s.phase === 'failed').map(([k]) => k),
+  )
+  const op = st.kind
+  const targets = containers.value.filter((c) => failedKeys.has(containerKey(c)))
+  if (targets.length === 0) return
+  runBatchPerRow(
+    containerBatch,
+    op,
+    targets,
+    containerKey,
+    (c) => dockerOp(hostId, op, containerKey(c)),
+    () => loadAll(true),
+  )
+}
+
+function retryImageBatchFailed() {
+  const st = imageBatch.value
+  if (st.kind !== 'remove_image' || !st.summary || st.summary.failed === 0) return
+  const failedKeys = new Set(
+    Object.entries(st.opStatus).filter(([, s]) => s.phase === 'failed').map(([k]) => k),
+  )
+  const targets = images.value.filter((i) => failedKeys.has(imageKey(i)))
+  if (targets.length === 0) return
+  runBatchPerRow(
+    imageBatch,
+    'remove_image',
+    targets,
+    imageKey,
+    (i) => dockerOp(hostId, 'remove_image', '', i.ID || i.Id),
+    () => loadImages(true),
+  )
 }
 
 // ---- 容器批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17）
@@ -242,9 +375,14 @@ function openBatchRmModal() {
 
 async function confirmBatchRm() {
   showBatchRmModal.value = false
-  await runBatchPerRow('c-rm', selectedContainers.value,
-    (c) => `c:${containerKey(c)}`,
-    (c) => dockerOp(hostId, 'rm', c.Names || c.ID), () => loadAll())
+  await runBatchPerRow(
+    containerBatch,
+    'rm',
+    selectedContainers.value,
+    containerKey,
+    (c) => dockerOp(hostId, 'rm', containerKey(c)),
+    () => loadAll(true),
+  )
 }
 
 // ---- 镜像批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17）
@@ -256,9 +394,14 @@ function openBatchImageRmModal() {
 
 async function confirmBatchImageRm() {
   showBatchImageRmModal.value = false
-  await runBatchPerRow('i-rm', selectedImages.value,
-    (i) => `i:${imageKey(i)}`,
-    (i) => dockerOp(hostId, 'remove_image', '', i.ID || i.Id), () => loadImages())
+  await runBatchPerRow(
+    imageBatch,
+    'remove_image',
+    selectedImages.value,
+    imageKey,
+    (i) => dockerOp(hostId, 'remove_image', '', i.ID || i.Id),
+    () => loadImages(true),
+  )
 }
 
 // Container Terminal Modal state
@@ -284,31 +427,54 @@ function openDeployApp() {
 
 // loadAll fetches containers + images in a single round trip via the
 // /docker/all endpoint, so the dashboard doesn't pay two sequential calls.
-async function loadAll() {
-  loading.value = true
-  try {
-    const res = await dockerAll(hostId)
-    containers.value = res.containers || []
-    images.value = res.images || []
-    dockerNotInstalled.value = false
-  } catch (e: any) {
-    if (
-      e.message?.includes('not found') ||
-      e.message?.includes('executable file not found') ||
-      e.message?.includes('Docker 未安装') ||
-      e.message?.includes('not in PATH')
-    ) {
-      dockerNotInstalled.value = true
-      containers.value = []
-      images.value = []
-    } else {
-      message.error(e.message || '加载 Docker 数据失败')
+// Coalesce concurrent calls so rapid clicks/tabs do not stack agent CLI scans.
+let loadAllInFlight: Promise<void> | null = null
+let allLoaded = false
+let loadAllSeq = 0
+
+async function loadAll(force = false) {
+  if (loadAllInFlight && !force) return loadAllInFlight
+  const seq = ++loadAllSeq
+  const task = (async () => {
+    loading.value = true
+    try {
+      const res = await dockerAll(hostId)
+      if (seq !== loadAllSeq) return
+      containers.value = res.containers || []
+      images.value = res.images || []
+      dockerNotInstalled.value = false
+      allLoaded = true
+    } catch (e: any) {
+      if (seq !== loadAllSeq) return
+      allLoaded = false
+      if (
+        e.message?.includes('not found') ||
+        e.message?.includes('executable file not found') ||
+        e.message?.includes('Docker 未安装') ||
+        e.message?.includes('not in PATH')
+      ) {
+        dockerNotInstalled.value = true
+        containers.value = []
+        images.value = []
+        usageLoaded.value = false
+      } else {
+        message.error(e.message || '加载 Docker 数据失败')
+      }
+    } finally {
+      if (seq === loadAllSeq) {
+        loading.value = false
+      }
+      // 刷新后清掉已不存在的行勾选，避免批量操作带上幽灵 key
+      pruneSelections()
     }
-  } finally {
-    loading.value = false
-    // 刷新后清掉已不存在的行勾选，避免批量操作带上幽灵 key
-    pruneSelections()
-  }
+  })()
+  loadAllInFlight = task
+  task.finally(() => {
+    if (loadAllInFlight === task) {
+      loadAllInFlight = null
+    }
+  })
+  return task
 }
 
 // watchmanAppLabel 从 docker ps 的 Labels 字段里提取 watchman.app=<appID>。
@@ -363,17 +529,28 @@ function openAppDetail(appID: string) {
   router.push(`/apps/${appID}`)
 }
 
-async function loadContainers() {
-  await loadAll()
+async function loadContainers(force = false) {
+  await loadAll(force)
 }
 
-async function loadImages() {
-  // dockerAll 一次往返同时带回容器与镜像，没有单独的镜像列表接口；镜像操作
-  // （拉取/删除/清理）后与手动刷新都必须无条件重拉，此前仅当列表为空才刷新，
-  // 导致操作成功后页面停留在旧数据。
-  // 使用状态另取一次 ps -a：dockerAll 的容器列表只含运行中容器，按它算会
-  // 把已停止容器引用的镜像错标成未使用。
-  await Promise.all([loadAll(), loadImageUsage()])
+async function loadImages(force = false) {
+  // 顺序执行 loadAll 与 loadImageUsage，避免浏览器端并发打出 ps + images + ps -a
+  // 三个子进程，在慢盘或元数据竞争场景下造成内存与磁盘读飙升。
+  await loadAll(force)
+  await loadImageUsage()
+}
+
+async function onDockerTabChange(v: string) {
+  if (v !== 'images') return
+  if (!allLoaded) {
+    await loadImages()
+    return
+  }
+  // 挂载时 loadAll 已拉取镜像清单，切到镜像页签只需补一次 ps_all 计算使用状态，
+  // 既避免已有镜像时「使用状态」一直显示 —，也避免无镜像时重复跑 ps + images。
+  if (!usageLoaded.value) {
+    await loadImageUsage()
+  }
 }
 
 // loadImageUsage 取全部容器（含已停止）建立「被引用镜像」集合，供镜像表
@@ -383,7 +560,7 @@ async function loadImageUsage() {
     const all = await dockerPsAll(hostId)
     const keys = new Set<string>()
     for (const c of all || []) {
-      if (c.Image) keys.add(c.Image)
+      if (c.Image) keys.add(String(c.Image))
       if (c.ImageID) keys.add(String(c.ImageID))
     }
     usedImageKeys.value = keys
@@ -403,7 +580,8 @@ function normImageId(id: string): string {
 // 或 ID 前缀互含（ps 的 ImageID 与 images 的 ID 长度可能不同，
 // 仅当双方都是十六进制 ID 时才做前缀比较，防仓库名误撞）。
 function imageUsed(row: any): boolean {
-  if (usedImageKeys.value.has(`${row.Repository}:${row.Tag}`)) return true
+  const { repo, tag } = imageRefPair(row)
+  if (usedImageKeys.value.has(`${repo}:${tag}`)) return true
   const id = normImageId(row.ID || row.Id || '')
   if (!id || !/^[0-9a-f]+$/.test(id)) return false
   for (const k of usedImageKeys.value) {
@@ -425,11 +603,11 @@ async function doOp(op: string, container: string) {
   try {
     if (op === 'rm') {
       containers.value = containers.value.filter(
-        (c) => (c.Names || c.ID || '').replace(/^\//, '') !== name,
+        (c) => containerKey(c) !== name,
       )
     } else if (op === 'start' || op === 'stop' || op === 'restart') {
       containers.value = containers.value.map((c) => {
-        const cn = (c.Names || c.ID || '').replace(/^\//, '')
+        const cn = containerKey(c)
         if (cn === name) {
           return {
             ...c,
@@ -441,10 +619,10 @@ async function doOp(op: string, container: string) {
         return c
       })
     }
-    await dockerOp(hostId, op, container)
+    await dockerOp(hostId, op, name)
     message.success(`${op} 成功`)
     // Reconcile with a background refresh (no await, no loading spinner).
-    loadAll()
+    loadAll(true)
   } catch (e: any) {
     // Roll back on failure.
     containers.value = prev
@@ -472,7 +650,7 @@ async function removeImage(imageId: string) {
   try {
     await dockerOp(hostId, 'remove_image', '', imageId)
     message.success('镜像已删除')
-    await loadImages()
+    await loadImages(true)
   } catch (e: any) {
     message.error(e.message)
   }
@@ -482,7 +660,7 @@ async function pruneImages() {
   try {
     await dockerOp(hostId, 'prune_images')
     message.success('已清除悬空镜像')
-    await loadImages()
+    await loadImages(true)
   } catch (e: any) {
     message.error(e.message)
   }
@@ -541,7 +719,11 @@ async function loadDeepCleanDf() {
   deepCleanLoading.value = true
   try {
     const rows = await dockerSystemDf(hostId)
-    deepCleanDf.value = (rows || []).map((r: any) => ({ ...r, typeLabel: dfTypeLabel(r.Type) }))
+    deepCleanDf.value = (rows || []).map((r: any) => ({
+      ...r,
+      TotalCount: r.TotalCount ?? r.Total ?? 0,
+      typeLabel: dfTypeLabel(r.Type),
+    }))
     deepCleanError.value = ''
   } catch (e: any) {
     deepCleanDf.value = []
@@ -580,7 +762,7 @@ async function runDeepClean() {
       deepCleanResult.value.push(`未使用卷：已回收 ${line || '未知'}`)
     }
     // 清理后刷新容器/镜像列表与预览（可回收量应归零）。
-    await loadAll()
+    await loadAll(true)
     await loadDeepCleanDf()
   } catch (e: any) {
     deepCleanError.value = e.message
@@ -600,7 +782,7 @@ async function pullImage() {
     await dockerOp(hostId, 'pull', '', pullImageName.value)
     message.success(`镜像 ${pullImageName.value} 拉取成功`)
     pullImageName.value = ''
-    await loadImages()
+    await loadImages(true)
   } catch (e: any) {
     message.error(e.message)
   } finally {
@@ -618,7 +800,7 @@ async function startInstallDocker() {
       message.success('Docker 安装完成，正在重新加载...')
       dockerNotInstalled.value = false
       setTimeout(() => {
-        loadAll()
+        loadAll(true)
       }, 2000)
     } else {
       installOutput.value += '\n>>> 执行异常 (Exit code ' + res.exit_code + '):\n' + (res.stderr || res.stdout || '')
@@ -756,12 +938,14 @@ function localizeContainerStatus(status: string): string {
   return status
 }
 
-const containerColumns = [
-  {
-    type: 'selection' as const,
-    width: 40,
-    disabled: () => batchRunning.value,
-  },
+const containerColumns = computed(() => [
+  ...(canInstall.value
+    ? [{
+        type: 'selection' as const,
+        width: 40,
+        disabled: () => containerBatch.value.running,
+      }]
+    : []),
   {
     title: '名称',
     key: 'Names',
@@ -776,7 +960,7 @@ const containerColumns = [
         contentStyle: { wordBreak: 'break-all' as const },
       },
     },
-    render: (row: any) => (row.Names || row.ID || '').replace(/^\//, ''),
+    render: (row: any) => containerNameStr(row),
   },
   { title: '镜像', key: 'Image', ellipsis: { tooltip: true } },
   {
@@ -793,27 +977,15 @@ const containerColumns = [
             h(NEllipsis, { tooltip: true }, { default: () => localizeContainerStatus(row.Status || row.State || '') }),
         },
       )
-      // 批量进度：执行期间状态格下方逐台显示当前阶段，失败时显示原因（悬停看全文）
-      const op = opStatus.value[`c:${containerKey(row)}`]
-      if (!op) return tag
-      const text = op.phase === 'queued'
-        ? '排队中…'
-        : op.phase === 'running'
-          ? '执行中…'
-          : op.phase === 'done'
-            ? '已完成'
-            : `失败：${op.message || '执行出错'}`
-      const color = op.phase === 'done' ? '#059669' : op.phase === 'failed' ? '#dc2626' : '#3b82f6'
-      return h('div', { style: 'display: flex; flex-direction: column; gap: 2px; min-width: 0;' }, [
-        tag,
-        h('span', {
-          style: `font-size: 12px; color: ${color}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;`,
-          title: op.message || '',
-        }, text),
-      ])
+      return renderBatchOpNode(containerBatch.value, containerKey(row), tag)
     },
   },
-  { title: '端口', key: 'Ports', ellipsis: { tooltip: true } },
+  {
+    title: '端口',
+    key: 'Ports',
+    ellipsis: { tooltip: true },
+    render: (row: any) => formatContainerPorts(row.Ports),
+  },
   {
     title: '纳管状态',
     key: 'managed',
@@ -846,7 +1018,7 @@ const containerColumns = [
               size: 'tiny',
               type: 'primary',
               quaternary: true,
-              onClick: () => openContainerTerminal(row.Names || row.ID),
+              onClick: () => openContainerTerminal(containerKey(row)),
             },
             {
               icon: () => h(NIcon, { component: TerminalOutline }),
@@ -855,48 +1027,50 @@ const containerColumns = [
           ),
           h(
             NButton,
-            { size: 'tiny', quaternary: true, onClick: () => doOp('start', row.Names) },
+            { size: 'tiny', quaternary: true, onClick: () => doOp('start', containerKey(row)) },
             { default: () => '启动' },
           ),
           h(
             NButton,
-            { size: 'tiny', quaternary: true, onClick: () => doOp('stop', row.Names) },
+            { size: 'tiny', quaternary: true, onClick: () => doOp('stop', containerKey(row)) },
             { default: () => '停止' },
           ),
           h(
             NButton,
-            { size: 'tiny', quaternary: true, onClick: () => doOp('restart', row.Names) },
+            { size: 'tiny', quaternary: true, onClick: () => doOp('restart', containerKey(row)) },
             { default: () => '重启' },
           ),
           h(
             NButton,
-            { size: 'tiny', quaternary: true, onClick: () => viewLogs(row.Names) },
+            { size: 'tiny', quaternary: true, onClick: () => viewLogs(containerKey(row)) },
             { default: () => '日志' },
           ),
           h(
             NPopconfirm,
-            { onPositiveClick: () => doOp('rm', row.Names) },
+            { onPositiveClick: () => doOp('rm', containerKey(row)) },
             {
               trigger: () =>
                 h(NButton, { size: 'tiny', quaternary: true, type: 'error' }, { default: () => '删除' }),
-              default: () => `确认删除容器 ${row.Names}?`,
+              default: () => `确认删除容器 ${containerKey(row)}?`,
             },
           ),
         ],
       }),
   },
-]
+])
 
-const imageColumns = [
-  {
-    type: 'selection' as const,
-    width: 40,
-    disabled: () => batchRunning.value,
-  },
-  { title: '仓库', key: 'Repository', ellipsis: { tooltip: true } },
-  { title: '标签', key: 'Tag', width: 100 },
-  { title: 'ID', key: 'ID', width: 80, ellipsis: { tooltip: true } },
-  { title: '大小', key: 'Size', width: 80 },
+const imageColumns = computed(() => [
+  ...(canInstall.value
+    ? [{
+        type: 'selection' as const,
+        width: 40,
+        disabled: () => imageBatch.value.running,
+      }]
+    : []),
+  { title: '仓库', key: 'Repository', ellipsis: { tooltip: true }, render: (row: any) => imageRefPair(row).repo },
+  { title: '标签', key: 'Tag', width: 100, render: (row: any) => imageRefPair(row).tag },
+  { title: 'ID', key: 'ID', width: 80, ellipsis: { tooltip: true }, render: (row: any) => String(row.ID || row.Id || '') },
+  { title: '大小', key: 'Size', width: 80, render: (row: any) => formatImageSize(row.Size) },
   {
     title: '使用状态',
     key: 'usage',
@@ -911,24 +1085,7 @@ const imageColumns = [
           ? h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => '使用中' })
           : h(NTag, { size: 'small', bordered: false }, { default: () => '未使用' })
       }
-      // 批量进度：执行期间状态格下方逐台显示当前阶段，失败时显示原因（悬停看全文）
-      const op = opStatus.value[`i:${imageKey(row)}`]
-      if (!op) return usage
-      const text = op.phase === 'queued'
-        ? '排队中…'
-        : op.phase === 'running'
-          ? '执行中…'
-          : op.phase === 'done'
-            ? '已完成'
-            : `失败：${op.message || '执行出错'}`
-      const color = op.phase === 'done' ? '#059669' : op.phase === 'failed' ? '#dc2626' : '#3b82f6'
-      return h('div', { style: 'display: flex; flex-direction: column; gap: 2px; min-width: 0;' }, [
-        usage,
-        h('span', {
-          style: `font-size: 12px; color: ${color}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;`,
-          title: op.message || '',
-        }, text),
-      ])
+      return renderBatchOpNode(imageBatch.value, imageKey(row), usage)
     },
   },
   {
@@ -949,11 +1106,11 @@ const imageColumns = [
                 default: () => '删除',
               },
             ),
-          default: () => `确认删除镜像 ${row.Repository}:${row.Tag}?`,
+          default: () => `确认删除镜像 ${imageRefPair(row).repo}:${imageRefPair(row).tag}?`,
         },
       ),
   },
-]
+])
 
 // 挂载时自注册 Workspace 页签（与 HostDetail.load() 同款）：直接访问
 // /docker/:id 时 AppShell 不会自动建签，标题取主机名、拉不到时回落主机 ID。
@@ -1022,7 +1179,7 @@ onMounted(() => {
       <NTabs
         v-model:value="tab"
         type="line"
-        @update:value="(v: string) => { if (v === 'images' && images.length === 0) loadImages() }"
+        @update:value="onDockerTabChange"
       >
         <NTabPane name="containers" tab="容器" display-directive="show:lazy">
           <div class="tab-pane-content">
@@ -1030,7 +1187,7 @@ onMounted(() => {
               <div class="tab-body">
                 <NSpace align="center" justify="space-between" class="tab-toolbar">
                   <NSpace align="center" :size="8">
-                    <NButton size="small" :loading="loading" @click="loadContainers">
+                    <NButton size="small" :loading="loading" @click="loadContainers(true)">
                       <template #icon><NIcon :component="RefreshOutline" /></template>
                       刷新
                     </NButton>
@@ -1048,8 +1205,8 @@ onMounted(() => {
                     一键安装 Docker
                   </NButton>
                 </NSpace>
-                <!-- 容器批量操作栏：有勾选时出现，执行期间按钮禁用、状态列逐台显示进度 -->
-                <div v-if="checkedContainerKeys.length > 0" class="batch-bar">
+                <!-- 容器批量操作栏：仅 admin/operator 可见，有勾选时出现，执行期间按钮禁用、状态列逐台显示进度 -->
+                <div v-if="canInstall && checkedContainerKeys.length > 0" class="batch-bar">
                   <span class="batch-info">
                     已选 {{ checkedContainerKeys.length }} 个容器
                     <span class="text-muted">（可启动 {{ batchContainerStartable.length }} · 可停止 {{ batchContainerStoppable.length }}）</span>
@@ -1058,9 +1215,9 @@ onMounted(() => {
                     size="small"
                     type="primary"
                     secondary
-                    :loading="batchRunning && batchKind === 'c-start'"
-                    :disabled="batchRunning || batchContainerStartable.length === 0"
-                    @click="runBatchPerRow('c-start', batchContainerStartable, (c) => `c:${containerKey(c)}`, (c) => dockerOp(hostId, 'start', c.Names || c.ID), () => loadAll(), selectedContainers.length - batchContainerStartable.length)"
+                    :loading="containerBatch.running && containerBatch.kind === 'start'"
+                    :disabled="containerBatch.running || batchContainerStartable.length === 0"
+                    @click="startOrStopContainers('start')"
                   >
                     批量启动
                   </NButton>
@@ -1068,9 +1225,9 @@ onMounted(() => {
                     size="small"
                     type="primary"
                     secondary
-                    :loading="batchRunning && batchKind === 'c-stop'"
-                    :disabled="batchRunning || batchContainerStoppable.length === 0"
-                    @click="runBatchPerRow('c-stop', batchContainerStoppable, (c) => `c:${containerKey(c)}`, (c) => dockerOp(hostId, 'stop', c.Names || c.ID), () => loadAll(), selectedContainers.length - batchContainerStoppable.length)"
+                    :loading="containerBatch.running && containerBatch.kind === 'stop'"
+                    :disabled="containerBatch.running || batchContainerStoppable.length === 0"
+                    @click="startOrStopContainers('stop')"
                   >
                     批量停止
                   </NButton>
@@ -1078,25 +1235,25 @@ onMounted(() => {
                     size="small"
                     type="error"
                     secondary
-                    :disabled="batchRunning"
+                    :disabled="containerBatch.running"
                     @click="openBatchRmModal"
                   >
                     批量删除
                   </NButton>
                   <NButton
-                    v-if="batchSummary && batchSummary.failed > 0"
+                    v-if="containerBatch.summary && containerBatch.summary.failed > 0"
                     size="small"
                     type="warning"
                     secondary
-                    :disabled="batchRunning"
-                    @click="retryBatchFailed"
+                    :disabled="containerBatch.running"
+                    @click="retryContainerBatchFailed"
                   >
-                    重试失败（{{ batchSummary.failed }}）
+                    重试失败（{{ containerBatch.summary.failed }}）
                   </NButton>
-                  <span v-if="batchSummary" class="batch-summary">
-                    成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}<span v-if="batchSummary.skipped > 0"> · 跳过 {{ batchSummary.skipped }}</span>
+                  <span v-if="containerBatch.summary" class="batch-summary">
+                    成功 {{ containerBatch.summary.done }} · 失败 {{ containerBatch.summary.failed }}<span v-if="containerBatch.summary.skipped > 0"> · 跳过 {{ containerBatch.summary.skipped }}</span>
                   </span>
-                  <NButton size="small" quaternary :disabled="batchRunning" @click="clearContainerSelection">
+                  <NButton size="small" quaternary :disabled="containerBatch.running" @click="clearContainerSelection">
                     取消选择
                   </NButton>
                 </div>
@@ -1106,12 +1263,12 @@ onMounted(() => {
                   :data="containers"
                   :row-key="(row: any) => containerKey(row)"
                   :checked-row-keys="checkedContainerKeys"
-                  :row-class-name="rowClassName"
+                  :row-class-name="containerRowClassName"
                   :pagination="containerPagination"
                   :bordered="false"
                   size="small"
                   :loading="loading"
-                  :scroll-x="940"
+                  :scroll-x="canInstall ? 940 : 900"
                   @update:checked-row-keys="onCheckedContainerKeysChange"
                 >
                   <template #empty>无容器或 Docker 未运行</template>
@@ -1127,7 +1284,7 @@ onMounted(() => {
               <div class="tab-body">
                 <NSpace align="center" justify="space-between" class="tab-toolbar">
                   <NSpace align="center">
-                    <NButton size="small" :loading="loading" @click="loadImages">
+                    <NButton size="small" :loading="loading" @click="loadImages(true)">
                       <template #icon><NIcon :component="RefreshOutline" /></template>
                       刷新
                     </NButton>
@@ -1161,8 +1318,8 @@ onMounted(() => {
                     镜像加速
                   </NButton>
                 </NSpace>
-                <!-- 镜像批量操作栏：有勾选时出现；清理悬空镜像仍走工具栏的单按钮 -->
-                <div v-if="checkedImageKeys.length > 0" class="batch-bar">
+                <!-- 镜像批量操作栏：仅 admin/operator 可见，有勾选时出现；清理悬空镜像仍走工具栏的单按钮 -->
+                <div v-if="canInstall && checkedImageKeys.length > 0" class="batch-bar">
                   <span class="batch-info">
                     已选 {{ checkedImageKeys.length }} 个镜像
                   </span>
@@ -1170,25 +1327,26 @@ onMounted(() => {
                     size="small"
                     type="error"
                     secondary
-                    :disabled="batchRunning"
+                    :loading="imageBatch.running && imageBatch.kind === 'remove_image'"
+                    :disabled="imageBatch.running"
                     @click="openBatchImageRmModal"
                   >
                     批量删除
                   </NButton>
                   <NButton
-                    v-if="batchSummary && batchSummary.failed > 0"
+                    v-if="imageBatch.summary && imageBatch.summary.failed > 0"
                     size="small"
                     type="warning"
                     secondary
-                    :disabled="batchRunning"
-                    @click="retryBatchFailed"
+                    :disabled="imageBatch.running"
+                    @click="retryImageBatchFailed"
                   >
-                    重试失败（{{ batchSummary.failed }}）
+                    重试失败（{{ imageBatch.summary.failed }}）
                   </NButton>
-                  <span v-if="batchSummary" class="batch-summary">
-                    成功 {{ batchSummary.done }} · 失败 {{ batchSummary.failed }}<span v-if="batchSummary.skipped > 0"> · 跳过 {{ batchSummary.skipped }}</span>
+                  <span v-if="imageBatch.summary" class="batch-summary">
+                    成功 {{ imageBatch.summary.done }} · 失败 {{ imageBatch.summary.failed }}<span v-if="imageBatch.summary.skipped > 0"> · 跳过 {{ imageBatch.summary.skipped }}</span>
                   </span>
-                  <NButton size="small" quaternary :disabled="batchRunning" @click="clearImageSelection">
+                  <NButton size="small" quaternary :disabled="imageBatch.running" @click="clearImageSelection">
                     取消选择
                   </NButton>
                 </div>
@@ -1198,11 +1356,12 @@ onMounted(() => {
                   :data="images"
                   :row-key="(row: any) => imageKey(row)"
                   :checked-row-keys="checkedImageKeys"
-                  :row-class-name="rowClassName"
+                  :row-class-name="imageRowClassName"
                   :pagination="imagePagination"
                   :bordered="false"
                   size="small"
                   :loading="loading"
+                  :scroll-x="canInstall ? 700 : 660"
                   @update:checked-row-keys="onCheckedImageKeysChange"
                 >
                   <template #empty>无镜像或 Docker 未运行</template>
@@ -1311,40 +1470,56 @@ onMounted(() => {
       </template>
     </NModal>
 
-    <!-- 容器批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17） -->
+    <!-- 容器批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17 / §9.22） -->
     <NModal
       v-model:show="showBatchRmModal"
-      preset="dialog"
-      title="批量删除容器"
-      positive-text="删除"
-      negative-text="取消"
-      type="error"
-      @positive-click="confirmBatchRm"
+      preset="card"
+      :title="`批量删除容器（${selectedContainers.length} 个）`"
+      style="width: 520px"
     >
-      <NSpace vertical :size="12">
-        <div>确定删除以下 {{ selectedContainers.length }} 个容器吗？数据不可恢复。</div>
-        <div class="batch-rm-list">
-          <div v-for="c in selectedContainers" :key="containerKey(c)">{{ containerKey(c) }}</div>
+      <div class="batch-confirm-body">
+        <div class="batch-target-list">
+          <div v-for="c in selectedContainers.slice(0, 5)" :key="containerKey(c)" class="batch-target-row">
+            {{ containerKey(c) }}
+          </div>
+          <div v-if="selectedContainers.length > 5" class="batch-target-row muted">
+            等 {{ selectedContainers.length - 5 }} 个…
+          </div>
         </div>
-      </NSpace>
+        <p class="field-hint">确定删除上述容器吗？容器数据将不可恢复。</p>
+      </div>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showBatchRmModal = false">取消</NButton>
+          <NButton type="error" :loading="containerBatch.running" @click="confirmBatchRm">确认删除</NButton>
+        </NSpace>
+      </template>
     </NModal>
 
-    <!-- 镜像批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17） -->
+    <!-- 镜像批量删除：危险操作，弹窗内就地二次确认（DESIGN.md §9.17 / §9.22） -->
     <NModal
       v-model:show="showBatchImageRmModal"
-      preset="dialog"
-      title="批量删除镜像"
-      positive-text="删除"
-      negative-text="取消"
-      type="error"
-      @positive-click="confirmBatchImageRm"
+      preset="card"
+      :title="`批量删除镜像（${selectedImages.length} 个）`"
+      style="width: 520px"
     >
-      <NSpace vertical :size="12">
-        <div>确定删除以下 {{ selectedImages.length }} 个镜像吗？被容器引用的镜像删除会失败、记为失败，可稍后重试。</div>
-        <div class="batch-rm-list">
-          <div v-for="i in selectedImages" :key="imageKey(i)">{{ i.Repository }}:{{ i.Tag }}</div>
+      <div class="batch-confirm-body">
+        <div class="batch-target-list">
+          <div v-for="i in selectedImages.slice(0, 5)" :key="imageKey(i)" class="batch-target-row">
+            {{ imageRefPair(i).repo }}:{{ imageRefPair(i).tag }}
+          </div>
+          <div v-if="selectedImages.length > 5" class="batch-target-row muted">
+            等 {{ selectedImages.length - 5 }} 个…
+          </div>
         </div>
-      </NSpace>
+        <p class="field-hint">确定删除上述镜像吗？被容器引用的镜像会删除失败、记为失败，可稍后重试。</p>
+      </div>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showBatchImageRmModal = false">取消</NButton>
+          <NButton type="error" :loading="imageBatch.running" @click="confirmBatchImageRm">确认删除</NButton>
+        </NSpace>
+      </template>
     </NModal>
 
     <!-- Docker 深度清理弹窗 -->
@@ -1477,8 +1652,8 @@ onMounted(() => {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  background: var(--n-color-modal);
-  border: 1px solid var(--n-border-color);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 8px 12px;
 
@@ -1500,22 +1675,44 @@ onMounted(() => {
   }
 }
 
-.batch-rm-list {
-  max-height: 200px;
-  overflow-y: auto;
-  font-size: 13px;
-  color: var(--text-secondary);
+/* 批量删除确认弹窗：目标清单内部滚动，行数多也不撑出视口（DESIGN.md §9.22） */
+.batch-confirm-body {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 12px;
 }
 
-/* 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突 */
-:deep(.batch-row-busy) {
-  .n-button {
-    pointer-events: none;
-    opacity: 0.5;
+.batch-target-list {
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 10px;
+
+  .batch-target-row {
+    padding: 3px 0;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &.muted {
+      color: var(--text-secondary);
+    }
   }
+}
+
+.field-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+/* 批量执行中的行：操作列整体置灰禁用，防单机操作与批量并发冲突（DESIGN.md §9.22） */
+:deep(.batch-row-busy [data-col-key="actions"]) {
+  pointer-events: none;
+  opacity: 0.5;
 }
 
 /* 状态标签默认按内容撑开，长状态串（如 Up 13 hours (healthy)）会溢出

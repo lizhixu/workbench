@@ -95,13 +95,14 @@ debian_codename() {
     return 1
 }
 
-# Package id used in docker-ce repository paths. RHEL rebuilds (Rocky, Alma)
-# are served by the centos tree: the mirror does not publish rocky/almalinux
-# directories, while centos/$releasever/$basearch is ABI compatible.
+# Package id used in docker-ce repository paths. RHEL rebuilds (Rocky, Alma,
+# Alibaba Cloud Linux, Anolis) are served by the centos tree: the mirror does
+# not publish those directories, while centos/$releasever/$basearch is ABI
+# compatible.
 docker_repo_distro() {
     case "$1" in
         ubuntu|debian|centos|rhel|fedora) echo "$1" ;;
-        rocky|almalinux) echo "centos" ;;
+        rocky|almalinux|alinux|anolis) echo "centos" ;;
         *) return 1 ;;
     esac
 }
@@ -145,6 +146,16 @@ install_rpm() {
     if ! fetch "${mirror}/linux/${distro}/docker-ce.repo" /etc/yum.repos.d/docker-ce.repo; then
         log "failed to fetch the repo file from ${mirror}"
         return 1
+    fi
+    # Alibaba Cloud Linux 3 reports $releasever=3 (and 4 reports 4), whereas the
+    # CentOS docker-ce tree publishes ABI-compatible major versions 8 / 9. Pin
+    # $releasever in the repo file directly so dnf does not 404 even when
+    # dnf-plugin-releasever-adapter is absent.
+    if [ "${ID:-}" = "alinux" ]; then
+        case "${VERSION_ID:-}" in
+            4*) sed -i 's/\$releasever/9/g' /etc/yum.repos.d/docker-ce.repo 2>/dev/null || true ;;
+            *)  sed -i 's/\$releasever/8/g' /etc/yum.repos.d/docker-ce.repo 2>/dev/null || true ;;
+        esac
     fi
     if command -v dnf >/dev/null 2>&1; then
         dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && return 0

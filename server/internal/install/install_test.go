@@ -171,6 +171,9 @@ func TestInstallScriptUsesGRPCHostOverride(t *testing.T) {
 		if osType == "linux" && !strings.Contains(body, `GRPC_PROBE_HOST="${WATCHMAN_GRPC%:*}"`) {
 			t.Fatalf("linux install script probe host split is malformed (%% escaping)")
 		}
+		if osType == "linux" && !strings.Contains(body, "LimitNOFILE=65536") {
+			t.Fatalf("linux install script systemd unit must set explicit LimitNOFILE")
+		}
 	}
 
 	// Without an override the script keeps deriving from the panel URL.

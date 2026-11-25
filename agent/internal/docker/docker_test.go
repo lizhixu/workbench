@@ -1,12 +1,15 @@
 package docker
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -254,14 +257,27 @@ func TestDockerArgsPruneOps(t *testing.T) {
 	}
 }
 
+// ps / ps_all 禁止使用 {{json .}} 或引用 .Size（Docker CE 24 下会触发 daemon
+// 扫描全量 overlay2 可写层计算磁盘大小，导致响应超时及内存/磁盘读飙升）；
 // ps_all 供镜像表「使用状态」列取全部容器（含已停止）：只读，30 秒超时。
 func TestDockerArgsPsAll(t *testing.T) {
-	args, ok := dockerArgs("ps_all", "", "")
-	if !ok {
-		t.Fatalf("dockerArgs(ps_all) 应被接受")
-	}
-	if want := "ps -a --format {{json .}}"; strings.Join(args, " ") != want {
-		t.Errorf("dockerArgs(ps_all) = %q, 想要 %q", strings.Join(args, " "), want)
+	for _, tc := range []struct {
+		op   string
+		want string
+	}{
+		{"ps", "ps --format " + psJSONFormat},
+		{"ps_all", "ps -a --format " + psJSONFormat},
+	} {
+		args, ok := dockerArgs(tc.op, "", "")
+		if !ok {
+			t.Fatalf("dockerArgs(%s) 应被接受", tc.op)
+		}
+		if strings.Join(args, " ") != tc.want {
+			t.Errorf("dockerArgs(%s) = %q, 想要 %q", tc.op, strings.Join(args, " "), tc.want)
+		}
+		if strings.Contains(tc.want, ".Size") || strings.Contains(tc.want, "{{json .}}") {
+			t.Errorf("dockerArgs(%s) 不得含 .Size 或 {{json .}}: %q", tc.op, tc.want)
+		}
 	}
 	if got := opTimeout("ps_all"); got != 30*time.Second {
 		t.Errorf("opTimeout(ps_all) 应为 30 秒，实际 %v", got)
@@ -484,5 +500,228 @@ func TestRunLogsMergesStderr(t *testing.T) {
 	}
 	if strings.Contains(string(ev.GetPayloadJson()), "ps-stderr-noise") {
 		t.Errorf("ps payload 不应含 stderr 内容，实际 %q", string(ev.GetPayloadJson()))
+	}
+}
+
+type multiSender struct {
+	mu   sync.Mutex
+	evs  map[string]*agentpb.DockerEvent
+	done chan struct{}
+	want int
+}
+
+func newMultiSender(want int) *multiSender {
+	return &multiSender{
+		evs:  make(map[string]*agentpb.DockerEvent),
+		done: make(chan struct{}),
+		want: want,
+	}
+}
+
+func (s *multiSender) Send(msg *agentpb.AgentMessage) bool {
+	ev := msg.GetDocker()
+	if ev == nil {
+		return true
+	}
+	s.mu.Lock()
+	s.evs[ev.GetOpId()] = ev
+	if len(s.evs) >= s.want {
+		select {
+		case <-s.done:
+		default:
+			close(s.done)
+		}
+	}
+	s.mu.Unlock()
+	return true
+}
+
+// runPsImages 与跨 op 只读清单必须受 readSem 串行保护，不能像此前 wg.Add(2) +
+// ps_all 那样并发拉起 2~3 个 CLI 进程（在 podman-docker 上会倍增内存并锁死存储）。
+func TestRunPsImagesSequentialAndSerializesReads(t *testing.T) {
+	m := NewManager(nil)
+	m.lookPath = func(string) (string, error) { return "/usr/bin/docker", nil }
+
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	var callsMu sync.Mutex
+	var calls []string
+
+	m.runCmd = func(ctx context.Context, combineStderr bool, args ...string) ([]byte, error) {
+		if combineStderr {
+			t.Errorf("inventory read should not combine stderr: %v", args)
+		}
+		cur := active.Add(1)
+		for {
+			prev := maxActive.Load()
+			if cur <= prev || maxActive.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		defer active.Add(-1)
+
+		time.Sleep(15 * time.Millisecond)
+
+		callsMu.Lock()
+		calls = append(calls, strings.Join(args, " "))
+		callsMu.Unlock()
+
+		switch args[0] {
+		case "ps":
+			return []byte(`{"ID":"c1","Names":"web"}` + "\n"), nil
+		case "images":
+			return []byte(`{"ID":"i1","Repository":"nginx","Tag":"latest"}` + "\n"), nil
+		case "system":
+			return []byte(`[{"Type":"Images","TotalCount":1}]`), nil
+		default:
+			return nil, errors.New("unexpected command")
+		}
+	}
+
+	s := newMultiSender(3)
+	m.SetSender(s)
+	m.Handle(&agentpb.DockerOp{OpId: "op1", Op: "ps_images"})
+	m.Handle(&agentpb.DockerOp{OpId: "op2", Op: "ps_all"})
+	m.Handle(&agentpb.DockerOp{OpId: "op3", Op: "system_df"})
+
+	select {
+	case <-s.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for serialized read ops")
+	}
+
+	if got := maxActive.Load(); got != 1 {
+		t.Errorf("concurrent read CLI count = %d, want max 1", got)
+	}
+	ev1 := s.evs["op1"]
+	if ev1 == nil || !ev1.GetOk() {
+		t.Fatalf("ps_images failed: %v", ev1)
+	}
+	var parsed struct {
+		Containers []map[string]any `json:"containers"`
+		Images     []map[string]any `json:"images"`
+	}
+	if err := json.Unmarshal(ev1.GetPayloadJson(), &parsed); err != nil {
+		t.Fatalf("unmarshal ps_images payload: %v", err)
+	}
+	if len(parsed.Containers) != 1 || len(parsed.Images) != 1 {
+		t.Errorf("unexpected ps_images payload: %+v", parsed)
+	}
+	// Verify ps preceded images within collectPsImages and uses psJSONFormat (without .Size).
+	callsMu.Lock()
+	psIdx, imgIdx := -1, -1
+	for idx, c := range calls {
+		if c == "ps --format "+psJSONFormat && psIdx == -1 {
+			psIdx = idx
+		}
+		if c == "images --format {{json .}}" && imgIdx == -1 {
+			imgIdx = idx
+		}
+	}
+	callsMu.Unlock()
+	if psIdx < 0 || imgIdx < 0 || psIdx > imgIdx {
+		t.Errorf("expected ps before images, calls = %v", calls)
+	}
+}
+
+// 并发相同的只读清单请求应合并为一次 CLI 执行（singleflight），而写操作之后发起的
+// 读取必须重新采集最新状态，不得复用写操作前的在途请求。
+func TestRunReadCoalescingAndMutationInvalidation(t *testing.T) {
+	m := NewManager(nil)
+	m.lookPath = func(string) (string, error) { return "/usr/bin/docker", nil }
+
+	var gen atomic.Int32
+	var psCount atomic.Int32
+	psStarted := make(chan struct{}, 8)
+	releasePs := make(chan struct{})
+	var releaseMu sync.Mutex
+
+	waitPsGate := func() {
+		releaseMu.Lock()
+		ch := releasePs
+		releaseMu.Unlock()
+		<-ch
+	}
+
+	m.runCmd = func(ctx context.Context, _ bool, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "ps":
+			psCount.Add(1)
+			select {
+			case psStarted <- struct{}{}:
+			default:
+			}
+			waitPsGate()
+			if gen.Load() == 0 {
+				return []byte(`{"ID":"c1","Status":"Up"}` + "\n"), nil
+			}
+			return []byte(`{"ID":"c1","Status":"Exited"}` + "\n"), nil
+		case "images":
+			return []byte(`{"ID":"i1","Repository":"alpine","Tag":"3.20"}` + "\n"), nil
+		case "stop":
+			gen.Store(1)
+			return []byte("c1\n"), nil
+		default:
+			return nil, errors.New("unexpected command")
+		}
+	}
+
+	// Phase 1: r1 and r2 run concurrently -> singleflight coalesces to 1 ps + 1 images.
+	s1 := newMultiSender(2)
+	m.SetSender(s1)
+	m.Handle(&agentpb.DockerOp{OpId: "r1", Op: "ps_images"})
+	<-psStarted
+	m.Handle(&agentpb.DockerOp{OpId: "r2", Op: "ps_images"})
+	time.Sleep(25 * time.Millisecond)
+	close(releasePs)
+
+	select {
+	case <-s1.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for coalesced reads")
+	}
+	if got := psCount.Load(); got != 1 {
+		t.Fatalf("coalesced ps_images calls = %d CLI executions, want 1", got)
+	}
+	for _, id := range []string{"r1", "r2"} {
+		if ev := s1.evs[id]; ev == nil || !ev.GetOk() {
+			t.Fatalf("%s failed: %v", id, ev)
+		}
+	}
+
+	// Phase 2: r3 starts pre-mutation and blocks; mutating "stop" finishes while r3
+	// is still running, then r4 arrives before r3 unblocks. r4 must NOT join r3's
+	// stale flight and must wait on readSem to observe post-mutation "Exited".
+	releaseMu.Lock()
+	releasePs = make(chan struct{})
+	gate2 := releasePs
+	releaseMu.Unlock()
+
+	s2 := newMultiSender(3)
+	m.SetSender(s2)
+	m.Handle(&agentpb.DockerOp{OpId: "r3", Op: "ps_images"})
+	<-psStarted
+	m.Handle(&agentpb.DockerOp{OpId: "mut", Op: "stop", Container: "c1"})
+	deadline := time.Now().Add(2 * time.Second)
+	for gen.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if gen.Load() == 0 {
+		t.Fatal("stop op did not run in time")
+	}
+	m.Handle(&agentpb.DockerOp{OpId: "r4", Op: "ps_images"})
+	time.Sleep(25 * time.Millisecond)
+	close(gate2)
+
+	select {
+	case <-s2.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for post-mutation invalidation")
+	}
+	if got := psCount.Load(); got != 3 {
+		t.Errorf("total ps executions after post-mutation read = %d, want 3", got)
+	}
+	if ev4 := s2.evs["r4"]; ev4 == nil || !ev4.GetOk() || !strings.Contains(string(ev4.GetPayloadJson()), `"Exited"`) {
+		t.Errorf("r4 should observe post-mutation Exited state, got %v", ev4)
 	}
 }

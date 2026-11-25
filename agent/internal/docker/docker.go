@@ -39,6 +39,31 @@ type Manager struct {
 
 	// lookPath is swappable in tests.
 	lookPath func(string) (string, error)
+	// runCmd runs the docker CLI and is swappable in unit tests so concurrency,
+	// singleflight, and ordering invariants can be verified cross-platform.
+	runCmd func(ctx context.Context, combineStderr bool, args ...string) ([]byte, error)
+
+	// readSem serializes heavy read-only inventory commands (ps, ps_all, images,
+	// system_df) to at most one running CLI subprocess at a time. This prevents
+	// concurrent metadata scans and lock/RSS spikes under both native docker-ce
+	// (slow storage/overlay2 contention) and daemonless runtimes like podman-docker.
+	readSemMu sync.Mutex
+	readSem   chan struct{}
+
+	// flightMu coalesces concurrent identical read-only DockerOps so overlapping
+	// dashboard/tab refreshes share one CLI execution. Mutating ops bump
+	// readGen and clear inflight entries so post-mutation reads never observe
+	// stale pre-mutation snapshots.
+	flightMu sync.Mutex
+	readGen  uint64
+	inflight map[string]*inflightRead
+}
+
+type inflightRead struct {
+	gen     uint64
+	done    chan struct{}
+	payload []byte
+	err     error
 }
 
 // negativeLookupTTL is how long a "docker is missing" answer stays cached.
@@ -48,7 +73,29 @@ func NewManager(log *slog.Logger) *Manager {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Manager{log: log, lookPath: exec.LookPath}
+	return &Manager{
+		log:      log,
+		lookPath: exec.LookPath,
+		readSem:  make(chan struct{}, 1),
+		inflight: make(map[string]*inflightRead),
+	}
+}
+
+func (m *Manager) getReadSem() chan struct{} {
+	m.readSemMu.Lock()
+	if m.readSem == nil {
+		m.readSem = make(chan struct{}, 1)
+	}
+	sem := m.readSem
+	m.readSemMu.Unlock()
+	return sem
+}
+
+func (m *Manager) invalidateReads() {
+	m.flightMu.Lock()
+	m.readGen++
+	clear(m.inflight)
+	m.flightMu.Unlock()
 }
 
 func (m *Manager) SetSender(s Sender) {
@@ -97,13 +144,29 @@ func (m *Manager) run(op *agentpb.DockerOp) {
 	ctx, cancel := context.WithTimeout(context.Background(), opTimeout(op.GetOp()))
 	defer cancel()
 
-	// ps_images is a compound op that runs `docker ps` and `docker images` in
-	// parallel and returns a single JSON object {containers:[...], images:[...]}.
-	// This collapses two round trips into one for the dashboard.
+	// ps_images is a compound op that runs `docker ps` then `docker images`
+	// sequentially (via readSem) and coalesces concurrent callers via
+	// runReadCoalesced, collapsing two HTTP round trips into one without
+	// spawning parallel cold-start CLI processes against Podman/overlay2.
 	if op.GetOp() == "ps_images" {
-		m.runPsImages(ctx, result)
+		out, err := m.runReadCoalesced(ctx, "ps_images", m.collectPsImages)
+		if err != nil {
+			result.Ok = false
+			result.Error = err.Error()
+		} else {
+			result.Ok = true
+			result.PayloadJson = out
+		}
 		m.send(result)
 		return
+	}
+
+	// Mutating ops invalidate any cached/in-flight read snapshots both before
+	// starting and on completion so subsequent dashboard refreshes never join a
+	// stale pre-mutation scan.
+	if !isReadOnlyOp(op.GetOp()) {
+		m.invalidateReads()
+		defer m.invalidateReads()
 	}
 
 	// "system_prune" (and its "prune" alias, which the server's dockerOp
@@ -153,6 +216,25 @@ func (m *Manager) run(op *agentpb.DockerOp) {
 		}
 	}
 
+	if isReadInventoryOp(op.GetOp()) {
+		out, err := m.runReadCoalesced(ctx, op.GetOp(), func(c context.Context) ([]byte, error) {
+			raw, runErr := m.execReadDocker(c, args...)
+			if runErr != nil {
+				return nil, fmt.Errorf("%s", formatExecError(runErr, raw))
+			}
+			return raw, nil
+		})
+		if err != nil {
+			result.Ok = false
+			result.Error = err.Error()
+		} else {
+			result.Ok = true
+			result.PayloadJson = out
+		}
+		m.send(result)
+		return
+	}
+
 	// `docker logs` 的容器输出分流：CLI 把容器 stdout 写到自身 stdout、
 	// 容器 stderr 写到自身 stderr；只抓 stdout 会丢掉写 stderr 的应用日志
 	// （如 Go 默认 log，certimate 即全量 stderr），故 logs 单独走
@@ -161,23 +243,13 @@ func (m *Manager) run(op *agentpb.DockerOp) {
 	var out []byte
 	var err error
 	if op.GetOp() == "logs" {
-		out, err = exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+		out, err = m.execDocker(ctx, true, args...)
 	} else {
-		out, err = exec.CommandContext(ctx, "docker", args...).Output()
+		out, err = m.execDocker(ctx, false, args...)
 	}
 	if err != nil {
-		// `Output()` 只抓 stdout 时用 ExitError.Stderr 补 CLI 报错；
-		// CombinedOutput 下 stderr 已在 out 里，Stderr 为空则回落用 out，
-		// 否则「容器不存在」这类报错会被吞成空字符串。
-		errOut := ""
-		if ee, ok := err.(*exec.ExitError); ok {
-			errOut = string(ee.Stderr)
-		}
-		if errOut == "" {
-			errOut = string(out)
-		}
 		result.Ok = false
-		result.Error = err.Error() + ": " + errOut
+		result.Error = formatExecError(err, out)
 	} else {
 		result.Ok = true
 		result.PayloadJson = out
@@ -186,39 +258,112 @@ func (m *Manager) run(op *agentpb.DockerOp) {
 	m.send(result)
 }
 
-// runPsImages runs `docker ps` and `docker images` concurrently and merges
-// their NDJSON output into a single JSON document.
-func (m *Manager) runPsImages(ctx context.Context, result *agentpb.DockerEvent) {
+func isReadInventoryOp(op string) bool {
+	return op == "ps" || op == "ps_all" || op == "images" || op == "ps_images" || op == "system_df"
+}
+
+func isReadOnlyOp(op string) bool {
+	return isReadInventoryOp(op) || op == "logs" || op == "inspect"
+}
+
+func formatExecError(err error, out []byte) string {
+	errOut := ""
+	if ee, ok := err.(*exec.ExitError); ok {
+		errOut = string(ee.Stderr)
+	}
+	if errOut == "" {
+		errOut = string(out)
+	}
+	return err.Error() + ": " + errOut
+}
+
+func (m *Manager) execDocker(ctx context.Context, combineStderr bool, args ...string) ([]byte, error) {
+	if m.runCmd != nil {
+		return m.runCmd(ctx, combineStderr, args...)
+	}
+	cmd := dockerCommand(ctx, args...)
+	if combineStderr {
+		return cmd.CombinedOutput()
+	}
+	return cmd.Output()
+}
+
+func (m *Manager) execReadDocker(ctx context.Context, args ...string) ([]byte, error) {
+	sem := m.getReadSem()
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return m.execDocker(ctx, false, args...)
+}
+
+func (m *Manager) runReadCoalesced(ctx context.Context, key string, fn func(context.Context) ([]byte, error)) ([]byte, error) {
+	m.flightMu.Lock()
+	if m.inflight == nil {
+		m.inflight = make(map[string]*inflightRead)
+	}
+	if call, ok := m.inflight[key]; ok && call.gen == m.readGen {
+		m.flightMu.Unlock()
+		select {
+		case <-call.done:
+			if call.err != nil {
+				return nil, call.err
+			}
+			return bytes.Clone(call.payload), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	gen := m.readGen
+	call := &inflightRead{gen: gen, done: make(chan struct{})}
+	m.inflight[key] = call
+	m.flightMu.Unlock()
+
+	execCtx, cancel := context.WithTimeout(context.Background(), opTimeout(key))
+	go func() {
+		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				call.err = fmt.Errorf("docker read %s panic: %v", key, r)
+			}
+			m.flightMu.Lock()
+			if m.inflight[key] == call {
+				delete(m.inflight, key)
+			}
+			m.flightMu.Unlock()
+			close(call.done)
+		}()
+		call.payload, call.err = fn(execCtx)
+	}()
+
+	select {
+	case <-call.done:
+		if call.err != nil {
+			return nil, call.err
+		}
+		return bytes.Clone(call.payload), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// collectPsImages runs `docker ps` then `docker images` sequentially via readSem
+// and merges their NDJSON output into a single JSON document.
+func (m *Manager) collectPsImages(ctx context.Context) ([]byte, error) {
 	type psImages struct {
 		Containers []any `json:"containers"`
 		Images     []any `json:"images"`
 	}
 
-	var (
-		cOut, iOut []byte
-		cErr, iErr error
-		wg         sync.WaitGroup
-	)
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		cOut, cErr = exec.CommandContext(ctx, "docker", "ps", "--format", "{{json .}}").Output()
-	}()
-	go func() {
-		defer wg.Done()
-		iOut, iErr = exec.CommandContext(ctx, "docker", "images", "--format", "{{json .}}").Output()
-	}()
-	wg.Wait()
-
+	cOut, cErr := m.execReadDocker(ctx, "ps", "--format", psJSONFormat)
 	if cErr != nil {
-		result.Ok = false
-		result.Error = "docker ps: " + cErr.Error()
-		return
+		return nil, fmt.Errorf("docker ps: %s", formatExecError(cErr, cOut))
 	}
+	iOut, iErr := m.execReadDocker(ctx, "images", "--format", "{{json .}}")
 	if iErr != nil {
-		result.Ok = false
-		result.Error = "docker images: " + iErr.Error()
-		return
+		return nil, fmt.Errorf("docker images: %s", formatExecError(iErr, iOut))
 	}
 
 	merged := psImages{
@@ -227,12 +372,9 @@ func (m *Manager) runPsImages(ctx context.Context, result *agentpb.DockerEvent) 
 	}
 	payload, err := json.Marshal(merged)
 	if err != nil {
-		result.Ok = false
-		result.Error = "marshal ps_images: " + err.Error()
-		return
+		return nil, fmt.Errorf("marshal ps_images: %w", err)
 	}
-	result.Ok = true
-	result.PayloadJson = payload
+	return payload, nil
 }
 
 // systemPruneStep is one targeted prune inside the system_prune compound op.
@@ -258,17 +400,10 @@ func (m *Manager) runSystemPrune(ctx context.Context, result *agentpb.DockerEven
 		{Name: "builder", Argv: []string{"builder", "prune", "-af"}},
 	}
 	for i := range steps {
-		out, err := exec.CommandContext(ctx, "docker", steps[i].Argv...).Output()
+		out, err := m.execDocker(ctx, false, steps[i].Argv...)
 		if err != nil {
-			errOut := ""
-			if ee, ok := err.(*exec.ExitError); ok {
-				errOut = string(ee.Stderr)
-			}
-			if errOut == "" {
-				errOut = string(out)
-			}
 			result.Ok = false
-			result.Error = steps[i].Name + " prune failed: " + err.Error() + ": " + errOut
+			result.Error = steps[i].Name + " prune failed: " + formatExecError(err, out)
 			return
 		}
 		if match := reclaimedSpaceRe.FindSubmatch(out); match != nil {
@@ -407,7 +542,7 @@ func (m *Manager) runRun(ctx context.Context, op *agentpb.DockerOp, result *agen
 		argv = append(argv, c)
 	}
 
-	out, err := exec.CommandContext(ctx, "docker", argv...).Output()
+	out, err := m.execDocker(ctx, false, argv...)
 	if err != nil {
 		errOut := ""
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -475,16 +610,25 @@ func logsArgs(container string, argsJSON []byte) ([]string, error) {
 	return argv, nil
 }
 
+// psJSONFormat selects only the container fields consumed by the console and
+// explicitly omits .Size. On Docker CE 24.x, `--format {{json .}}` causes the
+// CLI to evaluate the full ContainerContext and request writable-layer size
+// calculation (`size=1`), forcing dockerd to walk every overlay2 tree on disk
+// (tens of seconds + heavy slab/RSS spikes), whereas selecting fields without
+// .Size keeps `docker ps` around ~20ms. Each field uses `{{json ...}}` so
+// special characters (and podman-docker slices/maps) stay valid JSON.
+const psJSONFormat = `{"ID":{{json .ID}},"Names":{{json .Names}},"Image":{{json .Image}},"Status":{{json .Status}},"State":{{json .State}},"Ports":{{json .Ports}},"Labels":{{json .Labels}}}`
+
 // dockerArgs maps an op to its `docker` CLI argv.
 func dockerArgs(op, container, image string) ([]string, bool) {
 	switch op {
 	case "ps":
-		return []string{"ps", "--format", "{{json .}}"}, true
+		return []string{"ps", "--format", psJSONFormat}, true
 	case "ps_all":
 		// ps_all 跑 `docker ps -a`：镜像表「使用状态」列按 Docker 口径判断
 		// 镜像是否被任意容器引用（含已停止容器）。只用运行中容器算会把
 		// -prev 回滚容器等已停止容器引用的镜像错标成未使用。
-		return []string{"ps", "-a", "--format", "{{json .}}"}, true
+		return []string{"ps", "-a", "--format", psJSONFormat}, true
 	case "images":
 		return []string{"images", "--format", "{{json .}}"}, true
 	case "start":
@@ -555,7 +699,7 @@ func parseNDJSONAny(raw []byte) []any {
 	return rows
 }
 
-// ContainerInfo is a typed subset of `docker ps --format {{json .}}`.
+// ContainerInfo is a typed subset of `docker ps --format` JSON lines.
 type ContainerInfo struct {
 	ID     string `json:"ID"`
 	Image  string `json:"Image"`
@@ -564,7 +708,7 @@ type ContainerInfo struct {
 	Ports  string `json:"Ports"`
 }
 
-// ParseContainers parses `docker ps --format {{json .}}` output lines.
+// ParseContainers parses `docker ps --format` NDJSON output lines.
 func ParseContainers(raw []byte) []ContainerInfo {
 	var list []ContainerInfo
 	for _, line := range splitLines(raw) {

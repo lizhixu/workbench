@@ -258,6 +258,7 @@ extract_tarball() {
 link_server_binary() {
   # 救援开关（-reset-panel-domain 等）按文档用裸命令调用：
   # 安装脚本负责把服务端二进制链进 /usr/local/bin，否则每次都要拼全路径。
+  mkdir -p /usr/local/bin
   ln -sf "$INSTALL_DIR/bin/watchman-server" /usr/local/bin/watchman-server
   log_ok "已创建快捷方式 /usr/local/bin/watchman-server"
 }
@@ -346,6 +347,7 @@ After=network.target watchman-server.service
 Type=simple
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/bin/watchman-agent -server 127.0.0.1:9090 ${enroll_param}-state $DATA_DIR/agent-state.json
+LimitNOFILE=65536
 Restart=always
 RestartSec=3
 

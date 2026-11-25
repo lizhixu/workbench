@@ -586,6 +586,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/watchman-agent -server ${WATCHMAN_GRPC} -enroll ${WATCHMAN_TOKEN} -state /var/lib/watchman/state.json%s
+LimitNOFILE=65536
 Restart=always
 RestartSec=5
 StandardOutput=journal

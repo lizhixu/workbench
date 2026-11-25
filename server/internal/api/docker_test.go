@@ -67,3 +67,32 @@ func TestDockerOpTimeout(t *testing.T) {
 		}
 	}
 }
+
+// ps、ps_all 与 images 即使只有 0 或 1 条记录，也必须返回数组（而非单个对象），
+// 否则前端按数组遍历判断镜像使用状态时会在单容器宿主机上报错失效。
+func TestFormatDockerPayloadListOpsAlwaysReturnSlice(t *testing.T) {
+	cases := []struct {
+		payload string
+		wantLen int
+	}{
+		{"", 0},
+		{`{"ID":"only1"}` + "\n", 1},
+		{`{"ID":"a"}` + "\n" + `{"ID":"b"}` + "\n", 2},
+	}
+	for _, op := range []string{"ps", "ps_all", "images"} {
+		for _, tc := range cases {
+			res := formatDockerPayload(op, []byte(tc.payload))
+			rows, ok := res["data"].([]any)
+			if !ok {
+				t.Fatalf("op=%s payload=%q: data 应为 []any，实际 %T", op, tc.payload, res["data"])
+			}
+			if len(rows) != tc.wantLen {
+				t.Errorf("op=%s payload=%q: len(data)=%d, want %d", op, tc.payload, len(rows), tc.wantLen)
+			}
+		}
+	}
+	logs := formatDockerPayload("logs", []byte(`{"not":"json"}`+"\nline2"))
+	if logs["raw"] == "" {
+		t.Errorf("logs 应保留 raw 文本，实际 %+v", logs)
+	}
+}

@@ -12,10 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"watchman/proto/agentpb"
 	"watchman/server/internal/audit"
 	"watchman/server/internal/rpc"
+
+	"github.com/gin-gonic/gin"
 )
 
 // Handlers implements REST endpoints for overlay networking (Tailscale/Headscale).
@@ -267,7 +268,22 @@ func (h *Handlers) checkNode(c *gin.Context) {
 
 	// 2. Check tailscale status --json
 	resStatus, err := h.runExec(hub, hostID, "tailscale status --json", 20)
-	if err != nil || resStatus.ExitCode != 0 {
+	if err != nil {
+		// The exec itself failed (timeout / agent disconnected): resStatus is
+		// nil here, so read the error, never resStatus.Stderr.
+		st := NodeStatus{
+			HostID:       hostID,
+			Installed:    true,
+			Online:       false,
+			Version:      cleanVer,
+			ErrorMessage: "探测 Tailscale 状态失败: " + err.Error(),
+			LastChecked:  time.Now(),
+		}
+		_ = h.store.SetNodeStatus(st)
+		c.JSON(http.StatusOK, gin.H{"data": st})
+		return
+	}
+	if resStatus.ExitCode != 0 {
 		// Possibly daemon not running
 		errMsg := string(resStatus.Stderr)
 		if errMsg == "" {
@@ -682,6 +698,11 @@ func (h *Handlers) leaveNode(c *gin.Context) {
 	}
 
 	st, _ := h.store.GetNodeStatus(hostID)
+	// GetNodeStatus returns a zero value when the host has never been cached
+	// (e.g. a freshly registered agent that was never probed). Set HostID so
+	// the store keeps the record under the real host key instead of writing
+	// it to nodes[""].
+	st.HostID = hostID
 	st.Online = false
 	if action == "logout" {
 		st.IP = ""

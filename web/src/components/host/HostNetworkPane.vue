@@ -143,10 +143,7 @@ function openJoinModal() {
 }
 
 async function doJoin() {
-  if (!joinForm.value.auth_key.trim()) {
-    message.warning('请输入 Auth Key')
-    return
-  }
+  // 留空时由服务端回退到全局预设 Auth Key（GET 不回显密钥，无法预填）。
   joining.value = true
   try {
     const task = await runNetworkTask(props.hostId, () =>
@@ -355,7 +352,7 @@ onMounted(loadData)
             v-model:value="joinForm.auth_key"
             type="password"
             show-password-on="click"
-            placeholder="输入 Auth Key (已默认读取控制面预设密钥)"
+            placeholder="留空则使用全局预设密钥"
           />
         </NFormItem>
 

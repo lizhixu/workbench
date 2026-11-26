@@ -528,23 +528,6 @@ onMounted(loadData)
           >
             {{ config.server_url }}
           </NTag>
-          <div class="stat-group">
-            <div class="stat-item">
-              <span class="stat-num">{{ stats.total }}</span>
-              <span class="stat-lbl">全部主机</span>
-            </div>
-            <div class="stat-sep" />
-            <div class="stat-item">
-              <span class="stat-num text-success">{{ stats.connected }}</span>
-              <span class="stat-lbl">已组网在线</span>
-            </div>
-            <div class="stat-sep" />
-            <div class="stat-item">
-              <span class="stat-num text-info">{{ stats.installed }}</span>
-              <span class="stat-lbl">已安装客户端</span>
-            </div>
-          </div>
-
           <NButton secondary type="primary" @click="showConfigModal = true">
             <template #icon><NIcon :component="SettingsOutline" /></template>
             控制面设置
@@ -1150,39 +1133,6 @@ onMounted(loadData)
         white-space: nowrap;
       }
     }
-  }
-}
-
-.stat-group {
-  display: flex;
-  align-items: center;
-  background: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  padding: 6px 14px;
-  gap: 12px;
-
-  .stat-item {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-
-    .stat-num {
-      font-size: 17px;
-      font-weight: 700;
-      line-height: 1.2;
-    }
-
-    .stat-lbl {
-      font-size: 11px;
-      color: var(--n-text-color-3);
-    }
-  }
-
-  .stat-sep {
-    width: 1px;
-    height: 22px;
-    background: var(--border-color);
   }
 }
 

@@ -6,25 +6,55 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
 const storeFileName = "github_app.json"
 
+// InstallationRepo holds the metadata fetched from GitHub for one repository
+// inside an App installation. UnmarshalJSON accepts both historical bare
+// "owner/repo" strings and structured objects so older github_app.json files
+// continue loading without migration errors.
+type InstallationRepo struct {
+	FullName      string    `json:"full_name"`
+	Private       bool      `json:"private,omitempty"`
+	Description   string    `json:"description,omitempty"`
+	DefaultBranch string    `json:"default_branch,omitempty"`
+	Language      string    `json:"language,omitempty"`
+	PushedAt      time.Time `json:"pushed_at,omitempty"`
+}
+
+func (r *InstallationRepo) UnmarshalJSON(data []byte) error {
+	var raw string
+	if err := json.Unmarshal(data, &raw); err == nil {
+		r.FullName = strings.ToLower(strings.TrimSpace(raw))
+		return nil
+	}
+	type alias InstallationRepo
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	a.FullName = strings.ToLower(strings.TrimSpace(a.FullName))
+	*r = InstallationRepo(a)
+	return nil
+}
+
 // Installation is one account (personal or organization) the GitHub App is
-// installed on. Repos lists the installation's repository full names as of
+// installed on. Repos lists the installation's repositories as of
 // the last sync; it is a matching cache, not an authorization source — the
 // actual push routing only needs the repo name, and git fetch re-resolves
 // the installation token through the GitHub API.
 type Installation struct {
-	ID           int64     `json:"id"`
-	AccountLogin string    `json:"account_login"`
-	AccountType  string    `json:"account_type"` // User | Organization
-	TargetType   string    `json:"target_type"`  // all | selected
-	Repos        []string  `json:"repos,omitempty"`
-	Suspended    bool      `json:"suspended,omitempty"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID           int64              `json:"id"`
+	AccountLogin string             `json:"account_login"`
+	AccountType  string             `json:"account_type"` // User | Organization
+	TargetType   string             `json:"target_type"`  // all | selected
+	Repos        []InstallationRepo `json:"repos,omitempty"`
+	Suspended    bool               `json:"suspended,omitempty"`
+	UpdatedAt    time.Time          `json:"updated_at"`
 }
 
 // Config is the GitHub App identity. PrivateKeyPEM and WebhookSecret are
@@ -205,7 +235,7 @@ func (s *Store) FindInstallationForRepo(normalizedRepo string) (Installation, bo
 			continue
 		}
 		for _, r := range inst.Repos {
-			if r == normalizedRepo {
+			if strings.EqualFold(r.FullName, normalizedRepo) {
 				return inst, true
 			}
 		}

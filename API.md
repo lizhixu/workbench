@@ -205,12 +205,12 @@
 | POST | `/apps` | 创建应用（创建即自动入队首轮部署） |
 | GET | `/apps/catalog` | 内置模板目录（声明式 Catalog） |
 | GET | `/apps/:id` | 应用详情 |
-| PUT | `/apps/:id` | 部分更新（PATCH 语义）：未提交的键保持原值，显式 `false` / `""` / `{}` 才清空。`host_id` / `source_type` / `container_name` 不可改；镜像地址仅 `image` 来源可改 |
-| DELETE | `/apps/:id?purge=` | 删除应用（可选清除容器与镜像） |
+| PUT | `/apps/:id` | 部分更新（PATCH 语义）：未提交的键保持原值，显式 `false` / `""` / `{}` 才清空。`host_id` / `source_type` / `container_name` 不可改；镜像地址仅 `image` 来源可改；Git 仓库/分支/凭据/构建配置与 `image` 的 `registry_vault_id`/`ci_repo`/`auto_deploy` 均可通过该接口更新 |
+| DELETE | `/apps/:id?purge=` | 删除应用（可选清除容器、镜像与 `/var/lib/watchman/apps/:id` 工作目录） |
 | POST | `/apps/:id/deploy?force=` | 触发部署（`force=true` 支持终止在途任务并重新部署） |
 | POST | `/apps/:id/upgrade` | 升级应用：先拉取最新镜像再重新部署（单条部署记录，`trigger=upgrade`；见 `AGENTS.md` §3.7「应用升级」） |
 | POST | `/apps/:id/deployments/cancel` | 终止当前正在进行的部署任务 |
-| POST | `/apps/:id/rollback` | 版本回滚 |
+| POST | `/apps/:id/rollback` | 版本回滚（`git` 按 `commit_hash`、`raw_compose` 按 `compose_content`、`image` 按 `image_ref` 快照） |
 | POST | `/apps/:id/stop` | 停止 |
 | POST | `/apps/:id/start` | 启动 |
 | POST | `/apps/:id/restart` | 重启 |
@@ -218,15 +218,14 @@
 | POST | `/apps/:id/migrate/precheck` | 只读预检 `{target_host_id}` → `{agent_online, docker_running, s3_ready, s3_bucket, volume_count, port_conflicts, warnings}`；读组、免审计，问题只以 `warnings` 上报 |
 | GET | `/apps/:id/deployments` | 部署历史（分页；列表不含 `build_log`，正文走单条接口） |
 | GET | `/apps/:id/deployments/:depID` | 单条部署记录。运行中时 `build_log` 叠加引擎内存缓冲（实时日志） |
+| GET | `/apps/:id/triggers` | 应用最近推送 / CI 触发动态（最新 30 条，含 `triggered` / `skipped` / `rejected` 状态及具体跳过/拒绝原因；只读，免审计） |
 | POST | `/apps/:id/deployments/:depID/diagnose` | AI 排障 |
 | GET | `/apps/:id/status` | 应用状态 |
 | PUT | `/apps/:id/proxy` | 绑定域名（全量替换） |
 | DELETE | `/apps/:id/proxy` | 解绑（同时清理应用主机与网关主机配置） |
-| POST | `/apps/:id/webhook/sync` | 同步 webhook |
-| GET/POST | `/apps/webhook/:token` | Git push 自动部署（token 鉴权） |
+| GET/POST | `/apps/webhook/:token` | 应用级通用 Webhook 触发器（token-in-path 或 `Authorization: Bearer <token>` 鉴权，安全入口豁免）：`git` 来源校验分支与 `watch_paths` 后触发构建（`trigger=webhook`）；`image` / `raw_compose` 来源支持 CI 触发镜像升级（免 `branch` 校验，可传 `{tag?, image?, actor?}` 仅允许同镜像仓库切换 tag，`trigger=ci` 或 `webhook`），全部结果写入应用触发动态 |
 | POST | `/apps/inspect-image` | 镜像元数据免拉取只读探测 `{image}` → Registry V2 / OCI 真实端口 / 环境变量 / 卷 / 启动命令 |
-| POST | `/apps/inspect-repo` | GitHub 仓库探测 `{repo_url}` → 默认分支 / Dockerfile / Compose / `.env.example` 解析（只读） |
-| POST | `/apps/:id/github-app/switch` | 切换到 GitHub App 触发（非 github.com 仓库 400；有旧逐仓 hook 时先删，失败 502 不改库） |
+| POST | `/apps/inspect-repo` | GitHub 仓库探测 `{repo_url, branch?, auth_vault_id?, build_context?}` → 目标/默认分支、Dockerfile / Compose / `.env.example` 解析（只读，按 `Vault > GitHub App 安装令牌 > 公开匿名` 取数） |
 
 ### 应用中心：域名绑定（`PUT /apps/:id/proxy`）
 
@@ -263,26 +262,14 @@ Body `{domains: [{domain, cert_id?, force_https?}], mode: local|gateway, gateway
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/github-app/status` | App 配置与安装概览（`configured` / `app_id` / `slug` / `webhook_url` / `installations`） |
-| GET | `/github-app/installations/repos` | 全部安装的仓库清单（App 令牌取数） |
+| GET | `/github-app/installations/repos` | 全部未暂停安装的仓库清单（App 令牌取数，按最新推送倒序，包含 `installation_id` / `account` / `account_type` / `full_name` / `private` / `description` / `default_branch` / `language` / `pushed_at`） |
 | GET | `/github-app/repos/:owner/:repo/branches` | 仓库分支（App 令牌取数；不在安装范围 404） |
 | POST | `/github-app/manifest` | 生成 Manifest（`name` 可空 → 自动生成唯一名；`state` 内存 15 分钟过期） |
 | POST | `/github-app/manifest/exchange` | 验 `state` 后换 code 落盘（私钥可用性校验） |
 | POST | `/github-app/config` | 手动填写 App ID / 私钥 / Webhook Secret（私钥可用性校验） |
 | POST | `/github-app/installations/sync` | 同步安装与仓库清单 |
 | DELETE | `/github-app` | 断开（清配置与安装） |
-| POST | `/github-app/webhook` | 公开端点（HMAC-SHA256 验签、恒时比较、delivery 去重、body 4MB 上限；未配置 503；ping 200；仅 `refs/heads/` 分支推送触发，tag 跳过；按 `full_name` 匹配应用，`trigger=github-app`） |
-
-## Git 仓库接入（经典 PAT）
-
-与 GitHub App 互补的老接入方式。
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| GET | `/git/providers` | 已接入的 Git 供应商 |
-| GET | `/git/github/repos` | 仓库列表 |
-| GET | `/git/github/repos/:owner/:repo/branches` | 仓库分支 |
-| POST | `/git/github/token` | 保存 GitHub Token |
-| DELETE | `/git/github` | 断开 GitHub 接入 |
+| POST | `/github-app/webhook` | 公开端点（HMAC-SHA256 验签、恒时比较、delivery 去重、body 4MB 上限；未配置 503；ping 200；仅 `refs/heads/` 分支推送触发，tag 跳过；按 `full_name` 匹配应用，`trigger=github-app`，触发与跳过结果均记入应用触发动态） |
 
 ## 按需运维隧道
 

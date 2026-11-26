@@ -89,9 +89,12 @@ func VerifySignature(secret string, body []byte, sigHeader string) bool {
 
 // PushEvent is the subset of a GitHub push delivery the panel acts on.
 type PushEvent struct {
+	DeliveryID     string
 	Ref            string
 	RepoFullName   string
 	InstallationID int64
+	CommitSHA      string
+	Actor          string
 	// ChangedPaths lists the repo-relative files touched by the push
 	// (added/removed/modified across its commits). ChangedPathsKnown is
 	// false when the delivery carried no file lists — a provider that
@@ -121,6 +124,16 @@ func branchFromRef(ref string) string {
 func ParsePushEvent(body []byte) (*PushEvent, error) {
 	var payload struct {
 		Ref        string `json:"ref"`
+		After      string `json:"after"`
+		HeadCommit *struct {
+			ID string `json:"id"`
+		} `json:"head_commit"`
+		Pusher *struct {
+			Name string `json:"name"`
+		} `json:"pusher"`
+		Sender *struct {
+			Login string `json:"login"`
+		} `json:"sender"`
 		Repository *struct {
 			FullName string `json:"full_name"`
 		} `json:"repository"`
@@ -134,7 +147,25 @@ func ParsePushEvent(body []byte) (*PushEvent, error) {
 	if payload.Repository == nil || payload.Repository.FullName == "" {
 		return nil, fmt.Errorf("push 事件缺少仓库信息")
 	}
-	ev := &PushEvent{Ref: payload.Ref, RepoFullName: strings.ToLower(payload.Repository.FullName)}
+	commit := strings.TrimSpace(payload.After)
+	if payload.HeadCommit != nil && payload.HeadCommit.ID != "" {
+		commit = payload.HeadCommit.ID
+	}
+	if len(commit) > 7 {
+		commit = commit[:7]
+	}
+	actor := ""
+	if payload.Pusher != nil && payload.Pusher.Name != "" {
+		actor = payload.Pusher.Name
+	} else if payload.Sender != nil && payload.Sender.Login != "" {
+		actor = payload.Sender.Login
+	}
+	ev := &PushEvent{
+		Ref:          payload.Ref,
+		RepoFullName: strings.ToLower(payload.Repository.FullName),
+		CommitSHA:    commit,
+		Actor:        actor,
+	}
 	if payload.Installation != nil {
 		ev.InstallationID = payload.Installation.ID
 	}

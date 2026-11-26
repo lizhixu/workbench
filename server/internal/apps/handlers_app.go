@@ -11,7 +11,7 @@ import (
 	"context"
 
 	"github.com/gin-gonic/gin"
-	"watchman/server/internal/githubapp"
+	"watchman/server/internal/repoinspect"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/settings"
 )
@@ -21,22 +21,14 @@ type AIDiagnoseFunc func(ctx context.Context, command, stdout, stderr string, ex
 
 // AppHandlers manages Git-linked application CRUD, deployments and rollback.
 type AppHandlers struct {
-	reg         *rpc.Registry
-	store       *Store
-	engine      *Engine
-	settings    *settings.Store
-	ai          AIDiagnoseFunc
-	gitProvider GitWebhookManager
-	ghAppStore  *githubapp.Store
+	reg      *rpc.Registry
+	store    *Store
+	engine   *Engine
+	settings *settings.Store
+	ai       AIDiagnoseFunc
 
 	imageInspector ImageInspectFunc
 	repoInspector  RepoInspectFunc
-}
-
-// GitWebhookManager handles automatic lifecycle sync for Git provider webhooks.
-type GitWebhookManager interface {
-	EnsureRepoWebhook(ctx context.Context, repoURL, webhookURL string) (int64, error)
-	DeleteRepoWebhook(ctx context.Context, repoURL string, hookID int64) error
 }
 
 // NewAppHandlers creates the application management handlers.
@@ -54,18 +46,6 @@ func (h *AppHandlers) SetAI(fn AIDiagnoseFunc) {
 	h.ai = fn
 }
 
-// SetGitProvider injects the Git provider store for automatic Webhook lifecycle management.
-func (h *AppHandlers) SetGitProvider(gp GitWebhookManager) {
-	h.gitProvider = gp
-}
-
-// SetGitHubAppStore injects the GitHub App store so the App-trigger switch
-// can verify the App is configured and the repository is actually covered
-// by an installation before deleting the legacy per-repo hook.
-func (h *AppHandlers) SetGitHubAppStore(s *githubapp.Store) {
-	h.ghAppStore = s
-}
-
 // RegisterAppRoutes mounts the application lifecycle routes. Reads are open
 // to every authenticated role; mutations (create/deploy/rollback/delete)
 // require admin or operator and the caller wraps them with the audit
@@ -76,6 +56,7 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	readRG.GET("/apps/:id", h.getApp)
 	readRG.GET("/apps/:id/deployments", h.listDeployments)
 	readRG.GET("/apps/:id/deployments/:depID", h.getDeployment)
+	readRG.GET("/apps/:id/triggers", h.listTriggerEvents)
 	readRG.POST("/apps/:id/deployments/:depID/diagnose", h.diagnoseDeployment)
 	readRG.GET("/apps/:id/status", h.appStatus)
 	// App volume backup/restore: archive listing and download are reads (the
@@ -100,8 +81,6 @@ func (h *AppHandlers) RegisterAppRoutes(readRG, writeRG, public *gin.RouterGroup
 	writeRG.POST("/apps/:id/stop", h.stopApp)
 	writeRG.POST("/apps/:id/start", h.startApp)
 	writeRG.POST("/apps/:id/restart", h.restartApp)
-	writeRG.POST("/apps/:id/webhook/sync", h.syncAppWebhook)
-	writeRG.POST("/apps/:id/github-app/switch", h.switchToGitHubApp)
 	// Service migration: moving an app across hosts (optionally with its
 	// volumes) is a high-risk mutation, so it rides the audited write group.
 	// The precheck only probes readiness and stays on the read group.
@@ -144,27 +123,29 @@ func (h *AppHandlers) getApp(c *gin.Context) {
 }
 
 type createAppReq struct {
-	Name           string            `json:"name"`
-	HostID         string            `json:"host_id"`
-	SourceType     string            `json:"source_type"` // "git" | "raw_compose" | "image" | "template" | "forward"
-	RepoURL        string            `json:"repo_url"`
-	Branch         string            `json:"branch"`
-	AuthVaultID    string            `json:"auth_vault_id"`
-	AutoDeploy     bool              `json:"auto_deploy"`
-	WatchPaths     []string          `json:"watch_paths"`
-	BuildType      string            `json:"build_type"`
-	Dockerfile     string            `json:"dockerfile"`
-	BuildContext   string            `json:"build_context"`
-	BuildTimeout   int32             `json:"build_timeout_sec"`
-	ComposeContent string            `json:"compose_content"` // raw compose.yaml
-	Image          string            `json:"image"`           // pre-built image for source_type=image/template
-	TemplateID     string            `json:"template_id"`
-	TemplateParams map[string]string `json:"template_params"`
-	EnvVars        map[string]string `json:"env_vars"`
-	Ports          []PortMapping     `json:"ports"`
-	Volumes        []string          `json:"volumes"`
-	HealthcheckURL string            `json:"healthcheck_url"`
-	ContainerName  string            `json:"container_name"`
+	Name            string            `json:"name"`
+	HostID          string            `json:"host_id"`
+	SourceType      string            `json:"source_type"` // "git" | "raw_compose" | "image" | "template"
+	RepoURL         string            `json:"repo_url"`
+	Branch          string            `json:"branch"`
+	AuthVaultID     string            `json:"auth_vault_id"`
+	RegistryVaultID string            `json:"registry_vault_id"`
+	CIRepo          string            `json:"ci_repo"`
+	AutoDeploy      bool              `json:"auto_deploy"`
+	WatchPaths      []string          `json:"watch_paths"`
+	BuildType       string            `json:"build_type"`
+	Dockerfile      string            `json:"dockerfile"`
+	BuildContext    string            `json:"build_context"`
+	BuildTimeout    int32             `json:"build_timeout_sec"`
+	ComposeContent  string            `json:"compose_content"` // raw compose.yaml
+	Image           string            `json:"image"`           // pre-built image for source_type=image/template
+	TemplateID      string            `json:"template_id"`
+	TemplateParams  map[string]string `json:"template_params"`
+	EnvVars         map[string]string `json:"env_vars"`
+	Ports           []PortMapping     `json:"ports"`
+	Volumes         []string          `json:"volumes"`
+	HealthcheckURL  string            `json:"healthcheck_url"`
+	ContainerName   string            `json:"container_name"`
 	// Mesh Forwarding (TCP Relay via an entry host)
 	MeshForwardEnabled    bool   `json:"mesh_forward_enabled"`
 	MeshForwardHostID     string `json:"mesh_forward_host_id"`
@@ -232,6 +213,15 @@ func (r *createAppReq) validate() error {
 		return err
 	}
 	r.WatchPaths = normalized
+	if srcType == "git" {
+		if ctxDir, err := repoinspect.NormalizeSubdir(r.BuildContext); err != nil {
+			return err
+		} else if ctxDir == "" {
+			r.BuildContext = "."
+		} else {
+			r.BuildContext = ctxDir
+		}
+	}
 	return nil
 }
 
@@ -320,6 +310,8 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 		RepoURL:               strings.TrimSpace(req.RepoURL),
 		Branch:                firstNonEmpty(req.Branch, "main"),
 		AuthVaultID:           req.AuthVaultID,
+		RegistryVaultID:       strings.TrimSpace(req.RegistryVaultID),
+		CIRepo:                strings.TrimSpace(req.CIRepo),
 		AutoDeploy:            req.AutoDeploy,
 		WatchPaths:            req.WatchPaths,
 		WebhookToken:          randomToken(16),
@@ -343,23 +335,6 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 		CreatedAt:             time.Now(),
 	}
 
-	// If AutoDeploy is enabled for a GitHub repository and the Git Provider is connected,
-	// automatically register the push webhook on the repository via GitHub API.
-	// Repositories covered by a GitHub App installation are triggered by App-level
-	// events instead; registering a per-repo hook there would duplicate every push.
-	if app.AutoDeploy && h.gitProvider != nil && strings.Contains(strings.ToLower(app.RepoURL), "github.com") && !h.repoCoveredByGitHubApp(app.RepoURL) {
-		webhookURL := h.buildWebhookURL(c, app.WebhookToken)
-		hookID, err := h.gitProvider.EnsureRepoWebhook(c.Request.Context(), app.RepoURL, webhookURL)
-		if err == nil {
-			app.WebhookAutoManaged = true
-			app.GitHubHookID = hookID
-			app.WebhookError = ""
-		} else {
-			app.WebhookAutoManaged = false
-			app.WebhookError = err.Error()
-		}
-	}
-
 	if err := h.store.PutApp(app); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -381,45 +356,22 @@ func (h *AppHandlers) createApp(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-// buildWebhookURL returns the absolute event URL handed to a Git provider.
-// It uses the shared panel-URL resolver (bound panel domain → request Host,
-// see settings.BaseURL) so the address matches the one the GitHub App path
-// advertises.
-func (h *AppHandlers) buildWebhookURL(c *gin.Context, token string) string {
-	base, _ := settings.RequestBaseURL(c, h.settings)
-	if base == "" {
-		base = "http://127.0.0.1:18080"
-	}
-	return fmt.Sprintf("%s/api/v1/apps/webhook/%s", base, token)
-}
-
-// repoCoveredByGitHubApp reports whether the repository is inside a
-// non-suspended GitHub App installation. Those pushes already reach the App
-// event endpoint, so auto-deploy must not also register a per-repo webhook.
-func (h *AppHandlers) repoCoveredByGitHubApp(repoURL string) bool {
-	if h.ghAppStore == nil || !h.ghAppStore.Configured() {
-		return false
-	}
-	_, covered := h.ghAppStore.FindInstallationForRepo(githubapp.NormalizeRepoURL(repoURL))
-	return covered
-}
-
 // updateAppReq is the body of PUT /apps/:id. Every mutable field is a pointer
-// so an omitted key means "leave unchanged". The previous code reused
-// createAppReq, whose non-pointer fields were overwritten unconditionally:
-// saving only the env vars silently wiped auto_deploy, the Git credential,
-// the health check URL and a running mesh relay. Explicit false / "" / {}
-// still clears a field; nil means untouched.
+// so an omitted key means "leave unchanged". Explicit false / "" / {} still
+// clears a field; nil means untouched.
 //
 // host_id, source_type and container_name stay immutable here (moving an app
-// to another host is a redeploy, not an edit).
+// to another host is a migration, not an edit).
 type updateAppReq struct {
-	Name        *string   `json:"name"`
-	RepoURL     *string   `json:"repo_url"`
-	Branch      *string   `json:"branch"`
-	AuthVaultID *string   `json:"auth_vault_id"`
-	AutoDeploy  *bool     `json:"auto_deploy"`
-	WatchPaths  *[]string `json:"watch_paths"`
+	Name                *string   `json:"name"`
+	RepoURL             *string   `json:"repo_url"`
+	Branch              *string   `json:"branch"`
+	AuthVaultID         *string   `json:"auth_vault_id"`
+	RegistryVaultID     *string   `json:"registry_vault_id"`
+	CIRepo              *string   `json:"ci_repo"`
+	AutoDeploy          *bool     `json:"auto_deploy"`
+	WatchPaths          *[]string `json:"watch_paths"`
+	LegacyWebhookNotice *bool     `json:"legacy_webhook_notice"`
 
 	BuildType      *string `json:"build_type"`
 	Dockerfile     *string `json:"dockerfile"`
@@ -498,6 +450,44 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 		}
 		*req.WatchPaths = normalized
 	}
+	if req.RepoURL != nil {
+		u := strings.TrimSpace(*req.RepoURL)
+		if oldApp.SourceType == "git" {
+			if u == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Git 仓库地址不能为空"})
+				return
+			}
+			if !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "http://") {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "仅支持 http(s) Git 仓库地址"})
+				return
+			}
+		}
+		*req.RepoURL = u
+	}
+	if req.BuildType != nil && oldApp.SourceType == "git" {
+		bt := strings.TrimSpace(*req.BuildType)
+		if bt != "" && bt != "dockerfile" && bt != "compose" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "不支持的构建模式: " + bt})
+			return
+		}
+		*req.BuildType = bt
+	}
+	if req.BuildContext != nil {
+		if strings.TrimSpace(*req.BuildContext) == "" {
+			*req.BuildContext = ""
+		} else {
+			ctxDir, err := repoinspect.NormalizeSubdir(*req.BuildContext)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			if ctxDir == "" {
+				*req.BuildContext = "."
+			} else {
+				*req.BuildContext = ctxDir
+			}
+		}
+	}
 
 	// Mesh-forward rules are validated on the EFFECTIVE config (stored values
 	// with this request applied), and only when the request touches a relay
@@ -567,11 +557,20 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 		if req.AuthVaultID != nil {
 			a.AuthVaultID = *req.AuthVaultID
 		}
+		if req.RegistryVaultID != nil {
+			a.RegistryVaultID = strings.TrimSpace(*req.RegistryVaultID)
+		}
+		if req.CIRepo != nil {
+			a.CIRepo = strings.TrimSpace(*req.CIRepo)
+		}
 		if req.AutoDeploy != nil {
 			a.AutoDeploy = *req.AutoDeploy
 		}
 		if req.WatchPaths != nil {
 			a.WatchPaths = *req.WatchPaths
+		}
+		if req.LegacyWebhookNotice != nil {
+			a.LegacyWebhookNotice = *req.LegacyWebhookNotice
 		}
 		// Explicit "" / 0 clears: the pipeline re-applies its defaults
 		// (Dockerfile, "." context, 900s timeout) for empty values, so
@@ -626,30 +625,6 @@ func (h *AppHandlers) updateApp(c *gin.Context) {
 			a.MeshForwardEntryPort = 0
 			a.MeshForwardTargetPort = 0
 			a.MeshForwardTarget = ""
-		}
-
-		// Sync webhook if auto_deploy state or repo changed. Repositories covered
-		// by a GitHub App installation are driven by App-level events, so the two
-		// trigger mechanisms never stack; disabling still cleans up any legacy hook.
-		if h.gitProvider != nil && strings.Contains(strings.ToLower(a.RepoURL), "github.com") {
-			coveredByApp := h.repoCoveredByGitHubApp(a.RepoURL)
-			if a.AutoDeploy && !coveredByApp && (!oldApp.AutoDeploy || a.RepoURL != oldApp.RepoURL || a.GitHubHookID == 0) {
-				webhookURL := h.buildWebhookURL(c, a.WebhookToken)
-				hookID, err := h.gitProvider.EnsureRepoWebhook(c.Request.Context(), a.RepoURL, webhookURL)
-				if err == nil {
-					a.WebhookAutoManaged = true
-					a.GitHubHookID = hookID
-					a.WebhookError = ""
-				} else {
-					a.WebhookAutoManaged = false
-					a.WebhookError = err.Error()
-				}
-			} else if !a.AutoDeploy && oldApp.AutoDeploy && oldApp.GitHubHookID > 0 {
-				_ = h.gitProvider.DeleteRepoWebhook(c.Request.Context(), oldApp.RepoURL, oldApp.GitHubHookID)
-				a.WebhookAutoManaged = false
-				a.GitHubHookID = 0
-				a.WebhookError = ""
-			}
 		}
 		return nil
 	}); err != nil {
@@ -729,9 +704,6 @@ func (h *AppHandlers) deleteApp(c *gin.Context) {
 			return
 		}
 	}
-	if app.WebhookAutoManaged && app.GitHubHookID > 0 && h.gitProvider != nil {
-		_ = h.gitProvider.DeleteRepoWebhook(context.Background(), app.RepoURL, app.GitHubHookID)
-	}
 	if err := h.store.DeleteApp(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
@@ -746,108 +718,13 @@ func (h *AppHandlers) deleteApp(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-func (h *AppHandlers) syncAppWebhook(c *gin.Context) {
+func (h *AppHandlers) listTriggerEvents(c *gin.Context) {
 	id := c.Param("id")
-	app, ok := h.store.GetApp(id)
-	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": "应用不存在"})
+	if _, ok := h.store.GetApp(id); !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "app not found"})
 		return
 	}
-	if h.gitProvider == nil || !strings.Contains(strings.ToLower(app.RepoURL), "github.com") {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "该应用不是 GitHub 仓库或未启用 Git Provider 集成"})
-		return
-	}
-	webhookURL := h.buildWebhookURL(c, app.WebhookToken)
-	hookID, err := h.gitProvider.EnsureRepoWebhook(c.Request.Context(), app.RepoURL, webhookURL)
-	if err != nil {
-		_ = h.store.UpdateApp(id, func(a *Application) error {
-			a.WebhookAutoManaged = false
-			a.WebhookError = err.Error()
-			return nil
-		})
-		c.JSON(http.StatusBadGateway, gin.H{"error": "自动同步 GitHub Webhook 失败: " + err.Error()})
-		return
-	}
-	_ = h.store.UpdateApp(id, func(a *Application) error {
-		a.WebhookAutoManaged = true
-		a.GitHubHookID = hookID
-		a.WebhookError = ""
-		return nil
-	})
-	updated, _ := h.store.GetApp(id)
-	c.JSON(http.StatusOK, gin.H{
-		"ok":      true,
-		"message": "已成功通过 GitHub API 为该仓库配置 Webhook",
-		"data":    updated,
-	})
-}
-
-// switchToGitHubApp moves an app's push trigger from its legacy per-repo
-// webhook to the GitHub App: the repo-level hook (if one was auto-managed)
-// is deleted on GitHub and the auto-managed flags are cleared, so later
-// pushes arrive only through the App-level event endpoint. The App trigger
-// itself needs no per-app record — a push to an installed repository with
-// auto_deploy on is routed by repository name — so after this call the
-// app is App-triggered as long as its repository is inside an installation.
-//
-// The switch is refused unless that coverage actually holds: deleting the
-// legacy hook for a repository no installation covers would silently break
-// automatic deployment (the app would fall back to a manual webhook URL
-// while reporting a successful switch).
-func (h *AppHandlers) switchToGitHubApp(c *gin.Context) {
-	id := c.Param("id")
-	app, ok := h.store.GetApp(id)
-	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": "应用不存在"})
-		return
-	}
-	if !strings.Contains(strings.ToLower(app.RepoURL), "github.com") {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "该应用不是 GitHub 仓库"})
-		return
-	}
-	if h.ghAppStore == nil || !h.ghAppStore.Configured() {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "请先在系统设置中配置 GitHub App"})
-		return
-	}
-	if _, covered := h.ghAppStore.FindInstallationForRepo(githubapp.NormalizeRepoURL(app.RepoURL)); !covered {
-		c.JSON(http.StatusConflict, gin.H{"error": "该仓库不在 GitHub App 安装范围内，请先将 App 安装到该仓库（设置 → 代码源集成 → 同步安装），再切换"})
-		return
-	}
-	hookDeleted := false
-	if app.GitHubHookID > 0 {
-		if h.gitProvider == nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "未启用 Git Provider 集成，无法删除旧的逐仓 Webhook"})
-			return
-		}
-		if err := h.gitProvider.DeleteRepoWebhook(c.Request.Context(), app.RepoURL, app.GitHubHookID); err != nil {
-			c.JSON(http.StatusBadGateway, gin.H{"error": "删除旧的逐仓 Webhook 失败: " + err.Error()})
-			return
-		}
-		hookDeleted = true
-	}
-	if err := h.store.UpdateApp(id, func(a *Application) error {
-		a.WebhookAutoManaged = false
-		a.GitHubHookID = 0
-		a.WebhookError = ""
-		return nil
-	}); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "切换失败: " + err.Error()})
-		return
-	}
-	updated, ok := h.store.GetApp(id)
-	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "切换已保存，但应用记录读取失败"})
-		return
-	}
-	msg := "已切换到 GitHub App 触发"
-	if hookDeleted {
-		msg += "（旧的逐仓 Webhook 已删除）"
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"ok":      true,
-		"message": msg,
-		"data":    updated,
-	})
+	c.JSON(http.StatusOK, gin.H{"data": h.store.ListTriggerEvents(id)})
 }
 
 // precheckMigrate reports whether a target host is ready to receive the app:
@@ -1028,6 +905,20 @@ func (h *AppHandlers) rollbackApp(c *gin.Context) {
 			return
 		}
 		pinned.ComposeContent = target.ComposeContent
+		dep, err := h.engine.StartRollback(&pinned, "", usernameOf(c))
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": dep})
+		return
+	}
+	if app.SourceType == "image" {
+		if target.ImageRef == "" {
+			c.JSON(http.StatusConflict, gin.H{"error": "该部署记录缺少镜像版本快照，无法回滚（建议 CI 使用不可变 Commit SHA 标签）"})
+			return
+		}
+		pinned.Image = target.ImageRef
 		dep, err := h.engine.StartRollback(&pinned, "", usernameOf(c))
 		if err != nil {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})

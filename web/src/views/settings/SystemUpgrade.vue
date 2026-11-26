@@ -450,7 +450,7 @@ onMounted(async () => {
                 <p class="sec-desc">
                   支持从官方 GitHub Releases 在线自动升级，或离线上传最新编译的 <code>watchman-server</code> 单二进制进行原子安全替换，替换后系统自动下发维护预告帧并支持一键平滑重启。
                 </p>
-                <p v-if="systemUpdate.checkError" class="sec-desc" style="color: #ef4444; margin: 4px 0 8px;">
+                <p v-if="systemUpdate.checkError" class="sec-desc sec-error">
                   <NIcon :component="AlertCircleOutline" style="vertical-align: -2px; margin-right: 4px;" />
                   检查更新异常: {{ systemUpdate.checkError }}
                 </p>
@@ -508,7 +508,7 @@ onMounted(async () => {
 
               <!-- 测试计划：决定升级时跟踪正式版还是预发布版（仅管理员） -->
               <template v-if="isAdmin">
-                <NDivider style="margin: 12px 0" />
+                <NDivider class="beta-divider" />
                 <div class="beta-row">
                   <div class="beta-text">
                     <div class="beta-title">加入测试计划</div>
@@ -548,13 +548,13 @@ onMounted(async () => {
               <p class="sec-desc">
                 自动比对全网已纳管主机的 Agent 版本。支持一键并发批量下发自升级指令，并自动开启 3 分钟维护静默期，平滑升级零假告警。
               </p>
-              <NAlert v-if="isAnyUpgrading" type="info" :bordered="false" style="margin-top: 10px">
+              <NAlert v-if="isAnyUpgrading" type="info" :bordered="false" class="status-alert">
                 <template #icon>
-                  <NSpin :size="14" />
+                  <NSpin :size="16" />
                 </template>
                 正在执行后台升级中（{{ upgradingHosts.map(h => `${h.hostname}${h.upgrade_stage ? ` [${formatUpgradeStage(h.upgrade_stage)}]` : ''}`).join('、') }}），已开启 3 分钟维护静默期，请稍候...
               </NAlert>
-              <NAlert v-if="failedHosts.length > 0" type="error" :bordered="false" style="margin-top: 10px" closable>
+              <NAlert v-if="failedHosts.length > 0" type="error" :bordered="false" class="status-alert" closable>
                 部分主机升级遇到异常：
                 <span v-for="(h, idx) in failedHosts" :key="h.id">
                   {{ idx > 0 ? '；' : '' }}<strong>{{ h.hostname }}</strong>: {{ h.upgrade_error || '升级失败' }}
@@ -562,7 +562,7 @@ onMounted(async () => {
               </NAlert>
             </div>
 
-            <div class="sec-actions">
+            <div class="sec-actions sec-actions-bottom">
               <NSpace :size="10" align="center">
                 <NButton
                   v-if="isAdmin && outdatedHosts.length > 0"
@@ -991,19 +991,23 @@ onMounted(async () => {
     background: var(--n-color-modal);
     border: 1px solid var(--border-color);
     border-radius: 6px;
-    padding: 14px;
+    padding: 16px;
     display: flex;
     flex-direction: column;
-    justify-content: space-between;
+    gap: 14px;
     height: 100%;
     box-sizing: border-box;
 
     .section-header {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+
       .title-wrap {
         display: flex;
         align-items: center;
+        flex-wrap: wrap;
         gap: 8px;
-        margin-bottom: 6px;
 
         .sec-title {
           font-weight: 700;
@@ -1012,10 +1016,18 @@ onMounted(async () => {
       }
 
       .sec-desc {
-        margin: 0 0 12px;
+        margin: 0;
         font-size: 12px;
         color: var(--n-text-color-3);
-        line-height: 1.5;
+        line-height: 1.55;
+      }
+
+      .sec-error {
+        color: #ef4444;
+      }
+
+      .status-alert {
+        margin-top: 4px;
       }
     }
 
@@ -1023,10 +1035,18 @@ onMounted(async () => {
       display: flex;
       align-items: center;
 
+      &.sec-actions-bottom {
+        margin-top: auto;
+      }
+
       .muted-hint {
         font-size: 12px;
         color: var(--n-text-color-3);
       }
+    }
+
+    .beta-divider {
+      margin: 0;
     }
 
     .beta-row {

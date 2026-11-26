@@ -30,11 +30,14 @@ type Application struct {
 	// per-repo webhook push paths consult it; manual deploy/upgrade always
 	// run. A push whose delivery carries no file list deploys as before
 	// (fail-open) instead of being judged by an incomplete list.
-	WatchPaths         []string `json:"watch_paths,omitempty"`
-	WebhookToken       string   `json:"webhook_token,omitempty"` // secret path segment for /apps/webhook/:token
-	WebhookAutoManaged bool     `json:"webhook_auto_managed,omitempty"`
-	GitHubHookID       int64    `json:"github_hook_id,omitempty"`
-	WebhookError       string   `json:"webhook_error,omitempty"`
+	WatchPaths          []string `json:"watch_paths,omitempty"`
+	WebhookToken        string   `json:"webhook_token,omitempty"` // secret path segment for /apps/webhook/:token
+	LegacyWebhookNotice bool     `json:"legacy_webhook_notice,omitempty"`
+	// Compat-only read fields for pre-App PAT apps; cleared on load into
+	// LegacyWebhookNotice so they never persist forward.
+	WebhookAutoManaged bool   `json:"webhook_auto_managed,omitempty"`
+	GitHubHookID       int64  `json:"github_hook_id,omitempty"`
+	WebhookError       string `json:"webhook_error,omitempty"`
 
 	// Build configuration.
 	BuildType      string `json:"build_type,omitempty"`    // "dockerfile" | "compose"
@@ -44,8 +47,10 @@ type Application struct {
 	ComposeContent string `json:"compose_content,omitempty"` // raw compose.yaml for source_type == "raw_compose"
 
 	// Runtime configuration.
-	Image          string            `json:"image,omitempty"`    // resolved image for source_type=image / after build
-	EnvVars        map[string]string `json:"env_vars,omitempty"` // supports "{{ vault:<id>:<key> }}" references
+	Image           string            `json:"image,omitempty"`             // resolved image for source_type=image / after build
+	RegistryVaultID string            `json:"registry_vault_id,omitempty"` // vault credential for private container registries
+	CIRepo          string            `json:"ci_repo,omitempty"`           // optional linked GitHub repo for GitHub Actions workflow generation
+	EnvVars         map[string]string `json:"env_vars,omitempty"`          // supports "{{ vault:<id>:<key> }}" references
 	Ports          []PortMapping     `json:"ports,omitempty"`
 	Volumes        []string          `json:"volumes,omitempty"`         // "host:container" docker -v specs
 	HealthcheckURL string            `json:"healthcheck_url,omitempty"` // e.g. "http://127.0.0.1:8080/healthz"
@@ -149,7 +154,10 @@ const (
 // pipeline pulls the latest images before the normal rollout (see
 // runWithPin). Git apps carry no pull step — fetch+build already refreshes
 // them — so for git an upgrade run is a redeploy with this trigger.
-const TriggerUpgrade = "upgrade"
+const (
+	TriggerUpgrade = "upgrade"
+	TriggerCI      = "ci"
+)
 
 // Deployment records one build+rollout attempt of an application.
 type Deployment struct {
@@ -157,7 +165,8 @@ type Deployment struct {
 	AppID         string    `json:"app_id"`
 	CommitHash    string    `json:"commit_hash,omitempty"`
 	CommitMessage string    `json:"commit_message,omitempty"`
-	Trigger       string    `json:"trigger"` // "create" | "webhook" | "github-app" | "manual" | "rollback" | "migrate" | "upgrade"
+	ImageRef      string    `json:"image_ref,omitempty"`
+	Trigger       string    `json:"trigger"` // "create" | "webhook" | "github-app" | "ci" | "manual" | "rollback" | "migrate" | "upgrade"
 	Status        string    `json:"status"`
 	StartedBy     string    `json:"started_by,omitempty"`
 	StartedAt     time.Time `json:"started_at"`
@@ -175,6 +184,29 @@ type Deployment struct {
 	// CancelledBy records the username that aborted this run (only set when
 	// Status == DeployCancelled).
 	CancelledBy string `json:"cancelled_by,omitempty"`
+}
+
+// Trigger event outcomes recorded for push / CI deliveries.
+const (
+	TriggerTriggered = "triggered"
+	TriggerSkipped   = "skipped"
+	TriggerRejected  = "rejected"
+)
+
+// TriggerEvent records one incoming Git push or CI webhook evaluation for an
+// application so operators can diagnose skipped or rejected deliveries.
+type TriggerEvent struct {
+	ID           string    `json:"id"`
+	AppID        string    `json:"app_id"`
+	Source       string    `json:"source"` // "github-app" | "webhook" | "ci"
+	DeliveryID   string    `json:"delivery_id,omitempty"`
+	Ref          string    `json:"ref,omitempty"`
+	Commit       string    `json:"commit,omitempty"`
+	Actor        string    `json:"actor,omitempty"`
+	Outcome      string    `json:"outcome"` // "triggered" | "skipped" | "rejected"
+	Reason       string    `json:"reason,omitempty"`
+	DeploymentID string    `json:"deployment_id,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // MigrateAppReq is the payload of POST /apps/:id/migrate.

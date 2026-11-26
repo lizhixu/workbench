@@ -34,7 +34,6 @@ import (
 	"watchman/server/internal/cert"
 	"watchman/server/internal/commands"
 	"watchman/server/internal/githubapp"
-	"watchman/server/internal/gitprovider"
 	"watchman/server/internal/groups"
 	"watchman/server/internal/install"
 	"watchman/server/internal/metrics"
@@ -43,6 +42,7 @@ import (
 	"watchman/server/internal/policy"
 	"watchman/server/internal/registry"
 	"watchman/server/internal/release"
+	"watchman/server/internal/repoinspect"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/session"
@@ -354,21 +354,19 @@ func main() {
 	}
 	appEngine.SetVolumeUploadStore(volumeUploadStore)
 
-	// Git provider integration (GitHub authorization & repo selector).
-	gitProviderStore, err := gitprovider.NewStore(*dataDir, log)
-	if err != nil {
-		log.Error("git provider store init", "err", err)
-		os.Exit(1)
-	}
-	appEngine.SetGitProvider(gitProviderStore)
-	log.Info("git provider store ready")
-
-	// GitHub App integration (App-level push events, no per-repo webhook).
+	// GitHub App integration (App-level push events & installation tokens).
 	githubAppStore, err := githubapp.NewStore(*dataDir, log)
 	if err != nil {
 		log.Error("github app store init", "err", err)
 		os.Exit(1)
 	}
+	ghTokenProvider := githubapp.NewTokenProvider(githubAppStore, githubapp.NewClient())
+	repoInspector := repoinspect.NewService(ghTokenProvider, func(id string) (string, bool) {
+		if cred, ok := vaultStore.Get(id); ok {
+			return cred.Secret, true
+		}
+		return "", false
+	})
 	log.Info("github app store ready")
 
 	// Host & container volume snapshots / database hot-backup.
@@ -426,7 +424,7 @@ func main() {
 			}
 		},
 		Repo: func(ctx context.Context, repoURL string) *ai.AppRepoProbe {
-			meta, err := gitProviderStore.InspectRepo(ctx, repoURL)
+			meta, err := repoInspector.InspectRepo(ctx, repoURL, repoinspect.InspectOptions{})
 			if err != nil {
 				return &ai.AppRepoProbe{RepoURL: repoURL, Err: err.Error()}
 			}
@@ -624,7 +622,7 @@ func main() {
 	}()
 
 	// HTTP server (REST + WS).
-	hr := api.Router(reg, log, authStore, sessStore, alertStore, vaultStore, aiAssistant, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore, settingsStore, backupStore, networkStore, appStore, appEngine, certHub, snapshotStore, snapshotEngine, gitProviderStore, githubAppStore, alertMonitor, *opGRPCAddr)
+	hr := api.Router(reg, log, authStore, sessStore, alertStore, vaultStore, aiAssistant, metricsStore, scanStore, policyStore, auditStore, commandStore, groupStore, settingsStore, backupStore, networkStore, appStore, appEngine, certHub, snapshotStore, snapshotEngine, githubAppStore, ghTokenProvider, alertMonitor, *opGRPCAddr)
 	// Install endpoints (one-line agent install + binary download).
 	installHandler := install.NewHandler(reg, "bin")
 	installHandler.UpgradePubKey = api.UpgradePubKeyHex

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NCard,
@@ -9,7 +9,6 @@ import {
   NFormItem,
   NAlert,
   NIcon,
-  NAvatar,
   NTag,
   NModal,
   NSelect,
@@ -19,101 +18,20 @@ import {
 } from 'naive-ui'
 import { LogoGithub } from '@vicons/ionicons5'
 import {
-  getGitProviders, connectGitHubToken, disconnectGitHub,
-  listGitHubRepos, type GitProvidersStatus,
-  getGitHubAppStatus, createGitHubAppManifest, exchangeGitHubAppManifest,
-  saveGitHubAppConfig, disconnectGitHubApp, syncGitHubAppInstallations,
+  getGitHubAppStatus,
+  createGitHubAppManifest,
+  exchangeGitHubAppManifest,
+  saveGitHubAppConfig,
+  disconnectGitHubApp,
+  syncGitHubAppInstallations,
   type GitHubAppStatus,
 } from '../../api/git'
 
-// 从旧 Settings.vue 抽取：代码源集成 (Git Providers) + 连接弹窗
 defineOptions({ name: 'GitProviders' })
 
 const message = useMessage()
 const route = useRoute()
 const router = useRouter()
-
-const gitStatus = ref<GitProvidersStatus | null>(null)
-const loadingGit = ref(false)
-
-// GitHub 头像首次加载缓慢时先显示 GitHub 标志占位，不留空白灰圆：
-// 头像预加载完成前渲染图标占位，加载成功后再换成真实头像，失败则一直留占位。
-// 不用 NAvatar 内置 placeholder 插槽：它要求同时开 lazy，而无
-// intersection-observer 配置时 lazy 会阻止图片开始加载。
-const avatarLoaded = ref(false)
-watch(
-  () => gitStatus.value?.github?.account?.avatar_url,
-  (url) => {
-    avatarLoaded.value = false
-    if (!url) return
-    const img = new Image()
-    img.onload = () => { avatarLoaded.value = true }
-    img.onerror = () => { avatarLoaded.value = false }
-    img.src = url
-  },
-)
-const showGitAuthModal = ref(false)
-const gitTokenInput = ref('')
-const connectingGit = ref(false)
-const disconnectingGit = ref(false)
-const refreshingGit = ref(false)
-
-async function loadGitStatus() {
-  loadingGit.value = true
-  try {
-    gitStatus.value = await getGitProviders()
-  } catch (e: any) {
-    // silently fail
-  } finally {
-    loadingGit.value = false
-  }
-}
-
-async function submitGitToken() {
-  if (!gitTokenInput.value.trim()) {
-    message.warning('请输入 GitHub Personal Access Token')
-    return
-  }
-  connectingGit.value = true
-  try {
-    const acc = await connectGitHubToken(gitTokenInput.value.trim())
-    message.success(`成功连接 GitHub 账号: ${acc.login}`)
-    showGitAuthModal.value = false
-    gitTokenInput.value = ''
-    await loadGitStatus()
-  } catch (e: any) {
-    message.error(e.message || '连接失败')
-  } finally {
-    connectingGit.value = false
-  }
-}
-
-async function doDisconnectGit() {
-  disconnectingGit.value = true
-  try {
-    await disconnectGitHub()
-    message.success('已断开 GitHub 连接')
-    await loadGitStatus()
-  } catch (e: any) {
-    message.error(e.message || '断开失败')
-  } finally {
-    disconnectingGit.value = false
-  }
-}
-
-async function refreshGitRepos() {
-  refreshingGit.value = true
-  try {
-    const repos = await listGitHubRepos()
-    message.success(`GitHub 授权有效，已成功获取 ${repos.length} 个可用仓库`)
-  } catch (e: any) {
-    message.error(e.message || '同步失败')
-  } finally {
-    refreshingGit.value = false
-  }
-}
-
-// ---- GitHub App（App 级推送事件，替代逐仓 Webhook）----
 
 const appStatus = ref<GitHubAppStatus | null>(null)
 const loadingApp = ref(false)
@@ -134,7 +52,7 @@ async function loadAppStatus() {
   try {
     appStatus.value = await getGitHubAppStatus()
   } catch (e: any) {
-    // silently fail
+    message.error(e.message || '加载 GitHub App 状态失败')
   } finally {
     loadingApp.value = false
   }
@@ -229,6 +147,13 @@ function openAppInstallPage() {
   window.open(`https://github.com/apps/${appStatus.value.slug}/installations/new`, '_blank')
 }
 
+function openInstallSettings(instId: number, accountType: string, accountLogin: string) {
+  const url = accountType === 'Organization' && accountLogin
+    ? `https://github.com/organizations/${encodeURIComponent(accountLogin)}/settings/installations/${instId}`
+    : `https://github.com/settings/installations/${instId}`
+  window.open(url, '_blank')
+}
+
 function copyAppWebhook() {
   if (!appStatus.value?.webhook_url) return
   navigator.clipboard?.writeText(appStatus.value.webhook_url).then(
@@ -261,7 +186,6 @@ async function handleAppCallback() {
 }
 
 onMounted(() => {
-  loadGitStatus()
   loadAppStatus()
   handleAppCallback()
 })
@@ -272,73 +196,7 @@ onMounted(() => {
     <template #header>
       <span style="font-size: 16px; font-weight: 700">
         <NIcon style="vertical-align: middle; margin-right: 6px"><LogoGithub /></NIcon>
-        代码源集成
-      </span>
-    </template>
-
-    <NSpace vertical :size="14">
-      <p class="muted tip-hint">
-        连接您的 Git 账号后，发布应用可直接读取私有与公开代码仓库。启用自动部署后，系统将自动通过 API 为仓库配置 Webhook，实现代码提交即自动构建与更新，无需手动去仓库配置 Webhook。
-      </p>
-
-      <div class="git-provider-row">
-        <NSpace align="center" justify="space-between" style="width: 100%">
-          <NSpace align="center" :size="12">
-            <NAvatar
-              v-if="gitStatus?.github?.connected && gitStatus.github.account?.avatar_url && avatarLoaded"
-              :src="gitStatus.github.account.avatar_url"
-              round
-              :size="36"
-            />
-            <NAvatar
-              v-else-if="gitStatus?.github?.connected && gitStatus.github.account?.avatar_url"
-              round
-              :size="36"
-              color="var(--bg-card-subtle)"
-            >
-              <NIcon size="20" :component="LogoGithub" />
-            </NAvatar>
-            <NIcon v-else size="32" :component="LogoGithub" />
-            <div>
-              <NSpace align="center" :size="8">
-                <span style="font-size: 15px; font-weight: 600">GitHub</span>
-                <NTag v-if="gitStatus?.github?.connected" type="success" size="small" round>已连接</NTag>
-                <NTag v-else type="default" size="small" round>未连接</NTag>
-              </NSpace>
-              <div class="muted" style="font-size: 12px; margin-top: 2px">
-                {{ gitStatus?.github?.connected
-                    ? `已授权账号：${gitStatus.github.account?.name || gitStatus.github.account?.login} (@${gitStatus.github.account?.login})`
-                    : '通过 Personal Access Token 连接您的 GitHub 账号' }}
-              </div>
-            </div>
-          </NSpace>
-
-          <NSpace align="center">
-            <template v-if="gitStatus?.github?.connected">
-              <NButton size="small" secondary :loading="refreshingGit" @click="refreshGitRepos">
-                测试同步仓库
-              </NButton>
-              <NButton size="small" quaternary type="error" :loading="disconnectingGit" @click="doDisconnectGit">
-                断开连接
-              </NButton>
-            </template>
-            <template v-else>
-              <NButton type="primary" size="small" @click="showGitAuthModal = true">
-                连接 GitHub
-              </NButton>
-            </template>
-          </NSpace>
-        </NSpace>
-      </div>
-    </NSpace>
-  </NCard>
-
-  <!-- GitHub App：App 级推送事件，替代逐仓 Webhook -->
-  <NCard :bordered="false" size="small" style="margin-top: 14px">
-    <template #header>
-      <span style="font-size: 16px; font-weight: 700">
-        <NIcon style="vertical-align: middle; margin-right: 6px"><LogoGithub /></NIcon>
-        GitHub App（自动部署主推）
+        GitHub 代码源集成（GitHub App）
       </span>
     </template>
     <template #header-extra>
@@ -348,12 +206,12 @@ onMounted(() => {
 
     <NSpace vertical :size="14">
       <p class="muted tip-hint">
-        在账号或组织里安装一次 App，之后该账号下所有仓库（或选定的仓库）推送到应用配置的分支时，都会自动触发面板部署，全程不用再给任何仓库单独配置 Webhook。注意：GitHub 仍需把事件推给面板，面板必须有公网地址，否则事件送不进来。
+        在个人账号或组织安装一次 GitHub App，应用中心即可直接读取私有与公开仓库、实时拉取分支与文件，并在推送到目标分支时零配置自动触发部署（替代易过期的经典 PAT 与逐仓 Webhook）。私有镜像或其它 Git 托管平台（Gitee / GitLab / 自建 Gitea）请在「凭据保险库」存放 <b>Git 访问令牌</b> 或 <b>镜像仓库凭据</b>。
       </p>
 
       <template v-if="appStatus?.configured">
         <div class="git-provider-row">
-          <NSpace vertical :size="8" style="width: 100%">
+          <NSpace vertical :size="10" style="width: 100%">
             <NSpace align="center" :size="8">
               <span style="font-weight: 600">{{ appStatus.slug || `App #${appStatus.app_id}` }}</span>
               <span class="muted" style="font-size: 12px">App ID：{{ appStatus.app_id }}</span>
@@ -364,7 +222,7 @@ onMounted(() => {
               <NButton size="tiny" secondary @click="copyAppWebhook">复制</NButton>
             </NSpace>
             <div v-if="appStatus.installations.length">
-              <div class="muted" style="font-size: 12px; margin-bottom: 6px">已安装：</div>
+              <div class="muted" style="font-size: 12px; margin-bottom: 6px">已安装授权：</div>
               <NSpace vertical :size="6">
                 <div v-for="inst in appStatus.installations" :key="inst.id">
                   <NSpace align="center" :size="8">
@@ -376,12 +234,15 @@ onMounted(() => {
                       {{ inst.target_type === 'all' ? '全部仓库' : `选定仓库 ${(inst.repos || []).length} 个` }}
                     </NTag>
                     <NTag v-if="inst.suspended" size="small" type="warning">已暂停</NTag>
+                    <NButton size="tiny" text type="primary" @click="openInstallSettings(inst.id, inst.account_type, inst.account_login)">
+                      管理授权仓库
+                    </NButton>
                   </NSpace>
                 </div>
               </NSpace>
             </div>
             <NAlert v-else type="info" :show-icon="true" style="margin-top: 4px">
-              App 已创建但尚未安装。点「安装到账号或组织」选好仓库范围并授权，回来点「同步安装」即可。
+              App 已创建但尚未安装。点击下方「安装到账号或组织」选好仓库范围并授权，回到面板点击「同步安装」即可。
             </NAlert>
           </NSpace>
         </div>
@@ -392,7 +253,7 @@ onMounted(() => {
             <template #trigger>
               <NButton size="small" quaternary type="error" :loading="disconnectingApp">断开 GitHub App</NButton>
             </template>
-            断开后 App 推送不再触发部署，已配置的应用需切回逐仓 Webhook 或手动部署。
+            断开后 GitHub App 推送事件不再触发自动部署，应用可继续使用手工触发或逐仓 / CI Webhook。
           </NPopconfirm>
         </NSpace>
       </template>
@@ -421,64 +282,16 @@ onMounted(() => {
             />
           </NSpace>
           <NSpace>
-            <NButton type="primary" :loading="creatingApp" @click="doCreateApp">创建 GitHub App</NButton>
+            <NButton type="primary" :loading="creatingApp" @click="doCreateApp">一键创建 GitHub App</NButton>
             <NButton secondary @click="showAppManualModal = true">手动填写已有 App</NButton>
           </NSpace>
           <p class="muted tip-hint" style="font-size: 12px">
-            名称留空会自动生成一个全局唯一的名字（<code>watchman-随机后缀</code>）——GitHub App 名称在全站唯一，手填的常用名很可能已被占用。点「创建」会跳到 GitHub 建 App（权限只要内容只读与元数据只读、只订阅 push 事件），建好自动跳回面板完成配置；第二步再点「安装到账号或组织」选仓库范围。老的手动逐仓 Webhook 方式仍可继续用。
+            名称留空会自动生成全局唯一名称（<code>watchman-随机后缀</code>）。点击「一键创建」会跳转到 GitHub 确认创建（仅申请 Contents 只读、Metadata 只读及 push 事件），完成后自动跳回面板；随后点「安装到账号或组织」选择授权仓库范围即可。注意：面板需可被 GitHub 访问以接收推送事件。
           </p>
         </NSpace>
       </template>
     </NSpace>
   </NCard>
-
-  <!-- 连接 GitHub 弹窗 -->
-  <NModal
-    v-model:show="showGitAuthModal"
-    preset="card"
-    title="连接 GitHub 账号 (Connect GitHub)"
-    style="width: 620px; max-width: 94vw"
-  >
-    <NSpace vertical size="medium">
-      <NAlert type="info" :show-icon="true">
-        <div style="font-weight: 600; margin-bottom: 6px">Token 权限配置说明（满足以下任一方式即可）：</div>
-        <div style="font-size: 13px; line-height: 1.6">
-          <div>
-            <b>1. 细粒度 Token（Fine-grained，官方推荐）</b>：
-            <ul style="margin: 2px 0 6px 18px; padding: 0">
-              <li><b>Repository access</b>：选择目标仓库或 <i>All repositories</i></li>
-              <li><b>Permissions -> Contents</b>：设置为 <b>Read-only</b>（用于读取代码与 Compose 编排）</li>
-              <li><b>Permissions -> Webhooks</b>：设置为 <b>Read and write</b>（用于系统自动创建 push Webhook）</li>
-            </ul>
-          </div>
-          <div>
-            <b>2. 传统 Token（Tokens classic）</b>：
-            <ul style="margin: 2px 0 0 18px; padding: 0">
-              <li>私有仓库勾选 <b>repo</b>（公开仓库仅需 <b>public_repo</b>）</li>
-              <li>勾选 <b>admin:repo_hook</b>（用于系统自动配置 Push Webhook）</li>
-            </ul>
-          </div>
-        </div>
-      </NAlert>
-
-      <NFormItem label="GitHub Personal Access Token" required>
-        <NInput
-          v-model:value="gitTokenInput"
-          type="password"
-          show-password-on="click"
-          :input-props="{ autocomplete: 'new-password' }"
-          placeholder="github_pat_xxx 或 ghp_xxx"
-        />
-      </NFormItem>
-
-      <NSpace justify="end">
-        <NButton @click="showGitAuthModal = false">取消</NButton>
-        <NButton type="primary" :loading="connectingGit" @click="submitGitToken">
-          验证并连接
-        </NButton>
-      </NSpace>
-    </NSpace>
-  </NModal>
 
   <!-- 手动填写已有 GitHub App -->
   <NModal

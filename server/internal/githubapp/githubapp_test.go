@@ -278,3 +278,26 @@ func TestDefaultAppNameFormatAndUniqueness(t *testing.T) {
 		seen[name] = true
 	}
 }
+
+func TestInstallationRepoLegacyJSONCompat(t *testing.T) {
+	var inst Installation
+	raw := `{"id":1,"account_login":"acme","account_type":"Organization","target_type":"selected","repos":["Acme/Web","acme/api"]}`
+	if err := json.Unmarshal([]byte(raw), &inst); err != nil {
+		t.Fatalf("legacy unmarshal failed: %v", err)
+	}
+	if len(inst.Repos) != 2 || inst.Repos[0].FullName != "acme/web" || inst.Repos[1].FullName != "acme/api" {
+		t.Fatalf("unexpected legacy repos: %+v", inst.Repos)
+	}
+	if !strings.EqualFold(inst.Repos[0].FullName, "acme/web") {
+		t.Error("expected normalized repo lookup to match")
+	}
+
+	var rich Installation
+	rawRich := `{"id":2,"account_login":"acme","repos":[{"full_name":"acme/priv","private":true,"default_branch":"develop","language":"Go","pushed_at":"2026-01-02T03:04:05Z"}]}`
+	if err := json.Unmarshal([]byte(rawRich), &rich); err != nil {
+		t.Fatalf("rich unmarshal failed: %v", err)
+	}
+	if len(rich.Repos) != 1 || !rich.Repos[0].Private || rich.Repos[0].DefaultBranch != "develop" || rich.Repos[0].Language != "Go" {
+		t.Fatalf("unexpected rich repo metadata: %+v", rich.Repos)
+	}
+}

@@ -191,14 +191,19 @@ func (c *Client) CreateInstallationToken(ctx context.Context, jwt string, instal
 
 type installationReposResp struct {
 	Repositories []struct {
-		FullName string `json:"full_name"`
+		FullName      string    `json:"full_name"`
+		Private       bool      `json:"private"`
+		Description   string    `json:"description"`
+		DefaultBranch string    `json:"default_branch"`
+		Language      string    `json:"language"`
+		PushedAt      time.Time `json:"pushed_at"`
 	} `json:"repositories"`
 }
 
-// ListInstallationRepos returns the installation's repository full names
-// ("owner/repo"), following pagination up to 5 pages.
-func (c *Client) ListInstallationRepos(ctx context.Context, instToken string) ([]string, error) {
-	var names []string
+// ListInstallationRepos returns enriched repository metadata for one installation,
+// following pagination up to 5 pages.
+func (c *Client) ListInstallationRepos(ctx context.Context, instToken string) ([]InstallationRepo, error) {
+	var repos []InstallationRepo
 	for page := 1; page <= 5; page++ {
 		var resp installationReposResp
 		path := fmt.Sprintf("/installation/repositories?per_page=100&page=%d", page)
@@ -206,13 +211,24 @@ func (c *Client) ListInstallationRepos(ctx context.Context, instToken string) ([
 			return nil, err
 		}
 		for _, r := range resp.Repositories {
-			names = append(names, strings.ToLower(r.FullName))
+			branch := r.DefaultBranch
+			if branch == "" {
+				branch = "main"
+			}
+			repos = append(repos, InstallationRepo{
+				FullName:      strings.ToLower(r.FullName),
+				Private:       r.Private,
+				Description:   r.Description,
+				DefaultBranch: branch,
+				Language:      r.Language,
+				PushedAt:      r.PushedAt,
+			})
 		}
 		if len(resp.Repositories) < 100 {
 			break
 		}
 	}
-	return names, nil
+	return repos, nil
 }
 
 // ListRepoBranches returns branch names for one repository, using an

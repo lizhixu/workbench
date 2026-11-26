@@ -417,8 +417,9 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 				// A git-backed compose stack is not a single container:
 				// `docker rm` would miss every <project>-<service>-1
 				// container, so bring the stack down instead.
+				workDir, composeFile := gitComposeLocation(repoDir, app)
 				cleanCmd = fmt.Sprintf("cd %s && docker compose -f %s -p %s down 2>/dev/null || true",
-					shellQuote(repoDir), shellQuote(gitComposeFile(app)), shellQuote("watchman-"+app.ID))
+					shellQuote(workDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID))
 			}
 			cleanRes, cleanErr := execOnAgent(context.Background(), targetHub, "mig-rb-clean-"+randomToken(4), cleanCmd, 60, deployStallSec, nil)
 			if cleanErr != nil || cleanRes.GetExitCode() != 0 {
@@ -484,8 +485,9 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 				// A git-backed compose stack is not a single container:
 				// `docker rm` would miss every <project>-<service>-1
 				// container, so bring the stack down instead.
+				workDir, composeFile := gitComposeLocation(repoDir, app)
 				cleanCmd = fmt.Sprintf("cd %s && docker compose -f %s -p %s down 2>/dev/null || true",
-					shellQuote(repoDir), shellQuote(gitComposeFile(app)), shellQuote("watchman-"+app.ID))
+					shellQuote(workDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID))
 			}
 			_, _ = execOnAgent(context.Background(), targetHub, "mig-gone-clean-"+randomToken(4), cleanCmd, 60, deployStallSec, nil)
 			// Best-effort cleanup of volume files this run already
@@ -765,8 +767,9 @@ func (e *Engine) runMigration(ctx context.Context, app *Application, dep *Deploy
 		if app.SourceType == "raw_compose" {
 			cleanCmd = fmt.Sprintf("docker compose -f %s -p %s down --remove-orphans 2>/dev/null || true", shellQuote(composePath), shellQuote("watchman-"+app.ID))
 		} else if app.SourceType == "git" && app.BuildType == "compose" {
+			workDir, composeFile := gitComposeLocation(repoDir, app)
 			cleanCmd = fmt.Sprintf("cd %s && docker compose -f %s -p %s down 2>/dev/null || true",
-				shellQuote(repoDir), shellQuote(gitComposeFile(app)), shellQuote("watchman-"+app.ID))
+				shellQuote(workDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID))
 		}
 		logBuf.WriteString("$ 清理源主机容器(保留宿主数据目录)\n")
 		if _, err := execOnAgent(context.Background(), sourceHub, "mig-src-clean-"+randomToken(4), cleanCmd, 90, deployStallSec, nil); err != nil {
@@ -835,11 +838,21 @@ func (e *Engine) deployOnTargetHost(ctx context.Context, hub *rpc.Hub, app *Appl
 				return fmt.Errorf("解析应用模板失败: %v", err)
 			}
 		}
+		if app.Image != "" {
+			var pullErr error
+			failPull := func(format string, args ...any) { pullErr = fmt.Errorf(format, args...) }
+			if !e.ensureImagePresent(ctx, hub, app, app.Image, logBuf, func() bool { return ctx.Err() != nil }, failPull) {
+				if pullErr != nil {
+					return pullErr
+				}
+				return fmt.Errorf("拉取镜像失败")
+			}
+		}
 		logBuf.WriteString("$ 目标主机拉起容器\n")
 		return e.runContainerOnTarget(ctx, hub, app, logBuf, app.Image, container)
 	}
 
-	// source_type == "git": clone/fetch, then build (dockerfile or compose).
+	// source_type == "git": shallow clone/fetch, then build (dockerfile or compose).
 	repoDir := fmt.Sprintf("/var/lib/watchman/apps/%s/repo", app.ID)
 	imageTag := fmt.Sprintf("watchman-app-%s", app.ID)
 	branch := app.Branch
@@ -851,21 +864,7 @@ func (e *Engine) deployOnTargetHost(ctx context.Context, hub *rpc.Hub, app *Appl
 		return fmt.Errorf("获取 Git 凭据失败: %v", authErr)
 	}
 	authArgs := gitAuthArgs(authToken)
-	fetchScript := fmt.Sprintf(`set -e
-if [ -d %[1]s/.git ]; then
-  git %[5]s -C %[1]s fetch --force origin
-else
-  mkdir -p %[1]s
-  git %[5]s clone --branch %[3]s %[2]s %[1]s
-fi
-git -C %[1]s checkout --force %[4]s
-git -C %[1]s reset --hard %[4]s
-git -C %[1]s clean -fd
-COMMIT=$(git -C %[1]s rev-parse --short HEAD)
-MESSAGE=$(git -C %[1]s log -1 --pretty=%%s)
-echo "WATCHMAN_COMMIT=$COMMIT"
-echo "WATCHMAN_MESSAGE=$MESSAGE"`,
-		shellQuote(repoDir), shellQuote(app.RepoURL), shellQuote(branch), shellQuote("origin/"+branch), authArgs)
+	fetchScript := buildGitFetchScript(repoDir, app.RepoURL, branch, "", authArgs)
 	logBuf.WriteString("$ git fetch/checkout " + app.RepoURL + " (" + branch + ")\n")
 	if err := ctx.Err(); err != nil {
 		return err
@@ -889,15 +888,15 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 	}
 
 	if app.BuildType == "compose" {
-		composeFile := gitComposeFile(app)
+		workDir, composeFile := gitComposeLocation(repoDir, app)
 		upCmd := fmt.Sprintf("docker compose -f %s -p %s up -d --build --remove-orphans",
 			shellQuote(composeFile), shellQuote("watchman-"+app.ID))
-		logBuf.WriteString("$ " + upCmd + "\n")
+		logBuf.WriteString(fmt.Sprintf("$ (cd %s && %s)\n", workDir, upCmd))
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		res, err = execOnAgent(ctx, hub, "mig-compose-up-"+randomToken(4),
-			fmt.Sprintf("cd %s && %s", shellQuote(repoDir), upCmd), buildTimeout, deployStallSec, logBuf)
+			fmt.Sprintf("cd %s && %s", shellQuote(workDir), upCmd), buildTimeout, deployStallSec, logBuf)
 		if err != nil {
 			return fmt.Errorf("Docker Compose 部署失败: %v", err)
 		}

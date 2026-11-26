@@ -1,75 +1,22 @@
 import { http, unwrap } from './http'
 
-export interface GitHubAccount {
-  login: string
-  name: string
-  avatar_url: string
-  html_url: string
-  auth_type: string
-  updated_at: string
-}
+// ---- GitHub App（App 级仓库授权与自动部署）----
 
-export interface GitProvidersStatus {
-  github: {
-    connected: boolean
-    account?: GitHubAccount
-  }
-}
-
-export interface GitHubRepo {
-  id: number
-  name: string
+export interface GitHubAppRepoMeta {
   full_name: string
-  private: boolean
-  html_url: string
-  clone_url: string
-  description: string
-  default_branch: string
-  pushed_at: string
-  language: string
-  stargazers_count: number
+  private?: boolean
+  description?: string
+  default_branch?: string
+  language?: string
+  pushed_at?: string
 }
-
-export interface GitHubBranch {
-  name: string
-  protected: boolean
-  sha: string
-}
-
-export function getGitProviders() {
-  return unwrap<{ data: GitProvidersStatus }>(http.get('/git/providers')).then((r) => r.data)
-}
-
-export function connectGitHubToken(token: string) {
-  return unwrap<{ ok: boolean; data: GitHubAccount }>(
-    http.post('/git/github/token', { token }),
-  ).then((r) => r.data)
-}
-
-export function disconnectGitHub() {
-  return unwrap<{ ok: boolean }>(http.delete('/git/github'))
-}
-
-export function listGitHubRepos(query = '') {
-  return unwrap<{ data: GitHubRepo[] }>(
-    http.get('/git/github/repos', { params: { q: query } }),
-  ).then((r) => r.data)
-}
-
-export function listGitHubBranches(owner: string, repo: string) {
-  return unwrap<{ data: GitHubBranch[] }>(
-    http.get(`/git/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches`),
-  ).then((r) => r.data)
-}
-
-// ---- GitHub App（App 级推送事件，替代逐仓 Webhook）----
 
 export interface GitHubAppInstallation {
   id: number
   account_login: string
   account_type: string
   target_type: string
-  repos?: string[]
+  repos?: GitHubAppRepoMeta[]
   suspended?: boolean
   updated_at: string
 }
@@ -83,8 +30,15 @@ export interface GitHubAppStatus {
 }
 
 export interface GitHubAppInstalledRepo {
+  installation_id: number
   account: string
+  account_type: string
   full_name: string
+  private: boolean
+  description?: string
+  default_branch: string
+  language?: string
+  pushed_at?: string
 }
 
 export interface GitHubAppManifest {
@@ -140,10 +94,4 @@ export function listGitHubAppBranches(owner: string, repo: string) {
   return unwrap<{ branches: string[] }>(
     http.get(`/github-app/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches`),
   ).then((r) => r.branches)
-}
-
-export function switchAppToGitHubApp(appId: string) {
-  return unwrap<{ ok: boolean; message: string; data: unknown }>(
-    http.post(`/apps/${appId}/github-app/switch`),
-  )
 }

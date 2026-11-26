@@ -1,8 +1,7 @@
-package gitprovider
+package repoinspect
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -62,9 +61,9 @@ services:
     ports:
       - "8484:8484"
       - "127.0.0.1:9090:80"
-      - "3000"               # 仅容器端口
-      - "5353:53/udp"        # 非 TCP 跳过
-      - "8000-8003:8000-8003" # 范围跳过
+      - "3000"
+      - "5353:53/udp"
+      - "8000-8003:8000-8003"
     environment:
       CLEWDR_PORT: "8484"
       CLEWDR_IP: 0.0.0.0
@@ -118,7 +117,7 @@ BROKEN LINE WITHOUT EQUALS
 		t.Errorf("DATABASE_URL = %q", m["DATABASE_URL"])
 	}
 	if m["REDIS_HOST"] != "redis" {
-		t.Errorf("REDIS_HOST（export 前缀+单引号）= %q", m["REDIS_HOST"])
+		t.Errorf("REDIS_HOST = %q", m["REDIS_HOST"])
 	}
 	if v, ok := m["EMPTY_VALUE"]; !ok || v != "" {
 		t.Errorf("EMPTY_VALUE 应为存在且为空: %v", m)
@@ -128,15 +127,16 @@ BROKEN LINE WITHOUT EQUALS
 	}
 }
 
-// mockGitHub emulates the subset of api.github.com used by InspectRepo, with
-// a token (contents API form). 404 for unknown paths.
 func mockGitHub(t *testing.T) *httptest.Server {
 	t.Helper()
 	files := map[string]string{
-		"docker-compose.yml": "services:\n  app:\n    image: x/y\n    ports:\n      - \"8484:8484\"\n    environment:\n      PORT: \"8484\"\n",
-		"Dockerfile":         "FROM alpine\nEXPOSE 8484\nENV CLEWDR_PORT=8484\n",
-		".env.example":       "COOKIE=\nPORT=8484\n",
-		"go.mod":             "module x/y\n",
+		"main/docker-compose.yml":   "services:\n  app:\n    image: x/y\n    ports:\n      - \"8484:8484\"\n    environment:\n      PORT: \"8484\"\n",
+		"main/Dockerfile":           "FROM alpine\nEXPOSE 8484\nENV CLEWDR_PORT=8484\n",
+		"main/.env.example":         "COOKIE=\nPORT=8484\n",
+		"main/go.mod":               "module x/y\n",
+		"dev/Dockerfile":            "FROM node:20\nEXPOSE 3000\n",
+		"dev/apps/web/compose.yaml": "services:\n  web:\n    build: .\n    ports:\n      - \"5173:5173\"\n",
+		"dev/apps/web/Dockerfile":   "FROM node:20\nEXPOSE 5173\n",
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -146,12 +146,13 @@ func mockGitHub(t *testing.T) *httptest.Server {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/repos/o/r/contents/") {
-			path := strings.TrimPrefix(r.URL.Path, "/repos/o/r/contents/")
-			if r.URL.Query().Get("ref") != "main" {
-				w.WriteHeader(http.StatusNotFound)
+			if r.Header.Get("Authorization") != "Bearer tok-app" && r.Header.Get("Authorization") != "Bearer tok-vault" {
+				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
-			if content, ok := files[path]; ok {
+			path := strings.TrimPrefix(r.URL.Path, "/repos/o/r/contents/")
+			ref := r.URL.Query().Get("ref")
+			if content, ok := files[ref+"/"+path]; ok {
 				w.Header().Set("Content-Type", "application/vnd.github.raw+json")
 				_, _ = w.Write([]byte(content))
 				return
@@ -172,56 +173,70 @@ func withMockHosts(t *testing.T, srv *httptest.Server) {
 	t.Cleanup(func() { githubAPIBase, rawBase = origAPI, origRaw })
 }
 
-func TestInspectRepoEndToEnd(t *testing.T) {
+type fakeAppTokens struct{ tok string }
+
+func (f fakeAppTokens) InstallationTokenForRepo(repoURL string) (string, bool) {
+	if strings.Contains(repoURL, "github.com/o/r") {
+		return f.tok, true
+	}
+	return "", false
+}
+
+func TestInspectRepoEndToEndAndPrecedence(t *testing.T) {
 	srv := mockGitHub(t)
 	defer srv.Close()
 	withMockHosts(t, srv)
 
-	meta, err := NewClient().InspectRepo(context.Background(), "tok", "o", "r")
+	svc := NewService(fakeAppTokens{tok: "tok-app"}, func(id string) (string, bool) {
+		if id == "v1" {
+			return "tok-vault", true
+		}
+		return "", false
+	})
+
+	meta, err := svc.InspectRepo(context.Background(), "https://github.com/o/r", InspectOptions{})
 	if err != nil {
 		t.Fatalf("InspectRepo error: %v", err)
 	}
-	if !meta.HasCompose || meta.ComposeFile != "docker-compose.yml" {
-		t.Errorf("应检测到 compose 文件: %+v", meta)
-	}
-	if meta.Branch != "main" {
-		t.Errorf("Branch = %q, want main", meta.Branch)
+	if !meta.HasCompose || meta.ComposeFile != "docker-compose.yml" || meta.Branch != "main" {
+		t.Errorf("unexpected meta: %+v", meta)
 	}
 	if len(meta.ComposePorts) != 1 || meta.ComposePorts[0].Host != 8484 {
 		t.Errorf("ComposePorts = %+v", meta.ComposePorts)
 	}
-	if meta.ComposeEnv["PORT"] != "8484" {
-		t.Errorf("ComposeEnv = %v", meta.ComposeEnv)
+	if meta.ComposeEnv["PORT"] != "8484" || meta.EnvExample["PORT"] != "8484" || meta.Language != "go" {
+		t.Errorf("unexpected compose/env/lang: %+v", meta)
 	}
-	if !meta.HasDockerfile || meta.DockerfilePath != "Dockerfile" {
-		t.Errorf("应检测到 Dockerfile: %+v", meta)
+
+	// Explicit branch + monorepo build_context + Vault override.
+	subMeta, err := svc.InspectRepo(context.Background(), "https://github.com/o/r.git", InspectOptions{
+		Branch:       "dev",
+		BuildContext: "apps/web",
+		AuthVaultID:  "v1",
+	})
+	if err != nil {
+		t.Fatalf("InspectRepo subdir error: %v", err)
 	}
-	if len(meta.ExposedPorts) != 1 || meta.ExposedPorts[0] != 8484 {
-		t.Errorf("ExposedPorts = %v", meta.ExposedPorts)
+	if subMeta.Branch != "dev" || !subMeta.HasCompose || subMeta.ComposeFile != "apps/web/compose.yaml" {
+		t.Errorf("unexpected subdir compose meta: %+v", subMeta)
 	}
-	if meta.DockerfileEnv["CLEWDR_PORT"] != "8484" {
-		t.Errorf("DockerfileEnv = %v", meta.DockerfileEnv)
+	if !subMeta.HasDockerfile || subMeta.DockerfilePath != "apps/web/Dockerfile" {
+		t.Errorf("unexpected subdir dockerfile meta: %+v", subMeta)
 	}
-	if meta.EnvExample["PORT"] != "8484" {
-		t.Errorf("EnvExample = %v", meta.EnvExample)
-	}
-	if meta.Language != "go" {
-		t.Errorf("Language = %q, want go", meta.Language)
-	}
-	if meta.ComposeContent == "" {
-		t.Errorf("ComposeContent 应保留原文")
+	if len(subMeta.ExposedPorts) != 1 || subMeta.ExposedPorts[0] != 5173 {
+		t.Errorf("ExposedPorts = %v, want [5173]", subMeta.ExposedPorts)
 	}
 }
 
-func TestStoreInspectRepoRejectsNonGitHub(t *testing.T) {
-	st, err := NewStore(t.TempDir(), slog.Default())
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
+func TestServiceRejectsInvalidInputs(t *testing.T) {
+	svc := NewService(nil, nil)
+	if _, err := svc.InspectRepo(context.Background(), "https://gitlab.com/a/b", InspectOptions{}); err == nil {
+		t.Fatal("non-GitHub repo should fail")
 	}
-	if _, err := st.InspectRepo(context.Background(), "https://gitlab.com/a/b"); err == nil {
-		t.Fatal("非 GitHub 地址应报错")
+	if _, err := svc.InspectRepo(context.Background(), "not a url", InspectOptions{}); err == nil {
+		t.Fatal("invalid URL should fail")
 	}
-	if _, err := st.InspectRepo(context.Background(), "not a url"); err == nil {
-		t.Fatal("非法 URL 应报错")
+	if _, err := svc.InspectRepo(context.Background(), "https://github.com/o/r", InspectOptions{BuildContext: "../secret"}); err == nil {
+		t.Fatal("traversal build_context should fail")
 	}
 }

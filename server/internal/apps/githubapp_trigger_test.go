@@ -2,6 +2,7 @@ package apps
 
 import (
 	"errors"
+	"log/slog"
 	"testing"
 
 	"watchman/server/internal/githubapp"
@@ -158,5 +159,54 @@ func TestGitHubAppTriggerWatchPaths(t *testing.T) {
 	res = byID(trigger.TriggerPush(ev))
 	if res["w1"].DeploymentID == "" || res["w2"].DeploymentID == "" {
 		t.Errorf("unknown file list should deploy both, got %+v", res)
+	}
+}
+
+func TestGitHubAppTriggerRecordsEvents(t *testing.T) {
+	store, err := NewStore(t.TempDir(), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	apps := []*Application{
+		{ID: "t1", Name: "web", SourceType: "git", RepoURL: "https://github.com/acme/mono.git", Branch: "main", AutoDeploy: true, WatchPaths: []string{"apps/web"}},
+		{ID: "t2", Name: "docs", SourceType: "git", RepoURL: "https://github.com/acme/mono.git", Branch: "docs", AutoDeploy: true},
+		{ID: "t3", Name: "off", SourceType: "git", RepoURL: "https://github.com/acme/mono.git", Branch: "main", AutoDeploy: false},
+		// image app with same-shaped CI repo should NOT match Git push trigger
+		{ID: "t4", Name: "ci-img", SourceType: "image", Image: "ghcr.io/acme/mono:latest", AutoDeploy: true},
+	}
+	starter := &fakeStarter{running: map[string]bool{}}
+	trigger := &GitHubAppTrigger{Apps: &fakeAppLister{apps: apps}, Triggers: store, Starter: starter}
+
+	ev := pushEvent("acme/mono", "main")
+	ev.DeliveryID = "deliv-1"
+	ev.CommitSHA = "deadbee"
+	ev.Actor = "alice"
+	ev.ChangedPaths = []string{"apps/web/main.go"}
+	results := trigger.TriggerPush(ev)
+	if len(results) != 3 {
+		t.Fatalf("expected 3 git results (excluding image app), got %d", len(results))
+	}
+
+	e1 := store.ListTriggerEvents("t1")
+	if len(e1) != 1 || e1[0].Outcome != TriggerTriggered || e1[0].DeliveryID != "deliv-1" || e1[0].DeploymentID != "dep-t1" {
+		t.Fatalf("t1 expected triggered event, got %+v", e1)
+	}
+	e2 := store.ListTriggerEvents("t2")
+	if len(e2) != 1 || e2[0].Outcome != TriggerSkipped {
+		t.Fatalf("t2 expected skipped (branch), got %+v", e2)
+	}
+	e3 := store.ListTriggerEvents("t3")
+	if len(e3) != 1 || e3[0].Outcome != TriggerSkipped {
+		t.Fatalf("t3 expected skipped (disabled), got %+v", e3)
+	}
+
+	// Second push not touching t1's watch_paths records skipped with path hint.
+	ev2 := pushEvent("acme/mono", "main")
+	ev2.DeliveryID = "deliv-2"
+	ev2.ChangedPaths = []string{"README.md"}
+	trigger.TriggerPush(ev2)
+	e1 = store.ListTriggerEvents("t1")
+	if len(e1) != 2 || e1[0].Outcome != TriggerSkipped {
+		t.Fatalf("t1 newest event should be skipped watch_paths, got %+v", e1)
 	}
 }

@@ -9,8 +9,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"watchman/server/internal/auth"
-	"watchman/server/internal/gitprovider"
 	"watchman/server/internal/registry"
+	"watchman/server/internal/repoinspect"
 )
 
 // ImageInspectFunc probes a container registry for an image's true runtime
@@ -20,7 +20,7 @@ type ImageInspectFunc func(ctx context.Context, image string) (*registry.ImageMe
 
 // RepoInspectFunc probes a GitHub repository's checked-in deployment files
 // (docker-compose.yml / Dockerfile / .env.example) without cloning.
-type RepoInspectFunc func(ctx context.Context, repoURL string) (*gitprovider.RepoMetadata, error)
+type RepoInspectFunc func(ctx context.Context, repoURL string, opts repoinspect.InspectOptions) (*repoinspect.RepoMetadata, error)
 
 // SetProbers injects the image / repository metadata probes used by the
 // read-only inspect endpoints and the create-page auto-fill hints.
@@ -109,7 +109,10 @@ type inspectImageReq struct {
 
 // inspectRepoReq is the payload for POST /apps/inspect-repo.
 type inspectRepoReq struct {
-	RepoURL string `json:"repo_url" binding:"required"`
+	RepoURL      string `json:"repo_url" binding:"required"`
+	Branch       string `json:"branch"`
+	BuildContext string `json:"build_context"`
+	AuthVaultID  string `json:"auth_vault_id"`
 }
 
 // inspectImage probes the registry for the image's config blob and returns
@@ -167,7 +170,11 @@ func (h *AppHandlers) inspectRepo(c *gin.Context) {
 	}
 	pctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
-	meta, err := h.repoInspector(pctx, repoURL)
+	meta, err := h.repoInspector(pctx, repoURL, repoinspect.InspectOptions{
+		Branch:       strings.TrimSpace(req.Branch),
+		BuildContext: strings.TrimSpace(req.BuildContext),
+		AuthVaultID:  strings.TrimSpace(req.AuthVaultID),
+	})
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return

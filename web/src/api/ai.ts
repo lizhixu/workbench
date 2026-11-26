@@ -191,7 +191,7 @@ export function getOpsReport(id: string) {
 // Snapshot of the create-app form sent as AI context. Secret values are
 // redacted server-side before reaching the model.
 export interface AppFormSnapshot {
-  source_mode: 'template' | 'image' | 'compose' | 'github' | 'custom'
+  source_mode: 'template' | 'image' | 'compose' | 'git' | 'github' | 'custom'
   name: string
   container_name: string
   host_id: string

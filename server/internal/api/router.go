@@ -33,7 +33,6 @@ import (
 	"watchman/server/internal/cert"
 	"watchman/server/internal/commands"
 	"watchman/server/internal/githubapp"
-	"watchman/server/internal/gitprovider"
 	"watchman/server/internal/groups"
 	"watchman/server/internal/install"
 	"watchman/server/internal/metrics"
@@ -42,6 +41,7 @@ import (
 	"watchman/server/internal/policy"
 	"watchman/server/internal/registry"
 	"watchman/server/internal/release"
+	"watchman/server/internal/repoinspect"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/scan"
 	"watchman/server/internal/secentry"
@@ -124,7 +124,7 @@ type HostDTO struct {
 // authorization, prefsStore backs per-user terminal preferences and
 // backupStore backs control-plane backup/restore; all may be nil to disable
 // those features.
-func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, settingsStore *settings.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine, gitProviderStore *gitprovider.Store, githubAppStore *githubapp.Store, alertMon *alert.Monitor, opGRPCAddr string) *gin.Engine {
+func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStore *session.Store, alertStore *alert.Store, vaultStore *vault.Store, aiAssistant *ai.Assistant, metricsStore *metrics.Store, scanStore *scan.Store, policyStore *policy.Store, auditStore *audit.Store, commandStore *commands.Store, groupStore *groups.Store, settingsStore *settings.Store, backupStore *backup.Store, networkStore *network.Store, appStore *apps.Store, appEngine *apps.Engine, certHub *cert.Hub, snapshotStore *snapshots.Store, snapshotEngine *snapshots.Engine, githubAppStore *githubapp.Store, ghProvider *githubapp.TokenProvider, alertMon *alert.Monitor, opGRPCAddr string) *gin.Engine {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -270,22 +270,40 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 	apps.NewHandlers(reg).Register(authed,
 		authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator), h.auditMutation()))
 
-	// Git-linked applications (Dokploy-style lifecycle: link repo, auto
-	// deploy on push, rollback, build log). Mutations are audited; the
-	// webhook endpoint is public with its own per-app token.
+	var ghClient *githubapp.Client
+	if githubAppStore != nil {
+		ghClient = githubapp.NewClient()
+		if ghProvider == nil {
+			ghProvider = githubapp.NewTokenProvider(githubAppStore, ghClient)
+		}
+	}
+
+	var repoInspector *repoinspect.Service
+	{
+		var appTok repoinspect.AppTokenResolver
+		if ghProvider != nil {
+			appTok = ghProvider
+		}
+		var vaultFn repoinspect.VaultSecretResolver
+		if vaultStore != nil {
+			vaultFn = func(id string) (string, bool) {
+				if cred, ok := vaultStore.Get(id); ok {
+					return cred.Secret, true
+				}
+				return "", false
+			}
+		}
+		repoInspector = repoinspect.NewService(appTok, vaultFn)
+	}
+
+	// Linked applications (Dokploy-style lifecycle: GitHub App, CI images,
+	// auto-deploy, rollback, build log). Mutations are audited; webhook
+	// endpoints are public with per-app token or HMAC authentication.
 	if appStore != nil {
 		appWrite := authed.Group("", auth.RequireRole(auth.RoleAdmin, auth.RoleOperator), h.auditMutation())
 		appHandlers := apps.NewAppHandlers(reg, appStore, appEngine)
 		appHandlers.SetSettings(settingsStore)
-		appHandlers.SetProbers(registry.Inspect, nil)
-
-		if gitProviderStore != nil {
-			appHandlers.SetGitProvider(gitProviderStore)
-			appHandlers.SetProbers(registry.Inspect, gitProviderStore.InspectRepo)
-		}
-		if githubAppStore != nil {
-			appHandlers.SetGitHubAppStore(githubAppStore)
-		}
+		appHandlers.SetProbers(registry.Inspect, repoInspector.InspectRepo)
 		if aiAssistant != nil {
 			appHandlers.SetAI(func(ctx context.Context, command, stdout, stderr string, exitCode int32) (any, error) {
 				return aiAssistant.AnalyzeExecResult(ctx, command, stdout, stderr, exitCode)
@@ -391,23 +409,13 @@ func Router(reg *rpc.Registry, log *slog.Logger, authStore *auth.Store, sessStor
 		)
 	}
 
-	// Git provider integration (GitHub account authorization & repo selector).
-	if gitProviderStore != nil {
-		gitprovider.NewHandlers(gitProviderStore).Register(
-			authed.Group(""),
-			hostWrite.Group("", h.auditMutation()),
-		)
-	}
-
-	// GitHub App integration (App-level push events, no per-repo webhook).
+	// GitHub App integration (App-level push events).
 	// Management is admin-only (it handles the App private key); the event
 	// endpoint is public and verifies the HMAC signature itself.
 	if githubAppStore != nil {
-		ghClient := githubapp.NewClient()
-		ghProvider := githubapp.NewTokenProvider(githubAppStore, ghClient)
 		var ghTrigger githubapp.PushTrigger
 		if appStore != nil && appEngine != nil {
-			ghTrigger = &apps.GitHubAppTrigger{Apps: appStore, Starter: appEngine}
+			ghTrigger = &apps.GitHubAppTrigger{Apps: appStore, Triggers: appStore, Starter: appEngine}
 			appEngine.SetGitHubAppTokenProvider(ghProvider)
 		}
 		githubapp.NewHandlers(githubAppStore, ghClient, ghProvider, settingsStore, ghTrigger).Register(
@@ -2463,8 +2471,6 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodPost, "/api/v1/apps/:id/stop", "app_stop", "app", "id", audit.RiskHigh, "停止应用"},
 		{http.MethodPost, "/api/v1/apps/:id/start", "app_start", "app", "id", audit.RiskHigh, "启动应用"},
 		{http.MethodPost, "/api/v1/apps/:id/restart", "app_restart", "app", "id", audit.RiskHigh, "重启应用"},
-		{http.MethodPost, "/api/v1/apps/:id/webhook/sync", "app_webhook_sync", "app", "id", audit.RiskHigh, "同步应用 Webhook 自动部署"},
-		{http.MethodPost, "/api/v1/apps/:id/github-app/switch", "app_github_app_switch", "app", "id", "", "切换应用到 GitHub App 触发"},
 		// GitHub App integration: App-level push events replace per-repo webhooks.
 		{http.MethodPost, "/api/v1/github-app/manifest", "github_app_manifest", "system", "", audit.RiskLow, "生成 GitHub App 创建清单"},
 		{http.MethodPost, "/api/v1/github-app/manifest/exchange", "github_app_config", "system", "", audit.RiskHigh, "保存 GitHub App 配置"},
@@ -2528,9 +2534,6 @@ func deriveAllMutationRules() []mutationRule {
 		{http.MethodPut, "/api/v1/backups/s3-targets/:id", "backup_s3_update", "backup", "id", "", "更新 S3 备份目标"},
 		{http.MethodDelete, "/api/v1/backups/s3-targets/:id", "backup_s3_delete", "backup", "id", audit.RiskHigh, "删除 S3 备份目标"},
 		{http.MethodPost, "/api/v1/backups/s3-targets/:id/test", "backup_s3_test", "backup", "id", audit.RiskLow, "测试 S3 备份目标连通性"},
-		// Git provider credentials: token material is sensitive.
-		{http.MethodPost, "/api/v1/git/github/token", "git_token_set", "system", "", audit.RiskHigh, "设置 Git 访问令牌"},
-		{http.MethodDelete, "/api/v1/git/github", "git_account_delete", "system", "", audit.RiskHigh, "解绑 Git 账户"},
 		// Host groups + per-group grants: authorization changes are high-risk.
 		{http.MethodPost, "/api/v1/groups", "group_create", "group", "", "", "创建分组"},
 		{http.MethodPatch, "/api/v1/groups/:id", "group_update", "group", "id", "", "更新分组"},

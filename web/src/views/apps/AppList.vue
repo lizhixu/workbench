@@ -193,7 +193,8 @@ function sourceLabel(row: AppEntity): string {
     case 'git':
       return `${row.repo_url ?? ''}${row.auto_deploy ? ' · 自动部署' : ''}`
     case 'image':
-      return row.image || '镜像'
+      if (row.ci_repo) return `${row.image || '镜像'} · CI (${row.ci_repo})`
+      return `${row.image || '镜像'}${row.auto_deploy ? ' · CI Webhook' : ''}`
     case 'template':
       return `模板 ${row.template_id ?? ''}`.trim()
     case 'raw_compose':

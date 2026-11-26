@@ -1,6 +1,7 @@
 package apps
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -176,5 +177,147 @@ func TestWebhookWatchPaths(t *testing.T) {
 	waitSettled(2)
 	if deployments() != 2 {
 		t.Fatalf("no-list push should deploy (fail-open), got %d records", deployments())
+	}
+}
+
+func TestCIWebhookImageAndBearerAndTriggers(t *testing.T) {
+	r, s, e := newWebhookRouter(t)
+	waitSettled := func(id string) {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if !e.IsRunning(id) {
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}
+
+	app := &Application{
+		ID: "app_ci", Name: "ci-app", HostID: "h1",
+		SourceType: "image", Image: "ghcr.io/acme/web:latest",
+		AutoDeploy: true, WebhookToken: "tok_ci", CreatedAt: time.Now(),
+	}
+	if err := s.PutApp(app); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Same-repository tag update via CI webhook updates Image & enqueues CI deploy.
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/apps/webhook/tok_ci", strings.NewReader(`{"tag":"sha-abc123","actor":"github-actions"}`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("CI tag webhook failed: code=%d body=%s", w.Code, w.Body.String())
+	}
+	waitSettled("app_ci")
+	updated, ok := s.GetApp("app_ci")
+	if !ok || updated.Image != "ghcr.io/acme/web:sha-abc123" {
+		t.Fatalf("expected Image updated to sha-abc123, got %+v", updated)
+	}
+	deps, _ := s.ListDeployments("app_ci", 0, 10)
+	if len(deps) != 1 || deps[0].Trigger != TriggerCI {
+		t.Fatalf("expected 1 CI deployment, got %+v", deps)
+	}
+
+	// 2. Cross-repository image replacement is rejected with 400.
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/apps/webhook/tok_ci", strings.NewReader(`{"image":"evil.io/other/app:v1"}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("cross-repo hijack must fail 400, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	// 3. Invalid tag format rejected with 400.
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/apps/webhook/tok_ci", strings.NewReader(`{"tag":"bad tag!"}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid tag must fail 400, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	// 4. Token via Authorization: Bearer on /apps/webhook/_ with empty body triggers rolling update.
+	w = httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/apps/webhook/_", nil)
+	req.Header.Set("Authorization", "Bearer tok_ci")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("bearer webhook failed: code=%d body=%s", w.Code, w.Body.String())
+	}
+	waitSettled("app_ci")
+
+	// 5. GET /apps/:id/triggers returns recorded triggered & rejected events.
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/apps/app_ci/triggers", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("list triggers failed: code=%d body=%s", w.Code, w.Body.String())
+	}
+	var trResp struct {
+		Data []TriggerEvent `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &trResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(trResp.Data) < 3 {
+		t.Fatalf("expected at least 3 trigger events, got %d: %+v", len(trResp.Data), trResp.Data)
+	}
+
+	// 6. Image app rollback uses historical Deployment.ImageRef snapshot.
+	if err := s.AddDeployment(&Deployment{
+		ID: "dep_img_prev", AppID: "app_ci", Trigger: TriggerCI,
+		Status: DeploySuccess, ImageRef: "ghcr.io/acme/web:v1.0.0", StartedAt: time.Now().Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("POST", "/apps/app_ci/rollback?deployment_id=dep_img_prev", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("image rollback failed: code=%d body=%s", w.Code, w.Body.String())
+	}
+	waitSettled("app_ci")
+	var rbResp struct {
+		Data Deployment `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &rbResp); err != nil {
+		t.Fatal(err)
+	}
+	if rbResp.Data.Trigger != "rollback" {
+		t.Fatalf("expected rollback trigger, got %+v", rbResp.Data)
+	}
+}
+
+func TestUpdateAppClearLegacyNotice(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.PutApp(&Application{
+		ID: "app_leg", Name: "legacy", HostID: "h1", SourceType: "git",
+		RepoURL: "https://github.com/acme/web", AutoDeploy: true,
+		WebhookAutoManaged: true, GitHubHookID: 42, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Reloading promotes legacy auto-managed flag into dismissible LegacyWebhookNotice.
+	s2, err := NewStore(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s2.GetApp("app_leg")
+	if !ok || !got.LegacyWebhookNotice || got.WebhookAutoManaged || got.GitHubHookID != 0 {
+		t.Fatalf("expected legacy flag promoted on reload, got %+v", got)
+	}
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	e := NewEngine(nil, s2, nil, nil)
+	h := NewAppHandlers(nil, s2, e)
+	h.RegisterAppRoutes(r.Group(""), r.Group(""), r.Group("/api/v1"))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("PUT", "/apps/app_leg", strings.NewReader(`{"legacy_webhook_notice":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("clear legacy_webhook_notice failed: %d %s", w.Code, w.Body.String())
+	}
+	got2, _ := s2.GetApp("app_leg")
+	if got2.LegacyWebhookNotice {
+		t.Fatal("legacy_webhook_notice should be cleared")
 	}
 }

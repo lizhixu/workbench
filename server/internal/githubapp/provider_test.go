@@ -37,7 +37,13 @@ func TestRefreshReposKeepsFailedInstallations(t *testing.T) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"repositories": []map[string]string{{"full_name": "Acme/Web"}},
+			"repositories": []map[string]any{{
+				"full_name":      "Acme/Web",
+				"private":        true,
+				"description":    "Web app",
+				"default_branch": "develop",
+				"language":       "TypeScript",
+			}},
 		})
 	})
 	srv := httptest.NewServer(mux)
@@ -55,8 +61,8 @@ func TestRefreshReposKeepsFailedInstallations(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.SetInstallations([]Installation{
-		{ID: 11, AccountLogin: "acme", Repos: []string{"acme/old"}},
-		{ID: 22, AccountLogin: "other", Repos: []string{"acme/legacy"}},
+		{ID: 11, AccountLogin: "acme", Repos: []InstallationRepo{{FullName: "acme/old"}}},
+		{ID: 22, AccountLogin: "other", Repos: []InstallationRepo{{FullName: "acme/legacy"}}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -73,11 +79,11 @@ func TestRefreshReposKeepsFailedInstallations(t *testing.T) {
 	for _, inst := range store.Installations() {
 		byID[inst.ID] = inst
 	}
-	if got := byID[11].Repos; len(got) != 1 || got[0] != "acme/web" {
-		t.Fatalf("installation 11 should carry refreshed repos, got %v", got)
+	if got := byID[11].Repos; len(got) != 1 || got[0].FullName != "acme/web" || !got[0].Private || got[0].DefaultBranch != "develop" {
+		t.Fatalf("installation 11 should carry refreshed rich repos, got %+v", got)
 	}
-	if got := byID[22].Repos; len(got) != 1 || got[0] != "acme/legacy" {
-		t.Fatalf("installation 22 must keep its previous repos, got %v", got)
+	if got := byID[22].Repos; len(got) != 1 || got[0].FullName != "acme/legacy" {
+		t.Fatalf("installation 22 must keep its previous repos, got %+v", got)
 	}
 }
 
@@ -92,7 +98,7 @@ func TestInstallationTokenForRepoRejectsNonGitHub(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.SetInstallations([]Installation{
-		{ID: 11, AccountLogin: "acme", Repos: []string{"acme/web"}},
+		{ID: 11, AccountLogin: "acme", Repos: []InstallationRepo{{FullName: "acme/web"}}},
 	}); err != nil {
 		t.Fatal(err)
 	}

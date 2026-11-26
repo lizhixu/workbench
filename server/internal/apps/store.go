@@ -13,9 +13,11 @@ import (
 )
 
 const (
-	appsFile         = "apps.json"
-	deploymentsFile  = "app_deployments.jsonl"
-	maxDeployHistory = 200 // per-application retained deployment records
+	appsFile          = "apps.json"
+	deploymentsFile   = "app_deployments.jsonl"
+	triggersFile      = "app_triggers.jsonl"
+	maxDeployHistory  = 200 // per-application retained deployment records
+	maxTriggerHistory = 30  // per-application retained push/CI trigger events
 )
 
 // Store persists application entities and their deployment history, following
@@ -29,6 +31,8 @@ type Store struct {
 	apps map[string]*Application
 	// deployments per app_id, newest first (index 0).
 	deployments map[string][]*Deployment
+	// triggers per app_id, newest first (index 0).
+	triggers map[string][]*TriggerEvent
 }
 
 // NewStore loads or initializes the application store under dataDir.
@@ -41,11 +45,15 @@ func NewStore(dataDir string, log *slog.Logger) (*Store, error) {
 		log:         log,
 		apps:        make(map[string]*Application),
 		deployments: make(map[string][]*Deployment),
+		triggers:    make(map[string][]*TriggerEvent),
 	}
 	if err := s.loadApps(); err != nil {
 		return nil, err
 	}
 	if err := s.loadDeployments(); err != nil {
+		return nil, err
+	}
+	if err := s.loadTriggers(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -89,6 +97,14 @@ func (s *Store) loadApps() error {
 				}}
 			}
 			a.Domain = ""
+		}
+		// Detect historical PAT-managed webhook flags once so the detail page
+		// can remind the operator to clean up old GitHub repo webhooks.
+		if a.WebhookAutoManaged || a.GitHubHookID > 0 {
+			a.LegacyWebhookNotice = true
+			a.WebhookAutoManaged = false
+			a.GitHubHookID = 0
+			a.WebhookError = ""
 		}
 		s.apps[a.ID] = a
 	}
@@ -203,6 +219,9 @@ func cloneApplication(a *Application) *Application {
 	}
 	if a.Volumes != nil {
 		cp.Volumes = append([]string(nil), a.Volumes...)
+	}
+	if a.WatchPaths != nil {
+		cp.WatchPaths = append([]string(nil), a.WatchPaths...)
 	}
 	if a.ProxyDomains != nil {
 		cp.ProxyDomains = append([]DomainBinding(nil), a.ProxyDomains...)
@@ -431,6 +450,117 @@ func (s *Store) ListSuccessfulDeployments(appID string) []*Deployment {
 			cp := *d
 			out = append(out, &cp)
 		}
+	}
+	return out
+}
+
+func (s *Store) loadTriggers() error {
+	b, err := os.ReadFile(filepath.Join(s.dir, triggersFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read %s: %w", triggersFile, err)
+	}
+	for _, line := range splitLines(b) {
+		if len(line) == 0 {
+			continue
+		}
+		var ev TriggerEvent
+		if err := json.Unmarshal(line, &ev); err != nil {
+			s.log.Warn("skipping malformed trigger record", "err", err)
+			continue
+		}
+		s.triggers[ev.AppID] = append(s.triggers[ev.AppID], &ev)
+	}
+	for id := range s.triggers {
+		list := s.triggers[id]
+		sort.SliceStable(list, func(i, j int) bool { return list[i].CreatedAt.After(list[j].CreatedAt) })
+		if len(list) > maxTriggerHistory {
+			s.triggers[id] = list[:maxTriggerHistory]
+		}
+	}
+	return nil
+}
+
+// AddTriggerEvent records one incoming webhook / GitHub App push evaluation
+// and retains at most maxTriggerHistory entries per application.
+func (s *Store) AddTriggerEvent(ev *TriggerEvent) error {
+	if ev == nil || ev.AppID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := *ev
+	if cp.ID == "" {
+		cp.ID = "trg_" + randomToken(8)
+	}
+	if cp.CreatedAt.IsZero() {
+		cp.CreatedAt = time.Now()
+	}
+	list := append([]*TriggerEvent{&cp}, s.triggers[cp.AppID]...)
+	sort.SliceStable(list, func(i, j int) bool { return list[i].CreatedAt.After(list[j].CreatedAt) })
+	trimmed := len(list) > maxTriggerHistory
+	if trimmed {
+		list = list[:maxTriggerHistory]
+	}
+	s.triggers[cp.AppID] = list
+
+	if err := os.MkdirAll(s.dir, 0755); err != nil {
+		return err
+	}
+	if trimmed {
+		return s.rewriteTriggersLocked()
+	}
+	b, err := json.Marshal(&cp)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(s.dir, triggersFile), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func (s *Store) rewriteTriggersLocked() error {
+	ids := make([]string, 0, len(s.triggers))
+	for id := range s.triggers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var buf []byte
+	for _, id := range ids {
+		for _, ev := range s.triggers[id] {
+			b, err := json.Marshal(ev)
+			if err != nil {
+				return err
+			}
+			buf = append(buf, b...)
+			buf = append(buf, '\n')
+		}
+	}
+	tmp := filepath.Join(s.dir, fmt.Sprintf("%s.tmp.%d", triggersFile, time.Now().UnixNano()))
+	if err := os.WriteFile(tmp, buf, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(s.dir, triggersFile))
+}
+
+// ListTriggerEvents returns up to maxTriggerHistory recent push/CI events for
+// an application, newest first.
+func (s *Store) ListTriggerEvents(appID string) []*TriggerEvent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	src := s.triggers[appID]
+	out := make([]*TriggerEvent, 0, len(src))
+	for _, ev := range src {
+		cp := *ev
+		out = append(out, &cp)
 	}
 	return out
 }

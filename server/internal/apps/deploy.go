@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,18 +15,13 @@ import (
 
 	"watchman/proto/agentpb"
 	"watchman/server/internal/network"
+	"watchman/server/internal/repoinspect"
 	"watchman/server/internal/rpc"
 	"watchman/server/internal/vault"
 )
 
-type gitTokenProvider interface {
-	GetToken() (string, bool)
-}
-
 // gitHubAppTokenProvider resolves a git-fetch credential from a GitHub App
-// installation covering the repository. It sits between the app's explicit
-// Vault credential and the legacy provider token in the deploy credential
-// chain.
+// installation covering the repository.
 type gitHubAppTokenProvider interface {
 	InstallationTokenForRepo(repoURL string) (string, bool)
 }
@@ -50,7 +46,6 @@ type Engine struct {
 	store        *Store
 	vault        *vault.Store
 	networkStore *network.Store
-	gitProvider  gitTokenProvider
 	ghAppToken   gitHubAppTokenProvider
 	// proxy re-points a bound domain at the new host when an app migrates
 	// (migrate.go), and rolls it back on failure. nil until wired.
@@ -83,11 +78,6 @@ type Engine struct {
 	// agent scripts over the same data dir would interleave tar with untar.
 	volMu   sync.Mutex
 	volBusy map[string]bool
-}
-
-// SetGitProvider injects a token provider (e.g. GitHub connection) for auto-cloning.
-func (e *Engine) SetGitProvider(gp gitTokenProvider) {
-	e.gitProvider = gp
 }
 
 // SetGitHubAppTokenProvider injects the GitHub App installation-token
@@ -138,6 +128,12 @@ func (e *Engine) StartRollback(app *Application, commit, startedBy string) (*Dep
 // already-running error and the pull step is visible in the build log.
 func (e *Engine) StartUpgrade(app *Application, startedBy string) (*Deployment, error) {
 	return e.enqueueDeployment(app, TriggerUpgrade, startedBy, "")
+}
+
+// StartCIDeploy enqueues a CI webhook deployment (e.g. GitHub Actions pushing
+// a new image) using the same pull-first pipeline with trigger="ci".
+func (e *Engine) StartCIDeploy(app *Application, startedBy string) (*Deployment, error) {
+	return e.enqueueDeployment(app, TriggerCI, startedBy, "")
 }
 
 // enqueueDeployment creates the deployment record, claims the single-slot
@@ -485,23 +481,13 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 			return
 		}
 
-		// Upgrade step: refresh every image the stack references before
+		// Upgrade/CI step: refresh every image the stack references before
 		// bringing it up, so a floating tag actually moves. A failed pull
 		// fails the run before `up` touches any container.
-		if dep.Trigger == TriggerUpgrade {
+		if dep.Trigger == TriggerUpgrade || dep.Trigger == TriggerCI {
 			pullCmd := fmt.Sprintf("docker compose -f %s -p %s pull",
 				shellQuote(composePath), shellQuote("watchman-"+app.ID))
-			logBuf.WriteString("$ " + pullCmd + "\n")
-			if cancelled() {
-				return
-			}
-			res, err := execOnAgent(ctx, hub, "compose-pull-"+randomToken(4), pullCmd, 1800, deployStallSec, logBuf)
-			if err != nil {
-				fail("拉取 Compose 镜像失败: %v", err)
-				return
-			}
-			if res.GetExitCode() != 0 {
-				fail("拉取 Compose 镜像失败 (exit %d)", res.GetExitCode())
+			if !e.execRegistryCommand(ctx, hub, app, "", "compose-pull-"+randomToken(4), pullCmd, "docker compose pull", 1800, logBuf, fail, "拉取 Compose 镜像失败") {
 				return
 			}
 		}
@@ -559,18 +545,18 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 		return
 	}
 
-	// Branch for single pre-built image deployment (app store / quick run):
+	// Branch for single pre-built image deployment (app store / quick run / CI image):
 	if app.SourceType == "image" {
 		if !e.setDeploymentStatus(app.ID, dep.ID, DeployDeploying) {
 			return
 		}
 		logBuf.WriteString("$ deploy pre-built image\n")
 		if app.Image != "" {
-			if dep.Trigger == TriggerUpgrade {
-				if !e.pullImage(ctx, hub, app.Image, logBuf, cancelled, fail) {
+			if dep.Trigger == TriggerUpgrade || dep.Trigger == TriggerCI {
+				if !e.pullImage(ctx, hub, app, app.Image, logBuf, cancelled, fail) {
 					return
 				}
-			} else if !e.ensureImagePresent(ctx, hub, app.Image, logBuf, cancelled, fail) {
+			} else if !e.ensureImagePresent(ctx, hub, app, app.Image, logBuf, cancelled, fail) {
 				return
 			}
 		}
@@ -589,11 +575,11 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 			return
 		}
 		if app.Image != "" {
-			if dep.Trigger == TriggerUpgrade {
-				if !e.pullImage(ctx, hub, app.Image, logBuf, cancelled, fail) {
+			if dep.Trigger == TriggerUpgrade || dep.Trigger == TriggerCI {
+				if !e.pullImage(ctx, hub, app, app.Image, logBuf, cancelled, fail) {
 					return
 				}
-			} else if !e.ensureImagePresent(ctx, hub, app.Image, logBuf, cancelled, fail) {
+			} else if !e.ensureImagePresent(ctx, hub, app, app.Image, logBuf, cancelled, fail) {
 				return
 			}
 		}
@@ -601,36 +587,14 @@ func (e *Engine) runWithPin(ctx context.Context, app *Application, dep *Deployme
 		return
 	}
 
-	// Step 1: fetch or clone the linked repository, then check out the branch
-	// head — or the pinned commit for a rollback.
-	// The git credential (when configured) travels as an http.extraHeader on
-	// these two commands only; it is never written into the on-disk remote
-	// URL, so a token cannot linger in the agent's .git/config.
+	// Step 1: shallow-clone/fetch the linked repository, then check out the
+	// branch head — or the pinned commit for a rollback.
 	authArgs := gitAuthArgs(authToken)
-	checkout := "origin/" + branch
 	branchLabel := branch
 	if pin != "" {
-		checkout = pin
 		branchLabel = branch + " @ " + pin
 	}
-	// NOTE: set -e is load-bearing. Without it, a failed `fetch` would fall
-	// through to `checkout --force` on the stale local copy and the pipeline
-	// would silently build + deploy the previous commit as if it succeeded.
-	fetchScript := fmt.Sprintf(`set -e
-if [ -d %[1]s/.git ]; then
-  git %[5]s -C %[1]s fetch --force origin
-else
-  mkdir -p %[1]s
-  git %[5]s clone --branch %[3]s %[2]s %[1]s
-fi
-git -C %[1]s checkout --force %[4]s
-git -C %[1]s reset --hard %[4]s
-git -C %[1]s clean -fd
-COMMIT=$(git -C %[1]s rev-parse --short HEAD)
-MESSAGE=$(git -C %[1]s log -1 --pretty=%%s)
-echo "WATCHMAN_COMMIT=$COMMIT"
-echo "WATCHMAN_MESSAGE=$MESSAGE"`,
-		shellQuote(repoDir), shellQuote(app.RepoURL), shellQuote(branch), shellQuote(checkout), authArgs)
+	fetchScript := buildGitFetchScript(repoDir, app.RepoURL, branch, pin, authArgs)
 	logBuf.WriteString("$ git fetch/checkout " + app.RepoURL + " (" + branchLabel + ")\n")
 	if cancelled() {
 		return
@@ -667,34 +631,27 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 		if !e.setDeploymentStatus(app.ID, dep.ID, DeployDeploying) {
 			return
 		}
-		composeFile := app.Dockerfile
-		if composeFile == "" || composeFile == "Dockerfile" {
-			composeFile = "compose.yaml"
-		}
+		workDir, composeFile := gitComposeLocation(repoDir, app)
 		composeCmd := fmt.Sprintf("docker compose -f %s -p %s up -d --build --remove-orphans",
 			shellQuote(composeFile), shellQuote("watchman-"+app.ID))
-		logBuf.WriteString("$ " + composeCmd + "\n")
+		logBuf.WriteString(fmt.Sprintf("$ (cd %s && %s)\n", workDir, composeCmd))
 		if cancelled() {
 			return
 		}
 		res, err = execOnAgent(ctx, hub, "compose-up-"+randomToken(4),
-			fmt.Sprintf("cd %s && %s", shellQuote(repoDir), composeCmd), buildTimeout, deployStallSec, logBuf)
+			fmt.Sprintf("cd %s && %s", shellQuote(workDir), composeCmd), buildTimeout, deployStallSec, logBuf)
 		if err != nil {
 			if ctx.Err() == nil {
 				fail("Docker Compose 部署失败: %v", err)
 				return
 			}
-			// Cancelled mid-exec: execOnAgent already stopped the
-			// command on the agent, but a half-started stack may
-			// still be up. Fall through to the ctx.Err() teardown
-			// below instead of failing the (already cancelled) record.
 		} else if res.GetExitCode() != 0 {
 			fail("Docker Compose 部署失败 (exit %d)", res.GetExitCode())
 			return
 		}
 		if _, ok := e.store.GetApp(app.ID); !ok {
 			downRes, downErr := execOnAgent(context.Background(), hub, "compose-down-"+randomToken(4),
-				fmt.Sprintf("cd %s && docker compose -f %s -p %s down", shellQuote(repoDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID)), 60, deployStallSec, nil)
+				fmt.Sprintf("cd %s && docker compose -f %s -p %s down", shellQuote(workDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID)), 60, deployStallSec, nil)
 			if downErr != nil || downRes.GetExitCode() != 0 {
 				logBuf.WriteString(fmt.Sprintf("WARN: 应用已删除但清理 Compose 栈失败: %v\n", firstErr(downErr, downRes)))
 				fail("应用在部署期间已被删除，部署已中止；清理 Compose 栈失败，栈可能仍在运行，请手动执行 docker compose down 清理")
@@ -704,11 +661,8 @@ echo "WATCHMAN_MESSAGE=$MESSAGE"`,
 			return
 		}
 		if ctx.Err() != nil {
-			// A cancel that landed during (or just after) `up -d` may
-			// leave a live or half-started stack: tear it down before
-			// finalizing, same as the raw_compose branch above.
 			downOK := e.cancelComposeStack(hub,
-				fmt.Sprintf("cd %s && docker compose -f %s -p %s down", shellQuote(repoDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID)), logBuf)
+				fmt.Sprintf("cd %s && docker compose -f %s -p %s down", shellQuote(workDir), shellQuote(composeFile), shellQuote("watchman-"+app.ID)), logBuf)
 			e.cleanupCancelled(app, dep, hub, "", "", logBuf)
 			if !downOK {
 				_ = e.store.UpdateDeployment(app.ID, dep.ID, func(d *Deployment) {
@@ -1247,27 +1201,13 @@ func (e *Engine) swapRollbackNote(hub *rpc.Hub, container, nextName string, logB
 }
 
 // ensureImagePresent pulls imageRef only when the target host does not
-// already have it. A plain `docker run` folds the pull into its own 600s
-// budget, so a first deploy of a large uncached image (mysql:8.0) times
-// out mid-pull and leaves an orphan -next container; pulling up front
-// with the 1800s budget keeps the run step fast. A cached image skips the
-// pull entirely, so an offline host with a local copy still deploys.
-func (e *Engine) ensureImagePresent(ctx context.Context, hub *rpc.Hub, imageRef string, logBuf *logBuffer, cancelled func() bool, fail func(string, ...any)) bool {
+// already have it. Uses app.RegistryVaultID when configured.
+func (e *Engine) ensureImagePresent(ctx context.Context, hub *rpc.Hub, app *Application, imageRef string, logBuf *logBuffer, cancelled func() bool, fail func(string, ...any)) bool {
 	if cancelled() {
 		return false
 	}
 	script := fmt.Sprintf("docker image inspect %s >/dev/null 2>&1 || docker pull %s", shellQuote(imageRef), shellQuote(imageRef))
-	logBuf.WriteString("$ " + script + "\n")
-	res, err := execOnAgent(ctx, hub, "docker-pull-"+randomToken(4), script, 1800, deployStallSec, logBuf)
-	if err != nil {
-		fail("拉取镜像失败: %v", err)
-		return false
-	}
-	if res.GetExitCode() != 0 {
-		fail("拉取镜像失败 (exit %d)", res.GetExitCode())
-		return false
-	}
-	return true
+	return e.execRegistryCommand(ctx, hub, app, imageRef, "docker-pull-"+randomToken(4), script, script, 1800, logBuf, fail, "拉取镜像失败")
 }
 
 // resolveMeshIP returns the host's current Tailscale IPv4 for mesh-scoped port
@@ -1339,6 +1279,9 @@ func (e *Engine) finishDeploySuccess(app *Application, dep *Deployment, commit, 
 		d.Status = DeploySuccess
 		d.FinishedAt = now
 		d.DurationMS = now.Sub(d.StartedAt).Milliseconds()
+		if imageRef != "" {
+			d.ImageRef = imageRef
+		}
 		d.BuildLog = finalLog
 	})
 	if finalized {
@@ -1525,13 +1468,6 @@ func (e *Engine) gitToken(app *Application) (string, error) {
 	// (short-lived, minted at deploy time, never persisted).
 	if e.ghAppToken != nil {
 		if tok, ok := e.ghAppToken.InstallationTokenForRepo(app.RepoURL); ok && tok != "" {
-			return tok, nil
-		}
-	}
-	// If no explicit Vault credential is configured, but this is a GitHub repository
-	// and the GitHub Provider is connected, automatically use the GitHub account token.
-	if e.gitProvider != nil && strings.Contains(strings.ToLower(app.RepoURL), "github.com") {
-		if tok, ok := e.gitProvider.GetToken(); ok && tok != "" {
 			return tok, nil
 		}
 	}
@@ -1725,26 +1661,177 @@ func classifyDockerPreflight(exitCode int32) error {
 }
 
 // pullImage pulls one image reference on the target host. It is the upgrade
-// step for image/template apps: the pull runs before any container is
-// touched, so a failed pull fails the deployment with the old container
-// still serving. Returns false when the caller must stop the pipeline
-// (fail() already recorded the reason).
-func (e *Engine) pullImage(ctx context.Context, hub *rpc.Hub, imageRef string, logBuf *logBuffer, cancelled func() bool, fail func(string, ...any)) bool {
+// and CI trigger path — floating tags (:latest) must re-pull instead of
+// reusing a stale local copy.
+func (e *Engine) pullImage(ctx context.Context, hub *rpc.Hub, app *Application, imageRef string, logBuf *logBuffer, cancelled func() bool, fail func(string, ...any)) bool {
 	if cancelled() {
 		return false
 	}
 	pullCmd := fmt.Sprintf("docker pull %s", shellQuote(imageRef))
-	logBuf.WriteString("$ " + pullCmd + "\n")
-	res, err := execOnAgent(ctx, hub, "docker-pull-"+randomToken(4), pullCmd, 1800, deployStallSec, logBuf)
+	return e.execRegistryCommand(ctx, hub, app, imageRef, "docker-pull-"+randomToken(4), pullCmd, pullCmd, 1800, logBuf, fail, "拉取镜像失败")
+}
+
+// execRegistryCommand executes a docker pull command on the agent, using an
+// ephemeral isolated DOCKER_CONFIG login when app.RegistryVaultID is set so
+// registry credentials never linger in ~/.docker/config.json.
+func (e *Engine) execRegistryCommand(ctx context.Context, hub *rpc.Hub, app *Application, imageRef, execPrefix, dockerCmd, displayCmd string, timeoutSec int32, logBuf *logBuffer, fail func(string, ...any), errTitle string) bool {
+	var user, pass, regServer string
+	if app != nil && app.RegistryVaultID != "" {
+		if e.vault == nil {
+			fail("获取镜像仓库凭据失败: vault 未启用")
+			return false
+		}
+		cred, ok := e.vault.Get(app.RegistryVaultID)
+		if !ok {
+			fail("获取镜像仓库凭据失败: 凭据 %q 不存在", app.RegistryVaultID)
+			return false
+		}
+		user = strings.TrimSpace(cred.Username)
+		pass = cred.Secret
+		if user == "" || pass == "" {
+			fail("镜像仓库凭据 %q 缺少用户名或密码/Token", cred.Name)
+			return false
+		}
+		if imageRef == "" && app.ComposeContent != "" {
+			imageRef = firstComposeImage(app.ComposeContent)
+		}
+		regServer = resolveRegistryHost(imageRef)
+	}
+
+	if pass == "" {
+		logBuf.WriteString("$ " + displayCmd + "\n")
+		res, err := execOnAgent(ctx, hub, execPrefix, dockerCmd, timeoutSec, deployStallSec, logBuf)
+		if err != nil {
+			fail("%s: %v", errTitle, err)
+			return false
+		}
+		if res.GetExitCode() != 0 {
+			fail("%s (exit %d)", errTitle, res.GetExitCode())
+			return false
+		}
+		return true
+	}
+
+	loginArgs := fmt.Sprintf("login -u %s --password-stdin", shellQuote(user))
+	if regServer != "" {
+		loginArgs = fmt.Sprintf("login %s -u %s --password-stdin", shellQuote(regServer), shellQuote(user))
+	}
+	wrapped := fmt.Sprintf(`set -e
+TMP_DC=$(mktemp -d)
+trap 'rm -rf "$TMP_DC"' EXIT
+printf '%%s' %s | docker --config "$TMP_DC" %s >/dev/null
+export DOCKER_CONFIG="$TMP_DC"
+%s`, shellQuote(pass), loginArgs, dockerCmd)
+
+	logBuf.WriteString("$ " + displayCmd + " (using vault registry credential)\n")
+	res, err := execOnAgent(ctx, hub, execPrefix, wrapped, timeoutSec, deployStallSec, nil)
 	if err != nil {
-		fail("拉取镜像失败: %v", err)
+		fail("%s: %s", errTitle, string(redact([]byte(err.Error()), pass)))
 		return false
 	}
+	logBuf.WriteResult(res, redact(res.GetStdout(), pass), redact(res.GetStderr(), pass))
 	if res.GetExitCode() != 0 {
-		fail("拉取镜像失败 (exit %d)", res.GetExitCode())
+		fail("%s (exit %d)", errTitle, res.GetExitCode())
 		return false
 	}
 	return true
+}
+
+func resolveRegistryHost(imageRef string) string {
+	s := strings.TrimSpace(imageRef)
+	first, _, hasSlash := strings.Cut(s, "/")
+	if !hasSlash {
+		return ""
+	}
+	if strings.Contains(first, ".") || strings.Contains(first, ":") || first == "localhost" {
+		return first
+	}
+	return ""
+}
+
+func firstComposeImage(composeYAML string) string {
+	for _, line := range strings.Split(composeYAML, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "image:") {
+			val := strings.TrimSpace(strings.TrimPrefix(trimmed, "image:"))
+			return strings.Trim(val, `'"`)
+		}
+	}
+	return ""
+}
+
+// buildGitFetchScript renders the shallow-clone / branch-switch / rollback
+// fetch script shared by deploy and migration pipelines.
+func buildGitFetchScript(repoDir, repoURL, branch, pin, authArgs string) string {
+	qDir := shellQuote(repoDir)
+	qURL := shellQuote(repoURL)
+	qBranch := shellQuote(branch)
+	if pin != "" {
+		qPin := shellQuote(pin)
+		return fmt.Sprintf(`set -e
+if [ -d %[1]s/.git ]; then
+  CUR_URL=$(git -C %[1]s remote get-url origin 2>/dev/null || true)
+  if [ "$CUR_URL" != %[2]s ]; then
+    rm -rf %[1]s
+  fi
+fi
+if [ ! -d %[1]s/.git ]; then
+  mkdir -p %[1]s
+  git %[5]s clone --depth 1 --branch %[3]s %[2]s %[1]s
+fi
+if ! git -C %[1]s cat-file -e %[4]s^{commit} 2>/dev/null; then
+  if ! git %[5]s -C %[1]s fetch --depth 1 origin %[4]s 2>/dev/null; then
+    if [ -f %[1]s/.git/shallow ]; then
+      git %[5]s -C %[1]s fetch --unshallow origin '+refs/heads/*:refs/remotes/origin/*'
+    else
+      git %[5]s -C %[1]s fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
+    fi
+  fi
+fi
+git -C %[1]s checkout --force %[4]s
+git -C %[1]s reset --hard %[4]s
+git -C %[1]s clean -fd
+COMMIT=$(git -C %[1]s rev-parse --short HEAD)
+MESSAGE=$(git -C %[1]s log -1 --pretty=%%s)
+echo "WATCHMAN_COMMIT=$COMMIT"
+echo "WATCHMAN_MESSAGE=$MESSAGE"`,
+			qDir, qURL, qBranch, qPin, authArgs)
+	}
+	return fmt.Sprintf(`set -e
+if [ -d %[1]s/.git ]; then
+  CUR_URL=$(git -C %[1]s remote get-url origin 2>/dev/null || true)
+  if [ "$CUR_URL" != %[2]s ]; then
+    rm -rf %[1]s
+  fi
+fi
+if [ ! -d %[1]s/.git ]; then
+  mkdir -p %[1]s
+  git %[4]s clone --depth 1 --branch %[3]s %[2]s %[1]s
+fi
+git %[4]s -C %[1]s fetch --depth 1 --force origin %[3]s:refs/watchman/target
+git -C %[1]s checkout --force refs/watchman/target
+git -C %[1]s reset --hard refs/watchman/target
+git -C %[1]s clean -fd
+COMMIT=$(git -C %[1]s rev-parse --short HEAD)
+MESSAGE=$(git -C %[1]s log -1 --pretty=%%s)
+echo "WATCHMAN_COMMIT=$COMMIT"
+echo "WATCHMAN_MESSAGE=$MESSAGE"`,
+		qDir, qURL, qBranch, authArgs)
+}
+
+// gitComposeLocation resolves the execution directory (honoring Monorepo
+// build_context) and compose file path relative to that directory.
+func gitComposeLocation(repoDir string, app *Application) (workDir, composeFile string) {
+	composeFile = gitComposeFile(app)
+	sub, err := repoinspect.NormalizeSubdir(app.BuildContext)
+	if err != nil || sub == "" {
+		return repoDir, composeFile
+	}
+	workDir = path.Join(repoDir, sub)
+	if strings.HasPrefix(composeFile, sub+"/") {
+		composeFile = strings.TrimPrefix(composeFile, sub+"/")
+	}
+	return workDir, composeFile
 }
 
 // checkDockerReady runs the preflight on the target host. A transport

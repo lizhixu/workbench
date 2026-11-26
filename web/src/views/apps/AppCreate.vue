@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onActivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, h, onActivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  NAlert, NAvatar, NButton, NCard, NCollapse, NCollapseItem, NDynamicInput, NForm, NFormItem, NGi, NGrid, NIcon, NInput, NInputNumber,
+  NAlert, NButton, NCard, NCollapse, NCollapseItem, NDynamicInput, NForm, NFormItem, NGi, NGrid, NIcon, NInput, NInputNumber,
   NRadio, NRadioButton, NRadioGroup, NSelect, NSpace, NSwitch, NTag, useMessage,
 } from 'naive-ui'
 import {
@@ -21,11 +21,8 @@ import { getNetworkConfig, listNetworkNodes, probeMeshIP, type NetworkConfig } f
 import { bothMeshed } from '../../utils/mesh'
 import { listCredentials } from '../../api/vault'
 import {
-  getGitProviders,
-  listGitHubBranches, listGitHubRepos, type GitHubAccount,
-  type GitHubBranch, type GitHubRepo,
-  getGitHubAppStatus, listGitHubAppRepos, listGitHubAppBranches,
-  type GitHubAppInstalledRepo,
+  getGitHubAppStatus, syncGitHubAppInstallations, listGitHubAppRepos, listGitHubAppBranches,
+  type GitHubAppInstalledRepo, type GitHubAppStatus,
 } from '../../api/git'
 import { useWorkspaceStore } from '../../stores/workspace'
 import AppAiAssistant from '../../components/apps/AppAiAssistant.vue'
@@ -79,8 +76,8 @@ const meshProbeLoading = ref(false)
 // 实时探测结果只对「当前选中主机」有效，换主机即失效
 const meshProbeResult = ref<{ hostId: string; ip: string; source: '' | 'live' | 'cache' } | null>(null)
 
-// 部署来源。模板/单镜像/Compose 不依赖 Git，Git 保持原有授权与手填两种子模式。
-type SourceMode = 'template' | 'image' | 'compose' | 'github' | 'custom'
+// 部署来源（模板 / 容器镜像 / Compose 编排 / Git 仓库）。
+type SourceMode = 'template' | 'image' | 'compose' | 'git'
 const sourceMode = ref<SourceMode>('template')
 
 const defaultComposeTemplate = `services:
@@ -117,50 +114,60 @@ const wordpressTemplate = `services:
       - MYSQL_RANDOM_ROOT_PASSWORD='1'
 `
 
-// GitHub 授权与仓库列表状态
-const githubAccount = ref<GitHubAccount | null>(null)
-const checkingGitHub = ref(false)
+// Git 接入模式（GitHub App 授权仓库 vs 手动仓库 URL）与交付方式（本地构建 vs GitHub Actions 远程推镜像）。
+type GitInputMode = 'app' | 'manual'
+type GitDeliveryMode = 'local' | 'ci'
+const gitInputMode = ref<GitInputMode>('app')
+let gitInputModeTouched = false
+const gitDeliveryMode = ref<GitDeliveryMode>('local')
+let lastAutoCIImage = ''
+let lastAutoCIRepo = ''
 
-const githubRepos = ref<GitHubRepo[]>([])
-const loadingRepos = ref(false)
-const selectedRepoFullName = ref<string | null>(null)
-
-// GitHub App 已安装仓库（无 PAT 时也能选仓；取数走 App 安装令牌）。
+const appStatus = ref<GitHubAppStatus | null>(null)
 const appInstalledRepos = ref<GitHubAppInstalledRepo[]>([])
-const appConfigured = ref(false)
-const githubSourceReady = computed(() => githubAccount.value !== null || appConfigured.value)
-
-// 先选接入方式、再选仓库：两种方式各自独立的仓库清单，不做跨来源合并去重。
-type GitHubMethod = 'pat' | 'app'
-const githubMethod = ref<GitHubMethod | null>(null)
-// 只列出实际已配置的接入方式；都未配置时由上方连接引导接管。
-const githubMethodOptions = computed(() => {
-  const opts: Array<{ label: string; value: GitHubMethod }> = []
-  if (githubAccount.value) opts.push({ label: 'GitHub 账号（PAT）', value: 'pat' })
-  if (appConfigured.value) opts.push({ label: 'GitHub App', value: 'app' })
-  return opts
-})
+const loadingRepos = ref(false)
+const syncingRepos = ref(false)
+const selectedAccountFilter = ref<string | null>(null)
+const selectedRepoFullName = ref<string | null>(null)
+const appBranches = ref<string[]>([])
+const loadingBranches = ref(false)
+const appConfigured = computed(() => !!appStatus.value?.configured)
 
 async function fetchAppInstalledRepos() {
+  loadingRepos.value = true
   try {
     const st = await getGitHubAppStatus()
-    appConfigured.value = st.configured
-    // 断开 App 后必须清空旧清单，否则已移除的安装仓库仍会出现在下拉里。
+    appStatus.value = st
     appInstalledRepos.value = st.configured ? await listGitHubAppRepos() : []
+    if (!gitInputModeTouched) {
+      gitInputMode.value = st.configured && appInstalledRepos.value.length > 0 ? 'app' : 'manual'
+    }
   } catch {
-    // GitHub App 未配置时静默，PAT 流程不受影响
+    appStatus.value = null
+    appInstalledRepos.value = []
+    if (!gitInputModeTouched) gitInputMode.value = 'manual'
+  } finally {
+    loadingRepos.value = false
   }
 }
 
-// 只有一种方式可用时自动选中；两种都可用时留空，强制先做出选择。
-function syncGithubMethod() {
-  const available = githubMethodOptions.value.map((o) => o.value)
-  if (githubMethod.value && available.includes(githubMethod.value)) return
-  githubMethod.value = available.length === 1 ? available[0] : null
+async function syncAndRefreshAppRepos() {
+  syncingRepos.value = true
+  try {
+    await syncGitHubAppInstallations()
+    await fetchAppInstalledRepos()
+    message.success(`已同步 ${appInstalledRepos.value.length} 个授权仓库`)
+  } catch (e: any) {
+    message.error(e?.message || '同步 GitHub App 安装失败')
+  } finally {
+    syncingRepos.value = false
+  }
 }
 
-const branches = ref<GitHubBranch[]>([])
-const loadingBranches = ref(false)
+function setGitInputMode(mode: GitInputMode) {
+  gitInputModeTouched = true
+  gitInputMode.value = mode
+}
 
 const form = reactive({
   name: '',
@@ -169,6 +176,9 @@ const form = reactive({
   host_id: null as string | null,
   template_id: '',
   image: '',
+  registry_vault_id: null as string | null,
+  ci_repo: '',
+  image_auto_deploy: false,
   repo_url: '',
   branch: 'main',
   auth_vault_id: null as string | null,
@@ -440,14 +450,39 @@ function isPortsEffectivelyEmpty(): boolean {
   return form.ports.length === 0 || form.ports.every(isEmptyPortRow)
 }
 
+const effectiveIsImage = computed(
+  () => sourceMode.value === 'image' || (sourceMode.value === 'git' && gitDeliveryMode.value === 'ci'),
+)
+const isGitLocal = computed(
+  () => sourceMode.value === 'git' && gitDeliveryMode.value === 'local',
+)
+
 watch(sourceMode, (mode) => {
   // 切来源时清空模板残留，避免把模板端口误提交成镜像应用的配置
   if (mode !== 'template') {
     form.template_id = ''
     form.template_params = {}
   }
-  if (mode === 'image' && isPortsEffectivelyEmpty()) {
+  if ((mode === 'image' || (mode === 'git' && gitDeliveryMode.value === 'ci')) && isPortsEffectivelyEmpty()) {
     form.ports = [{ host: 8080, container: 8080, bind_scope: 'public' }]
+  }
+})
+
+watch(gitDeliveryMode, (mode) => {
+  if (sourceMode.value !== 'git') return
+  if (mode === 'ci') {
+    form.image_auto_deploy = true
+    const ghSlug = extractGitHubFullName(form.repo_url)
+    if (ghSlug) {
+      form.ci_repo = ghSlug
+      if (!form.image.trim() || form.image === lastAutoCIImage) {
+        lastAutoCIImage = `ghcr.io/${ghSlug.toLowerCase()}:latest`
+        form.image = lastAutoCIImage
+      }
+    }
+    if (isPortsEffectivelyEmpty()) {
+      form.ports = [{ host: 8080, container: 8080, bind_scope: 'public' }]
+    }
   }
 })
 
@@ -600,6 +635,12 @@ function markBuildTypeTouched() {
   buildTypeTouched = true
 }
 
+function extractGitHubFullName(v: string): string {
+  const s = v.trim().replace(/\/+$/, '').replace(/\.git$/i, '')
+  const m = s.match(/github\.com[:/]([\w.-]+\/[\w.-]+)/i)
+  return m ? m[1] : ''
+}
+
 function normalizeRepoURL(v: string): string {
   return v.trim().toLowerCase().replace(/\.git$/, '').replace(/\/+$/, '')
 }
@@ -618,7 +659,11 @@ async function probeRepo(url: string) {
   const seq = ++probeSeq
   repoProbe.value.loading = true
   try {
-    const meta = await inspectRepo(v)
+    const meta = await inspectRepo(v, {
+      branch: form.branch.trim() || undefined,
+      build_context: form.build_context.trim() || undefined,
+      auth_vault_id: form.auth_vault_id || undefined,
+    })
     if (seq !== probeSeq || lastProbedRepo !== normalizeRepoURL(form.repo_url)) return
     repoProbe.value = { loading: false, data: meta, error: '' }
     applyRepoProbeAuto(meta)
@@ -633,17 +678,20 @@ watch(() => form.repo_url, () => {
     lastProbedRepo = ''
     repoProbe.value = { loading: false, data: null, error: '' }
   }
+  const slug = extractGitHubFullName(form.repo_url)
+  if (!form.ci_repo.trim() || form.ci_repo === lastAutoCIRepo) {
+    lastAutoCIRepo = slug
+    form.ci_repo = slug
+  }
+  if (sourceMode.value === 'git' && (!form.image.trim() || form.image === lastAutoCIImage)) {
+    lastAutoCIImage = slug ? `ghcr.io/${slug.toLowerCase()}:latest` : ''
+    form.image = lastAutoCIImage
+  }
 })
 
-// 生效的 Compose 模式：raw_compose 来源，或 Git 来源且构建方式为 compose。
-// 详情页同款判定（AppDetail isCompose）：创建页的端口/健康检查/环境变量
-// 区段与拓扑预览改按它显隐，而不是只看 sourceMode——否则 Git 应用切到
-// Compose 后表单还留着单容器那套输入框，填了也不会被部署使用
-// （Compose 部署只跑 `docker compose up`，表单端口/env/健康检查全被忽略）。
+// 生效的 Compose 模式：raw_compose 来源，或 Git 本地构建且构建方式为 compose。
 const isGitCompose = computed(
-  () =>
-    (sourceMode.value === 'github' || sourceMode.value === 'custom') &&
-    form.build_type === 'compose',
+  () => isGitLocal.value && form.build_type === 'compose',
 )
 const isComposeMode = computed(() => sourceMode.value === 'compose' || isGitCompose.value)
 
@@ -709,8 +757,8 @@ function applyRepoProbeAuto(meta: RepoMetadata) {
       if (meta.has_compose) {
         form.dockerfile = meta.compose_file || 'compose.yaml'
       }
-    } else if (meta.has_dockerfile && meta.dockerfile_path !== 'Dockerfile') {
-      form.dockerfile = meta.dockerfile_path
+    } else if (meta.has_dockerfile) {
+      form.dockerfile = meta.dockerfile_path || 'Dockerfile'
     }
   }
   if (meta.branch && (!form.branch.trim() || form.branch.trim() === 'main') && meta.branch !== 'main') {
@@ -923,65 +971,92 @@ watch(() => form.host_id, async (id) => {
   }
 })
 
-const vaultOptions = computed(() => [
-  { label: '不使用凭据（公开仓库）', value: '' },
-  ...vaults.value.map((v) => ({ label: `${v.name} (${v.type})`, value: v.id })),
-])
+const gitVaultOptions = computed(() =>
+  [...vaults.value]
+    .sort((a, b) => (a.type === 'git_token' ? -1 : 0) - (b.type === 'git_token' ? -1 : 0))
+    .map((v) => ({
+      label: v.type === 'git_token' ? `${v.name}（Git 令牌）` : `${v.name} (${v.type})`,
+      value: v.id,
+    })),
+)
 
-const patRepoOptions = computed(() =>
-  githubRepos.value.map((r) => ({
-    // 账号清单里同时被 App 覆盖的仓库仍如实列出，但要点明实际触发与拉码
-    // 由 App 优先，不能让人误以为是 PAT 在生效。
-    label:
-      `${r.full_name}${r.private ? ' [私有]' : ''}${r.description ? ' - ' + r.description : ''}` +
-      (appInstalledRepos.value.some((a) => a.full_name === r.full_name) ? ' · App 已覆盖' : ''),
+const registryVaultOptions = computed(() =>
+  [...vaults.value]
+    .sort((a, b) => (a.type === 'container_registry' ? -1 : 0) - (b.type === 'container_registry' ? -1 : 0))
+    .map((v) => ({
+      label: v.type === 'container_registry' ? `${v.name}（镜像仓库）` : `${v.name} (${v.type})`,
+      value: v.id,
+    })),
+)
+
+const repoAccountOptions = computed(() => {
+  const accounts = new Set<string>()
+  for (const r of appInstalledRepos.value) {
+    if (r.account) accounts.add(r.account)
+  }
+  return Array.from(accounts).map((a) => ({ label: `@${a}`, value: a }))
+})
+
+const filteredAppRepos = computed(() => {
+  if (!selectedAccountFilter.value) return appInstalledRepos.value
+  return appInstalledRepos.value.filter((r) => r.account === selectedAccountFilter.value)
+})
+
+const repoOptions = computed(() =>
+  filteredAppRepos.value.map((r) => ({
+    label: [r.full_name, r.description || '', r.language || ''].filter(Boolean).join(' '),
     value: r.full_name,
+    raw: r,
   })),
 )
-const appRepoOptions = computed(() =>
-  appInstalledRepos.value.map((r) => ({ label: r.full_name, value: r.full_name })),
-)
-// 当前接入方式下的仓库；未选择方式时不展示任何来源的清单。
-const repoOptions = computed(() => {
-  if (githubMethod.value === 'pat') return patRepoOptions.value
-  if (githubMethod.value === 'app') return appRepoOptions.value
-  return []
-})
+
+function renderRepoLabel(option: { value?: string | number; raw?: GitHubAppInstalledRepo }) {
+  const r = option.raw
+  if (!r) return String(option.value ?? '')
+  return h('div', { style: 'display:flex;align-items:center;gap:8px;min-width:0;width:100%' }, [
+    h('span', { style: 'font-weight:600;white-space:nowrap' }, r.full_name),
+    r.private
+      ? h(NTag, { size: 'tiny', type: 'warning', bordered: false }, { default: () => '私有' })
+      : null,
+    r.language
+      ? h(NTag, { size: 'tiny', type: 'info', bordered: false }, { default: () => r.language })
+      : null,
+    r.description
+      ? h('span', { style: 'color:var(--text-secondary);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1' }, r.description)
+      : null,
+  ])
+}
 
 const branchOptions = computed(() =>
-  branches.value.map((b) => ({
-    label: b.name + (b.protected ? ' (受保护)' : ''),
-    value: b.name,
+  appBranches.value.map((b) => ({
+    label: b,
+    value: b,
   })),
 )
 
-// ---- 代码推送自动部署：独立于代码来源的触发方式 ----
-// 所选仓库是否在 GitHub App（未暂停安装）的仓库清单内。命中时推送由
-// App 级事件触发，后端不会再给该仓库注册逐仓 Webhook。
-const selectedRepoAppCovered = computed(
-  () =>
-    !!selectedRepoFullName.value &&
-    appInstalledRepos.value.some((r) => r.full_name === selectedRepoFullName.value),
-)
-
-// 仓库地址是否已确定：GitHub 来源要先选仓，通用 Git 来源看手填地址。
-const autoDeployRepoReady = computed(() =>
-  sourceMode.value === 'github' ? !!selectedRepoFullName.value : form.repo_url.trim() !== '',
-)
-
-// 实际触发机制（与后端注册逻辑一致）：App 级事件 / 创建时自动注册逐仓
-// Webhook（仅 github.com 且已连接 GitHub 账号）/ 手动配置 Webhook 地址。
-const autoDeployMechanism = computed<'app' | 'webhook' | 'manual'>(() => {
-  if (sourceMode.value === 'github' && selectedRepoAppCovered.value) return 'app'
-  if (githubAccount.value && form.repo_url.toLowerCase().includes('github.com')) return 'webhook'
-  return 'manual'
+// ---- 代码推送自动部署 ----
+// 无论来自「GitHub App 授权仓库」还是「手动仓库 URL」，只要指向已被 GitHub App
+// 覆盖的 GitHub 仓库（且安装未暂停），推送即走 App 级事件，不需手动复制 Webhook。
+const selectedRepoAppCovered = computed(() => {
+  const slug =
+    gitInputMode.value === 'app' && selectedRepoFullName.value
+      ? selectedRepoFullName.value
+      : extractGitHubFullName(form.repo_url)
+  if (!slug) return false
+  const lower = slug.toLowerCase()
+  return appInstalledRepos.value.some((r) => r.full_name.toLowerCase() === lower)
 })
 
-const autoDeployMechanismLabel = computed(
-  () =>
-    ({ app: 'GitHub App 托管', webhook: '自动注册 Webhook', manual: '手动 Webhook' })[
-      autoDeployMechanism.value
-    ],
+const autoDeployRepoReady = computed(() =>
+  gitInputMode.value === 'app' ? !!selectedRepoFullName.value : form.repo_url.trim() !== '',
+)
+
+const autoDeployMechanism = computed<'app' | 'manual'>(() =>
+  selectedRepoAppCovered.value ? 'app' : 'manual',
+)
+
+const autoDeployMechanismLabel = computed(() =>
+  autoDeployMechanism.value === 'app' ? 'GitHub App 托管' : '手动 Webhook',
 )
 
 const autoDeployHint = computed(() => {
@@ -989,19 +1064,13 @@ const autoDeployHint = computed(() => {
     return '已关闭：推送代码不会触发部署；创建后仍可在应用详情页开启。'
   }
   if (!autoDeployRepoReady.value) {
-    return '选定仓库后按实际接入情况自动识别触发方式。'
+    return '选定或填写仓库后自动识别触发方式。'
   }
   const branch = form.branch.trim() || 'main'
-  switch (autoDeployMechanism.value) {
-    case 'app':
-      return `该仓库在 GitHub App 安装范围内：推送 ${branch} 分支时由 App 级事件触发部署，无需逐仓配置 Webhook。`
-    case 'webhook':
-      return `创建时将自动通过已连接的 GitHub 账号为该仓库注册 Push Webhook，推送 ${branch} 分支后自动部署。`
-    default:
-      return sourceMode.value === 'github'
-        ? '该仓库不在 GitHub App 安装范围内且未连接 GitHub 账号：创建后到应用详情页复制 Webhook 地址配置到仓库，或先在系统设置接入 GitHub App。'
-        : '创建后到应用详情页复制 Webhook 地址，配置到代码仓库的 push 事件。'
+  if (autoDeployMechanism.value === 'app') {
+    return `该仓库在 GitHub App 安装范围内：推送 ${branch} 分支时由 App 级事件自动触发部署，无需手动配置 Webhook。`
   }
+  return '该仓库未命中当前 GitHub App 安装范围（如自建 Git / 其他 GitHub 账号）：创建后可在应用详情页复制 Webhook 地址到仓库 Push 事件。'
 })
 
 const parsedEnvVars = computed<Record<string, string> | undefined>(() => {
@@ -1065,10 +1134,11 @@ const formSnapshot = computed<AppFormSnapshot>(() => ({
 // 绝不触发提交——最终仍由用户检查后点「创建应用」。
 function applyDraft(draft: AppFormDraft) {
   const modeMap: Record<string, SourceMode> = {
-    template: 'template', image: 'image', raw_compose: 'compose', git: 'custom',
+    template: 'template', image: 'image', raw_compose: 'compose', git: 'git',
   }
   if (draft.source_type && modeMap[draft.source_type]) {
     sourceMode.value = modeMap[draft.source_type]
+    if (draft.source_type === 'git') gitDeliveryMode.value = 'local'
   }
   if (sourceMode.value === 'template' && draft.template_id) {
     if (templates.value.some((t) => t.id === draft.template_id)) {
@@ -1094,7 +1164,17 @@ function applyDraft(draft: AppFormDraft) {
   }
   if (draft.mesh_forward_entry_port !== undefined) form.mesh_forward_entry_port = draft.mesh_forward_entry_port
   if (draft.mesh_forward_target_port !== undefined) form.mesh_forward_target_port = draft.mesh_forward_target_port
-  if (draft.repo_url !== undefined) form.repo_url = draft.repo_url
+  if (draft.repo_url !== undefined) {
+    form.repo_url = draft.repo_url
+    const slug = extractGitHubFullName(draft.repo_url)
+    const matched = slug ? appInstalledRepos.value.find((r) => r.full_name.toLowerCase() === slug.toLowerCase()) : undefined
+    if (matched) {
+      gitInputMode.value = 'app'
+      selectedRepoFullName.value = matched.full_name
+    } else if (draft.repo_url) {
+      gitInputMode.value = 'manual'
+    }
+  }
   if (draft.branch !== undefined) form.branch = draft.branch
   if (draft.auto_deploy !== undefined) form.auto_deploy = draft.auto_deploy
   if (draft.build_type !== undefined) form.build_type = draft.build_type
@@ -1168,123 +1248,71 @@ async function loadData() {
 }
 
 async function checkGitHubStatus() {
-  checkingGitHub.value = true
-  try {
-    const st = await getGitProviders()
-    if (st.github.connected && st.github.account) {
-      githubAccount.value = st.github.account
-      await fetchGitHubRepos()
-    } else {
-      githubAccount.value = null
-      // 在系统设置里断开账号后返回：PAT 仓库清单已失效，清掉避免下拉框
-      // 继续展示当前凭证拉取不到的旧仓库。
-      githubRepos.value = []
-    }
-  } catch {
-    githubAccount.value = null
-  } finally {
-    checkingGitHub.value = false
-  }
   await fetchAppInstalledRepos()
-  syncGithubMethod()
 }
 
-async function fetchGitHubRepos() {
-  loadingRepos.value = true
-  try {
-    githubRepos.value = await listGitHubRepos()
-  } catch (e: any) {
-    message.error(e.message || '获取 GitHub 仓库列表失败')
-  } finally {
-    loadingRepos.value = false
-  }
-}
-
-async function refreshRepoLists() {
-  if (githubAccount.value) await fetchGitHubRepos()
-  await fetchAppInstalledRepos()
-  syncGithubMethod()
-}
-
-// 当用户在下拉框选中某个 GitHub 仓库时：自动填充应用名、克隆地址，并拉取所有分支。
-// 取数通道由接入方式决定：App 方式即使该仓库也在 PAT 清单里，分支仍走安装令牌。
+// 当用户在 GitHub App 下拉框选中某个仓库时：自动填充真实 default_branch、克隆地址与建议镜像地址，并实时探测与拉取分支。
 let repoPickSeq = 0
 watch(selectedRepoFullName, async (fullName) => {
   if (!fullName) return
   const seq = ++repoPickSeq
-  const repo =
-    githubMethod.value === 'pat'
-      ? githubRepos.value.find((r) => r.full_name === fullName)
-      : undefined
-  if (!repo) {
-    // GitHub App 安装仓库：只填克隆地址与应用名，分支走 App 令牌拉取。
-    const [owner, name] = fullName.split('/')
-    if (!owner || !name) return
-    form.repo_url = `https://github.com/${fullName}.git`
-    if (!form.name) form.name = name
-    void probeRepo(form.repo_url)
-    // 先清空分支：上一个仓库的分支残留到新仓库是静默错配，必须先清再拉。
-    form.branch = ''
-    loadingBranches.value = true
-    try {
-      const names = await listGitHubAppBranches(owner, name)
-      if (seq !== repoPickSeq) return
-      branches.value = names.map((n) => ({ name: n, protected: false, sha: '' }))
-      if (names.includes('main')) form.branch = 'main'
-      else if (names.length > 0) form.branch = names[0]
-    } catch (e: any) {
-      if (seq === repoPickSeq) message.error(e.message || '获取仓库分支失败')
-    } finally {
-      if (seq === repoPickSeq) loadingBranches.value = false
-    }
-    return
-  }
+  const repoMeta = appInstalledRepos.value.find((r) => r.full_name === fullName)
+  const [owner, name] = fullName.split('/')
+  if (!owner || !name) return
 
-  form.repo_url = repo.clone_url
-  if (!form.name) {
-    form.name = repo.name
+  form.repo_url = `https://github.com/${fullName}.git`
+  if (!form.ci_repo.trim() || form.ci_repo === lastAutoCIRepo) {
+    lastAutoCIRepo = fullName
+    form.ci_repo = fullName
   }
-  // 顺带客观读取仓库的部署配置（Dockerfile/Compose/.env），失败静默
-  void probeRepo(repo.clone_url)
+  if (!form.name.trim()) form.name = name
+  if (!form.image.trim() || form.image === lastAutoCIImage) {
+    lastAutoCIImage = `ghcr.io/${fullName.toLowerCase()}:latest`
+    form.image = lastAutoCIImage
+  }
+  // 立即用安装元数据里的真实 default_branch，避免盲猜 main。
+  const preferredBranch = repoMeta?.default_branch || ''
+  form.branch = preferredBranch
+  appBranches.value = preferredBranch ? [preferredBranch] : []
 
+  void probeRepo(form.repo_url)
   loadingBranches.value = true
   try {
-    const [owner, name] = repo.full_name.split('/')
-    const bList = await listGitHubBranches(owner, name)
+    const names = await listGitHubAppBranches(owner, name)
     if (seq !== repoPickSeq) return
-    branches.value = bList
-    if (bList.some((b) => b.name === repo.default_branch)) {
-      form.branch = repo.default_branch
-    } else if (bList.length > 0) {
-      form.branch = bList[0].name
+    appBranches.value = names
+    if (preferredBranch && names.includes(preferredBranch)) {
+      form.branch = preferredBranch
+    } else if (names.includes('main')) {
+      form.branch = 'main'
+    } else if (names.length > 0) {
+      form.branch = names[0]
+    } else if (!form.branch) {
+      form.branch = 'main'
     }
   } catch (e: any) {
-    if (seq === repoPickSeq) message.error(e.message || '获取仓库分支失败')
+    if (seq === repoPickSeq) {
+      if (!form.branch) form.branch = 'main'
+      message.error(e.message || '获取仓库分支失败')
+    }
   } finally {
     if (seq === repoPickSeq) loadingBranches.value = false
   }
 })
 
-// 切换接入方式后旧仓库与分支不再属于当前来源，必须清空，避免带着另一来源
-// 的元数据提交；在途的分支请求一并作废。
-watch(githubMethod, (method, prev) => {
-  if (!prev || prev === method) return
-  repoPickSeq++
-  selectedRepoFullName.value = null
-  branches.value = []
-  loadingBranches.value = false
-  form.branch = ''
-  form.repo_url = ''
-})
-
-// 账号接入属于系统级凭据管理：创建页不再内嵌 Token 表单，统一跳到
-// 「系统设置 → 代码源集成」，避免同一份授权在两处各维护一套 UI。
 function openGitHubSettings() {
   router.push('/settings?s=git')
 }
 
-// 从系统设置连好/断开账号后切回本页时，授权与仓库清单可能已经变化。
-// 首次激活由 onMounted 的 loadData 负责，这里跳过以免重复请求。
+function openGitHubAppInstallPage() {
+  if (appStatus.value?.slug) {
+    window.open(`https://github.com/apps/${appStatus.value.slug}/installations/new`, '_blank')
+  } else {
+    openGitHubSettings()
+  }
+}
+
+// 从系统设置连好/断开 GitHub App 后切回本页时刷新仓库列表。
 let githubActivatedOnce = false
 onActivated(() => {
   if (!githubActivatedOnce) {
@@ -1314,13 +1342,12 @@ function validate(): string | null {
     case 'compose':
       if (!form.compose_content.trim()) return '请填写 Docker Compose 内容'
       break
-    case 'github':
-      if (!githubMethod.value) return '请先选择代码接入方式'
-      if (!selectedRepoFullName.value) return '请选择 GitHub 仓库'
-      if (!form.repo_url.trim()) return '请选择或填写 Git 仓库地址'
-      if (!/^https?:\/\//.test(form.repo_url.trim())) return '仓库地址必须是 http(s):// 开头的 URL'
-      break
-    case 'custom':
+    case 'git':
+      if (gitDeliveryMode.value === 'ci') {
+        if (!form.image.trim()) return '请填写目标镜像地址（如 ghcr.io/owner/repo:latest）'
+        break
+      }
+      if (gitInputMode.value === 'app' && !selectedRepoFullName.value) return '请选择 GitHub 仓库或切换到「手动仓库 URL」'
       if (!form.repo_url.trim()) return '请选择或填写 Git 仓库地址'
       if (!/^https?:\/\//.test(form.repo_url.trim())) return '仓库地址必须是 http(s):// 开头的 URL'
       break
@@ -1453,7 +1480,11 @@ async function submit() {
   try {
     const mode = sourceMode.value
     const isCompose = mode === 'compose'
-    const isGit = mode === 'github' || mode === 'custom'
+    const isImagePayload = effectiveIsImage.value
+    const isGit = isGitLocal.value
+    const resolvedCIRepo = isImagePayload
+      ? (form.ci_repo.trim() || extractGitHubFullName(form.repo_url) || undefined)
+      : undefined
     const app = (await createApp({
       name: form.name.trim(),
       host_id: form.host_id as string, // validate() 已拦截空值
@@ -1465,20 +1496,21 @@ async function submit() {
       repo_url: isGit ? form.repo_url.trim() : isCompose ? 'compose://local' : undefined,
       branch: isGit ? form.branch.trim() || 'main' : undefined,
       auth_vault_id: isGit ? form.auth_vault_id || undefined : undefined,
-      auto_deploy: isGit ? form.auto_deploy : false,
+      registry_vault_id: isImagePayload ? form.registry_vault_id || undefined : undefined,
+      ci_repo: resolvedCIRepo,
+      auto_deploy: isGit ? form.auto_deploy : isImagePayload ? form.image_auto_deploy : false,
       watch_paths: isGit ? form.watch_paths : undefined,
       build_type: isCompose ? 'compose' : isGit ? form.build_type : undefined,
       compose_content: isCompose ? form.compose_content : undefined,
-      dockerfile: isGit ? form.dockerfile.trim() || 'Dockerfile' : undefined,
+      dockerfile: isGit ? form.dockerfile.trim() || (form.build_type === 'compose' ? 'compose.yaml' : 'Dockerfile') : undefined,
       build_context: isGit ? form.build_context.trim() || '.' : undefined,
       build_timeout_sec: isGit ? Number(form.build_timeout_sec) || 900 : undefined,
-      image: mode === 'image' ? form.image.trim() : undefined,
+      image: isImagePayload ? form.image.trim() : undefined,
       mesh_forward_enabled: form.mesh_forward_enabled,
       mesh_forward_host_id: form.mesh_forward_enabled ? form.mesh_forward_host_id || undefined : undefined,
       mesh_forward_entry_port: form.mesh_forward_enabled ? form.mesh_forward_entry_port ?? undefined : undefined,
       mesh_forward_target_port: form.mesh_forward_enabled ? form.mesh_forward_target_port ?? undefined : undefined,
-      // Git + Compose 模式下表单端口/env/卷/健康检查不参与部署（编排文件
-      // 本身就是权威），提交时清空，免得切模式前填的死值落库后在详情页误导。
+      // Compose 模式下表单端口/env/卷/健康检查不参与部署（编排文件本身就是权威），提交时清空。
       env_vars: isGitCompose.value ? {} : parsedEnvVars.value,
       ports: isGitCompose.value ? [] : form.ports.filter((p) => p.host > 0 && p.container > 0),
       volumes: isGitCompose.value ? [] : parsedVolumes.value,
@@ -1557,10 +1589,9 @@ onMounted(loadData)
           <NRadioGroup v-model:value="sourceMode">
             <NSpace>
               <NRadio value="template">应用模板</NRadio>
-              <NRadio value="image">单镜像</NRadio>
+              <NRadio value="image">容器镜像</NRadio>
               <NRadio value="compose">Compose 编排</NRadio>
-              <NRadio value="github">GitHub 仓库</NRadio>
-              <NRadio value="custom">通用 Git</NRadio>
+              <NRadio value="git">Git 仓库</NRadio>
             </NSpace>
           </NRadioGroup>
         </NFormItem>
@@ -1642,7 +1673,7 @@ onMounted(loadData)
               <NSpace vertical style="width: 100%" :size="6">
                 <NInput
                   v-model:value="form.image"
-                  placeholder="nginx:alpine / redis:7.2 / registry.example.com/app:1.0"
+                  placeholder="nginx:alpine / ghcr.io/owner/app:latest / registry.example.com/app:1.0"
                   @blur="probeImage"
                   @keyup.enter="probeImage"
                 />
@@ -1656,6 +1687,32 @@ onMounted(loadData)
                 </div>
               </NSpace>
             </NFormItem>
+
+            <NFormItem label="镜像仓库凭据">
+              <NSelect
+                v-model:value="form.registry_vault_id"
+                :options="registryVaultOptions"
+                clearable
+                filterable
+                placeholder="不使用凭据（公开镜像）；私有 GHCR/ACR 请在凭据保险库添加「镜像仓库凭据」"
+              />
+              <template #feedback>
+                <span class="field-hint tip-hint">仅在拉取镜像时通过临时隔离 DOCKER_CONFIG 登录目标仓库，不在宿主机落盘保留凭据</span>
+              </template>
+            </NFormItem>
+
+            <div class="auto-deploy-box">
+              <div class="auto-deploy-head">
+                <div class="auto-deploy-title">GitHub Actions / CI 推镜像自动部署</div>
+                <NSwitch v-model:value="form.image_auto_deploy" size="small" />
+              </div>
+              <div class="hint">
+                开启后自动生成 CI Webhook（支持 Bearer Token 与镜像 Tag 更新）。适合由 GitHub Actions 在云端构建镜像推送到 GHCR 后通知低配置主机零编译更新；创建后可在应用详情直接复制工作流 YAML。
+              </div>
+              <NFormItem v-if="form.image_auto_deploy" label="关联源代码仓库 (可选)" style="margin-top: 10px; margin-bottom: 0">
+                <NInput v-model:value="form.ci_repo" placeholder="例如 owner/repo（仅用于回溯与生成工作流模板）" />
+              </NFormItem>
+            </div>
           </template>
 
           <!-- Compose 来源 -->
@@ -1682,176 +1739,223 @@ onMounted(loadData)
             </NFormItem>
           </template>
 
-          <!-- GitHub 授权仓库 -->
-          <template v-if="sourceMode === 'github'">
-            <div v-if="!githubSourceReady" class="github-connect-box">
-              <NSpace align="center" justify="space-between" style="width: 100%">
-                <NSpace align="center">
-                  <NIcon size="28"><LogoGithub /></NIcon>
-                  <div>
-                    <div style="font-weight: 600">未配置 GitHub 接入</div>
-                    <div class="hint">可接入 GitHub 账号（PAT）或 GitHub App，配置后即可直接选仓并自动拉取分支。两种接入统一在「系统设置 → 代码源集成」中管理。</div>
-                  </div>
-                </NSpace>
-                <NButton type="primary" secondary @click="openGitHubSettings">
-                  <template #icon>
-                    <NIcon><LogoGithub /></NIcon>
-                  </template>
-                  前往代码源设置
+          <!-- Git 仓库（GitHub App 授权选仓 + 手动仓库 URL） -->
+          <template v-if="sourceMode === 'git'">
+            <div class="git-mode-bar" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:14px">
+              <NRadioGroup :value="gitInputMode" size="small" @update:value="(v: GitInputMode) => setGitInputMode(v)">
+                <NRadioButton value="app">GitHub App 授权仓库</NRadioButton>
+                <NRadioButton value="manual">手动仓库 URL</NRadioButton>
+              </NRadioGroup>
+              <NSpace align="center" :size="6">
+                <NButton v-if="appConfigured" size="tiny" secondary :loading="syncingRepos" @click="syncAndRefreshAppRepos">
+                  <template #icon><NIcon><RefreshOutline /></NIcon></template>
+                  同步安装
                 </NButton>
+                <NButton v-if="appConfigured" size="tiny" quaternary @click="openGitHubAppInstallPage">
+                  管理授权仓库
+                </NButton>
+                <NButton size="tiny" quaternary @click="openGitHubSettings">代码源设置</NButton>
               </NSpace>
             </div>
 
-            <div v-else class="github-connected-bar">
-              <NSpace align="center" justify="space-between" style="width: 100%">
-                <NSpace align="center">
-                  <template v-if="githubAccount">
-                    <NAvatar :src="githubAccount.avatar_url" round size="small" />
-                    <span style="font-weight: 600">{{ githubAccount.name || githubAccount.login }}</span>
-                    <NTag size="tiny" type="success" :bordered="false">GitHub 账号已授权</NTag>
-                  </template>
-                  <NTag v-if="appConfigured" size="tiny" type="info" :bordered="false">
-                    GitHub App 已配置
-                  </NTag>
-                </NSpace>
-                <NSpace align="center" :size="4">
-                  <NButton size="tiny" secondary @click="refreshRepoLists" :loading="loadingRepos">
-                    <template #icon>
-                      <NIcon><RefreshOutline /></NIcon>
-                    </template>
-                    刷新仓库
-                  </NButton>
-                  <NButton size="tiny" quaternary @click="openGitHubSettings">代码源设置</NButton>
-                </NSpace>
-              </NSpace>
-            </div>
-
-            <template v-if="githubSourceReady">
-              <NFormItem label="接入方式" required>
-                <NRadioGroup v-model:value="githubMethod">
-                  <NSpace>
-                    <NRadioButton v-for="m in githubMethodOptions" :key="m.value" :value="m.value">
-                      {{ m.label }}
-                    </NRadioButton>
+            <!-- GitHub App 授权选仓 -->
+            <template v-if="gitInputMode === 'app'">
+              <div v-if="!appConfigured || (!loadingRepos && appInstalledRepos.length === 0)" class="github-connect-box">
+                <NSpace align="center" justify="space-between" style="width: 100%">
+                  <NSpace align="center">
+                    <NIcon size="28"><LogoGithub /></NIcon>
+                    <div>
+                      <div style="font-weight: 600">
+                        {{ appConfigured ? 'GitHub App 尚未授权任何仓库' : '未配置 GitHub App 接入' }}
+                      </div>
+                      <div class="hint">
+                        {{
+                          appConfigured
+                            ? '请前往 GitHub 安装页面授权目标仓库，完成后点上方「同步安装」；或切换到「手动仓库 URL」。'
+                            : '在「系统设置 → 代码源集成」配置 GitHub App 后，可直接选取私有/公开仓库并启用零配置自动部署；当前也可切换到「手动仓库 URL」。'
+                        }}
+                      </div>
+                    </div>
                   </NSpace>
-                </NRadioGroup>
-              </NFormItem>
-              <div v-if="githubMethod" class="hint tip-hint github-method-hint">
-                {{
-                  githubMethod === 'pat'
-                    ? '读取已授权 GitHub 账号的仓库；未被 App 安装覆盖的仓库推送时走逐仓 Webhook。'
-                    : '读取 GitHub App 安装范围内的仓库；拉码使用短期安装令牌，推送由 App 级事件触发。'
-                }}
-              </div>
-              <div v-else class="hint github-method-hint">先选择本次使用的接入方式，再从中挑选仓库。</div>
-
-              <NFormItem label="选择 GitHub 仓库" required>
-                <NSelect
-                  v-model:value="selectedRepoFullName"
-                  :options="repoOptions"
-                  :loading="loadingRepos"
-                  :disabled="!githubMethod"
-                  :placeholder="githubMethod ? '搜索并选择您的代码仓库' : '请先选择接入方式'"
-                  filterable
-                />
-                <template #feedback>
-                  <span class="field-hint tip-hint">支持私有库与组织仓库；未选择接入方式时不可选</span>
-                </template>
-              </NFormItem>
-              <div v-if="githubMethod && !loadingRepos && repoOptions.length === 0" class="hint github-method-hint">
-                {{
-                  githubMethod === 'pat'
-                    ? '该账号下没有读取到仓库：请到「代码源设置」检查授权后刷新。'
-                    : 'App 尚未同步到任何已安装仓库：请到「代码源设置」安装到账号/组织并同步。'
-                }}
+                  <NSpace>
+                    <NButton size="small" secondary @click="setGitInputMode('manual')">改用手动 URL</NButton>
+                    <NButton type="primary" size="small" @click="appConfigured ? openGitHubAppInstallPage() : openGitHubSettings()">
+                      <template #icon><NIcon><LogoGithub /></NIcon></template>
+                      {{ appConfigured ? '前往授权仓库' : '配置 GitHub App' }}
+                    </NButton>
+                  </NSpace>
+                </NSpace>
               </div>
 
-              <NSpace v-if="selectedRepoFullName">
-                <NFormItem label="应用名称" required style="flex: 1">
-                  <NInput v-model:value="form.name" placeholder="如 my-web-api" />
-                </NFormItem>
-                <NFormItem label="部署分支" required style="flex: 1">
+              <template v-else>
+                <NFormItem v-if="repoAccountOptions.length > 1" label="筛选账号 / 组织">
                   <NSelect
-                    v-model:value="form.branch"
-                    :options="branchOptions"
-                    :loading="loadingBranches"
-                    placeholder="选择分支"
+                    v-model:value="selectedAccountFilter"
+                    :options="repoAccountOptions"
+                    clearable
+                    placeholder="全部账号与组织"
+                  />
+                </NFormItem>
+
+                <NFormItem label="选择 GitHub 仓库" required>
+                  <NSelect
+                    v-model:value="selectedRepoFullName"
+                    :options="repoOptions"
+                    :render-label="renderRepoLabel"
+                    :loading="loadingRepos"
+                    placeholder="搜索仓库名或简介（私有库与组织仓库均可读取）"
                     filterable
                   />
+                  <template #feedback>
+                    <span class="field-hint tip-hint">由 GitHub App 短期安装令牌读取目录与分支，自动填入仓库真实默认分支</span>
+                  </template>
+                </NFormItem>
+
+                <NSpace v-if="selectedRepoFullName">
+                  <NFormItem label="应用名称" required style="flex: 1">
+                    <NInput v-model:value="form.name" placeholder="如 my-web-api" />
+                  </NFormItem>
+                  <NFormItem label="部署分支" required style="flex: 1">
+                    <NSelect
+                      v-model:value="form.branch"
+                      :options="branchOptions"
+                      :loading="loadingBranches"
+                      placeholder="选择或输入分支名"
+                      filterable
+                      tag
+                      @update:value="() => form.repo_url && probeRepo(form.repo_url)"
+                    />
+                  </NFormItem>
+                </NSpace>
+              </template>
+            </template>
+
+            <!-- 手动仓库 URL -->
+            <template v-else>
+              <NFormItem label="应用名称" required>
+                <NInput v-model:value="form.name" placeholder="如 my-web-api" />
+              </NFormItem>
+
+              <NFormItem label="Git 仓库地址" required>
+                <NInput
+                  v-model:value="form.repo_url"
+                  placeholder="https://github.com/yourname/your-repo.git 或 Gitee / GitLab / Gitea HTTPS URL"
+                  @blur="probeRepo(form.repo_url)"
+                  @keyup.enter="probeRepo(form.repo_url)"
+                />
+              </NFormItem>
+
+              <NSpace>
+                <NFormItem label="监听分支" required style="flex: 1">
+                  <NInput v-model:value="form.branch" placeholder="main" @blur="() => form.repo_url && probeRepo(form.repo_url)" />
+                </NFormItem>
+                <NFormItem label="Git 访问凭据" style="flex: 1">
+                  <NSelect
+                    v-model:value="form.auth_vault_id"
+                    :options="gitVaultOptions"
+                    clearable
+                    filterable
+                    placeholder="不使用凭据（公开仓库）"
+                    @update:value="() => form.repo_url && probeRepo(form.repo_url)"
+                  />
+                  <template #feedback>
+                    <span class="field-hint tip-hint">私有库请从凭据保险库选择「Git 访问令牌」</span>
+                  </template>
                 </NFormItem>
               </NSpace>
             </template>
+
+            <!-- 构建交付方式：本地构建 vs GitHub Actions 远程推镜像 -->
+            <NFormItem label="构建交付方式" style="margin-top: 4px">
+              <NRadioGroup v-model:value="gitDeliveryMode">
+                <NSpace vertical :size="6">
+                  <NRadio value="local">当前主机本地构建（拉取代码后在本机 docker build / compose）</NRadio>
+                  <NRadio value="ci">GitHub Actions 远程构建推镜像（推荐小内存主机：云端编译推 GHCR，主机只 pull 运行）</NRadio>
+                </NSpace>
+              </NRadioGroup>
+            </NFormItem>
+
+            <!-- GitHub Actions 远程构建交付字段 -->
+            <template v-if="gitDeliveryMode === 'ci'">
+              <NFormItem label="产物镜像地址" required>
+                <NSpace vertical style="width: 100%" :size="6">
+                  <NInput
+                    v-model:value="form.image"
+                    placeholder="ghcr.io/owner/repo:latest"
+                    @blur="probeImage"
+                    @keyup.enter="probeImage"
+                  />
+                  <div v-if="imageProbe.loading" class="probe-bar loading">正在检查目标镜像是否已存在配置…</div>
+                  <div v-else-if="imageProbe.data" class="probe-bar ok">
+                    <span class="probe-text">已识别镜像配置：{{ imageProbeSummary }}</span>
+                    <NButton size="tiny" secondary type="primary" @click="applyImageProbe">按镜像配置填入</NButton>
+                  </div>
+                </NSpace>
+                <template #feedback>
+                  <span class="field-hint tip-hint">应用将以镜像方式创建；部署与 CI Webhook 只更新同仓库下的 Tag，并在创建完成后提供一键复制的 GitHub Actions 工作流 YAML</span>
+                </template>
+              </NFormItem>
+
+              <NFormItem label="镜像仓库凭据（私有 GHCR / 私有镜像必填）">
+                <NSelect
+                  v-model:value="form.registry_vault_id"
+                  :options="registryVaultOptions"
+                  clearable
+                  filterable
+                  placeholder="不使用凭据（公开镜像 Package）"
+                />
+              </NFormItem>
+
+              <div class="auto-deploy-box">
+                <div class="auto-deploy-head">
+                  <div class="auto-deploy-title">开启 CI Webhook 自动滚更</div>
+                  <NSwitch v-model:value="form.image_auto_deploy" size="small" />
+                </div>
+                <div class="hint">
+                  开启后创建时自动生成 CI Webhook Token；Actions 推送完新镜像后调用 Webhook 即可零编译完成滚动替换。
+                </div>
+              </div>
+            </template>
+
+            <!-- 本地构建：仓库客观探测结果 + 自动部署 -->
+            <template v-else>
+              <div v-if="repoProbe.loading" class="probe-bar loading" style="margin-bottom: 14px">正在读取仓库的部署配置（Dockerfile / Compose / .env）…</div>
+              <div v-else-if="repoProbe.data" class="probe-bar ok" style="margin-bottom: 14px">
+                <NTag size="tiny" type="success" :bordered="false">已客观读取</NTag>
+                <span class="probe-text">分支 {{ repoProbe.data.branch }}</span>
+                <template v-for="t in repoProbeTags" :key="t.label">
+                  <NTag size="tiny" type="info" :bordered="false">{{ t.label }}</NTag>
+                  <span v-if="t.text" class="probe-text">{{ t.text }}</span>
+                </template>
+                <span v-if="!buildTypeTouched && (repoProbe.data.has_compose !== repoProbe.data.has_dockerfile)" class="probe-text">
+                  构建方式已按仓库事实自动对齐
+                </span>
+                <NButton size="tiny" secondary @click="form.repo_url && probeRepo(form.repo_url)">重新探测</NButton>
+              </div>
+              <div v-else-if="repoProbe.error" class="probe-bar warn" style="margin-bottom: 14px">
+                <span>{{ repoProbe.error }}（不影响手动填写）</span>
+                <NButton size="tiny" secondary @click="form.repo_url && probeRepo(form.repo_url)">重试</NButton>
+              </div>
+
+              <div class="auto-deploy-box">
+                <div class="auto-deploy-head">
+                  <div class="auto-deploy-title">代码推送自动部署</div>
+                  <NSpace align="center" :size="8">
+                    <NTag v-if="form.auto_deploy && autoDeployRepoReady" size="tiny" type="info" :bordered="false">
+                      {{ autoDeployMechanismLabel }}
+                    </NTag>
+                    <NSwitch v-model:value="form.auto_deploy" size="small" />
+                  </NSpace>
+                </div>
+                <div class="hint">{{ autoDeployHint }}</div>
+                <div v-if="form.auto_deploy" class="watch-paths">
+                  <div class="watch-paths-label">监听目录</div>
+                  <NDynamicInput v-model:value="form.watch_paths" placeholder="仓库相对目录或文件，如 apps/web" :min="0" />
+                  <div class="hint">只监听所填目录或文件下的变更；留空时任意推送都触发部署。</div>
+                </div>
+              </div>
+            </template>
           </template>
-
-          <!-- 通用 Git -->
-          <template v-else-if="sourceMode === 'custom'">
-            <NFormItem label="应用名称" required>
-              <NInput v-model:value="form.name" placeholder="如 my-web-api" />
-            </NFormItem>
-
-            <NFormItem label="Git 仓库地址" required>
-              <NInput
-                v-model:value="form.repo_url"
-                placeholder="https://github.com/yourname/your-repo.git"
-                @blur="probeRepo(form.repo_url)"
-                @keyup.enter="probeRepo(form.repo_url)"
-              />
-            </NFormItem>
-
-            <NFormItem label="监听分支" required>
-              <NInput v-model:value="form.branch" placeholder="main" />
-            </NFormItem>
-
-            <NFormItem label="Git 凭据">
-              <NSelect
-                v-model:value="form.auth_vault_id"
-                :options="vaultOptions"
-                placeholder="选择凭据"
-              />
-              <template #feedback>
-                <span class="field-hint tip-hint">私有仓库需要；从凭据金库选择 Access Token，公开仓库可不选</span>
-              </template>
-            </NFormItem>
-          </template>
-
-          <!-- 仓库客观探测结果徽标（GitHub / 通用 Git 共用，渲染在两段的下方） -->
-          <template v-if="sourceMode === 'github' || sourceMode === 'custom'">
-            <div v-if="repoProbe.loading" class="probe-bar loading">正在读取仓库的部署配置（Dockerfile / Compose / .env）…</div>
-            <div v-else-if="repoProbe.data" class="probe-bar ok">
-              <NTag size="tiny" type="success" :bordered="false">已客观读取</NTag>
-              <span class="probe-text">默认分支 {{ repoProbe.data.branch }}</span>
-              <template v-for="t in repoProbeTags" :key="t.label">
-                <NTag size="tiny" type="info" :bordered="false">{{ t.label }}</NTag>
-                <span v-if="t.text" class="probe-text">{{ t.text }}</span>
-              </template>
-              <span v-if="!buildTypeTouched && (repoProbe.data.has_compose !== repoProbe.data.has_dockerfile)" class="probe-text">
-                构建方式已按仓库事实自动对齐
-              </span>
-            </div>
-            <div v-else-if="repoProbe.error" class="probe-bar warn">
-              {{ repoProbe.error }}（不影响手动填写）
-            </div>
-          </template>
-
-          <!-- 代码推送自动部署：与「代码来源」概念分离——来源决定构建什么，
-               这里只决定何时构建；触发机制按实际接入情况显式标注。 -->
-          <div v-if="sourceMode === 'github' || sourceMode === 'custom'" class="auto-deploy-box">
-            <div class="auto-deploy-head">
-              <div class="auto-deploy-title">代码推送自动部署</div>
-              <NSpace align="center" :size="8">
-                <NTag v-if="form.auto_deploy && autoDeployRepoReady" size="tiny" type="info" :bordered="false">
-                  {{ autoDeployMechanismLabel }}
-                </NTag>
-                <NSwitch v-model:value="form.auto_deploy" size="small" />
-              </NSpace>
-            </div>
-            <div class="hint">{{ autoDeployHint }}</div>
-            <div v-if="form.auto_deploy" class="watch-paths">
-              <div class="watch-paths-label">监听目录</div>
-              <NDynamicInput v-model:value="form.watch_paths" placeholder="仓库相对目录或文件，如 apps/web" :min="0" />
-              <div class="hint">只监听所填目录或文件下的变更；留空时任意推送都触发部署。</div>
-            </div>
-          </div>
 
           <NFormItem label="目标主机" required>
             <NSelect
@@ -1865,8 +1969,8 @@ onMounted(loadData)
             </template>
           </NFormItem>
 
-          <!-- Git 构建配置 -->
-          <template v-if="sourceMode === 'github' || sourceMode === 'custom'">
+          <!-- Git 本地构建配置 -->
+          <template v-if="isGitLocal">
             <NFormItem label="构建部署模式">
               <NRadioGroup v-model:value="form.build_type" @update:value="markBuildTypeTouched">
                 <NSpace>
@@ -1874,6 +1978,23 @@ onMounted(loadData)
                   <NRadio value="compose">Docker Compose 复合微服务栈</NRadio>
                 </NSpace>
               </NRadioGroup>
+            </NFormItem>
+
+            <NFormItem label="项目根目录 (Build Context)">
+              <NInput
+                v-model:value="form.build_context"
+                placeholder=". 或 Monorepo 子目录（如 apps/web）"
+                @blur="() => form.repo_url && probeRepo(form.repo_url)"
+              />
+              <template #feedback>
+                <span class="field-hint tip-hint">
+                  {{
+                    form.build_type === 'compose'
+                      ? 'Monorepo 子目录（如 apps/web）；Compose 命令会在该目录内执行，路径可填相对该目录的 compose.yaml'
+                      : 'docker build 的构建上下文目录；填 . 表示仓库根目录，填写子目录会自动重新探测该目录的 Dockerfile'
+                  }}
+                </span>
+              </template>
             </NFormItem>
 
             <NSpace>
@@ -2041,7 +2162,7 @@ onMounted(loadData)
             :mesh-forward-target-port="form.mesh_forward_target_port"
           />
 
-          <NFormItem v-if="sourceMode === 'image' || sourceMode === 'template'" label="挂载卷">
+          <NFormItem v-if="!isComposeMode" label="挂载卷">
             <NInput
               v-model:value="form.volumes_text"
               type="textarea"

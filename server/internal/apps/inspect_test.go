@@ -10,8 +10,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"watchman/server/internal/gitprovider"
 	"watchman/server/internal/registry"
+	"watchman/server/internal/repoinspect"
 )
 
 func init() { gin.SetMode(gin.TestMode) }
@@ -37,9 +37,9 @@ func TestInspectHandlersRejectViewer(t *testing.T) {
 			called = true
 			return &registry.ImageMetadata{}, nil
 		},
-		repoInspector: func(context.Context, string) (*gitprovider.RepoMetadata, error) {
+		repoInspector: func(context.Context, string, repoinspect.InspectOptions) (*repoinspect.RepoMetadata, error) {
 			called = true
-			return &gitprovider.RepoMetadata{}, nil
+			return &repoinspect.RepoMetadata{}, nil
 		},
 	}
 	probeLimiter = newProbeRateLimiter(30, time.Minute)

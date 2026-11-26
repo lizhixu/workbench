@@ -29,12 +29,13 @@ export interface AppEntity {
   repo_url?: string
   branch?: string
   auth_vault_id?: string
+  registry_vault_id?: string
+  ci_repo?: string
   auto_deploy: boolean
   /** 监听目录：仅 push 触发的自动部署参考；空 = 监听全部目录 */
   watch_paths?: string[]
   webhook_token?: string
-  webhook_auto_managed?: boolean
-  github_hook_id?: number
+  legacy_webhook_notice?: boolean
   webhook_error?: string
   build_type?: string
   dockerfile?: string
@@ -71,7 +72,9 @@ export interface Deployment {
   app_id: string
   commit_hash?: string
   commit_message?: string
-  trigger: 'create' | 'webhook' | 'github-app' | 'manual' | 'rollback' | 'migrate' | 'upgrade'
+  image_ref?: string
+  compose_content?: string
+  trigger: 'create' | 'webhook' | 'github-app' | 'ci' | 'manual' | 'rollback' | 'migrate' | 'upgrade'
   status: 'queued' | 'building' | 'deploying' | 'success' | 'failed' | 'cancelled'
   started_by?: string
   cancelled_by?: string
@@ -92,6 +95,9 @@ export interface AppCreateRequest {
   repo_url?: string
   branch?: string
   auth_vault_id?: string
+  registry_vault_id?: string
+  ci_repo?: string
+  legacy_webhook_notice?: boolean
   auto_deploy?: boolean
   watch_paths?: string[]
   build_type?: 'dockerfile' | 'compose'
@@ -443,10 +449,22 @@ export function getAppStatus(id: string) {
   return unwrap<{ data: AppStatus }>(http.get(`/apps/${id}/status`)).then((r) => r.data)
 }
 
-export function syncAppWebhook(appId: string) {
-  return unwrap<{ ok: boolean; message: string; data: AppEntity }>(
-    http.post(`/apps/${encodeURIComponent(appId)}/webhook/sync`),
-  )
+export interface TriggerEvent {
+  id: string
+  app_id: string
+  source: 'github-app' | 'webhook' | 'ci'
+  delivery_id?: string
+  ref?: string
+  commit?: string
+  actor?: string
+  outcome: 'triggered' | 'skipped' | 'rejected'
+  reason?: string
+  deployment_id?: string
+  created_at: string
+}
+
+export function listAppTriggers(appId: string) {
+  return unwrap<{ data: TriggerEvent[] }>(http.get(`/apps/${appId}/triggers`)).then((r) => r.data)
 }
 
 // ---- Ground-truth metadata probing (read-only, used by the create form's
@@ -501,8 +519,20 @@ export function inspectImage(image: string) {
   ).then((r) => r.data)
 }
 
-export function inspectRepo(repoUrl: string) {
+export function inspectRepo(
+  repoUrl: string,
+  opts?: { branch?: string; build_context?: string; auth_vault_id?: string },
+) {
   return unwrap<{ data: RepoMetadata }>(
-    http.post('/apps/inspect-repo', { repo_url: repoUrl }, { timeout: 30000 }),
+    http.post(
+      '/apps/inspect-repo',
+      {
+        repo_url: repoUrl,
+        branch: opts?.branch || undefined,
+        build_context: opts?.build_context || undefined,
+        auth_vault_id: opts?.auth_vault_id || undefined,
+      },
+      { timeout: 30000 },
+    ),
   ).then((r) => r.data)
 }

@@ -17,13 +17,14 @@ import {
 } from '@vicons/ionicons5'
 import {
   cancelDeployment, deployApp, diagnoseDeployment, getApp, getAppStatus, getDeployment, listDeployments, restartApp,
-  rollbackApp, startApp, stopApp, updateApp, syncAppWebhook, upgradeApp, type AppEntity, type AppStatus, type Deployment,
-  type AIDiagnosis,
+  rollbackApp, startApp, stopApp, updateApp, upgradeApp, listAppTriggers,
+  type AppEntity, type AppStatus, type Deployment, type TriggerEvent, type AIDiagnosis,
   backupAppVolumes, listVolumeBackups, restoreVolumeArchive, deleteVolumeArchive,
   scanVolumeUploads, commitVolumeUploadRestore,
   volumeArchiveDownloadUrl, type VolumeArchive, type DiscoveredVolume,
   type VolumeScanMatch, type VolumeItemArchive,
 } from '../../api/apps'
+import { listCredentials, type Credential } from '../../api/vault'
 import {
   listBackupJobs, createBackupJob, updateBackupJob, deleteBackupJob, runBackupJob,
   listS3Targets, type BackupJob, type CreateJobReq, type S3Target,
@@ -35,7 +36,7 @@ import {
 import { dockerAll, installDocker, listHosts } from '../../api/hosts'
 import { listNetworkNodes } from '../../api/network'
 import {
-  getGitHubAppStatus, switchAppToGitHubApp, type GitHubAppStatus,
+  getGitHubAppStatus, listGitHubAppBranches, type GitHubAppStatus,
 } from '../../api/git'
 import { bothMeshed } from '../../utils/mesh'
 import { fmtDateTime } from '../../utils/time'
@@ -786,15 +787,64 @@ const webhookURL = computed(() => {
   return `${base}/api/v1/apps/webhook/${app.value.webhook_token}`
 })
 
+const bearerWebhookURL = computed(() => `${window.location.origin}/api/v1/apps/webhook/_`)
+
 const sourceTypeLabel = computed(() => {
   switch (app.value?.source_type) {
     case 'git': return 'Git 仓库'
-    case 'image': return '单镜像'
+    case 'image': return app.value?.ci_repo ? '容器镜像 (CI)' : '单镜像'
     case 'template': return '应用模板'
     case 'raw_compose': return 'Compose 编排'
     default: return app.value?.source_type ?? '-'
   }
 })
+
+const vaults = ref<Credential[]>([])
+async function loadVaults() {
+  try {
+    vaults.value = await listCredentials()
+  } catch {
+    vaults.value = []
+  }
+}
+
+const gitVaultOptions = computed(() =>
+  [...vaults.value]
+    .sort((a, b) => (a.type === 'git_token' ? -1 : 0) - (b.type === 'git_token' ? -1 : 0))
+    .map((v) => ({
+      label: v.type === 'git_token' ? `${v.name}（Git 令牌）` : `${v.name} (${v.type})`,
+      value: v.id,
+    })),
+)
+
+const registryVaultOptions = computed(() =>
+  [...vaults.value]
+    .sort((a, b) => (a.type === 'container_registry' ? -1 : 0) - (b.type === 'container_registry' ? -1 : 0))
+    .map((v) => ({
+      label: v.type === 'container_registry' ? `${v.name}（镜像仓库）` : `${v.name} (${v.type})`,
+      value: v.id,
+    })),
+)
+
+const vaultNameMap = computed(() => {
+  const m = new Map<string, string>()
+  for (const v of vaults.value) m.set(v.id, v.name)
+  return m
+})
+
+const triggerEvents = ref<TriggerEvent[]>([])
+const loadingTriggers = ref(false)
+async function loadTriggerEvents() {
+  if (!appId.value) return
+  loadingTriggers.value = true
+  try {
+    triggerEvents.value = (await listAppTriggers(appId.value)) ?? []
+  } catch {
+    triggerEvents.value = []
+  } finally {
+    loadingTriggers.value = false
+  }
+}
 
 const composeEditContent = ref('')
 const savingCompose = ref(false)
@@ -834,35 +884,93 @@ async function saveAndRedeployCompose() {
 }
 
 // ---- 应用配置编辑（概览页签的「编辑配置」弹窗）----
-// PUT /apps/:id 是部分更新：这里只提交用户真正改过的字段，避免覆盖未展示
-// 的配置（Git 凭据、自动部署、组网转发等）。已部署应用改完需重新部署生效，
-// 弹窗内提供「保存并重新部署」。
+// PUT /apps/:id 是部分更新：这里只提交用户真正改过的字段。已部署应用改完需
+// 重新部署生效，弹窗内提供「保存并重新部署」。
 const showEdit = ref(false)
 const savingEdit = ref(false)
+const editBranches = ref<string[]>([])
+const loadingEditBranches = ref(false)
 const editForm = ref({
   name: '',
   image: '',
+  registry_vault_id: null as string | null,
+  ci_repo: '',
+  repo_url: '',
+  branch: '',
+  auth_vault_id: null as string | null,
+  build_type: 'dockerfile' as 'dockerfile' | 'compose',
+  dockerfile: '',
+  build_context: '',
+  build_timeout_sec: 900,
+  auto_deploy: false,
   healthcheck_url: '',
   ports: [] as { host: number | null; container: number | null; bind_scope: 'public' | 'mesh' }[],
   volumes_text: '',
   watch_paths: [] as string[],
 })
 
+const editRepoCovered = computed(() => {
+  const st = githubAppStatus.value
+  if (!st?.configured || !editForm.value.repo_url) return false
+  const norm = normalizeRepoUrl(editForm.value.repo_url)
+  if (!norm) return false
+  return (st.installations || []).some(
+    (inst) => !inst.suspended && (inst.repos || []).some((r) => r.full_name.toLowerCase() === norm),
+  )
+})
+
+const editBranchOptions = computed(() =>
+  editBranches.value.map((b) => ({ label: b, value: b })),
+)
+
+let editBranchSeq = 0
+async function refreshEditBranches(repoUrl: string) {
+  const norm = normalizeRepoUrl(repoUrl)
+  editBranches.value = []
+  if (!norm || !editRepoCovered.value) return
+  const [owner, repo] = norm.split('/')
+  if (!owner || !repo) return
+  const seq = ++editBranchSeq
+  loadingEditBranches.value = true
+  try {
+    const names = await listGitHubAppBranches(owner, repo)
+    if (seq === editBranchSeq) editBranches.value = names
+  } catch {
+    if (seq === editBranchSeq) editBranches.value = []
+  } finally {
+    if (seq === editBranchSeq) loadingEditBranches.value = false
+  }
+}
+
 function openEdit() {
   if (!app.value) return
+  const cur = app.value
   editForm.value = {
-    name: app.value.name,
-    image: app.value.image ?? '',
-    healthcheck_url: app.value.healthcheck_url ?? '',
-    ports: (app.value.ports ?? []).map((p) => ({
+    name: cur.name,
+    image: cur.image ?? '',
+    registry_vault_id: cur.registry_vault_id || null,
+    ci_repo: cur.ci_repo ?? '',
+    repo_url: cur.repo_url ?? '',
+    branch: cur.branch ?? 'main',
+    auth_vault_id: cur.auth_vault_id || null,
+    build_type: cur.build_type === 'compose' ? 'compose' : 'dockerfile',
+    dockerfile: cur.dockerfile ?? (cur.build_type === 'compose' ? 'compose.yaml' : 'Dockerfile'),
+    build_context: cur.build_context ?? '',
+    build_timeout_sec: cur.build_timeout_sec || 900,
+    auto_deploy: !!cur.auto_deploy,
+    healthcheck_url: cur.healthcheck_url ?? '',
+    ports: (cur.ports ?? []).map((p) => ({
       host: p.host,
       container: p.container,
       bind_scope: (p.bind_scope === 'mesh' ? 'mesh' : 'public') as 'public' | 'mesh',
     })),
-    volumes_text: (app.value.volumes ?? []).join('\n'),
-    watch_paths: [...(app.value.watch_paths ?? [])],
+    volumes_text: (cur.volumes ?? []).join('\n'),
+    watch_paths: [...(cur.watch_paths ?? [])],
   }
   showEdit.value = true
+  if (cur.source_type === 'git' && cur.repo_url) {
+    void refreshEditBranches(cur.repo_url)
+  }
 }
 
 const editIsDeployed = computed(() => {
@@ -870,52 +978,89 @@ const editIsDeployed = computed(() => {
   return !!app.value.current_commit || app.value.source_type === 'raw_compose' || !!status.value?.state && status.value.state !== 'undeployed'
 })
 
-// 只发送真正改动过的字段（部分更新语义）。
+// 只发送真正改动过的字段（部分更新语义；null 清空字段发送 ""）。
 function buildEditPatch() {
   const cur = app.value
   if (!cur) return {}
   const patch: Record<string, unknown> = {}
   const name = editForm.value.name.trim()
   if (name && name !== cur.name) patch.name = name
-  if (cur.source_type === 'image') {
-    const image = editForm.value.image.trim()
-    if (image && image !== (cur.image ?? '')) patch.image = image
+  if (cur.source_type === 'image' || cur.source_type === 'raw_compose') {
+    if (cur.source_type === 'image') {
+      const image = editForm.value.image.trim()
+      if (image && image !== (cur.image ?? '')) patch.image = image
+    }
+    const regVault = editForm.value.registry_vault_id ?? ''
+    if (regVault !== (cur.registry_vault_id ?? '')) patch.registry_vault_id = regVault
+    const ciRepo = editForm.value.ci_repo.trim()
+    if (ciRepo !== (cur.ci_repo ?? '')) patch.ci_repo = ciRepo
+    if (editForm.value.auto_deploy !== !!cur.auto_deploy) patch.auto_deploy = editForm.value.auto_deploy
   }
-  const health = editForm.value.healthcheck_url.trim()
-  if (health !== (cur.healthcheck_url ?? '')) patch.healthcheck_url = health
-  const ports = editForm.value.ports
-    .filter((p) => (p.host ?? 0) > 0 && (p.container ?? 0) > 0)
-    .map((p) => ({ host: Number(p.host), container: Number(p.container), bind_scope: p.bind_scope }))
-  const curPorts = (cur.ports ?? []).map((p) => ({
-    host: p.host,
-    container: p.container,
-    bind_scope: p.bind_scope === 'mesh' ? 'mesh' : 'public',
-  }))
-  if (JSON.stringify(ports) !== JSON.stringify(curPorts)) patch.ports = ports
-  const volumes = editForm.value.volumes_text
-    .split('\n')
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0)
-  if (JSON.stringify(volumes) !== JSON.stringify(cur.volumes ?? [])) patch.volumes = volumes
-  if (cur.source_type === 'git' && cur.auto_deploy) {
+  if (cur.source_type === 'git') {
+    const repoUrl = editForm.value.repo_url.trim()
+    if (repoUrl !== (cur.repo_url ?? '')) patch.repo_url = repoUrl
+    const branch = editForm.value.branch.trim()
+    if (branch !== (cur.branch ?? '')) patch.branch = branch
+    const authVault = editForm.value.auth_vault_id ?? ''
+    if (authVault !== (cur.auth_vault_id ?? '')) patch.auth_vault_id = authVault
+    if (editForm.value.build_type !== (cur.build_type || 'dockerfile')) patch.build_type = editForm.value.build_type
+    const dockerfile = editForm.value.dockerfile.trim()
+    if (dockerfile !== (cur.dockerfile ?? '')) patch.dockerfile = dockerfile
+    const buildContext = editForm.value.build_context.trim()
+    if (buildContext !== (cur.build_context ?? '')) patch.build_context = buildContext
+    const timeout = Number(editForm.value.build_timeout_sec) || 900
+    if (timeout !== (cur.build_timeout_sec || 900)) patch.build_timeout_sec = timeout
+    if (editForm.value.auto_deploy !== !!cur.auto_deploy) patch.auto_deploy = editForm.value.auto_deploy
     const watchPaths = editForm.value.watch_paths.map((p) => p.trim()).filter((p) => p.length > 0)
     if (JSON.stringify(watchPaths) !== JSON.stringify(cur.watch_paths ?? [])) patch.watch_paths = watchPaths
+  }
+  const isComposeEdit =
+    cur.source_type === 'raw_compose' || (cur.source_type === 'git' && editForm.value.build_type === 'compose')
+  if (!isComposeEdit) {
+    const health = editForm.value.healthcheck_url.trim()
+    if (health !== (cur.healthcheck_url ?? '')) patch.healthcheck_url = health
+    const ports = editForm.value.ports
+      .filter((p) => (p.host ?? 0) > 0 && (p.container ?? 0) > 0)
+      .map((p) => ({ host: Number(p.host), container: Number(p.container), bind_scope: p.bind_scope }))
+    const curPorts = (cur.ports ?? []).map((p) => ({
+      host: p.host,
+      container: p.container,
+      bind_scope: p.bind_scope === 'mesh' ? 'mesh' : 'public',
+    }))
+    if (JSON.stringify(ports) !== JSON.stringify(curPorts)) patch.ports = ports
+    const volumes = editForm.value.volumes_text
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0)
+    if (JSON.stringify(volumes) !== JSON.stringify(cur.volumes ?? [])) patch.volumes = volumes
   }
   return patch
 }
 
 async function saveEdit(redeploy: boolean) {
+  if (app.value?.source_type === 'git' && !editForm.value.repo_url.trim()) {
+    message.warning('Git 仓库地址不能为空')
+    return
+  }
+  if (app.value?.source_type === 'image' && !editForm.value.image.trim()) {
+    message.warning('镜像地址不能为空')
+    return
+  }
+  const isComposeEdit =
+    app.value?.source_type === 'raw_compose' || (app.value?.source_type === 'git' && editForm.value.build_type === 'compose')
+  if (!isComposeEdit) {
+    // 端口行填写不完整（只填了 host 或 container）时提示，避免静默丢弃或被无改动短路。
+    const incomplete = editForm.value.ports.some((p) => ((p.host ?? 0) > 0) !== ((p.container ?? 0) > 0))
+    if (incomplete) {
+      message.warning('端口映射需同时填写宿主机端口与容器端口')
+      return
+    }
+  }
   const patch = buildEditPatch()
   if (Object.keys(patch).length === 0) {
     if (redeploy) await doDeploy()
     else message.info('没有改动需要保存')
     showEdit.value = false
-    return
-  }
-  // 端口行填写不完整（只填了 host 或 container）时提示，避免静默丢弃。
-  const incomplete = editForm.value.ports.some((p) => ((p.host ?? 0) > 0) !== ((p.container ?? 0) > 0))
-  if (incomplete) {
-    message.warning('端口映射需同时填写宿主机端口与容器端口')
     return
   }
   savingEdit.value = true
@@ -1030,7 +1175,10 @@ async function loadDeployments(silent = false) {
 }
 
 async function refreshAll() {
-  await Promise.all([loadApp(), loadStatus(), loadDeployments(), loadVolumeBackups(), loadS3Targets(), loadAppBackupJobs(), refreshNewestDeployment()])
+  await Promise.all([
+    loadApp(), loadStatus(), loadDeployments(), loadTriggerEvents(), loadVaults(),
+    loadVolumeBackups(), loadS3Targets(), loadAppBackupJobs(), refreshNewestDeployment(),
+  ])
 }
 
 // 换页与改每页条数都显式重新请求：改条数会把页码重置为 1，若只靠
@@ -1283,7 +1431,8 @@ async function doRollback(dep?: Deployment) {
   acting.value = true
   try {
     await rollbackApp(appId.value, dep?.id)
-    message.success(dep ? `正在回滚到 ${dep.commit_hash}` : '正在回滚到上一版本')
+    const verLabel = dep?.commit_hash || dep?.image_ref || ''
+    message.success(dep ? (verLabel ? `正在回滚到 ${verLabel}` : '正在恢复历史版本') : '正在回滚到上一版本')
     await Promise.all([loadStatus(), loadDeployments()])
   } catch (e: any) {
     message.error(e.message || '回滚失败')
@@ -2459,24 +2608,104 @@ async function copyWebhook() {
   ok ? message.success('已复制 Webhook 地址') : message.warning('复制失败，请手动复制')
 }
 
-const syncingWebhook = ref(false)
-async function doSyncWebhook() {
+async function copyBearerWebhook() {
+  const ok = await copyToClipboard(bearerWebhookURL.value)
+  ok ? message.success('已复制 CI Webhook 地址') : message.warning('复制失败，请手动复制')
+}
+
+async function copyWebhookToken() {
+  if (!app.value?.webhook_token) return
+  const ok = await copyToClipboard(app.value.webhook_token)
+  ok ? message.success('已复制 Webhook Token') : message.warning('复制失败，请手动复制')
+}
+
+const dismissingLegacy = ref(false)
+async function dismissLegacyNotice() {
   if (!app.value?.id) return
-  syncingWebhook.value = true
+  dismissingLegacy.value = true
   try {
-    const res = await syncAppWebhook(app.value.id)
-    message.success(res.message || '已成功通过 GitHub API 配置 Webhook')
-    app.value = res.data
+    await updateApp(app.value.id, { legacy_webhook_notice: false })
+    if (app.value) app.value.legacy_webhook_notice = false
   } catch (e: any) {
-    message.error(e.message || '同步失败')
+    message.error(e?.message || '关闭提示失败')
   } finally {
-    syncingWebhook.value = false
+    dismissingLegacy.value = false
   }
 }
 
+const showWorkflowModal = ref(false)
+const actionsImageInfo = computed(() => {
+  let rawImg = (app.value?.image || '').trim()
+  if (!rawImg && app.value?.compose_content) {
+    const m = app.value.compose_content.match(/^\s*image:\s*['"]?([^\s'"#]+)/m)
+    if (m) rawImg = m[1]
+  }
+  if (!rawImg) rawImg = 'ghcr.io/owner/app:latest'
+  const lastSlash = rawImg.lastIndexOf('/')
+  const lastColon = rawImg.lastIndexOf(':')
+  const imgRepo = lastColon > lastSlash ? rawImg.slice(0, lastColon) : rawImg
+  const firstSlash = imgRepo.indexOf('/')
+  const firstSeg = firstSlash >= 0 ? imgRepo.slice(0, firstSlash) : ''
+  const registry = (firstSeg.includes('.') || firstSeg.includes(':') || firstSeg === 'localhost')
+    ? firstSeg
+    : 'docker.io'
+  return { imgRepo, registry, isGHCR: registry === 'ghcr.io' }
+})
+const actionsWorkflowYAML = computed(() => {
+  const { imgRepo, registry, isGHCR } = actionsImageInfo.value
+  const permissionsBlock = isGHCR
+    ? `permissions:
+  contents: read
+  packages: write`
+    : `permissions:
+  contents: read`
+  const loginBlock = isGHCR
+    ? `      - uses: docker/login-action@v3
+        with:
+          registry: ${registry}
+          username: \${{ github.actor }}
+          password: \${{ secrets.GITHUB_TOKEN }}`
+    : `      - uses: docker/login-action@v3
+        with:
+          registry: ${registry}
+          username: \${{ secrets.REGISTRY_USERNAME }}
+          password: \${{ secrets.REGISTRY_PASSWORD }}`
+  const webhookBody = app.value?.source_type === 'raw_compose'
+    ? `"{\\"actor\\":\\"\${{ github.actor }}\\"}"`
+    : `"{\\"tag\\":\\"sha-\${{ github.sha }}\\",\\"actor\\":\\"\${{ github.actor }}\\"}"`
+  return `name: Build & Deploy to Watchman
+on:
+  push:
+    branches: [main]
+
+${permissionsBlock}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+${loginBlock}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${imgRepo}:sha-\${{ github.sha }}
+            ${imgRepo}:latest
+
+      - name: Trigger Watchman Deploy
+        run: |
+          curl -fsS -X POST "\${{ secrets.WATCHMAN_WEBHOOK_URL }}" \\
+            -H "Authorization: Bearer \${{ secrets.WATCHMAN_WEBHOOK_TOKEN }}" \\
+            -H "Content-Type: application/json" \\
+            -d ${webhookBody}`
+})
+
 // GitHub App 托管判定：App 已配置，且该应用仓库落在某个未暂停安装的
-// 仓库清单里。仓库地址归一化与后端 NormalizeRepoURL 同款（去 .git 后缀、
-// 小写、https/ssh 两种写法都认）。
+// 仓库清单里。仓库地址归一化与后端 NormalizeRepoURL 同款。
 const githubAppStatus = ref<GitHubAppStatus | null>(null)
 function normalizeRepoUrl(raw: string): string {
   let s = (raw || '').trim().replace(/\/$/, '').replace(/\.git$/, '')
@@ -2491,29 +2720,14 @@ const appManagedByGitHubApp = computed(() => {
   const norm = normalizeRepoUrl(app.value.repo_url)
   if (!norm) return false
   return (st.installations || []).some(
-    (inst) => !inst.suspended && (inst.repos || []).includes(norm),
+    (inst) => !inst.suspended && (inst.repos || []).some((r) => r.full_name.toLowerCase() === norm),
   )
 })
 async function loadGitHubAppStatus() {
   try {
     githubAppStatus.value = await getGitHubAppStatus()
-  } catch (e: any) {
-    // silently fail：GitHub App 未配置时详情页其余内容不受影响
-  }
-}
-const switchingToApp = ref(false)
-async function doSwitchToGitHubApp() {
-  if (!app.value?.id) return
-  switchingToApp.value = true
-  try {
-    const res = await switchAppToGitHubApp(app.value.id)
-    message.success(res.message || '已切换到 GitHub App 触发')
-    app.value = res.data as AppEntity
-    await loadGitHubAppStatus()
-  } catch (e: any) {
-    message.error(e.message || '切换失败')
-  } finally {
-    switchingToApp.value = false
+  } catch {
+    // GitHub App 未配置时详情页其余内容不受影响
   }
 }
 
@@ -2613,18 +2827,28 @@ const depStatusTag = (s: string) => {
 
 const triggerLabel = (t: string) =>
   t === 'create' ? '创建'
-    : t === 'webhook' ? 'Git 推送'
-      : t === 'rollback' ? '回滚'
-        : t === 'migrate' ? '迁移'
-          : t === 'upgrade' ? '升级'
-            : '手动'
+    : t === 'github-app' ? 'GitHub App'
+      : t === 'ci' ? 'CI 触发'
+        : t === 'webhook' ? 'Webhook'
+          : t === 'rollback' ? '回滚'
+            : t === 'migrate' ? '迁移'
+              : t === 'upgrade' ? '升级'
+                : '手动'
+
+function shortImageTag(ref?: string): string {
+  if (!ref) return ''
+  const slash = ref.lastIndexOf('/')
+  const colon = ref.lastIndexOf(':')
+  if (colon > slash) return ref.slice(colon + 1)
+  return ref
+}
 
 const columns = computed<DataTableColumns<Deployment>>(() => [
   { title: '状态', key: 'status', width: 100, render: (r) => depStatusTag(r.status) },
   {
     title: '触发',
     key: 'trigger',
-    width: 104,
+    width: 112,
     render: (r) => h('div', { style: 'line-height: 1.35' }, [
       h('div', null, triggerLabel(r.trigger)),
       r.started_by
@@ -2633,12 +2857,18 @@ const columns = computed<DataTableColumns<Deployment>>(() => [
     ]),
   },
   {
-    title: 'Commit',
+    title: '版本 / Commit',
     key: 'commit_hash',
-    width: 118,
-    render: (r) => r.commit_hash
-      ? h(NTag, { size: 'small', bordered: false, type: 'info', class: 'mono-font' }, { default: () => r.commit_hash })
-      : '—',
+    width: 132,
+    render: (r) => {
+      if (r.commit_hash) {
+        return h(NTag, { size: 'small', bordered: false, type: 'info', class: 'mono-font' }, { default: () => r.commit_hash })
+      }
+      if (r.image_ref) {
+        return h(NTag, { size: 'small', bordered: false, type: 'info', class: 'mono-font', title: r.image_ref }, { default: () => shortImageTag(r.image_ref) })
+      }
+      return '—'
+    },
   },
   {
     title: '提交信息',
@@ -2715,14 +2945,19 @@ const columns = computed<DataTableColumns<Deployment>>(() => [
               ),
             )
           }
-          if (canWrite.value && r.status === 'success' && r.commit_hash) {
+          if (canWrite.value && r.status === 'success' && (r.commit_hash || r.image_ref || r.compose_content)) {
+            const label = r.commit_hash
+              ? `将应用回滚到 Commit ${r.commit_hash}？`
+              : r.image_ref
+                ? `将应用回滚到镜像版本 ${r.image_ref}？`
+                : '将应用恢复到该历史版本的 Compose 编排？'
             btns.push(
               h(
                 NPopconfirm,
                 { onPositiveClick: () => doRollback(r) },
                 {
                   trigger: () => h(NButton, { size: 'tiny', secondary: true, type: 'warning' }, { default: () => '回滚' }),
-                  default: () => `将应用回滚到 Commit ${r.commit_hash}？`,
+                  default: () => label,
                 },
               ),
             )
@@ -2762,6 +2997,7 @@ watch(activeTab, (tab) => {
   // 切到部署历史时补拉一次：页签缓存期间可能有 webhook 或他人触发的部署。
   if (tab === 'deployments') {
     loadDeployments()
+    loadTriggerEvents()
     refreshNewestDeployment()
     if (hasActiveDeployments.value) startDeployPolling()
   } else if (tab === 'volumes') {
@@ -3000,7 +3236,10 @@ onUnmounted(() => {
                 <span class="mono">{{ app.repo_url }}</span>
               </NDescriptionsItem>
               <NDescriptionsItem v-if="app.source_type === 'git'" label="监听分支">
-                <NTag size="small" :bordered="false">{{ app.branch }}</NTag>
+                <NTag size="small" :bordered="false">{{ app.branch || 'main' }}</NTag>
+              </NDescriptionsItem>
+              <NDescriptionsItem v-if="app.source_type === 'git'" label="构建根目录">
+                <span class="mono">{{ app.build_context || '.' }}</span>
               </NDescriptionsItem>
               <NDescriptionsItem v-if="app.source_type === 'git'" label="当前 Commit">
                 <NTag v-if="app.current_commit" size="small" type="info">
@@ -3013,6 +3252,12 @@ onUnmounted(() => {
               </NDescriptionsItem>
               <NDescriptionsItem label="镜像">
                 <span class="mono">{{ app.image || '-' }}</span>
+              </NDescriptionsItem>
+              <NDescriptionsItem v-if="app.source_type === 'image' && app.ci_repo" label="关联 Git 仓库">
+                <span class="mono">{{ app.ci_repo }}</span>
+              </NDescriptionsItem>
+              <NDescriptionsItem v-if="app.source_type === 'image' && app.registry_vault_id" label="镜像仓库凭据">
+                <span>{{ vaultNameMap.get(app.registry_vault_id) || app.registry_vault_id }}</span>
               </NDescriptionsItem>
               <NDescriptionsItem label="组网端口转发">
                 <template v-if="app.mesh_forward_enabled">
@@ -3053,64 +3298,73 @@ onUnmounted(() => {
               </NDescriptionsItem>
             </NDescriptions>
 
-            <NAlert v-if="app.auto_deploy && appManagedByGitHubApp" type="success" style="margin-top: 14px" :show-icon="true">
-              <template #header>自动部署已生效 (GitHub App 托管)</template>
+            <NAlert
+              v-if="app.legacy_webhook_notice"
+              type="warning"
+              style="margin-top: 14px"
+              :show-icon="true"
+            >
+              <template #header>自动部署接入模式已升级</template>
               <div>
-                该仓库在 GitHub App 的安装范围内。每当向 <code>{{ app.branch || 'main' }}</code> 分支推送代码（git push）时，App 级事件将自动触发构建并重新部署，无需为该仓库单独配置 Webhook。
+                系统已统一采用 <b>GitHub App</b> 与 <b>CI 推镜像（Actions）</b> 模式，移除了旧版经典 PAT 与逐仓自动 Webhook 托管。
+                如需继续使用推送自动部署，请在「系统设置 → 代码源集成」安装 GitHub App 覆盖该仓库，或使用下方手工 Webhook 地址。
               </div>
-            </NAlert>
-            <NAlert v-else-if="app.auto_deploy && app.webhook_auto_managed" type="success" style="margin-top: 14px" :show-icon="true">
-              <template #header>自动部署已生效 (GitHub 自动托管)</template>
-              <div>
-                系统已自动通过已连接的 GitHub 账号在仓库中配置了 Webhook。每当向 <code>{{ app.branch || 'main' }}</code> 分支推送代码（git push）时，将自动触发构建并重新部署（无需手动配置 Webhook）。
-              </div>
-              <div style="margin-top: 8px">
-                <NButton size="tiny" :loading="syncingWebhook" @click="doSyncWebhook">
-                  重新同步 Webhook
-                </NButton>
-                <NButton
-                  v-if="githubAppStatus?.configured"
-                  size="tiny"
-                  :loading="switchingToApp"
-                  style="margin-left: 8px"
-                  @click="doSwitchToGitHubApp"
-                >
-                  切换到 GitHub App
+              <div v-if="canWrite" style="margin-top: 8px">
+                <NButton size="tiny" secondary :loading="dismissingLegacy" @click="dismissLegacyNotice">
+                  已知晓，不再提醒
                 </NButton>
               </div>
             </NAlert>
-            <NAlert v-else-if="app.auto_deploy && webhookURL" type="info" style="margin-top: 14px" :show-icon="true">
-              <template #header>自动部署 Webhook（手动模式）</template>
-              <span v-if="app.webhook_error" style="color: var(--n-error-color); margin-bottom: 6px; display: block">
-                自动注册 Webhook 失败（{{ app.webhook_error }}），您可以手动将此地址配置到代码仓库的 Webhooks（push 事件）：
-              </span>
-              <span v-else>
-                将此地址配置到代码仓库的 Webhooks（push 事件）即可实现推送自动构建：
-              </span>
-              <div class="webhook-row">
-                <NCode :code="webhookURL" />
-                <NButton size="tiny" @click="copyWebhook">
-                  <template #icon>
-                    <NIcon><CopyOutline /></NIcon>
-                  </template>
-                  复制
-                </NButton>
-                <NButton v-if="app.repo_url?.includes('github.com')" size="tiny" :loading="syncingWebhook" @click="doSyncWebhook">
-                  重试自动同步
-                </NButton>
-                <NButton
-                  v-if="app.repo_url?.includes('github.com') && githubAppStatus?.configured"
-                  size="tiny"
-                  :loading="switchingToApp"
-                  @click="doSwitchToGitHubApp"
-                >
-                  切换到 GitHub App
-                </NButton>
+
+            <template v-if="app.source_type === 'git'">
+              <NAlert v-if="app.auto_deploy && appManagedByGitHubApp" type="success" style="margin-top: 14px" :show-icon="true">
+                <template #header>自动部署已生效（GitHub App 托管）</template>
+                <div>
+                  该仓库在 GitHub App 的安装范围内。向 <code>{{ app.branch || 'main' }}</code> 分支推送代码时将自动触发构建与滚动部署，无需额外配置 Webhook。
+                </div>
+              </NAlert>
+              <NAlert v-else-if="app.auto_deploy && webhookURL" type="info" style="margin-top: 14px" :show-icon="true">
+                <template #header>自动部署 Webhook（手动配置）</template>
+                <div>
+                  该仓库未覆盖在当前 GitHub App 安装范围内（如自建 Gitea/GitLab 或其他账号）。请将下方地址配置到仓库的 Push Webhook：
+                </div>
+                <div class="webhook-row">
+                  <NCode :code="webhookURL" />
+                  <NButton size="tiny" @click="copyWebhook">
+                    <template #icon>
+                      <NIcon><CopyOutline /></NIcon>
+                    </template>
+                    复制
+                  </NButton>
+                </div>
+              </NAlert>
+              <NAlert v-else type="default" style="margin-top: 14px" :show-icon="false">
+                代码推送自动部署未开启，可在右上角「编辑配置」中随时开启。
+              </NAlert>
+              <div v-if="app.auto_deploy && (app.watch_paths ?? []).length" style="margin-top: 10px; font-size: 13px">
+                仅监听目录变更：<span class="mono">{{ (app.watch_paths ?? []).join('、') }}</span>
               </div>
-            </NAlert>
-            <div v-if="app.auto_deploy && (app.watch_paths ?? []).length" style="margin-top: 10px; font-size: 13px">
-              仅监听目录变更：<span class="mono">{{ (app.watch_paths ?? []).join('、') }}</span>
-            </div>
+            </template>
+
+            <template v-else-if="app.source_type === 'image' || app.source_type === 'raw_compose'">
+              <NAlert v-if="app.auto_deploy && webhookURL" type="info" style="margin-top: 14px" :show-icon="true">
+                <template #header>CI / GitHub Actions 自动触发</template>
+                <div>
+                  支持由 GitHub Actions 在构建并推送新镜像后自动触发主机拉取与滚动替换（可选附带同仓库新 <code>tag</code>）。推荐通过 Bearer Token 请求无密钥路径：
+                </div>
+                <div class="webhook-row" style="margin-top: 8px">
+                  <NCode :code="bearerWebhookURL" />
+                  <NButton size="tiny" @click="copyBearerWebhook">复制地址</NButton>
+                  <NButton size="tiny" @click="copyWebhookToken">复制 Token</NButton>
+                  <NButton size="tiny" type="primary" secondary @click="showWorkflowModal = true">
+                    查看 Actions 工作流模板
+                  </NButton>
+                </div>
+              </NAlert>
+              <NAlert v-else type="default" style="margin-top: 14px" :show-icon="false">
+                CI 自动更新未开启，可在右上角「编辑配置」中开启并获取 GitHub Actions 工作流模板。
+              </NAlert>
+            </template>
           </div>
         </NTabPane>
 
@@ -3690,6 +3944,42 @@ onUnmounted(() => {
                 />
               </div>
             </NCard>
+
+            <NCollapse v-if="triggerEvents.length > 0 || app?.auto_deploy" style="flex-shrink: 0">
+              <NCollapseItem :title="`自动触发与跳过诊断日志 (${triggerEvents.length})`" name="triggers">
+                <template #header-extra>
+                  <NButton size="tiny" secondary :loading="loadingTriggers" @click.stop="loadTriggerEvents">刷新</NButton>
+                </template>
+                <div v-if="triggerEvents.length === 0" class="deploy-hint" style="padding: 8px 0">
+                  暂无推送或 CI Webhook 触发记录（收到 GitHub Push 或 Webhook 请求后自动记录触发/跳过原因）
+                </div>
+                <div v-else class="trigger-list" style="max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px">
+                  <div
+                    v-for="ev in triggerEvents"
+                    :key="ev.id"
+                    style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 10px;border:1px solid var(--border-color);border-radius:6px;font-size:12px"
+                  >
+                    <NSpace align="center" :size="8" style="min-width: 0; flex: 1">
+                      <NTag
+                        size="tiny"
+                        :type="ev.outcome === 'triggered' ? 'success' : ev.outcome === 'rejected' ? 'error' : 'warning'"
+                        :bordered="false"
+                      >
+                        {{ ev.outcome === 'triggered' ? '已触发' : ev.outcome === 'rejected' ? '已拒绝' : '已跳过' }}
+                      </NTag>
+                      <NTag size="tiny" :bordered="false">{{ ev.source }}</NTag>
+                      <span v-if="ev.ref" class="mono">{{ ev.ref }}</span>
+                      <span v-if="ev.commit" class="mono">{{ ev.commit }}</span>
+                      <span style="color: var(--text-secondary)">{{ ev.reason || '-' }}</span>
+                    </NSpace>
+                    <NSpace align="center" :size="8" style="flex-shrink: 0">
+                      <span v-if="ev.actor" class="deploy-hint">{{ ev.actor }}</span>
+                      <span class="deploy-hint mono">{{ fmtDateTime(ev.created_at) }}</span>
+                    </NSpace>
+                  </div>
+                </div>
+              </NCollapseItem>
+            </NCollapse>
           </div>
         </NTabPane>
 
@@ -4305,52 +4595,142 @@ onUnmounted(() => {
       v-model:show="showEdit"
       preset="card"
       title="编辑应用配置"
-      style="width: 640px; max-width: 94vw"
+      style="width: 680px; max-width: 94vw"
     >
-      <NForm label-placement="top" size="small">
-        <NFormItem label="应用名称">
-          <NInput v-model:value="editForm.name" placeholder="应用名称" />
-        </NFormItem>
-        <NFormItem v-if="app?.source_type === 'image'" label="镜像地址">
-          <NInput v-model:value="editForm.image" placeholder="nginx:alpine" />
-        </NFormItem>
-        <NFormItem label="健康检查 URL">
-          <NInput v-model:value="editForm.healthcheck_url" placeholder="http://127.0.0.1:8080/healthz（留空则不检查）" />
-        </NFormItem>
-        <NFormItem label="端口映射">
-          <div style="width: 100%">
-            <div v-for="(p, idx) in editForm.ports" :key="idx" class="port-edit-row">
-              <NInputNumber v-model:value="p.host" placeholder="宿主端口" :min="1" :max="65535" style="width: 130px" />
-              <span class="mono">:</span>
-              <NInputNumber v-model:value="p.container" placeholder="容器端口" :min="1" :max="65535" style="width: 130px" />
+      <div style="max-height: 70vh; overflow-y: auto; padding-right: 4px">
+        <NForm label-placement="top" size="small">
+          <NFormItem label="应用名称">
+            <NInput v-model:value="editForm.name" placeholder="应用名称" />
+          </NFormItem>
+
+          <template v-if="app?.source_type === 'image' || app?.source_type === 'raw_compose'">
+            <NFormItem v-if="app?.source_type === 'image'" label="镜像地址">
+              <NInput v-model:value="editForm.image" placeholder="nginx:alpine / ghcr.io/owner/app:latest" />
+            </NFormItem>
+            <NFormItem label="镜像仓库凭据">
               <NSelect
-                v-model:value="p.bind_scope"
-                :options="[{ label: '公网开放', value: 'public' }, { label: '仅异地组网', value: 'mesh' }]"
-                style="width: 140px"
+                v-model:value="editForm.registry_vault_id"
+                :options="registryVaultOptions"
+                clearable
+                filterable
+                placeholder="不使用凭据（公开镜像）"
               />
-              <NButton size="tiny" quaternary type="error" @click="editForm.ports.splice(idx, 1)">删除</NButton>
-            </div>
-            <NButton size="tiny" @click="editForm.ports.push({ host: null, container: null, bind_scope: 'public' })">
-              添加端口
-            </NButton>
-          </div>
-        </NFormItem>
-        <NFormItem label="挂载卷（每行 host:container）">
-          <NInput
-            v-model:value="editForm.volumes_text"
-            type="textarea"
-            :autosize="{ minRows: 2, maxRows: 5 }"
-            placeholder="/opt/data:/data"
-          />
-        </NFormItem>
-        <NFormItem v-if="app?.source_type === 'git' && app?.auto_deploy" label="监听目录">
-          <NDynamicInput v-model:value="editForm.watch_paths" placeholder="仓库相对目录或文件，如 apps/web" :min="0" />
-          <template #feedback>
-            <span class="field-hint tip-hint">只监听所填目录或文件下的变更；留空时任意推送都触发部署</span>
+            </NFormItem>
+            <NFormItem label="关联 Git 仓库 (ci_repo，可选)">
+              <NInput v-model:value="editForm.ci_repo" placeholder="例如 owner/repo" />
+            </NFormItem>
+            <NFormItem label="开启 CI Webhook 自动触发">
+              <NSpace align="center">
+                <NSwitch v-model:value="editForm.auto_deploy" />
+                <span class="deploy-hint">开启后生成/启用 Webhook Token 供 GitHub Actions 触发滚动替换</span>
+              </NSpace>
+            </NFormItem>
           </template>
-        </NFormItem>
-      </NForm>
-      <NAlert v-if="editIsDeployed" type="warning" :show-icon="false" style="margin-bottom: 12px">
+
+          <template v-if="app?.source_type === 'git'">
+            <NFormItem label="Git 仓库地址">
+              <NInput
+                v-model:value="editForm.repo_url"
+                placeholder="https://github.com/owner/repo.git"
+                @blur="refreshEditBranches(editForm.repo_url)"
+              />
+            </NFormItem>
+            <NSpace>
+              <NFormItem label="监听分支" style="flex: 1">
+                <NSelect
+                  v-if="editRepoCovered && editBranchOptions.length > 0"
+                  v-model:value="editForm.branch"
+                  :options="editBranchOptions"
+                  :loading="loadingEditBranches"
+                  filterable
+                  tag
+                  placeholder="选择或输入分支"
+                />
+                <NInput v-else v-model:value="editForm.branch" placeholder="main" />
+              </NFormItem>
+              <NFormItem label="Git 访问凭据" style="flex: 1">
+                <NSelect
+                  v-model:value="editForm.auth_vault_id"
+                  :options="gitVaultOptions"
+                  clearable
+                  filterable
+                  placeholder="不使用凭据（公开或 GitHub App 覆盖）"
+                />
+              </NFormItem>
+            </NSpace>
+            <NFormItem label="构建部署模式">
+              <NRadioGroup v-model:value="editForm.build_type">
+                <NSpace>
+                  <NRadio value="dockerfile">Dockerfile 单容器</NRadio>
+                  <NRadio value="compose">Docker Compose 编排</NRadio>
+                </NSpace>
+              </NRadioGroup>
+            </NFormItem>
+            <NFormItem label="项目根目录 (Build Context)">
+              <NInput v-model:value="editForm.build_context" placeholder=". 或 apps/web" />
+              <template #feedback>
+                <span class="field-hint tip-hint">留空等同仓库根目录 .；Compose 模式下会在该目录内执行编排</span>
+              </template>
+            </NFormItem>
+            <NSpace>
+              <NFormItem :label="editForm.build_type === 'compose' ? 'Compose 文件路径' : 'Dockerfile 路径'" style="flex: 1">
+                <NInput
+                  v-model:value="editForm.dockerfile"
+                  :placeholder="editForm.build_type === 'compose' ? 'compose.yaml' : 'Dockerfile'"
+                />
+              </NFormItem>
+              <NFormItem label="构建超时（秒）" style="flex: 1">
+                <NInputNumber v-model:value="editForm.build_timeout_sec" :min="60" style="width: 100%" />
+              </NFormItem>
+            </NSpace>
+            <NFormItem label="代码推送自动部署">
+              <NSpace align="center">
+                <NSwitch v-model:value="editForm.auto_deploy" />
+                <span class="deploy-hint">推送目标分支时自动重新构建部署</span>
+              </NSpace>
+            </NFormItem>
+            <NFormItem v-if="editForm.auto_deploy" label="监听目录">
+              <NDynamicInput v-model:value="editForm.watch_paths" placeholder="仓库相对目录或文件，如 apps/web" :min="0" />
+              <template #feedback>
+                <span class="field-hint tip-hint">只监听所填目录或文件下的变更；留空时任意推送都触发部署</span>
+              </template>
+            </NFormItem>
+          </template>
+
+          <template v-if="app?.source_type !== 'raw_compose' && !(app?.source_type === 'git' && editForm.build_type === 'compose')">
+            <NFormItem label="健康检查 URL">
+              <NInput v-model:value="editForm.healthcheck_url" placeholder="http://127.0.0.1:8080/healthz（留空则不检查）" />
+            </NFormItem>
+            <NFormItem label="端口映射">
+              <div style="width: 100%">
+                <div v-for="(p, idx) in editForm.ports" :key="idx" class="port-edit-row">
+                  <NInputNumber v-model:value="p.host" placeholder="宿主端口" :min="1" :max="65535" style="width: 130px" />
+                  <span class="mono">:</span>
+                  <NInputNumber v-model:value="p.container" placeholder="容器端口" :min="1" :max="65535" style="width: 130px" />
+                  <NSelect
+                    v-model:value="p.bind_scope"
+                    :options="[{ label: '公网开放', value: 'public' }, { label: '仅异地组网', value: 'mesh' }]"
+                    style="width: 140px"
+                  />
+                  <NButton size="tiny" quaternary type="error" @click="editForm.ports.splice(idx, 1)">删除</NButton>
+                </div>
+                <NButton size="tiny" @click="editForm.ports.push({ host: null, container: null, bind_scope: 'public' })">
+                  添加端口
+                </NButton>
+              </div>
+            </NFormItem>
+            <NFormItem label="挂载卷（每行 host:container）">
+              <NInput
+                v-model:value="editForm.volumes_text"
+                type="textarea"
+                :autosize="{ minRows: 2, maxRows: 5 }"
+                placeholder="/opt/data:/data"
+              />
+            </NFormItem>
+          </template>
+        </NForm>
+      </div>
+      <NAlert v-if="editIsDeployed" type="warning" :show-icon="false" style="margin: 10px 0 12px">
         配置改动需重新部署后生效；可点「保存并重新部署」一次完成。
       </NAlert>
       <NSpace justify="end">
@@ -4359,6 +4739,45 @@ onUnmounted(() => {
         <NButton type="primary" :loading="savingEdit || deploying" @click="saveEdit(true)">
           保存并重新部署
         </NButton>
+      </NSpace>
+    </NModal>
+
+    <!-- GitHub Actions 工作流模板弹窗 -->
+    <NModal
+      v-model:show="showWorkflowModal"
+      preset="card"
+      title="GitHub Actions 自动构建与部署工作流"
+      style="width: 720px; max-width: 94vw"
+    >
+      <NSpace vertical :size="12">
+        <NAlert type="info" :show-icon="true">
+          在 GitHub 仓库的 <b>Settings → Secrets and variables → Actions</b> 添加以下 Repository secrets<span v-if="!actionsImageInfo.isGHCR">（非 GHCR 镜像源需额外配置 <code>REGISTRY_USERNAME</code> 与 <code>REGISTRY_PASSWORD</code>）</span>，然后将下方 YAML 保存到仓库的 <code>.github/workflows/watchman-deploy.yml</code>。
+        </NAlert>
+        <NDescriptions :column="1" bordered size="small" label-placement="left">
+          <NDescriptionsItem label="WATCHMAN_WEBHOOK_URL">
+            <NSpace align="center" :size="8">
+              <NCode :code="bearerWebhookURL" />
+              <NButton size="tiny" @click="copyBearerWebhook">复制</NButton>
+            </NSpace>
+          </NDescriptionsItem>
+          <NDescriptionsItem label="WATCHMAN_WEBHOOK_TOKEN">
+            <NSpace align="center" :size="8">
+              <NCode :code="app?.webhook_token || ''" />
+              <NButton size="tiny" @click="copyWebhookToken">复制</NButton>
+            </NSpace>
+          </NDescriptionsItem>
+        </NDescriptions>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:13px;font-weight:600">.github/workflows/watchman-deploy.yml</span>
+          <NButton
+            size="tiny"
+            type="primary"
+            @click="copyToClipboard(actionsWorkflowYAML).then(() => message.success('已复制工作流 YAML'))"
+          >
+            复制完整 YAML
+          </NButton>
+        </div>
+        <pre style="margin:0;padding:12px;border-radius:8px;background:var(--cmd-box-bg);color:#dbe4f0;font-family:'JetBrains Mono',Consolas,monospace;font-size:12px;overflow:auto;max-height:360px">{{ actionsWorkflowYAML }}</pre>
       </NSpace>
     </NModal>
 

@@ -335,10 +335,10 @@ web/
 > 原主机级「应用市场」Tab（`/hosts/:id/apps`）已废弃删除，全部部署能力收敛到全局应用中心。
 
 #### 功能点
-- **统一创建入口** (`/apps/create`)：四种部署来源卡片——应用模板（Nginx/Redis/MySQL/雷池 WAF 等，`GET /apps/catalog` 声明式目录，动态渲染参数表单）、单镜像（输入 `repo:tag`）、Compose 编排（在线 YAML）、Git 仓库（GitHub 授权选择或手动 URL，支持 Webhook 自动部署）。
+- **统一创建入口** (`/apps/create`)：四种正交部署来源——应用模板（Nginx/Redis/MySQL/雷池 WAF 等，`GET /apps/catalog` 声明式目录，动态渲染参数表单）、容器镜像（输入 `repo:tag`，支持私有镜像仓库 Vault 凭据与 CI Webhook 自动升级）、Compose 编排（在线 YAML）、Git 源码仓库。选择 Git 来源时默认为纯 GitHub App 选仓模式（展示单个仓库下拉，支持按安装账号/组织筛选、展示私有/语言标识、自动带出真实默认分支与仓库探测；未授权仓库提供行内跳转调整授权与原地同步），并支持切回「手动 Git 地址 + 凭据金库」以接入非 App 覆盖仓库或 GitLab/Gitee/自建 Git（填入已安装 GitHub App 的仓库 URL 自动识别为 App 托管）。Git 表单正式开放 `build_context`（工作子目录/构建上下文）填写；选定 GitHub 仓库后可一键切换为 **「GitHub Actions 远程构建（零编译部署）」**，以镜像部署 + CI Webhook 落库，避免低配主机本地编译 OOM。
 - **端口绑定范围**：每条端口映射可选「公网开放」（绑定 0.0.0.0）或「仅异地组网」（只绑定主机 Tailscale IP，公网不可达），联动展示所选主机的组网 IP。
 - **创建时绑定域名**：填写域名与反代模式（节点本地 / 统一网关），提交依次执行 创建应用 → 自动签发证书（默认 ACME 账户）→ 下发 Nginx 反代并热加载；绑定失败不回滚应用。
-- **应用管理**：应用列表/详情支持部署、回滚、启停、查看构建日志、部署历史、AI 排障诊断；健康检查探活失败自动保留旧版本（`-next`/`-prev` 滚动替换）。
+- **应用管理**：应用列表/详情支持部署、升级、回滚（Git 按 commit、Compose 按编排快照、镜像按历史 `image_ref` 快照）、启停、查看构建日志、部署历史、AI 排障诊断；详情页「编辑配置」弹窗完整支持 Git 源字段（分支——App 范围支持实时下拉、仓库地址、Git Vault 凭据、构建模式/路径、`build_context`、构建超时、`auto_deploy` 开关与 `watch_paths`）与 `image` 源字段（镜像地址、私有镜像 Vault 凭据、关联源仓库、CI 自动触发开关）；概览页精简自动部署状态为清晰的「GitHub App 托管 / 手动或 CI Webhook」，并针对 CI 联动镜像应用提供「查看 GitHub Actions 工作流配置」弹窗（一键复制 `.github/workflows/watchman-deploy.yml`），同时在概览/历史页签展示最近推送与 CI 触发动态（含分支不匹配、`watch_paths` 未命中等跳过理由）；健康检查探活失败自动保留旧版本（`-next`/`-prev` 滚动替换）。
 - **运行日志页签**（详情页「部署历史」之后，`AppRuntimeLogs.vue`）：容器选择器 + 日志查看器。单容器应用直接显示该容器，多容器 Compose 应用按服务切换（容器清单取 `docker ps`，按 `watchman.app` / Compose 项目标签过滤）；控件含行数（100/200/500/1000）、时间范围（全部/1 小时/6 小时/24 小时/7 天）、时间戳开关、搜索实时过滤、仅错误开关；行渲染按时间戳弱化、错误行红、警告行黄区分；自动跟随（向上滚动暂停、回到底部恢复）与每 2 秒自动刷新（失败保留旧内容）；另有复制全部与下载 `.log`；viewer 角色页签内明示无权。
 - **流量拓扑展示**：详情页「域名与反代」页签可视化 `公网用户 → 网关节点 (Nginx/SSL) → Tailscale 内网 → 应用容器`，网关模式下应用主机无需公网 IP。
 
@@ -389,7 +389,7 @@ web/
 
 #### 功能点
 - **通用设置**：进入主机管理时的首选落地页面配置、功能提示语 Toggle、全局暗色/亮色主题。
-- **常用命令库**：增删改查常用运维 Shell 脚本。
+- **代码源集成与凭据金库**：系统设置 → 代码源集成（`GitProviders.vue`）收口为单一 **GitHub App 集成卡片**（Manifest 一键创建、手动配置已有 App、安装列表与同步安装、Webhook 事件地址复制），移除经典 PAT 账号连接卡片。凭据金库（`/vault`，`CredentialList.vue`）新增「Git 访问令牌（`git_token`）」与「镜像仓库凭据（`container_registry`）」语义类型，分别服务私有手动仓库拉取与私有容器镜像拉取。
 - **在线终端与文件配置**：默认登录账号、默认文件打开路径。
 - **AI 适配层设置 (Admin 专享)**：配置 AI Provider (Ollama/vLLM/DeepSeek/GLM/OpenAI)、BaseURL、API Key、降级链 (Fallbacks)、频率限制与数据脱敏开关 (`mask_on_external`)。
 - **模型选择行布局**：`AiConfig.vue` 的模型选择框与「探测模型」按钮使用 `.model-row` 直接 flex 排列（宽度 100%、垂直居中、间距 8px）；`NSelect` 以 `flex: 1; min-width: 0` 占满剩余宽度，按钮保持自然宽度。该行不使用会增加子项包装层的 `NSpace`，避免选择框上的 flex 属性失效；字段说明仍放在 `NFormItem` 的 `#feedback` 插槽内。
@@ -538,7 +538,7 @@ web/
    - `flex-height` 与写死的 `:max-height` 是互斥语义，用了前者严禁再写后者。
    - 横向可滚动的宽表继续保留 `:scroll-x`（如 `:scroll-x="1240"`），两者完全兼容。
 
-4. **分页条固定在表格下方**：使用 `flex-shrink: 0` 钉住，不参与滚动。分页条需固定条高与上下对称内边距（`.table-pagination-bar`），让分页组件在条内垂直居中，避免紧贴卡片底边或导致下拉菜单被边缘裁切。
+4. **分页条固定在表格下方**：使用 `flex-shrink: 0` 钉住，不参与滚动。分页条需固定条高与上下对称内边距（`.table-pagination-bar`），让分页组件在条内垂直居中，避免紧贴卡片底边或导致下拉菜单被边缘裁切。若 `.table-pagination-bar` 嵌在带有 `padding: var(--card-padding)` 的自定义卡片内（如主机列表、组网列表），需通过负外边距抵消卡片左右与底部内边距（`margin: 0 calc(var(--card-padding) * -1) calc(var(--card-padding) * -1); padding: 10px var(--card-padding);`），保证分隔线通栏且分页条在底栏上下边界间严格垂直居中。
 
 #### 2. 分页选型与页码收敛机制
 凡不定长列表**必须分页**，按数据来源与交互场景二选一：

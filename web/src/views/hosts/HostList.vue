@@ -1589,6 +1589,12 @@ onUnmounted(() => {
     padding: var(--card-padding);
     box-shadow: var(--shadow-sm);
 
+    // 抵消卡片左右与底部 padding，让分隔线通栏且分页组件在底栏内严格垂直居中
+    .table-pagination-bar {
+      margin: 0 calc(var(--card-padding) * -1) calc(var(--card-padding) * -1);
+      padding: 10px var(--card-padding);
+    }
+
     .toolbar-bar {
       display: flex;
       align-items: center;

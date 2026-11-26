@@ -63,8 +63,13 @@ const canInstall = computed(() => auth.role === 'admin' || auth.role === 'operat
 
 const loading = ref(false)
 const tab = ref('containers')
+const showStopped = ref(true)
 const containers = ref<any[]>([])
 const images = ref<any[]>([])
+const isContainerRunning = (row: any) => row.Status?.includes('Up') || row.State === 'running'
+const displayedContainers = computed(() =>
+  showStopped.value ? containers.value : containers.value.filter(isContainerRunning),
+)
 
 // usedImageKeys 是全部容器（docker ps -a，含已停止）引用的镜像键：容器
 // Image（仓库:标签）与 ImageID。镜像表「使用状态」列据此判断使用/未使用；
@@ -84,7 +89,7 @@ const dockerNotInstalled = ref(false)
 const managedApps = ref<Map<string, AppEntity>>(new Map())
 
 // 容器与镜像列表都可能很长（AGENTS.md 8.2），各自独立分页。
-const containerCount = computed(() => containers.value.length)
+const containerCount = computed(() => displayedContainers.value.length)
 const imageCount = computed(() => images.value.length)
 const { pagination: containerPagination } = useTablePagination({ pageSize: 20, rowCount: containerCount })
 const { pagination: imagePagination } = useTablePagination({ pageSize: 20, rowCount: imageCount })
@@ -184,9 +189,8 @@ const imageKey = (row: any) => {
 const checkedContainerKeys = ref<string[]>([])
 const checkedImageKeys = ref<string[]>([])
 
-const selectedContainers = computed(() => containers.value.filter((c) => checkedContainerKeys.value.includes(containerKey(c))))
+const selectedContainers = computed(() => displayedContainers.value.filter((c) => checkedContainerKeys.value.includes(containerKey(c))))
 const selectedImages = computed(() => images.value.filter((i) => checkedImageKeys.value.includes(imageKey(i))))
-const isContainerRunning = (row: any) => row.Status?.includes('Up') || row.State === 'running'
 const batchContainerStartable = computed(() => selectedContainers.value.filter((c) => !isContainerRunning(c)))
 const batchContainerStoppable = computed(() => selectedContainers.value.filter((c) => isContainerRunning(c)))
 
@@ -241,7 +245,7 @@ function renderBatchOpNode(state: TabBatchState, key: string, baseNode: any) {
 }
 
 function pruneSelections() {
-  const aliveC = new Set(containers.value.map((c) => containerKey(c)))
+  const aliveC = new Set(displayedContainers.value.map((c) => containerKey(c)))
   checkedContainerKeys.value = checkedContainerKeys.value.filter((k) => aliveC.has(k))
   const aliveI = new Set(images.value.map((i) => imageKey(i)))
   checkedImageKeys.value = checkedImageKeys.value.filter((k) => aliveI.has(k))
@@ -324,7 +328,7 @@ function startOrStopContainers(op: 'start' | 'stop') {
     targets,
     containerKey,
     (c) => dockerOp(hostId, op, containerKey(c)),
-    () => loadAll(true),
+    () => loadContainers(true),
     selectedContainers.value.length - targets.length,
   )
 }
@@ -336,7 +340,7 @@ function retryContainerBatchFailed() {
     Object.entries(st.opStatus).filter(([, s]) => s.phase === 'failed').map(([k]) => k),
   )
   const op = st.kind
-  const targets = containers.value.filter((c) => failedKeys.has(containerKey(c)))
+  const targets = displayedContainers.value.filter((c) => failedKeys.has(containerKey(c)))
   if (targets.length === 0) return
   runBatchPerRow(
     containerBatch,
@@ -344,7 +348,7 @@ function retryContainerBatchFailed() {
     targets,
     containerKey,
     (c) => dockerOp(hostId, op, containerKey(c)),
-    () => loadAll(true),
+    () => loadContainers(true),
   )
 }
 
@@ -381,7 +385,7 @@ async function confirmBatchRm() {
     selectedContainers.value,
     containerKey,
     (c) => dockerOp(hostId, 'rm', containerKey(c)),
-    () => loadAll(true),
+    () => loadContainers(true),
   )
 }
 
@@ -440,7 +444,11 @@ async function loadAll(force = false) {
     try {
       const res = await dockerAll(hostId)
       if (seq !== loadAllSeq) return
-      containers.value = res.containers || []
+      // 若正在显示已停止容器且已拉过全量（ps_all），先保留现有列表等紧随其后的
+      // loadAllContainers 更新，避免刷新时已停止容器短暂闪消失。
+      if (!showStopped.value || !usageLoaded.value) {
+        containers.value = res.containers || []
+      }
       images.value = res.images || []
       dockerNotInstalled.value = false
       allLoaded = true
@@ -531,13 +539,18 @@ function openAppDetail(appID: string) {
 
 async function loadContainers(force = false) {
   await loadAll(force)
+  if (showStopped.value && !dockerNotInstalled.value) {
+    await loadAllContainers(force)
+  }
 }
 
 async function loadImages(force = false) {
-  // 顺序执行 loadAll 与 loadImageUsage，避免浏览器端并发打出 ps + images + ps -a
+  // 顺序执行 loadAll 与 loadAllContainers，避免浏览器端并发打出 ps + images + ps -a
   // 三个子进程，在慢盘或元数据竞争场景下造成内存与磁盘读飙升。
   await loadAll(force)
-  await loadImageUsage()
+  if (!dockerNotInstalled.value) {
+    await loadAllContainers(force)
+  }
 }
 
 async function onDockerTabChange(v: string) {
@@ -549,25 +562,54 @@ async function onDockerTabChange(v: string) {
   // 挂载时 loadAll 已拉取镜像清单，切到镜像页签只需补一次 ps_all 计算使用状态，
   // 既避免已有镜像时「使用状态」一直显示 —，也避免无镜像时重复跑 ps + images。
   if (!usageLoaded.value) {
-    await loadImageUsage()
+    await loadAllContainers()
   }
 }
 
-// loadImageUsage 取全部容器（含已停止）建立「被引用镜像」集合，供镜像表
-// 「使用状态」列判断。取数失败时 usageLoaded 保持 false，该列显示 —。
-async function loadImageUsage() {
-  try {
-    const all = await dockerPsAll(hostId)
-    const keys = new Set<string>()
-    for (const c of all || []) {
-      if (c.Image) keys.add(String(c.Image))
-      if (c.ImageID) keys.add(String(c.ImageID))
-    }
-    usedImageKeys.value = keys
-    usageLoaded.value = true
-  } catch {
-    usageLoaded.value = false
+async function onShowStoppedChange(val: boolean) {
+  pruneSelections()
+  if (val && !usageLoaded.value && !dockerNotInstalled.value) {
+    await loadAllContainers()
   }
+}
+
+// loadAllContainers 通过 ps_all 取全部容器（含已停止），同时供给容器列表的
+// 「显示已停止容器」展示与镜像表的「使用状态」列；取数失败时 usageLoaded 保持 false。
+let psAllInFlight: Promise<void> | null = null
+let psAllSeq = 0
+
+async function loadAllContainers(force = false) {
+  if (psAllInFlight && !force) return psAllInFlight
+  const seq = ++psAllSeq
+  const allSeqSnapshot = loadAllSeq
+  const task = (async () => {
+    try {
+      const all = await dockerPsAll(hostId)
+      if (seq !== psAllSeq) return
+      const keys = new Set<string>()
+      for (const c of all || []) {
+        if (c.Image) keys.add(String(c.Image))
+        if (c.ImageID) keys.add(String(c.ImageID))
+      }
+      usedImageKeys.value = keys
+      usageLoaded.value = true
+      if (!dockerNotInstalled.value && allSeqSnapshot === loadAllSeq) {
+        containers.value = all || []
+        pruneSelections()
+      }
+    } catch {
+      if (seq === psAllSeq) {
+        usageLoaded.value = false
+      }
+    }
+  })()
+  psAllInFlight = task
+  task.finally(() => {
+    if (psAllInFlight === task) {
+      psAllInFlight = null
+    }
+  })
+  return task
 }
 
 // normImageId 去掉 sha256: 前缀：docker ps 与 docker images 给出的 ID
@@ -621,8 +663,8 @@ async function doOp(op: string, container: string) {
     }
     await dockerOp(hostId, op, name)
     message.success(`${op} 成功`)
-    // Reconcile with a background refresh (no await, no loading spinner).
-    loadAll(true)
+    // Reconcile with a background refresh (no await).
+    loadContainers(true)
   } catch (e: any) {
     // Roll back on failure.
     containers.value = prev
@@ -762,7 +804,7 @@ async function runDeepClean() {
       deepCleanResult.value.push(`未使用卷：已回收 ${line || '未知'}`)
     }
     // 清理后刷新容器/镜像列表与预览（可回收量应归零）。
-    await loadAll(true)
+    await loadContainers(true)
     await loadDeepCleanDf()
   } catch (e: any) {
     deepCleanError.value = e.message
@@ -800,7 +842,7 @@ async function startInstallDocker() {
       message.success('Docker 安装完成，正在重新加载...')
       dockerNotInstalled.value = false
       setTimeout(() => {
-        loadAll(true)
+        loadContainers(true)
       }, 2000)
     } else {
       installOutput.value += '\n>>> 执行异常 (Exit code ' + res.exit_code + '):\n' + (res.stderr || res.stdout || '')
@@ -1018,6 +1060,7 @@ const containerColumns = computed(() => [
               size: 'tiny',
               type: 'primary',
               quaternary: true,
+              disabled: !isContainerRunning(row),
               onClick: () => openContainerTerminal(containerKey(row)),
             },
             {
@@ -1027,12 +1070,22 @@ const containerColumns = computed(() => [
           ),
           h(
             NButton,
-            { size: 'tiny', quaternary: true, onClick: () => doOp('start', containerKey(row)) },
+            {
+              size: 'tiny',
+              quaternary: true,
+              disabled: isContainerRunning(row),
+              onClick: () => doOp('start', containerKey(row)),
+            },
             { default: () => '启动' },
           ),
           h(
             NButton,
-            { size: 'tiny', quaternary: true, onClick: () => doOp('stop', containerKey(row)) },
+            {
+              size: 'tiny',
+              quaternary: true,
+              disabled: !isContainerRunning(row),
+              onClick: () => doOp('stop', containerKey(row)),
+            },
             { default: () => '停止' },
           ),
           h(
@@ -1196,14 +1249,19 @@ onMounted(() => {
                       部署新应用
                     </NButton>
                   </NSpace>
-                  <NButton
-                    v-if="dockerNotInstalled && canInstall"
-                    size="small"
-                    type="warning"
-                    @click="showInstallModal = true; startInstallDocker()"
-                  >
-                    一键安装 Docker
-                  </NButton>
+                  <NSpace align="center" :size="10">
+                    <NCheckbox v-model:checked="showStopped" size="small" @update:checked="onShowStoppedChange">
+                      显示已停止容器
+                    </NCheckbox>
+                    <NButton
+                      v-if="dockerNotInstalled && canInstall"
+                      size="small"
+                      type="warning"
+                      @click="showInstallModal = true; startInstallDocker()"
+                    >
+                      一键安装 Docker
+                    </NButton>
+                  </NSpace>
                 </NSpace>
                 <!-- 容器批量操作栏：仅 admin/operator 可见，有勾选时出现，执行期间按钮禁用、状态列逐台显示进度 -->
                 <div v-if="canInstall && checkedContainerKeys.length > 0" class="batch-bar">
@@ -1260,7 +1318,7 @@ onMounted(() => {
                 <NDataTable
                   flex-height
                   :columns="containerColumns"
-                  :data="containers"
+                  :data="displayedContainers"
                   :row-key="(row: any) => containerKey(row)"
                   :checked-row-keys="checkedContainerKeys"
                   :row-class-name="containerRowClassName"

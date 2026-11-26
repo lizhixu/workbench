@@ -9,7 +9,7 @@ import {
 import {
   AddCircleOutline, RefreshOutline, TrashOutline, LockClosedOutline, EyeOutline,
   CreateOutline, KeyOutline, CodeSlashOutline, ServerOutline, ShieldCheckmarkOutline,
-  CopyOutline, SearchOutline,
+  CopyOutline, SearchOutline, GitBranchOutline, CubeOutline,
 } from '@vicons/ionicons5'
 import type { Credential } from '../../api/vault'
 import { listCredentials, createCredential, updateCredential, deleteCredential, getCredential } from '../../api/vault'
@@ -46,6 +46,8 @@ const form = ref({
 const typeOptions = [
   { label: '全部类型', value: '__all__' },
   { label: 'SSH 密码', value: 'ssh_password' },
+  { label: 'Git 访问令牌', value: 'git_token' },
+  { label: '镜像仓库凭据', value: 'container_registry' },
   { label: 'API Key', value: 'api_key' },
   { label: '数据库密码', value: 'database' },
   { label: '自定义', value: 'custom' },
@@ -53,6 +55,8 @@ const typeOptions = [
 
 const formTypeOptions = [
   { label: 'SSH 密码', value: 'ssh_password' },
+  { label: 'Git 访问令牌', value: 'git_token' },
+  { label: '镜像仓库凭据', value: 'container_registry' },
   { label: 'API Key', value: 'api_key' },
   { label: '数据库密码', value: 'database' },
   { label: '自定义', value: 'custom' },
@@ -62,6 +66,10 @@ function typeMeta(t: string): { label: string; tagType: 'default' | 'info' | 'su
   switch (t) {
     case 'ssh_password':
       return { label: 'SSH 密码', tagType: 'info', icon: KeyOutline }
+    case 'git_token':
+      return { label: 'Git 访问令牌', tagType: 'info', icon: GitBranchOutline }
+    case 'container_registry':
+      return { label: '镜像仓库凭据', tagType: 'warning', icon: CubeOutline }
     case 'api_key':
       return { label: 'API Key', tagType: 'warning', icon: CodeSlashOutline }
     case 'database':

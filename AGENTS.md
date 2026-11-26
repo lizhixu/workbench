@@ -91,7 +91,7 @@ Agent 回连控制面的地址，新装机与已纳管共用同一入口；主�
 
 > Docker 面板定位为**运行时观测与运维**（容器/镜像的查看、启停、日志、终端、镜像加速），**不再承担应用部署入口**。所有新建服务一律走 §3.7 应用中心统一部署。
 
-- **容器管理**：容器运行状态、名称、镜像、资源使用、暴露端口、创建时间；支持启停、重启、删除、查看日志；支持批量操作。
+- **容器管理**：容器运行状态、名称、镜像、资源使用、暴露端口、创建时间；默认展示全部容器（含已停止容器，由工具栏「显示已停止容器」开关切换，数据源走 `ps_all` 并复用给镜像使用状态）；支持启停、重启、删除、查看日志；支持批量操作。
 - **纳管状态列**：容器列表识别 `watchman.app=<appID>` 标签：由应用中心部署的容器显示「应用中心纳管」并可跳转对应应用详情；标签指向的应用已删除时显示警告；无标签的外部/临时容器如实标注。
 - **部署新应用**：容器页签工具栏提供「部署新应用」入口，跳转 `/apps/create?host_id=<当前主机>`，预选目标主机后由应用中心完成创建。
 - **镜像加速**：主机详情 Docker「镜像」页签提供「镜像加速」入口，支持查看当前主机的 `registry-mirrors`、快捷选取常用国内加速源（DaoCloud、1ms 等）、手动编辑加速镜像列表，保存后自动平滑更新 `daemon.json` 并重载 Docker 守护进程，无需停机或重启现有容器。
@@ -124,19 +124,29 @@ Agent 回连控制面的地址，新装机与已纳管共用同一入口；主�
 
 - **四种部署来源**（`Application.source_type`）：
   - `template`：内置模板一键部署（Nginx、Redis、MySQL、PostgreSQL、雷池 WAF 等），只填模板参数即可拉起；模板经 `ResolveTemplate` 解析为镜像 + 环境变量 + 默认端口/卷，走与应用中心一致的引擎部署流（持久化、健康检查、滚动替换）。
-  - `image`：直接输入镜像引用（`nginx:alpine`、`registry.example.com/app:1.0`）部署单容器。
-  - `raw_compose`：在线编写 Docker Compose YAML 编排微服务栈。
-  - `git`：链接 Git 仓库（GitHub 授权选择或手动 URL），Dockerfile / Compose 构建，支持推送自动部署（Webhook；GitHub App 路径见下条）。
-- **GitHub App 自动部署（github.com 主推路径，逐仓 Webhook 降级为备选）**：
-  - **一次安装覆盖全部/部分仓库**：面板「系统设置 → 代码源集成」新建 GitHub App（Manifest 两步流：填名称 + 目标（个人/组织）→ 跳 GitHub 创建 → 回调换 code（1 小时内，state 防 CSRF，state 嵌在 redirect_url 的 `github_app_state` 参数里带回——submit URL 的 query GitHub 不保证透传）→ 配置落盘；或手动填已有 App 的 App ID/私钥/Webhook Secret）→ 到 GitHub 安装页选账号/组织与仓库范围 → 面板「同步安装」拉取安装与仓库清单。**名称可留空**：GitHub App 名称在 GitHub 全站唯一，手填常用名极易被占用，留空时服务端生成 `watchman-<8 位小写 hex>`（`DefaultAppName`）并随 manifest 一起提交，响应 `name` 字段回传实际取值、前端回填输入框以便重试；填了名称则原样使用。
-  - **事件入口**：GitHub App webhook（见 API.md「GitHub App」），HMAC-SHA256 验签、恒时比较、`X-GitHub-Delivery` 去重；仅 `refs/heads/` 分支推送触发，tag 推送跳过；push 按 `repository.full_name` 归一化匹配应用，分支匹配 + auto_deploy 门 + 在途 409，复用 `StartDeployment`，`trigger=github-app`；`installation`/`installation_repositories` 事件同步安装状态与仓库清单，卸载则相关应用降级提示；安装事件的仓库清单刷新走异步，upsert 本身同步落盘，持久化失败返回 5xx 供 GitHub 重投）。安全入口开启时该端点仍可达（secentry 豁免）。
-  - **部署取数优先级**：应用 vault 凭据 > installation token（现取现用、内存缓存 1h、过期前 5 分钟刷新；仓库不在安装范围时全量刷新后重试）> 现有 provider token。**刷新合并语义**：部分安装刷新失败时保留其旧缓存（只丢 GitHub 侧已不存在的安装），失败数如实返回调用方；配置变更/断开时清空内存 token 缓存。
-  - **凭据存储**：App ID/私钥/Webhook Secret 存 `github_app.json`（dataDir、0600、tmp+rename 原子写、API 永不回显），**不用 Vault**——Vault 是用户自管凭据的 UI，程序性塞入系统私钥反而会暴露在 Vault 界面；与 `git_provider.json` 同款先例。
-  - **前端**：GitProviders.vue GitHub App 分区（创建/手动/安装/同步/断开、事件地址复制，同步请求超时 60s）；AppDetail 三种自动部署状态（GitHub App 托管 / GitHub 自动托管 / 手动模式）+「切换到 GitHub App」按钮（切换前置条件：App 已配置且仓库在未暂停安装覆盖内，否则 409 并引导先安装/同步；切换时后端删旧逐仓 hook，失败 502 不改库）；AppCreate 仓库选择改为两步：先选接入方式，再选该方式下的仓库——「接入方式」只列出实际已配置的项（`GitHub 账号（PAT）` / `GitHub App`），两种都可用时留空要求先选、只有一种时自动选中，切换方式会清空已选仓库与分支；两套仓库清单各自独立、不做跨来源合并去重（PAT 清单中同时被 App 覆盖的仓库仍标注 `· App 已覆盖`，推送触发与拉码凭据实际 App 优先，App 方式即使仓库也在 PAT 清单里仍走 App 令牌拉分支）；顶部同时展示账号与 App 的连接状态，所选方式下仓库为空时给出对应设置/同步引导；App 来源应用默认 `auto_deploy=true`。**创建页把「代码推送自动部署」与「代码来源」显式分离**：来源（template/image/raw_compose/git）决定构建什么，自动部署独立成块只决定何时构建，按所选仓库实时标注实际触发机制——仓库在（未暂停）App 安装覆盖内 → `GitHub App 托管`（App 级事件触发，不注册逐仓 Webhook）；已连接 GitHub 账号的 github.com 仓库 → `自动注册 Webhook`（创建时经 GitHub API 注册逐仓 Push Webhook）；其余 → `手动 Webhook`（创建后在详情页复制地址）。文案随机制给出对应说明与目标分支，不再对仅有 GitHub App 的用户误称「通过已连接的 GitHub 账号配置 Webhook」。**账号接入统一收口到系统设置**：创建页不再内嵌 GitHub PAT 连接弹窗与断开按钮，「连接 GitHub 账号」「代码源设置」均跳转 `/settings?s=git`——GitProviders 是 PAT 与 GitHub App 的唯一管理入口，避免同一份授权在两处各维护一套 UI；创建页被 KeepAlive 缓存，从设置切回时经 `onActivated` 静默重拉授权状态与仓库清单（首次激活跳过、由 onMounted 负责），断开后清空已失效的 PAT 仓库清单；`SettingsLayout` 监听 `?s=` 深链并回写页签路径，保证点回设置页签仍停在代码源集成。
-  - **两种触发机制不叠加**：创建与更新应用时，若仓库已被（未暂停）GitHub App 安装覆盖（`repoCoveredByGitHubApp`），后端跳过逐仓 Webhook 注册——同一次 push 只会经 App 级事件抵达一次；关闭 `auto_deploy` 时仍照常删除历史逐仓 hook（存量遗留清理）。
-  - **监听目录（Watch paths）**：git 来源应用可配 `watch_paths`（仓库相对目录前缀或精确文件路径，空 = 监听全部）；push 触发时先比对本次推送的变更文件（取自 push 事件 `commits[].added/removed/modified`），无一命中则跳过本次部署、不产生部署记录；GitHub App 事件与逐仓 Webhook 两条路径共用同一套提取与匹配。拿不到文件清单时照常部署：GitLab/Gitee 推送不带文件清单、GitHub 一次 push 超 20 个 commit 会截断 `commits` 数组，此时无法判断、以部署为准并记日志；手动重新部署/升级不受监听目录影响。
-  - **前提与边界**：面板必须有 GitHub 可达的公网地址。Manifest 的 `hook_attributes.url` / `redirect_url` / `url` 与状态接口的 `webhook_url` 统一走面板对外地址解析（见下文「面板对外地址统一解析」小节，唯一配置来源是绑定的 `security.panel_domain`，未绑定则取请求 `scheme://Host`）；地址来自绑定域名时前三者视为显式配置（`public_url_configured=true`）；未绑定域名时地址取自浏览器访问方式（内网 IP/localhost），GitHub 投递不到，创建页弹 warning；反代终结 TLS 时对外 scheme 不再凭请求头推导（见下文「面板对外地址统一解析」）：面板自身未开 SSL 时对外地址为 http，如需 https 须开启面板 SSL、让 :443 实际提供 TLS。内网面板不在本方案范围内。权限最小化：`contents:read` + `metadata:read`，只订阅 push；v1 不含 PR 预览。
-  - **审计**：`app_github_app_switch`（medium）/ `github_app_manifest`（low）/ `github_app_config`（high）/ `github_app_disconnect`（high）/ `github_app_install_sync`（medium）。
+  - `image`：直接输入镜像引用（`nginx:alpine`、`registry.example.com/app:1.0`）部署单容器；同时承载 **GitHub Actions 远程构建联动模式（低配主机零编译部署）**：
+    - `Application` 新增可选字段 `registry_vault_id`（引用 Vault 中的 `Username + Secret` 认证，如 GHCR / Docker Hub / 私有 Registry）与 `ci_repo`（关联源仓库名或地址，用于前端生成 `.github/workflows/watchman-deploy.yml` 模板并识别来源），并开放 `auto_deploy`；
+    - 拉取私有镜像前（`pullImage` / `ensureImagePresent`），若配置了 `registry_vault_id`，Agent 使用一次性临时 `DOCKER_CONFIG` 目录（`mktemp -d` + `docker --config "$TMP" login ... --password-stdin` + `docker --config "$TMP" pull` + `trap` 清理），凭据不写入宿主机全局 `~/.docker/config.json`，且从部署日志中脱敏；
+    - `POST/GET /apps/webhook/:token` 针对 `image` / `raw_compose` 应用免除 Git 分支匹配，支持携带 `Authorization: Bearer <token>` 或 URL token，可接收可选 `{tag?, image?, actor?}` 载荷：显式传 `tag` 时校验合法 tag 字符并在同仓库名下替换为新 tag 落库升级；传完整 `image` 时必须与原镜像仓库名一致（禁止 Webhook 篡改为任意外部镜像源）；均以 `trigger=ci` 触发 `StartCIDeploy` 拉取新镜像并滚动替换（`raw_compose` 支持直接拉新重起或附带镜像替换前校验）；
+    - `Deployment` 新增 `image_ref` 快照字段，每次 `image` / `template` / `git` 成功部署记录实际落地的完整镜像引用，使使用不可变 tag（如 `:${{ github.sha }}`）的镜像应用可直接通过 `StartRollback` 按历史 `ImageRef` 回滚（使用 `:latest` 浮动标签且无差异快照时提示建议在 Workflow 中打 SHA 标签）。
+  - `raw_compose`：在线编写 Docker Compose YAML 编排微服务栈（同样支持 CI/手动 Webhook 触发升级与 `compose_content` 快照回滚）。
+  - `git`：链接 Git 仓库（GitHub App 统一选仓或手动 URL + 凭据金库），支持 Dockerfile / Compose 构建，推送自动部署（GitHub App 级事件或通用 `/apps/webhook/:token`）；新增 Monorepo 与浅克隆部署约定：
+    - **浅克隆与分支/换源适配**：Agent 拉取代码默认采用 `git clone --depth 1 --branch <branch>` 浅克隆；日常更新先校验 `origin` URL 是否匹配（若用户改了 `repo_url` 则清理重克隆），再执行 `git fetch --depth 1 --force origin <branch>:refs/watchman/target` + `checkout --force refs/watchman/target` + `reset --hard refs/watchman/target` + `clean -fd`（允许随时在详情页改切任意分支）。回滚指定历史 commit（`pin != ""`）时若本地浅历史缺少该提交，先尝试 `git fetch --depth 1 origin <pin>`，不支持按 SHA 浅取的远端在 `.git/shallow` 存在时回退 `git fetch --unshallow origin`、非浅仓直接 `git fetch --force origin` 后再检出；
+    - **Monorepo `build_context` 对双模式统一生效**：Dockerfile 模式执行 `docker build -t <tag> -f <dockerfile> <buildContext>`（工作目录为仓库根，`dockerfile` 与 `build_context` 均相对于仓库根目录，禁止 `..` 与绝对路径）；Compose 模式进入 `join(repoDir, buildContext)` 工作目录下执行 `docker compose -f <composeFile> -p watchman-<id> up -d --build --remove-orphans`（`composeFile` 相对所选工作目录或仓库根，使子项目内 `.env`、`build: .` 与相对卷路径正确解析）。
+- **GitHub App 统一部署与代码源收口（彻底替代 PAT 与逐仓 Webhook）**：
+  - **单一 GitHub 集成入口**：下线历史经典 PAT 账号连接（`gitprovider` 包、`/git/*` 接口、`git_provider.json`）与逐仓 Webhook 自动注册（`/apps/:id/webhook/sync`、`/apps/:id/github-app/switch`）；系统设置「代码源集成」（`GitProviders.vue`）只保留 **GitHub App** 配置卡片，其他私有仓库（未被 App 覆盖的 GitHub 仓、GitLab/Gitee/自建 Git）与私有镜像仓库统一走凭据金库（Vault 新增语义类型 `git_token` / `container_registry`）。
+  - **一次安装覆盖全部/部分仓库**：面板「系统设置 → 代码源集成」新建 GitHub App（Manifest 两步流：填名称 + 目标（个人/组织）→ 跳 GitHub 创建 → 回调换 code（1 小时内，state 防 CSRF，state 嵌在 redirect_url 的 `github_app_state` 参数里带回——submit URL 的 query GitHub 不保证透传）→ 配置落盘；或手动填已有 App 的 App ID/私钥/Webhook Secret）→ 到 GitHub 安装页选账号/组织与仓库范围 → 面板「同步安装」拉取安装与完整仓库元数据清单。**名称可留空**：`DefaultAppName` 生成 `watchman-<8 位小写 hex>`，响应回传实际取值、前端回填以便重试；填了名称则原样使用。
+  - **完整仓库元数据（`InstallationRepo`）**：`Installation.Repos` 从裸字符串切片升级为结构化条目（`full_name`、`private`、`description`、`default_branch`、`language`、`pushed_at`），并兼容旧 `github_app.json` 中字符串数组格式的无缝反序列化；`/github-app/installations/repos` 返回带安装账号信息的完整清单并按最近推送时间倒序排列，创建页选仓后自动采纳仓库真实的 `default_branch`。
+  - **事件入口**：GitHub App webhook（见 API.md「GitHub App」），HMAC-SHA256 验签、恒时比较、`X-GitHub-Delivery` 去重；仅 `refs/heads/` 分支推送触发，tag 推送跳过；push 按 `repository.full_name` 归一化匹配应用，分支匹配 + `auto_deploy` 门 + `watch_paths` + 在途校验，复用 `StartDeployment`，`trigger=github-app`；`installation`/`installation_repositories` 事件同步安装状态与仓库清单，卸载则相关应用降级提示；安装事件的仓库清单刷新走异步，upsert 本身同步落盘，持久化失败返回 5xx 供 GitHub 重投）。安全入口开启时该端点仍可达（secentry 豁免）。
+  - **触发与跳过可观测性（`TriggerEvent`）**：应用存储为每台应用维护最近 30 条推送/CI 触发记录（落盘于 `<dataDir>/app_triggers.jsonl`，按应用索引持久化），`github-app` Webhook 与通用 `/apps/webhook/:token` 无论 `triggered`、`skipped`（分支不匹配、未命中 `watch_paths`（附变更路径摘要）、在途部署占用、`auto_deploy` 未开）还是 `rejected` 均记入事件流，经 `GET /apps/:id/triggers` 在详情页直观呈现。
+  - **部署取数优先级（唯一规则）**：应用显式指定的 `auth_vault_id` 凭据 > GitHub App `installation token`（现取现用、内存缓存 1h、过期前 5 分钟刷新；仓库不在安装范围时全量刷新后重试）> 公开匿名拉取。**刷新合并语义**：部分安装刷新失败时保留其旧缓存（只丢 GitHub 侧已不存在的安装），失败数如实返回调用方；配置变更/断开时清空内存 token 缓存。
+  - **统一仓库探测（`POST /apps/inspect-repo` + AI 创建助手）**：探测服务迁移自原 `gitprovider` 至独立 `repoinspect` 模块，令牌按上述唯一优先级链（`Vault > GitHub App Installation Token > 匿名`）获取，支持请求显式指定 `branch` 与 `build_context` 子目录，使仅配置 GitHub App 的用户在创建页与 AI 创建助手中均能探测私有仓库配置。
+  - **凭据存储**：App ID/私钥/Webhook Secret 存 `github_app.json`（dataDir、0600、tmp+rename 原子写、API 永不回显），**不用 Vault**——Vault 是用户自管凭据的 UI，程序性塞入系统私钥反而会暴露在 Vault 界面。
+  - **前端交互**：GitProviders.vue 仅展示 GitHub App 管理卡片（创建/手动/安装/同步/断开/事件地址复制）；AppCreate.vue 统一为 4 个部署来源（应用模板 / 容器镜像 / Compose 编排 / Git 源码仓库），Git 内默认单下拉选仓（支持按安装账号筛选、显示 `[私有]`/简介/语言、行内跳转修改 App 选仓并就地同步），支持切手动 URL（命中 App 范围时自动识别托管）并正式暴露 `build_context` 输入及「GitHub Actions 远程构建」一键切换；AppDetail.vue 开放 Git 与镜像应用全字段编辑（分支实时下拉或输入、仓库地址、Git/Registry Vault 凭据、构建方式/路径、`build_context`、超时、`auto_deploy` 开关与 `watch_paths`）、Actions Workflow 一键复制弹窗与触发事件动态卡片。
+  - **存量数据平滑兼容**：`Application` 加载兼容旧版 `webhook_auto_managed` / `github_hook_id` / `webhook_error` 字段并在新保存时渐进清理；对于曾由 PAT 自动注册过逐仓 Webhook 的历史应用，前端检测若留有旧标记则提示管理员按需到 GitHub 仓库移除旧 Webhook；`git_provider.json` 保留在磁盘但不被控制端读取或写入。
+  - **监听目录（Watch paths）**：git 来源应用可配 `watch_paths`（仓库相对目录前缀或精确文件路径，空 = 监听全部）；push 触发时先比对本次推送的变更文件（取自 push 事件 `commits[].added/removed/modified`），无一命中则跳过本次部署并记录跳过事件（含实际变更路径摘要）；GitHub App 事件与通用 Webhook 两条路径共用同一套提取与匹配。拿不到文件清单时照常部署：GitLab/Gitee 推送不带文件清单、GitHub 一次 push 超 20 个 commit 会截断 `commits` 数组，此时无法判断、以部署为准并记日志；手动重新部署/升级不受监听目录影响。
+  - **前提与边界**：GitHub App 事件投递要求面板有 GitHub 可达的公网地址。Manifest 的 `hook_attributes.url` / `redirect_url` / `url` 与状态接口的 `webhook_url` 统一走面板对外地址解析（见下文「面板对外地址统一解析」小节，唯一配置来源是绑定的 `security.panel_domain`，未绑定则取请求 `scheme://Host`）；地址来自绑定域名时前三者视为显式配置（`public_url_configured=true`）；未绑定域名时地址取自浏览器访问方式（内网 IP/localhost），GitHub 投递不到，创建页与设置页弹 warning；反代终结 TLS 时对外 scheme 不再凭请求头推导（见下文「面板对外地址统一解析」）：面板自身未开 SSL 时对外地址为 http，如需 https 须开启面板 SSL、让 :443 实际提供 TLS。内网面板不在自动推送范围内。权限最小化：`contents:read` + `metadata:read`，只订阅 push；v1 不含 PR 预览。
+  - **审计**：`github_app_manifest`（low）/ `github_app_config`（high）/ `github_app_disconnect`（high）/ `github_app_install_sync`（medium）；已移除 `git_token_set`、`git_account_delete`、`app_webhook_sync`、`app_github_app_switch`。
 - **集成组网端口转发（4 层 TCP 流量中继）**：
   - 组网转发彻底从独立的假应用收敛为**具体业务应用的内置 4 层网络中继能力**（与 7 层 HTTP/HTTPS 域名反代并列）。
   - 用户在部署或维护任意具体应用（模板/镜像/Compose/Git）时，可开启「组网端口转发」，指定**入口主机**（`mesh_forward_host_id`，如带公网 IP 的跳板机/网关节点，不能是应用主机自身）、**入口监听端口**（`mesh_forward_entry_port`，1~65535）与**目标端口**（`mesh_forward_target_port`，缺省预填应用暴露端口）。
@@ -201,7 +211,7 @@ Agent 回连控制面的地址，新装机与已纳管共用同一入口；主�
   - **脱敏**：表单快照送模型前在服务端脱敏（`redactFormForLLM`）：环境变量值、模板密钥参数（`is_secret`）一律掩码为 `***`（只给键名与已填标记），Compose 内容中疑似口令行掩码，`auth_vault_id` 清空；不信任前端脱敏。AI 未启用/未配置时右侧面板明示并可跳转系统设置，手动填表完全不受影响（§3.15.1 降级原则）。两个接口均不改变系统状态，属 AI 诊断类，按 §7 豁免操作审计（与 `ai/nl2command` 同例）。
 - **镜像/仓库真实元数据探测（免拉取，防 AI 臆造端口）**：面对任意镜像引用（如 `ghcr.io/xerxes-2/clewdr`）或 GitHub 仓库，系统在生成草稿/填表前先**客观读取**目标的真实配置，彻底取代凭先验知识猜测：
   - **镜像探测**（`server/internal/registry`，新包，纯标准库无 SDK）：走 Docker Registry V2 / OCI 协议——`GET /v2/<repo>/manifests/<tag>`（Accept 声明 manifest v2/list + OCI manifest/index）→ 401 时按 `Www-Authenticate` 握手匿名 Bearer token（仅 pull scope）→ manifest list 自动选 `linux/amd64`（跳过 attestation 伪条目）→ 跟进 30x 读 config blob（上限 1MB）抽取 `ExposedPorts/EnvVars/Volumes/Cmd/Entrypoint`。**免拉取镜像层**，秒级往返；SSRF 防护拒绝解析为环回/私网地址的 registry；registry 传输不可达时回退 Docker Hub 镜像 `docker.m.daocloud.io` 重试一次。默认单请求超时 12s（ghcr.io 的 config blob 会 302 到 CDN）。
-  - **仓库探测**（`server/internal/gitprovider/inspect.go`）：不 clone，`GET /repos/<o>/<r>` 取默认分支，再按 `docker-compose.yml`/`compose.yaml` → `Dockerfile`/`docker/Dockerfile` → `.env.example` → 语言栈标记的优先级梯队拉取并解析：compose 经 yaml 解析 `services.*.ports/environment`（原文上限 64KB），Dockerfile 行级正则解析 `EXPOSE/ENV/VOLUME/ENTRYPOINT/CMD`；仅支持 github.com（公开仓库匿名、私有仓库用已接入的 provider token），非 GitHub 地址返回明确的「暂不支持探测」而非报错。
+  - **仓库探测**（`server/internal/repoinspect`，配合 `githubapp`）：不 clone，默认经 `Vault > GitHub App 安装令牌 > 公开匿名` 取数，支持指定 `branch`（未指定时查默认分支）与 `build_context` 子目录，按 `docker-compose.yml`/`compose.yaml` → `Dockerfile`/`docker/Dockerfile` → `.env.example` → 语言栈标记的优先级梯队拉取并解析：compose 经 yaml 解析 `services.*.ports/environment`（原文上限 64KB），Dockerfile 行级正则解析 `EXPOSE/ENV/VOLUME/ENTRYPOINT/CMD`；仅支持 github.com（其余 Git 地址返回明确的「暂不支持探测」而非报错）。
   - **AI 管线集成**（`server/internal/ai/app_facts.go`）：智能填充/对话辅助在调用模型**前**，从需求文本与表单快照扫描镜像引用（`registry.LooksLikeImageRef`，排除时间串/URL 等误报）与 `github.com/<o>/<r>` URL 并探测（镜像 6s / 仓库 8s ctx 上限，5 分钟内存缓存容量 64）；命中则把 `【已客观读取的真实配置】`事实区块（含真实端口、变量名、构建方式，密钥类变量值掩码 `***`）置顶注入 prompt 并附「事实优先级最高」规则。`sanitizeAppDraft` 再做**确定性兜底**（`alignDraftWithFacts`）：草稿端口与真实暴露端口不符时自动对齐/补齐并向 `warnings` 追加中文说明；仓库仅检出 Dockerfile 而草稿选了 compose（或反之）时自动纠正 `build_type` 与路径；环境变量与挂载卷同样按事实补齐（镜像/仓库探测值、模板非密钥默认值，密钥类只进 `missing` 不编造），响应附 `sources` 说明每项取自哪次探测；探测失败不改行为、仅在 warnings 提醒核实。模型输出始终只是草稿，创建仍走应用创建的审计链路。
   - **表单手动触发**：创建页「镜像地址」失焦/`Enter` 自动探测并展示紧凑提示条（「已客观读取：端口 8484 · 预置变量 N 项」）+「按真实配置填入」一键带入（仅替换未填的端口占位/空的环境变量与默认健康检查，不覆盖用户已填值；环境变量过滤通用运行时变量与空值，挂载卷按 `/opt/apps/<应用名>/<目录>:/容器路径` 生成，名字先按仓库末段补齐再生成卷路径）；Git 来源仓库失焦探测展示「默认分支 / Dockerfile（EXPOSE x）/ compose / 语言栈」徽章，并在用户未手动改动构建方式时自动对齐 `build_type`、分支与端口预填，Dockerfile 模式另自动带入 Dockerfile `ENV` 与 `VOLUME`（均仅字段为空时），环境变量再与 `.env.example` 合并：Dockerfile `ENV` 优先，示例文件补其余声明键——示例值原样带入、无值以 `KEY=` 形式保留进表单提醒填写（声明了键就是必要的变量，不因无值丢掉整项；提交前用户看得见，不是编造值）；Compose 模式下编排文件本身即权威，不填表单 env/卷；健康检查不自动补——端口给不出该服务是不是 HTTP，静默填 http 探针会让 TCP 服务部署后探针失败。其余表单级自动补充一律只填空值、不猜多选项：在线主机仅一台时预选目标主机、切网关模式且仅一个可选网关时选中它、组网转发目标端口在开启后或端口后填入时跟随首个端口补齐；域名、凭据 Vault、入口主机（多选）不自动猜。探测失败静默降级为提示条文字（「（不影响手动填写）」），不打断手动流程。单请求超时放宽为镜像 20s / 仓库 30s（必须覆盖服务端 15s/20s 的 ctx 预算，短了会把慢响应误报为失败）。接口为只读、无状态，按 §7 豁免操作审计。**角色与限速**：两探测端点改为仅 admin/operator 可用（viewer 调用 403——此前所有登录角色可用，且仓库探测无条件取用管理员存量 GitHub token，可读私有仓库完整 compose 与 env 值），每用户每分钟 30 次限速（超限 429，viewer 被拒不消耗配额）。**registry SSRF 纵深**：拨号层改为解析后校验公网 IP（拒绝环回/私网/链路本地/CGNAT/保留段，混合解析 fail-closed，拨号直连校验过的 IP 以关闭 DNS 重绑定窗口，TLS ServerName 仍取 URL 主机名）；重定向目标与 token realm 主机走同一套校验（ghcr blob 302 到 CDN 只要解析为公网 IP 即放行）；上游非 2xx 错误不再回显响应体（仅状态码）。拒绝清单另补 `0.0.0.0/8`（`0.1.2.3` 类此前可过，Linux 上 0.x 常路由本机）与 `198.18.0.0/15`（RFC 2544 benchmarking 段）。收紧注意：此前可用「解析到内网 IP 的自建 registry 主机名」探测，现会被拨号层拒绝（探测不影响部署本身）。
 - **系统设置面板安全与应用反代职责彻底解耦**：
@@ -528,7 +538,7 @@ workbench/
 │       ├── cert/               # 证书中心（ACME/签发/续期）
 │       ├── commands/           # 常用命令库
 │       ├── githubapp/          # GitHub App 集成
-│       ├── gitprovider/        # Git 仓库探测
+│       ├── repoinspect/        # GitHub 仓库结构探测（App 令牌 / Vault / 匿名）
 │       ├── groups/             # 分组与授权
 │       ├── install/            # Agent 安装脚本与二进制下载
 │       ├── metrics/            # 资源监控时序存储与采集
@@ -1033,7 +1043,7 @@ applications(id, name, host_id, source_type,        # git | image | template | r
              template_id, template_params json,
              repo_url, branch, auth_vault_id, auto_deploy, watch_paths,
              build_type, dockerfile, build_context, build_timeout_sec, compose_content,
-             image,
+             image, registry_vault_id, ci_repo,
              mesh_forward_enabled, mesh_forward_host_id, mesh_forward_entry_port, mesh_forward_target_port, mesh_forward_target, # 4层 TCP 组网端口中继
              env_vars json,
              ports json,                              # [{host, container, bind_scope}]，bind_scope: public|mesh
@@ -1043,8 +1053,9 @@ applications(id, name, host_id, source_type,        # git | image | template | r
              proxy_gateway_host_id,                   # gateway 模式下的网关主机
              proxy_upstream,                          # 127.0.0.1:port 或应用主机 Mesh IP:port
              current_commit, last_deploy_at, created_at)
-deployments(id, app_id, commit_hash, commit_message, trigger, status,
+deployments(id, app_id, commit_hash, commit_message, image_ref, trigger, status,
             started_by, started_at, finished_at, duration_ms, exit_code, error, build_log)
+app_triggers(id, app_id, source, delivery_id, ref, commit, actor, outcome, reason, deployment_id, created_at)
 
 # 动态组网
 network_nodes(host_id, virtual_ip, status, joined_at)

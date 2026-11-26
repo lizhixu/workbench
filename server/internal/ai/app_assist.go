@@ -69,7 +69,7 @@ type AppPortMapping struct {
 // context (draft base / chat context). Secret values inside it are redacted
 // before anything is sent to the model (see redactFormForLLM).
 type AppFormSnapshot struct {
-	SourceMode            string            `json:"source_mode"` // template|image|compose|github|custom
+	SourceMode            string            `json:"source_mode"` // template|image|compose|git (accepts github/custom legacy)
 	Name                  string            `json:"name"`
 	ContainerName         string            `json:"container_name"`
 	HostID                string            `json:"host_id"`
@@ -743,7 +743,7 @@ func sanitizeAppDraft(d *AppDraft, form AppFormSnapshot, hosts []appHostInfo, te
 			effSource = form.SourceMode
 		case "compose":
 			effSource = "raw_compose"
-		case "github", "custom":
+		case "git", "github", "custom":
 			effSource = "git"
 		}
 	}

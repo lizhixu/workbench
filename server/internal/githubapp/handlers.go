@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -92,8 +93,15 @@ func (h *Handlers) status(c *gin.Context) {
 
 func (h *Handlers) installationRepos(c *gin.Context) {
 	type repoRow struct {
-		Account  string `json:"account"`
-		FullName string `json:"full_name"`
+		InstallationID int64     `json:"installation_id"`
+		Account        string    `json:"account"`
+		AccountType    string    `json:"account_type"`
+		FullName       string    `json:"full_name"`
+		Private        bool      `json:"private"`
+		Description    string    `json:"description,omitempty"`
+		DefaultBranch  string    `json:"default_branch"`
+		Language       string    `json:"language,omitempty"`
+		PushedAt       time.Time `json:"pushed_at,omitempty"`
 	}
 	var rows []repoRow
 	for _, inst := range h.store.Installations() {
@@ -101,9 +109,29 @@ func (h *Handlers) installationRepos(c *gin.Context) {
 			continue
 		}
 		for _, r := range inst.Repos {
-			rows = append(rows, repoRow{Account: inst.AccountLogin, FullName: r})
+			branch := r.DefaultBranch
+			if branch == "" {
+				branch = "main"
+			}
+			rows = append(rows, repoRow{
+				InstallationID: inst.ID,
+				Account:        inst.AccountLogin,
+				AccountType:    inst.AccountType,
+				FullName:       r.FullName,
+				Private:        r.Private,
+				Description:    r.Description,
+				DefaultBranch:  branch,
+				Language:       r.Language,
+				PushedAt:       r.PushedAt,
+			})
 		}
 	}
+	sort.Slice(rows, func(i, j int) bool {
+		if !rows[i].PushedAt.Equal(rows[j].PushedAt) {
+			return rows[i].PushedAt.After(rows[j].PushedAt)
+		}
+		return rows[i].FullName < rows[j].FullName
+	})
 	if rows == nil {
 		rows = []repoRow{}
 	}
@@ -367,6 +395,7 @@ func (h *Handlers) webhookPush(c *gin.Context, body []byte) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	ev.DeliveryID = c.GetHeader("X-GitHub-Delivery")
 	// Only branch pushes deploy. Tag pushes (refs/tags/...) must not be
 	// mistaken for a branch of the same name, and other refs are ignored.
 	if !strings.HasPrefix(ev.Ref, "refs/heads/") {

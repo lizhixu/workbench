@@ -32,7 +32,7 @@ type AppImageProbe struct {
 	Err       string
 }
 
-// AppRepoProbe mirrors gitprovider.RepoMetadata. ComposeContent is
+// AppRepoProbe mirrors repoinspect.RepoMetadata. ComposeContent is
 // deliberately not mirrored: the full file is available through the
 // inspect-repo API for the create form, but injecting it into the prompt
 // would blow up token usage and could leak credentials from the repo.
@@ -51,7 +51,7 @@ type AppRepoProbe struct {
 }
 
 // AppProbers are the pluggable ground-truth fetchers, wired in main with
-// adapters over registry.Inspect / gitprovider.Store.InspectRepo. Either
+// adapters over registry.Inspect / repoinspect.Service.InspectRepo. Either
 // field may be nil (capability absent).
 type AppProbers struct {
 	Image func(ctx context.Context, ref string) *AppImageProbe
@@ -328,7 +328,7 @@ func effectiveSourceForAlign(d *AppDraft, form AppFormSnapshot) string {
 		return form.SourceMode
 	case "compose":
 		return "raw_compose"
-	case "github", "custom":
+	case "git", "github", "custom":
 		return "git"
 	}
 	return ""

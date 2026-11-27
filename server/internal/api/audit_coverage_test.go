@@ -77,7 +77,8 @@ func TestDeriveMutationActionCoverage(t *testing.T) {
 		// AI config.
 		{http.MethodPut, "/api/v1/ai/config", "ai_config_update", "system", ""},
 		// Vault family.
-		{http.MethodPost, "/api/v1/vault/credentials", "vault_op", "", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/vault/credentials", "vault_op", "credential", audit.RiskHigh},
+		{http.MethodPost, "/api/v1/vault/credentials/:id/secret", "vault_secret_reveal", "credential", audit.RiskHigh},
 	}
 	for _, tc := range cases {
 		rule, ok := deriveMutationAction(tc.method, tc.pattern)

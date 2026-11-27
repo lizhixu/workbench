@@ -112,6 +112,7 @@ export const actionLabels: Record<string, string> = {
   policy_update: '更新高危命令策略',
   ai_config_update: '更新 AI 模型配置',
   vault_op: '凭证库操作',
+  vault_secret_reveal: '查看凭据密钥明文',
   // 应用中心
   app_create: '创建应用',
   app_update: '更新应用配置',

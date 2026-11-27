@@ -2040,8 +2040,15 @@ func resolveVaultRef(vs *vault.Store, v string) string {
 	if strings.TrimSpace(parts[1]) == "secret" {
 		return cred.Secret
 	}
-	// Fall back to the whole secret for single-field credentials.
-	return cred.Secret
+	switch strings.TrimSpace(parts[1]) {
+	case "username":
+		return cred.Username
+	default:
+		// Unknown field: keep the placeholder so the mistake stays visible in
+		// the container env instead of silently injecting the secret into a
+		// variable the operator did not ask for.
+		return v
+	}
 }
 
 // resolveMeshForwardTarget derives the upstream target (IP:port) on the app host

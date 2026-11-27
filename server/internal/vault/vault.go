@@ -47,7 +47,11 @@ type onDiskEntry struct {
 
 // Store manages encrypted credentials.
 type Store struct {
-	mu       sync.RWMutex
+	mu sync.RWMutex
+	// writeMu serializes persist (snapshot + disk write) so two concurrent
+	// mutators cannot interleave and let an older snapshot overwrite a newer
+	// one on disk.
+	writeMu  sync.Mutex
 	creds    map[string]*Credential
 	filePath string
 	gcm      cipher.AEAD
@@ -127,7 +131,13 @@ func (s *Store) load() error {
 
 // persist writes the encrypted credentials to disk. It takes the read lock
 // itself, so callers must NOT hold s.mu — sync.RWMutex is not reentrant.
+// writeMu serializes the snapshot + disk write across concurrent mutators;
+// without it a slower writer holding an older snapshot could overwrite a
+// newer snapshot on disk (lost update).
 func (s *Store) persist() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	s.mu.RLock()
 	entries := make([]onDiskEntry, 0, len(s.creds))
 	for _, c := range s.creds {
@@ -152,7 +162,40 @@ func (s *Store) persist() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.filePath, data, 0o600)
+	return atomicWriteFile(s.filePath, data, 0o600)
+}
+
+// atomicWriteFile writes data to a temp file in the destination directory,
+// fsyncs and renames it into place so a crash mid-write can never leave a
+// truncated vault.json (which would make the store unreadable on restart).
+// The ".write-" temp prefix matches backup's isTransient filter, so a leftover
+// temp file is skipped when archiving.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".write-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }
 
 // List returns all credentials (without secrets).
@@ -196,18 +239,29 @@ func (s *Store) Create(c *Credential) (*Credential, error) {
 	c.ID = randomID()
 	c.CreatedAt = time.Now()
 	c.UpdatedAt = time.Now()
+	// Store our own copy so a caller mutating its argument cannot change the
+	// in-memory vault behind the store's back.
+	stored := *c
 	s.mu.Lock()
-	s.creds[c.ID] = c
+	s.creds[stored.ID] = &stored
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
+		// Roll back the in-memory insert: disk never got it, so keeping it
+		// would make the store diverge from vault.json until restart.
+		s.mu.Lock()
+		delete(s.creds, stored.ID)
+		s.mu.Unlock()
 		return nil, err
 	}
-	clone := *c
+	clone := stored
 	clone.Secret = ""
 	return &clone, nil
 }
 
-// Update modifies an existing credential.
+// Update modifies an existing credential. Name/Type are overwritten only when
+// non-empty (they are required), and an empty Secret keeps the current key.
+// Username/Host/Description are overwritten even when empty so the console can
+// clear them.
 func (s *Store) Update(id string, c *Credential) error {
 	s.mu.Lock()
 	existing, ok := s.creds[id]
@@ -215,33 +269,38 @@ func (s *Store) Update(id string, c *Credential) error {
 		s.mu.Unlock()
 		return errors.New("credential not found")
 	}
+	old := *existing
 	if c.Name != "" {
 		existing.Name = c.Name
 	}
 	if c.Type != "" {
 		existing.Type = c.Type
 	}
-	if c.Username != "" {
-		existing.Username = c.Username
-	}
+	existing.Username = c.Username
 	if c.Secret != "" {
 		existing.Secret = c.Secret
 	}
-	if c.Host != "" {
-		existing.Host = c.Host
-	}
-	if c.Description != "" {
-		existing.Description = c.Description
-	}
+	existing.Host = c.Host
+	existing.Description = c.Description
 	existing.UpdatedAt = time.Now()
 	s.mu.Unlock()
-	return s.persist()
+	if err := s.persist(); err != nil {
+		// Roll back so memory matches the last good on-disk snapshot.
+		s.mu.Lock()
+		if cur, ok := s.creds[id]; ok {
+			*cur = old
+		}
+		s.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // Delete removes a credential.
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
-	if _, ok := s.creds[id]; !ok {
+	removed, ok := s.creds[id]
+	if !ok {
 		s.mu.Unlock()
 		return errors.New("credential not found")
 	}
@@ -250,7 +309,14 @@ func (s *Store) Delete(id string) error {
 	// persist takes the read lock itself, so it must run after the unlock:
 	// sync.RWMutex is not reentrant and holding the write lock here would
 	// deadlock the store for the rest of the process's life.
-	return s.persist()
+	if err := s.persist(); err != nil {
+		// Disk still has the entry: restore it in memory to stay consistent.
+		s.mu.Lock()
+		s.creds[id] = removed
+		s.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func randomID() string {

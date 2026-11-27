@@ -37,6 +37,14 @@ export function deleteCredential(id: string) {
   return unwrap<{ ok: boolean }>(http.delete(`/vault/credentials/${id}`))
 }
 
+// 明文查看凭据密钥：adminOnly + 高危审计（vault_secret_reveal），与证书私钥 /
+// AI API Key 明文查看同惯例；用 POST 是因为共享审计中间件跳过 GET。
+export function revealCredentialSecret(id: string) {
+  return unwrap<{ data: { id: string; name: string; secret: string } }>(
+    http.post(`/vault/credentials/${id}/secret`),
+  ).then((r) => r.data)
+}
+
 export function upgradeAgent(hostId: string, version: string, sha256?: string) {
   return unwrap<{ ok: boolean; version: string; message: string }>(
     http.post(`/hosts/${hostId}/upgrade`, { version, sha256 }),

@@ -389,7 +389,7 @@ web/
 
 #### 功能点
 - **通用设置**：进入主机管理时的首选落地页面配置、功能提示语 Toggle、全局暗色/亮色主题。
-- **代码源集成与凭据金库**：系统设置 → 代码源集成（`GitProviders.vue`）收口为单一 **GitHub App 集成卡片**（Manifest 一键创建、手动配置已有 App、安装列表与同步安装、Webhook 事件地址复制），移除经典 PAT 账号连接卡片。凭据金库（`/vault`，`CredentialList.vue`）新增「Git 访问令牌（`git_token`）」与「镜像仓库凭据（`container_registry`）」语义类型，分别服务私有手动仓库拉取与私有容器镜像拉取。
+- **代码源集成与凭据金库**：系统设置 → 代码源集成（`GitProviders.vue`）收口为单一 **GitHub App 集成卡片**（Manifest 一键创建、手动配置已有 App、安装列表与同步安装、Webhook 事件地址复制），移除经典 PAT 账号连接卡片。凭据金库（`/vault`，`CredentialList.vue`）新增「Git 访问令牌（`git_token`）」与「镜像仓库凭据（`container_registry`）」语义类型，分别服务私有手动仓库拉取与私有容器镜像拉取；详情弹窗「密钥保护」默认掩码，管理员点「查看密钥」经 `POST /vault/credentials/:id/secret` 按需拉取明文（每次查看记高危审计 `vault_secret_reveal`），明文等宽展示、可复制 / 隐藏，关闭弹窗即清空，常规列表与详情响应仍不回显密钥。
 - **在线终端与文件配置**：默认登录账号、默认文件打开路径。
 - **AI 适配层设置 (Admin 专享)**：配置 AI Provider (Ollama/vLLM/DeepSeek/GLM/OpenAI)、BaseURL、API Key、降级链 (Fallbacks)、频率限制与数据脱敏开关 (`mask_on_external`)。
 - **模型选择行布局**：`AiConfig.vue` 的模型选择框与「探测模型」按钮使用 `.model-row` 直接 flex 排列（宽度 100%、垂直居中、间距 8px）；`NSelect` 以 `flex: 1; min-width: 0` 占满剩余宽度，按钮保持自然宽度。该行不使用会增加子项包装层的 `NSpace`，避免选择框上的 flex 属性失效；字段说明仍放在 `NFormItem` 的 `#feedback` 插槽内。

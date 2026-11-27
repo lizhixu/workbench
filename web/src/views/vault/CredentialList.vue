@@ -12,7 +12,7 @@ import {
   CopyOutline, SearchOutline, GitBranchOutline, CubeOutline,
 } from '@vicons/ionicons5'
 import type { Credential } from '../../api/vault'
-import { listCredentials, createCredential, updateCredential, deleteCredential, getCredential } from '../../api/vault'
+import { listCredentials, createCredential, updateCredential, deleteCredential, getCredential, revealCredentialSecret } from '../../api/vault'
 import { listHosts } from '../../api/hosts'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useTablePagination } from '../../composables/useTablePagination'
@@ -33,6 +33,8 @@ const selectedType = ref<string | null>(null)
 const showCreate = ref(false)
 const showView = ref(false)
 const viewingCred = ref<Credential | null>(null)
+const revealedSecret = ref('')
+const revealingSecret = ref(false)
 const editingId = ref<string | null>(null)
 const form = ref({
   name: '',
@@ -288,10 +290,21 @@ async function refresh(manual = false) {
       listHosts().catch(() => ({ data: [] })),
     ])
     creds.value = cList || []
-    hostOptions.value = (hList.data || []).map((h: any) => ({
-      label: `${h.hostname} (${h.internal_ip || h.public_ip || h.id.slice(0, 8)})`,
-      value: h.hostname || h.id,
-    }))
+    // 关联主机的存储值沿用主机名（历史数据即如此），但主机名可能重复。
+// 重复的 option value 会让 NSelect 渲染出重复条目，故按 value 去重，
+// 保留首个（label 仍带 IP，便于识别同名主机）。
+    const seenHosts = new Set<string>()
+    const hostOpts: { label: string; value: string }[] = []
+    for (const h of (hList.data || []) as any[]) {
+      const value = h.hostname || h.id
+      if (!value || seenHosts.has(value)) continue
+      seenHosts.add(value)
+      hostOpts.push({
+        label: `${h.hostname || h.id.slice(0, 8)} (${h.internal_ip || h.public_ip || h.id.slice(0, 8)})`,
+        value,
+      })
+    }
+    hostOptions.value = hostOpts
     // 刷新清掉上一批的旧进度；批量执行中不清除（runBatchDelete 在执行完才刷新，
     // 此时 batchRunning 仍为 true，进度得以保留到汇总展示）。
     if (!batchRunning.value) {
@@ -353,7 +366,12 @@ function openEdit(c: Credential) {
   showCreate.value = true
 }
 
+let revealSeq = 0
+
 async function viewCred(id: string) {
+  revealSeq++
+  revealedSecret.value = ''
+  revealingSecret.value = false
   try {
     viewingCred.value = await getCredential(id)
     showView.value = true
@@ -361,6 +379,37 @@ async function viewCred(id: string) {
     message.error(e.message || '获取凭据详情失败')
   }
 }
+
+async function revealSecret() {
+  const id = viewingCred.value?.id
+  if (!id) return
+  const seq = ++revealSeq
+  revealingSecret.value = true
+  try {
+    const data = await revealCredentialSecret(id)
+    // 在途时关闭弹窗或切到另一条凭据：丢弃结果，避免明文写进错误上下文。
+    if (seq !== revealSeq || !showView.value || viewingCred.value?.id !== id) return
+    revealedSecret.value = data.secret || ''
+    if (!revealedSecret.value) message.info('该凭据未保存密钥')
+  } catch (e: any) {
+    if (seq !== revealSeq || !showView.value) return
+    message.error(e.message || '查看密钥失败')
+  } finally {
+    if (seq === revealSeq) revealingSecret.value = false
+  }
+}
+
+function hideSecret() {
+  revealedSecret.value = ''
+}
+
+// 关闭详情弹窗立即清空明文，并让在途查看请求失效。
+watch(showView, (visible) => {
+  if (!visible) {
+    revealedSecret.value = ''
+    revealSeq++
+  }
+})
 
 async function doDelete(id: string) {
   try {
@@ -491,7 +540,7 @@ onMounted(refresh)
       </div>
       <div class="header-right">
         <NSpace align="center" :size="10">
-          <NTag size="small" :bordered="false" round type="info">AES-256-GCM 硬件加密</NTag>
+          <NTag size="small" :bordered="false" round type="info">AES-256-GCM 加密</NTag>
           <NButton :loading="loading" @click="() => refresh(true)">
             <template #icon><NIcon :component="RefreshOutline" /></template>
             刷新
@@ -627,7 +676,11 @@ onMounted(refresh)
   >
     <NForm label-placement="top">
       <NFormItem label="凭据名称" required>
-        <NInput v-model:value="form.name" placeholder="例如：生产数据库 Root 密码 / AWS 生产集群 AK" />
+        <NInput
+          v-model:value="form.name"
+          :input-props="{ autocomplete: 'off' }"
+          placeholder="例如：生产数据库 Root 密码 / AWS 生产集群 AK"
+        />
       </NFormItem>
 
       <NFormItem label="凭据类型" required>
@@ -635,7 +688,11 @@ onMounted(refresh)
       </NFormItem>
 
       <NFormItem label="用户名 / 账号 (可选)">
-        <NInput v-model:value="form.username" placeholder="例如：root / admin / ubuntu" />
+        <NInput
+          v-model:value="form.username"
+          :input-props="{ autocomplete: 'off' }"
+          placeholder="例如：root / admin / ubuntu"
+        />
       </NFormItem>
 
       <NFormItem :label="editingId ? '重置密钥 / 密码 (留空保持不变)' : '密钥 / 密码'" :required="!editingId">
@@ -643,12 +700,15 @@ onMounted(refresh)
           v-model:value="form.secret"
           type="password"
           show-password-on="click"
+          :input-props="{ autocomplete: 'new-password' }"
           :placeholder="editingId ? '留空保持原密钥不变' : '请输入密码、Private Key 或 API Token'"
         >
           <template #suffix>
-            <NButton text size="tiny" type="primary" @click="generateRandomPassword">
-              随机生成
-            </NButton>
+            <span class="secret-suffix">
+              <NButton text size="tiny" type="primary" @click="generateRandomPassword">
+                随机生成
+              </NButton>
+            </span>
           </template>
         </NInput>
       </NFormItem>
@@ -666,6 +726,7 @@ onMounted(refresh)
         <NInput
           v-else
           v-model:value="form.host"
+          :input-props="{ autocomplete: 'off' }"
           placeholder="例如：prod-app-01 或 192.168.1.100"
         />
       </NFormItem>
@@ -716,8 +777,21 @@ onMounted(refresh)
           <span v-else class="muted">未关联指定主机</span>
         </NDescriptionsItem>
         <NDescriptionsItem label="密钥保护" :span="2">
-          <NSpace align="center" :size="8">
-            <span class="secret-shielded">•••••••••••••••• (受安全策略保护，不回传浏览器)</span>
+          <div v-if="revealedSecret" class="secret-reveal">
+            <pre class="secret-revealed">{{ revealedSecret }}</pre>
+            <NSpace :size="6" style="margin-top: 6px">
+              <NButton size="tiny" secondary @click="() => copyText(revealedSecret, '密钥')">
+                <template #icon><NIcon :component="CopyOutline" /></template>
+                复制
+              </NButton>
+              <NButton size="tiny" quaternary @click="hideSecret">隐藏</NButton>
+            </NSpace>
+          </div>
+          <NSpace v-else align="center" :size="8">
+            <span class="secret-shielded">••••••••••••••••</span>
+            <NButton size="tiny" secondary :loading="revealingSecret" @click="revealSecret">
+              查看密钥
+            </NButton>
           </NSpace>
         </NDescriptionsItem>
         <NDescriptionsItem label="创建时间">
@@ -734,7 +808,7 @@ onMounted(refresh)
 
       <div class="view-notice">
         <NIcon size="14" color="#6366f1"><ShieldCheckmarkOutline /></NIcon>
-        <span>此凭据已在主控端密钥环通过高强度派生密钥加密。当您在「在线终端」或「批量执行」中使用它时，系统将在服务端直接通过鉴权管道加载，保护凭据不暴露在网络流量与控制台前端中。</span>
+        <span>密钥静态加密存储，常规接口仅返回掩码。点击「查看密钥」会按需拉取明文，每次查看都会记录一条高危操作审计；在「在线终端」「批量执行」等场景中，系统仍在服务端内部加载凭据。</span>
       </div>
     </template>
     <template #footer>
@@ -898,6 +972,31 @@ onMounted(refresh)
   color: #10b981;
   letter-spacing: 1px;
   font-size: 12px;
+}
+
+.secret-suffix {
+  display: inline-flex;
+  margin-right: 5px;
+}
+
+.secret-reveal {
+  width: 100%;
+}
+
+.secret-revealed {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-primary);
+  background-color: rgba(127, 127, 127, 0.08);
+  border: 1px solid rgba(127, 127, 127, 0.16);
+  border-radius: 6px;
 }
 
 .view-notice {

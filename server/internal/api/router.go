@@ -2512,6 +2512,11 @@ func deriveAllMutationRules() []mutationRule {
 		// Private-key reveal in the cert detail dialog: same convention as the
 		// AI API key reveal — adminOnly + high risk, one audit row per view.
 		{http.MethodPost, "/api/v1/certs/:id/key", "cert_key_reveal", "cert", "id", audit.RiskHigh, "查看证书私钥明文"},
+		// Credential secret reveal: same admin-only + high-risk convention as
+		// the cert private key / AI API key reveals; routine responses stay
+		// masked. POST because the shared audit middleware skips GET, and every
+		// reveal must leave one audit row.
+		{http.MethodPost, "/api/v1/vault/credentials/:id/secret", "vault_secret_reveal", "credential", "id", audit.RiskHigh, "查看凭据密钥明文"},
 		{http.MethodDelete, "/api/v1/certs/:id", "cert_delete", "cert", "id", audit.RiskHigh, "删除证书"},
 		// File management on hosts: removal is destructive.
 		{http.MethodPost, "/api/v1/hosts/:id/files/mkdir", "file_mkdir", "host", "id", "", "新建目录"},
@@ -2568,9 +2573,24 @@ func deriveMutationAction(method, pattern string) (mutationRule, bool) {
 			return r, true
 		}
 	}
-	// Vault credential mutations share one pattern family.
+	// Vault credential mutations share one pattern family. Target type is
+	// pinned so a credential ID is not mislabelled as a host by the legacy
+	// param heuristic; the action keeps create/update/delete distinguishable.
 	if strings.HasPrefix(pattern, "/api/v1/vault") {
-		return mutationRule{method: method, pattern: pattern, action: "vault_op", risk: audit.RiskHigh, desc: "凭证库操作"}, true
+		desc := "凭证库操作"
+		switch method {
+		case http.MethodPost:
+			desc = "新增凭据"
+		case http.MethodPut:
+			desc = "更新凭据"
+		case http.MethodDelete:
+			desc = "删除凭据"
+		}
+		return mutationRule{
+			method: method, pattern: pattern, action: "vault_op",
+			targetType: "credential", targetParam: "id",
+			risk: audit.RiskHigh, desc: desc,
+		}, true
 	}
 	return mutationRule{}, false
 }

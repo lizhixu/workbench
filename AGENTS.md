@@ -1086,7 +1086,7 @@ network_routes(host_id, dest_host_id, type)          # direct/relay
 - **备份/迁移**：控制端备份与恢复见 §3.12「控制端备份与恢复工程约定」（异步任务、64 GB 上限、S3 副本、跨机密钥延续）。
 - **enroll token 管理**：一次性、可过期、可吊销（`revoked` 标志 + 删除即失效）；一机一 token，注册成功后 `used_at` 置位并失效；防止 token 被多次复用注册。
 - **凭证加密**：`credentials.secret_enc` 用 AES-GCM，主密钥来自 `WATCHMAN_MASTER_KEY` 环境变量（B.6）；主密钥轮换需提供 re-encrypt 命令。
-- **凭证脱敏**：API 返回账号时 `secret` 永不回传，仅返回 `has_secret: true`。
+- **凭证脱敏与按需查看**：常规响应（列表 / 单条 / 创建与更新回执）中 `secret` 永不回传，仅返回 `has_secret: true`；明文唯一出口是管理员显式调用的 `POST /vault/credentials/:id/secret`（adminOnly + 高危审计 `vault_secret_reveal`，与 AI API Key / 证书私钥明文查看同惯例；用 POST 是因为共享审计中间件跳过 GET），每次查看各落一条审计。前端详情弹窗默认掩码，点「查看密钥」才拉取明文，可复制 / 隐藏，重新打开详情即清空。
 - **JWT**：access token 有效期 24h，无 refresh token；写操作记 `audit_logs`。
 - **数据保留与清理**：指标数据由 janitor 按 7 天固定保留期清理（每小时跑一次）；审计日志与会话录像无自动清理。
 
@@ -1366,3 +1366,12 @@ AI 运维助手页（`web/src/views/ai/AiChat.vue`）对话输入区采用一体
 - 卡片采用微弱磨砂质感（对应 `#131b2e` 底色）、顶缘微高光流线，不堆砌冗余伪状态或硬编码端口；
 - 顶部 Logo 采用纯净无边框贴合渲染（`.login-logo-img` 42px 直接呈现），保持沉浸通透；
 - 完整设计令牌与 CSS 实现详见 `DESIGN.md §9.14`。
+
+### 8.16 敏感/凭据类表单必须禁用浏览器自动填充
+
+凡包含密码、密钥、Token、私钥或用户名/账号的凭据类表单（凭据金库新增/编辑、系统设置中的 AI Key、GitHub App 私钥、备份口令等），**必须显式关闭浏览器自动填充**。否则浏览器会把「用户名 + 密码」识别成登录表单，在打开编辑弹窗时自动填入已保存的站点凭据，污染表单，甚至导致误覆盖真实密钥：
+- 密码/密钥输入（`type="password"` 或可切换明文）：`:input-props="{ autocomplete: 'new-password' }"`；
+- 用户名、账号、App ID、凭据名称、主机名等普通文本输入：`:input-props="{ autocomplete: 'off' }"`；
+- 凭据类表单禁止使用会被浏览器识别为登录语义的 `name`/`id`（如 `username` / `password`），无特殊需要不设置 `name`；
+- 仅真实登录页（`web/src/views/auth/Login.vue`）允许浏览器密码管理器的填充与保存行为。
+- 参考实现：`AiConfig.vue`、`GitProviders.vue`、`BackupRestore.vue`、`CredentialList.vue`。

@@ -125,3 +125,52 @@ func TestSecretsEncryptedAtRestAndReloadable(t *testing.T) {
 		t.Error("换了口令仍能解出明文密钥")
 	}
 }
+
+// Optional metadata must be clearable, while an empty secret keeps the key.
+func TestUpdateClearsOptionalFieldsAndKeepsSecret(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(dir, "test-pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := s.Create(&Credential{
+		Name: "db", Type: "database", Username: "root",
+		Secret: "s3cr3t", Host: "h1", Description: "prod root",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Update(created.ID, &Credential{Username: "", Host: "", Description: ""}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s.Get(created.ID)
+	if !ok {
+		t.Fatal("credential disappeared")
+	}
+	if got.Username != "" || got.Host != "" || got.Description != "" {
+		t.Errorf("optional fields not cleared: %+v", got)
+	}
+	if got.Name != "db" || got.Secret != "s3cr3t" {
+		t.Errorf("required fields/secret must survive: %+v", got)
+	}
+}
+
+// Create must not expose its internal pointer to the caller.
+func TestCreateDoesNotAliasCallerPointer(t *testing.T) {
+	s, err := NewStore(t.TempDir(), "test-pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := &Credential{Name: "api", Type: "api_key", Secret: "original"}
+	if _, err := s.Create(in); err != nil {
+		t.Fatal(err)
+	}
+	in.Secret = "mutated-after-create"
+	got, ok := s.Get(in.ID)
+	if !ok {
+		t.Fatal("credential disappeared")
+	}
+	if got.Secret != "original" {
+		t.Errorf("caller mutation leaked into store: %q", got.Secret)
+	}
+}

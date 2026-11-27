@@ -23,6 +23,7 @@ func (h *Handlers) Register(rg *gin.RouterGroup) {
 	admin.GET("/vault/credentials", h.list)
 	admin.POST("/vault/credentials", h.create)
 	admin.GET("/vault/credentials/:id", h.get)
+	admin.POST("/vault/credentials/:id/secret", h.revealSecret)
 	admin.PUT("/vault/credentials/:id", h.update)
 	admin.DELETE("/vault/credentials/:id", h.delete)
 }
@@ -55,10 +56,10 @@ func (h *Handlers) create(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"data": created})
 }
 
-// get returns a credential's metadata. The stored secret is deliberately not
-// included: AGENTS.md B.7.4 requires the API to answer with has_secret only, so
-// a leaked console token cannot be turned into the host's real password. The
-// plaintext stays available in-process (Store.Get) for terminal login.
+// get returns a credential's metadata with the secret masked. Routine
+// responses never carry the plaintext (AGENTS.md B.7.4); an admin can fetch it
+// explicitly via the audited revealSecret endpoint below. The plaintext stays
+// available in-process (Store.Get) for terminal login.
 func (h *Handlers) get(c *gin.Context) {
 	cred, ok := h.store.Get(c.Param("id"))
 	if !ok {
@@ -70,13 +71,35 @@ func (h *Handlers) get(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": masked, "has_secret": cred.Secret != ""})
 }
 
+// revealSecret returns the plaintext secret on demand (admin-only route).
+// POST rather than GET because the shared audit middleware skips GET, and every
+// reveal must leave a high-risk audit row (vault_secret_reveal).
+func (h *Handlers) revealSecret(c *gin.Context) {
+	cred, ok := h.store.Get(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{
+		"id":     cred.ID,
+		"name":   cred.Name,
+		"secret": cred.Secret,
+	}})
+}
+
 func (h *Handlers) update(c *gin.Context) {
 	var cred Credential
 	if err := c.ShouldBindJSON(&cred); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := h.store.Update(c.Param("id"), &cred); err != nil {
+	id := c.Param("id")
+	// Distinguish a missing credential (404) from an invalid body (400).
+	if _, ok := h.store.Get(id); !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "credential not found"})
+		return
+	}
+	if err := h.store.Update(id, &cred); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

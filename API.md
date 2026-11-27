@@ -196,6 +196,7 @@
 | --- | --- | --- |
 | GET/POST | `/vault/credentials` | 凭据列表 / 创建 |
 | GET/PUT/DELETE | `/vault/credentials/:id` | 单条凭据读写 / 删除 |
+| POST | `/vault/credentials/:id/secret` | 查看凭据密钥明文（仅管理员，高危审计 `vault_secret_reveal`；常规响应仍不回显密钥） |
 
 ## 应用中心
 

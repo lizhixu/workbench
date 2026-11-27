@@ -62,7 +62,9 @@ fi
 [ "$(git cat-file -t "refs/tags/${TAG}" 2>/dev/null || true)" = "tag" ] \
   || fail "无法取得 $TAG 的 tag 对象（本地 ref 被建成轻量引用，重新拉取也失败）"
 
-MSG="$(git tag -l --format='%(contents)' "$TAG")"
+# 去掉 CRLF 中的 \r：Windows 开发机 core.autocrlf=true 时用 -F 从 CRLF 文件建 tag，
+# 会把 \r 写进 tag 对象，使首行变成 "release: <tag>\r"，与 CI（Linux）严格比较失败。
+MSG="$(git tag -l --format='%(contents)' "$TAG" | tr -d '\r')"
 
 # 4. 附注不能为空
 if [ -z "$(printf '%s' "$MSG" | tr -d '[:space:]')" ]; then
